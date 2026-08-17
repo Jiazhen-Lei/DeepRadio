@@ -1,0 +1,32 @@
+# Copyright 2015 Free Software Foundation, Inc.
+#
+# This file is part of GNU Radio
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+
+########################################################################
+include(GrPython)
+
+gr_python_install(
+    FILES __init__.py
+          channel_construction.py
+          channel_construction_awgn.py
+          channel_construction_bec.py
+          helper_functions.py
+          encoder.py
+          decoder.py
+          common.py
+    DESTINATION ${GR_PYTHON_DIR}/gnuradio/fec/polar)
+configure_file(polar_channel_construction ${CMAKE_BINARY_DIR}/polar_channel_construction @ONLY)
+gr_python_install(PROGRAMS ${CMAKE_BINARY_DIR}/polar_channel_construction DESTINATION ${GR_RUNTIME_DIR})
+if(WIN32)
+    gen_py_launcher(
+        MODULES polar_channel_construction
+        PYTHON ${GR_BUNDLE_PYTHON}
+    )
+elseif(APPLE)
+gen_py_program_launcher(
+    PROGRAMS polar_channel_construction
+)
+endif()

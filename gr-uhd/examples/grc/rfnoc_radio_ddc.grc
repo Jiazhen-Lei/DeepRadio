@@ -1,0 +1,399 @@
+options:
+  parameters:
+    alias: ''
+    author: Martin Braun <martin.braun@ettus.com>
+    catch_exceptions: 'True'
+    comment: ''
+    copyright: ''
+    description: ''
+    gen_linking: dynamic
+    generate_options: qt_gui
+    generator_class_name: PythonQtGuiGenerator
+    generator_module: gnuradio.grc.workflows.python_qt_gui
+    hier_block_src_path: '.:'
+    id: rfnoc_radio_ddc
+    max_nouts: '0'
+    output_language: python
+    qt_qss_theme: ''
+    realtime_scheduling: ''
+    run: 'True'
+    run_command: '{python} -u {filename}'
+    thread_safe_setters: ''
+    title: 'RFNoC: Radio -> DDC Example'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [8, 8]
+    rotation: 0
+    state: enabled
+
+blocks:
+- name: freq
+  id: variable_qtgui_entry
+  parameters:
+    comment: ''
+    entry_signal: editingFinished
+    gui_hint: ''
+    label: Frequency (Hz)
+    type: real
+    value: 1e9
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [304, 108.0]
+    rotation: 0
+    state: true
+- name: gain
+  id: variable_qtgui_entry
+  parameters:
+    comment: ''
+    entry_signal: editingFinished
+    gui_hint: ''
+    label: Gain (dB)
+    type: int
+    value: '0'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [192, 108.0]
+    rotation: 0
+    state: true
+- name: samp_rate
+  id: variable_qtgui_entry
+  parameters:
+    comment: ''
+    entry_signal: editingFinished
+    gui_hint: ''
+    label: Sampling Rate (Hz)
+    type: real
+    value: 1e6
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [440, 108.0]
+    rotation: 0
+    state: true
+- name: uhd_rfnoc_graph
+  id: uhd_rfnoc_graph
+  parameters:
+    affinity: ''
+    alias: ''
+    clock_source: ''
+    comment: ''
+    dev_addr: args
+    dev_args: ''
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    num_mboards: '1'
+    time_source: ''
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [193, 10]
+    rotation: 0
+    state: true
+- name: args
+  id: parameter
+  parameters:
+    alias: ''
+    comment: ''
+    hide: none
+    label: Device Address
+    short_id: a
+    type: str
+    value: type=x300,addr=192.168.30.2
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [1104, 20.0]
+    rotation: 0
+    state: enabled
+- name: blocks_message_debug_0
+  id: blocks_message_debug
+  parameters:
+    affinity: ''
+    alias: ''
+    comment: 'This is just for visualization purposes,
+
+      it will show the message that is sent
+
+      to the motherboard controller block.'
+    en_uvec: 'True'
+    log_level: info
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [920, 200.0]
+    rotation: 0
+    state: enabled
+- name: qtgui_edit_box_msg_0
+  id: qtgui_edit_box_msg
+  parameters:
+    affinity: ''
+    alias: ''
+    comment: 'This will show an input field, into
+
+      which the user can type valid time sources,
+
+      such as external, internal, gpsdo, etc.
+
+
+      When updating the time source and hitting
+
+      enter, a message is sent to the motherboard
+
+      controller block which causes the time source
+
+      to update.'
+    gui_hint: ''
+    is_pair: 'True'
+    is_static: 'True'
+    key: time_source
+    label: Time Source
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    type: string
+    value: internal
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [416, 188.0]
+    rotation: 0
+    state: enabled
+- name: qtgui_freq_sink_x_0
+  id: qtgui_freq_sink_x
+  parameters:
+    affinity: ''
+    alias: ''
+    alpha1: '1.0'
+    alpha10: '1.0'
+    alpha2: '1.0'
+    alpha3: '1.0'
+    alpha4: '1.0'
+    alpha5: '1.0'
+    alpha6: '1.0'
+    alpha7: '1.0'
+    alpha8: '1.0'
+    alpha9: '1.0'
+    autoscale: 'False'
+    average: '1.0'
+    axislabels: 'True'
+    bw: samp_rate
+    color1: '"blue"'
+    color10: '"dark blue"'
+    color2: '"red"'
+    color3: '"green"'
+    color4: '"black"'
+    color5: '"cyan"'
+    color6: '"magenta"'
+    color7: '"yellow"'
+    color8: '"dark red"'
+    color9: '"dark green"'
+    comment: ''
+    ctrlpanel: 'False'
+    fc: '0'
+    fftsize: '1024'
+    freqhalf: 'True'
+    grid: 'False'
+    gui_hint: ''
+    label: Relative Gain
+    label1: ''
+    label10: ''''''
+    label2: ''''''
+    label3: ''''''
+    label4: ''''''
+    label5: ''''''
+    label6: ''''''
+    label7: ''''''
+    label8: ''''''
+    label9: ''''''
+    legend: 'True'
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    name: '""'
+    nconnections: '1'
+    norm_window: 'False'
+    showports: 'False'
+    tr_chan: '0'
+    tr_level: '0.0'
+    tr_mode: qtgui.TRIG_MODE_FREE
+    tr_tag: '""'
+    type: complex
+    units: dB
+    update_time: '0.10'
+    width1: '1'
+    width10: '1'
+    width2: '1'
+    width3: '1'
+    width4: '1'
+    width5: '1'
+    width6: '1'
+    width7: '1'
+    width8: '1'
+    width9: '1'
+    wintype: window.WIN_BLACKMAN_hARRIS
+    ymax: '10'
+    ymin: '-140'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [952, 476.0]
+    rotation: 0
+    state: true
+- name: uhd_rfnoc_ddc_0
+  id: uhd_rfnoc_ddc
+  parameters:
+    affinity: ''
+    alias: ''
+    block_args: ''
+    comment: ''
+    device_select: '-1'
+    freq0: '0'
+    freq1: '0'
+    freq2: '0'
+    freq3: '0'
+    instance_index: '-1'
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    num_chans: '1'
+    output_rate0: '0'
+    output_rate1: '0'
+    output_rate2: '0'
+    output_rate3: '0'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [424, 484.0]
+    rotation: 0
+    state: true
+- name: uhd_rfnoc_mb_controller_0
+  id: uhd_rfnoc_mb_controller
+  parameters:
+    affinity: ''
+    alias: ''
+    clock_source: ''
+    comment: 'This is an optional block, which allows more
+
+      fine-grained control over the USRP hardware.
+
+      It can be used to configure options that are
+
+      not tied to individual RFNoC blocks, e.g., the
+
+      clock or time source, or the current time.'
+    mb_index: uhd.rfnoc_mb_controller.ALL_MBOARDS
+    set_time_now: '-1'
+    time_source: ''
+    timekeeper_idx: '0'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [752, 24.0]
+    rotation: 0
+    state: enabled
+- name: uhd_rfnoc_rx_radio_0
+  id: uhd_rfnoc_rx_radio
+  parameters:
+    affinity: ''
+    alias: ''
+    antenna0: A
+    antenna1: RX2
+    antenna2: RX2
+    antenna3: RX2
+    bandwidth0: '0'
+    bandwidth1: '0'
+    bandwidth2: '0'
+    bandwidth3: '0'
+    block_args: ''
+    comment: ''
+    dc_offset0: 'False'
+    dc_offset1: 'False'
+    dc_offset2: 'False'
+    dc_offset3: 'False'
+    device_select: '-1'
+    enable_timestamps0: 'True'
+    enable_timestamps1: 'True'
+    enable_timestamps2: 'True'
+    enable_timestamps3: 'True'
+    frequency0: 1e9
+    frequency1: 1e9
+    frequency2: 1e9
+    frequency3: 1e9
+    gain0: '0'
+    gain1: '0'
+    gain2: '0'
+    gain3: '0'
+    instance_index: '-1'
+    iq_balance0: 'False'
+    iq_balance1: 'False'
+    iq_balance2: 'False'
+    iq_balance3: 'False'
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    num_chans: '1'
+    rate: 200e6
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [120, 444.0]
+    rotation: 0
+    state: true
+- name: uhd_rfnoc_rx_streamer_0
+  id: uhd_rfnoc_rx_streamer
+  parameters:
+    adapter_id_list: '[0]'
+    affinity: ''
+    alias: ''
+    args: ''
+    comment: ''
+    issue_stream_cmd: 'True'
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    num_chans: '1'
+    otw: sc16
+    output_type: fc32
+    start_time: '0'
+    start_time_set: 'False'
+    use_default_adapter_id: 'True'
+    vlen: '1'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [736, 492.0]
+    rotation: 0
+    state: true
+
+connections:
+- [qtgui_edit_box_msg_0, msg, blocks_message_debug_0, print]
+- [qtgui_edit_box_msg_0, msg, uhd_rfnoc_mb_controller_0, command]
+- params:
+    is_back_edge: 'False'
+  snk_blk_id: uhd_rfnoc_rx_streamer_0
+  snk_port_id: '0'
+  src_blk_id: uhd_rfnoc_ddc_0
+  src_port_id: '0'
+- [uhd_rfnoc_graph, mbc, uhd_rfnoc_mb_controller_0, g]
+- params:
+    is_back_edge: 'False'
+  snk_blk_id: uhd_rfnoc_ddc_0
+  snk_port_id: '0'
+  src_blk_id: uhd_rfnoc_rx_radio_0
+  src_port_id: '0'
+- [uhd_rfnoc_rx_streamer_0, '0', qtgui_freq_sink_x_0, '0']
+
+metadata:
+  file_format: 2
+  grc_version: v3.11.0.0git-1000-g7bfb8d06

@@ -1,0 +1,39 @@
+id: options
+label: Options
+flags: ['python', 'cpp']
+
+# NOTE: This block mainly defined in Python, and most of its functionality is
+# defined in core/blocks/options.py. This YAML is mostly a stub to populate some
+# basic fields.
+
+parameters:
+-   id: title
+    label: Title
+    dtype: string
+    hide: ${ ('none' if title else 'part') }
+-   id: author
+    label: Author
+    dtype: string
+    hide: ${ ('none' if author else 'part') }
+-   id: copyright
+    label: Copyright
+    dtype: string
+    hide: ${ ('none' if copyright else 'part') }
+-   id: description
+    label: Description
+    dtype: string
+    hide: ${ ('none' if description else 'part') }
+-   id: output_language
+    label: Output Language
+    dtype: enum
+    default: python
+    options: []
+    option_labels: []
+-   id: generate_options
+    label: Generate Options
+    dtype: enum
+    default: qt_gui
+    options: []
+    option_labels: []
+
+file_format: 1

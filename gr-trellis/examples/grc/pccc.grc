@@ -1,0 +1,551 @@
+options:
+  parameters:
+    author: AA
+    catch_exceptions: 'True'
+    category: Custom
+    cmake_opt: ''
+    comment: ''
+    copyright: ''
+    description: gnuradio flow graph
+    gen_cmake: 'On'
+    gen_linking: dynamic
+    generate_options: qt_gui
+    hier_block_src_path: '.:'
+    id: pccc
+    max_nouts: '0'
+    output_language: python
+    placement: (0,0)
+    qt_qss_theme: ''
+    realtime_scheduling: ''
+    run: 'True'
+    run_command: '{python} -u {filename}'
+    run_options: prompt
+    sizing_mode: fixed
+    thread_safe_setters: ''
+    title: Parallel Concatenated Convolutional Code
+    window_size: 2048, 2048
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [0, 4]
+    rotation: 0
+    state: enabled
+
+blocks:
+- name: Es
+  id: variable
+  parameters:
+    comment: ''
+    value: sum(numpy.square(constellation))/(len(constellation)/(1.0*dim))
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [728, 4]
+    rotation: 0
+    state: enabled
+- name: EsN0_dB
+  id: variable_qtgui_range
+  parameters:
+    comment: ''
+    gui_hint: ''
+    label: Es/N0 (dB)
+    min_len: '200'
+    orient: QtCore.Qt.Horizontal
+    rangeType: float
+    start: '-10'
+    step: '1'
+    stop: '20'
+    value: '2'
+    widget: counter_slider
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [864, 140]
+    rotation: 0
+    state: enabled
+- name: R
+  id: variable
+  parameters:
+    comment: ''
+    value: 100e3
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [184, 68]
+    rotation: 0
+    state: enabled
+- name: block
+  id: variable
+  parameters:
+    comment: ''
+    value: '1000'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [184, 4]
+    rotation: 0
+    state: enabled
+- name: constellation
+  id: variable
+  parameters:
+    comment: ''
+    value: mod[1]
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [488, 132]
+    rotation: 0
+    state: enabled
+- name: constellation
+  id: variable
+  parameters:
+    comment: ''
+    value: '-3,-3,-1,-3,1,-3,3,-3,   -3,-1,-1,-1,1,-1,3,-1,     -3,1,-1,1,1,1,3,1,     -3,3,-1,3,1,3,3,3        '
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [488, 4]
+    rotation: 0
+    state: disabled
+- name: dim
+  id: variable
+  parameters:
+    comment: ''
+    value: mod[0]
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [648, 132]
+    rotation: 0
+    state: enabled
+- name: dim
+  id: variable
+  parameters:
+    comment: ''
+    value: '2'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [648, 4]
+    rotation: 0
+    state: disabled
+- name: fsm1
+  id: variable
+  parameters:
+    comment: ''
+    value: trellis.fsm(prefix+"awgn1o2_4rsc.fsm")
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [288, 68]
+    rotation: 0
+    state: enabled
+- name: fsm2
+  id: variable
+  parameters:
+    comment: ''
+    value: trellis.fsm(prefix+"awgn1o1_4rsc.fsm")
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [288, 132]
+    rotation: 0
+    state: enabled
+- name: interleaver
+  id: variable
+  parameters:
+    comment: ''
+    value: trellis.interleaver(block,666)
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [288, 196]
+    rotation: 0
+    state: enabled
+- name: mod
+  id: variable
+  parameters:
+    comment: ''
+    value: fu.psk2x3
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [480, 68]
+    rotation: 0
+    state: enabled
+- name: noisevar
+  id: variable
+  parameters:
+    comment: ''
+    value: 10**(-EsN0_dB/10.0)  * Es   /2.0
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [648, 68]
+    rotation: 0
+    state: enabled
+- name: prefix
+  id: variable
+  parameters:
+    comment: ''
+    value: '"@FSM_FILE_INSTALL_DIR@"'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [288, 4]
+    rotation: 0
+    state: enabled
+- name: analog_noise_source_x_0
+  id: analog_noise_source_x
+  parameters:
+    affinity: ''
+    alias: ''
+    amp: noisevar**0.5
+    comment: ''
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    noise_type: analog.GR_GAUSSIAN
+    seed: '-42'
+    type: float
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [648, 412]
+    rotation: 0
+    state: enabled
+- name: analog_random_source_x_0_0
+  id: analog_random_source_x
+  parameters:
+    affinity: ''
+    alias: ''
+    comment: ''
+    max: '2'
+    maxoutbuf: '0'
+    min: '0'
+    minoutbuf: '0'
+    num_samps: block
+    repeat: 'True'
+    type: byte
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [0, 316]
+    rotation: 0
+    state: enabled
+- name: blocks_add_xx_1
+  id: blocks_add_xx
+  parameters:
+    affinity: ''
+    alias: ''
+    comment: ''
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    num_inputs: '2'
+    type: float
+    vlen: '1'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [864, 344]
+    rotation: 0
+    state: enabled
+- name: blocks_throttle_0_0
+  id: blocks_throttle
+  parameters:
+    affinity: ''
+    alias: ''
+    comment: ''
+    ignoretag: 'True'
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    samples_per_second: R
+    type: byte
+    vlen: '1'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [200, 340]
+    rotation: 0
+    state: enabled
+- name: digital_chunks_to_symbols_xx_0
+  id: digital_chunks_to_symbols_xx
+  parameters:
+    affinity: ''
+    alias: ''
+    comment: ''
+    dimension: dim
+    in_type: byte
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    num_ports: '1'
+    out_type: float
+    symbol_table: constellation
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [624, 332]
+    rotation: 0
+    state: enabled
+- name: fec_ber_bf_0
+  id: fec_ber_bf
+  parameters:
+    affinity: ''
+    alias: ''
+    berlimit: '-7.0'
+    berminerrors: '100'
+    comment: ''
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    test_mode: 'False'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [328, 720.0]
+    rotation: 0
+    state: enabled
+- name: import_0_0
+  id: import
+  parameters:
+    alias: ''
+    comment: ''
+    imports: import gnuradio.trellis.fsm_utils as fu
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [0, 132.0]
+    rotation: 0
+    state: enabled
+- name: qtgui_number_sink_0
+  id: qtgui_number_sink
+  parameters:
+    affinity: ''
+    alias: ''
+    autoscale: 'False'
+    avg: '0'
+    color1: ("black", "black")
+    color10: ("black", "black")
+    color2: ("black", "black")
+    color3: ("black", "black")
+    color4: ("black", "black")
+    color5: ("black", "black")
+    color6: ("black", "black")
+    color7: ("black", "black")
+    color8: ("black", "black")
+    color9: ("black", "black")
+    comment: ''
+    factor1: '1'
+    factor10: '1'
+    factor2: '1'
+    factor3: '1'
+    factor4: '1'
+    factor5: '1'
+    factor6: '1'
+    factor7: '1'
+    factor8: '1'
+    factor9: '1'
+    graph_type: qtgui.NUM_GRAPH_HORIZ
+    gui_hint: ''
+    label1: BER
+    label10: ''
+    label2: ''
+    label3: ''
+    label4: ''
+    label5: ''
+    label6: ''
+    label7: ''
+    label8: ''
+    label9: ''
+    max: '1'
+    min: '0'
+    name: '"BER"'
+    nconnections: '1'
+    type: float
+    unit1: ''
+    unit10: ''
+    unit2: ''
+    unit3: ''
+    unit4: ''
+    unit5: ''
+    unit6: ''
+    unit7: ''
+    unit8: ''
+    unit9: ''
+    update_time: '0.10'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [608, 692]
+    rotation: 0
+    state: enabled
+- name: trellis_pccc_decoder_combined_xx_0
+  id: trellis_pccc_decoder_combined_xx
+  parameters:
+    affinity: ''
+    alias: ''
+    block_size: block
+    comment: ''
+    dim: dim
+    i_final_state: '-1'
+    i_fsm_args: fsm2
+    i_init_state: '0'
+    interleaver: interleaver
+    iterations: '10'
+    maxoutbuf: '0'
+    metric_type: digital.TRELLIS_EUCLIDEAN
+    minoutbuf: '0'
+    o_final_state: '-1'
+    o_fsm_args: fsm1
+    o_init_state: '0'
+    out_type: b
+    scaling: 0.5/noisevar
+    siso_type: trellis.TRELLIS_MIN_SUM
+    table: constellation
+    type: f
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [312, 448]
+    rotation: 0
+    state: enabled
+- name: trellis_pccc_encoder_xx_0
+  id: trellis_pccc_encoder_xx
+  parameters:
+    affinity: ''
+    alias: ''
+    bl: block
+    comment: ''
+    i_fsm_args: fsm2
+    i_init_state: '0'
+    interleaver_args: interleaver
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    o_fsm_args: fsm1
+    o_init_state: '0'
+    type: bb
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [392, 300]
+    rotation: 0
+    state: enabled
+- name: virtual_sink_0
+  id: virtual_sink
+  parameters:
+    alias: ''
+    comment: ''
+    stream_id: observation
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [968, 356]
+    rotation: 0
+    state: enabled
+- name: virtual_sink_0_0
+  id: virtual_sink
+  parameters:
+    alias: ''
+    comment: ''
+    stream_id: info
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [200, 404]
+    rotation: 0
+    state: enabled
+- name: virtual_sink_0_1
+  id: virtual_sink
+  parameters:
+    alias: ''
+    comment: ''
+    stream_id: estimate
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [680, 548]
+    rotation: 0
+    state: enabled
+- name: virtual_source_0
+  id: virtual_source
+  parameters:
+    alias: ''
+    comment: ''
+    stream_id: observation
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [16, 548]
+    rotation: 0
+    state: enabled
+- name: virtual_source_0_0
+  id: virtual_source
+  parameters:
+    alias: ''
+    comment: ''
+    stream_id: info
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [56, 676]
+    rotation: 0
+    state: enabled
+- name: virtual_source_0_0_0
+  id: virtual_source
+  parameters:
+    alias: ''
+    comment: ''
+    stream_id: estimate
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [56, 732]
+    rotation: 0
+    state: enabled
+
+connections:
+- [analog_noise_source_x_0, '0', blocks_add_xx_1, '1']
+- [analog_random_source_x_0_0, '0', blocks_throttle_0_0, '0']
+- [analog_random_source_x_0_0, '0', virtual_sink_0_0, '0']
+- [blocks_add_xx_1, '0', virtual_sink_0, '0']
+- [blocks_throttle_0_0, '0', trellis_pccc_encoder_xx_0, '0']
+- [digital_chunks_to_symbols_xx_0, '0', blocks_add_xx_1, '0']
+- [fec_ber_bf_0, '0', qtgui_number_sink_0, '0']
+- [trellis_pccc_decoder_combined_xx_0, '0', virtual_sink_0_1, '0']
+- [trellis_pccc_encoder_xx_0, '0', digital_chunks_to_symbols_xx_0, '0']
+- [virtual_source_0, '0', trellis_pccc_decoder_combined_xx_0, '0']
+- [virtual_source_0_0, '0', fec_ber_bf_0, '0']
+- [virtual_source_0_0_0, '0', fec_ber_bf_0, '1']
+
+metadata:
+  file_format: 1
+  grc_version: v3.11.0.0git-689-g85dee02b
