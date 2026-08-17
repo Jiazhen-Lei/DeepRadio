@@ -6,3 +6,5 @@ build*/
 
 local/
 AGENT.md
+.DS_Store
+CODEBUDDY.md

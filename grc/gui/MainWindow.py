@@ -16,6 +16,7 @@ from . import Bars, Actions, Utils
 from .BlockTreeWindow import BlockTreeWindow
 from .Console import Console
 from .VariableEditor import VariableEditor
+from .AgentPanel import AgentPanel
 from .Constants import \
     NEW_FLOGRAPH_TITLE, DEFAULT_CONSOLE_WINDOW_WIDTH
 from .Dialogs import TextDisplay, MessageDialogWrapper
@@ -109,17 +110,44 @@ class MainWindow(Gtk.ApplicationWindow):
         self.vars.connect(
             'remove_block', self._remove_block_from_current_flow_graph)
 
+        # Create the Agent panel (right-side chat dock)
+        self.agent_panel = AgentPanel(platform)
+        self.agent_panel.connect(
+            'open_flow_graph', self._on_agent_open_flow_graph)
+
         # Figure out which place to put the variable editor
         self.left = Gtk.VPaned()  # orientation=Gtk.Orientation.VERTICAL)
         self.right = Gtk.VPaned()  # orientation=Gtk.Orientation.VERTICAL)
         # orientation=Gtk.Orientation.HORIZONTAL)
         self.left_subpanel = Gtk.HPaned()
 
+        # A vertical box that stacks a tab switcher (top) over a Gtk.Stack
+        # holding the block tree ("Core") and the Agent panel ("Agent").
+        # The Stack shows only one child at a time; the user clicks the
+        # switcher tabs to choose which one is visible in the right sidebar,
+        # similar to an IDE side panel.
+        self.right_top = Gtk.VBox()
+
+        self.right_stack = Gtk.Stack()
+        self.right_stack.set_transition_type(
+            Gtk.StackTransitionType.CROSSFADE)
+        self.right_stack.add_titled(self.btwin, "core", "Core")
+        self.right_stack.add_titled(self.agent_panel, "agent", "Agent")
+
+        self.right_switcher = Gtk.StackSwitcher()
+        self.right_switcher.set_stack(self.right_stack)
+        self.right_switcher.set_halign(Gtk.Align.CENTER)
+
+        self.right_top.pack_start(
+            self.right_switcher, expand=False, fill=False, padding=2)
+        self.right_top.pack_start(
+            self.right_stack, expand=True, fill=True, padding=0)
+
         self.variable_panel_sidebar = self.config.variable_editor_sidebar()
         if self.variable_panel_sidebar:
             self.left.pack1(self.notebook)
             self.left.pack2(self.console, False)
-            self.right.pack1(self.btwin)
+            self.right.pack1(self.right_top)
             self.right.pack2(self.vars, False)
         else:
             # Put the variable editor in a panel with the console
@@ -129,7 +157,7 @@ class MainWindow(Gtk.ApplicationWindow):
             self.left.pack2(self.left_subpanel, False)
 
             # Create the right panel
-            self.right.pack1(self.btwin)
+            self.right.pack1(self.right_top)
 
         self.main.pack1(self.left)
         self.main.pack2(self.right, False)
@@ -155,6 +183,10 @@ class MainWindow(Gtk.ApplicationWindow):
     def _add_block_to_current_flow_graph(self, widget, key):
         self.current_flow_graph.add_new_block(key)
 
+    def _on_agent_open_flow_graph(self, _widget, file_path):
+        """Open a .grc file produced by the Agent panel in a new page."""
+        self.new_page(file_path, show=True)
+
     def _remove_block_from_current_flow_graph(self, widget, key):
         block = self.current_flow_graph.get_block(key)
         self.current_flow_graph.remove_element(block)
@@ -179,10 +211,16 @@ class MainWindow(Gtk.ApplicationWindow):
         #  to be hidden as well.
 
         if panel == self.BLOCKS:
+            # The block tree ("Core") now lives inside the right-side stack
+            # together with the Agent panel. Toggling the "Blocks" menu item
+            # shows/hides that whole switchable area; when shown, make sure the
+            # Core page is the selected one.
             if visibility:
+                self.right_top.show()
                 self.btwin.show()
+                self.right_stack.set_visible_child_name("core")
             else:
-                self.btwin.hide()
+                self.right_top.hide()
         elif panel == self.CONSOLE:
             if visibility:
                 self.console.show()
@@ -197,13 +235,13 @@ class MainWindow(Gtk.ApplicationWindow):
             return
 
         if self.variable_panel_sidebar:
-            # If both the variable editor and block panels are hidden, hide the right container
-            if not (self.btwin.get_property('visible')) and not (self.vars.get_property('visible')):
+            # If both the variable editor and the switchable panel are hidden, hide the right container
+            if not (self.right_top.get_property('visible')) and not (self.vars.get_property('visible')):
                 self.right.hide()
             else:
                 self.right.show()
         else:
-            if not (self.btwin.get_property('visible')):
+            if not (self.right_top.get_property('visible')):
                 self.right.hide()
             else:
                 self.right.show()

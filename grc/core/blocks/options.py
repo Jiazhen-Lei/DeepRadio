@@ -310,24 +310,35 @@ class Options(Block):
         generate_options. Note that not all output languages have the same
         generate options, so we take the liberty to update those if we have to.
         """
+        # Use the raw stored values (``.value``) rather than ``get_value()``
+        # here: ``get_value()`` applies enum-option cleansing, but during the
+        # first ``rewrite()`` the initial ``self.params`` still carries an empty
+        # options list for ``output_language`` (the populated lists live in the
+        # per-workflow param sets). Reading ``get_value()`` would then wrongly
+        # reset a valid language such as ``python`` back to the empty default
+        # and break workflow matching. The raw value is what we actually want
+        # to match a workflow against.
+        output_language = self.params['output_language'].value
+        generate_options = self.params['generate_options'].value
+
         # First, see if we can find a workflow that matches the current output
         # language and generate options.
         for workflow in self.workflows:
-            if workflow.output_language == self.params['output_language'].get_value() \
-                    and workflow.generate_options == self.params['generate_options'].get_value():
+            if workflow.output_language == output_language \
+                    and workflow.generate_options == generate_options:
                 self.current_workflow = workflow
                 return
         # Otherwise, see if we can find a workflow that matches the current
         # output language, but ignore the generate options. We'll pick the first
         # available workflow, and update the generate options to match.
         for workflow in self.workflows:
-            if workflow.output_language == self.params['output_language'].get_value():
+            if workflow.output_language == output_language:
                 self.current_workflow = workflow
                 self.params['generate_options'].set_value(workflow.generate_options)
                 return
         assert False, f"No workflow found for output_language: " \
-                      f"{self.params['output_language'].get_value()} and " \
-                      f"generate_options: {self.params['generate_options'].get_value()}"
+                      f"{output_language} and " \
+                      f"generate_options: {generate_options}"
 
     def get_params_by_workflow_id(self, id):
         """
