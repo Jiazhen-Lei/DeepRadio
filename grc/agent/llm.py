@@ -29,6 +29,59 @@ import urllib.request
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------- #
+# .env 加载 (纯标准库, 不引入额外依赖)
+# ---------------------------------------------------------------------------- #
+def _load_env_file(path: str | None = None) -> None:
+    """从 .env 文件把变量注入 os.environ (已存在的变量不覆盖)。
+
+    查找顺序: 显式传入的 path -> 当前工作目录 ./env -> 本文件所在的
+    grc/agent 向上三级(即项目根目录)的 .env。只注入尚未在环境中出现的
+    key, 因此 shell 里已 export 的值优先级更高。
+
+    幂等, 可重复调用。
+    """
+    candidates = []
+    if path:
+        candidates.append(path)
+    candidates.append(os.path.join(os.getcwd(), ".env"))
+    # 本项目根目录: grc/agent/llm.py -> 上三级
+    root = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
+    candidates.append(os.path.join(root, ".env"))
+
+    target = next((c for c in candidates if os.path.isfile(c)), None)
+    if target is None:
+        return
+
+    try:
+        with open(target, "r", encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except OSError as e:
+        logger.warning("读取 .env 失败: %s", e)
+        return
+
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        if "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key, val = key.strip(), val.strip()
+        if not key:
+            continue
+        # 去掉成对引号
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+            val = val[1:-1]
+        os.environ.setdefault(key, val)
+
+    logger.info("已从 %s 载入 .env 配置", target)
+
+
 class LLMNotConfigured(Exception):
     """未配置 LLM(缺 BASE_URL / API_KEY / MODEL), 调用方应回落到 demo。"""
 
@@ -47,9 +100,13 @@ def _env(name: str, default: str = "") -> str:
 def get_config() -> dict:
     """从环境变量读取 LLM 配置。
 
+    调用前会先尝试从项目根目录的 .env 载入(不覆盖已 export 的变量)。
+
     Raises:
         LLMNotConfigured: 缺少 BASE_URL / API_KEY / MODEL 任一项时。
     """
+    _load_env_file()
+
     base_url = _env("GRC_AGENT_BASE_URL").rstrip("/")
     api_key = _env("GRC_AGENT_API_KEY")
     model = _env("GRC_AGENT_MODEL")

@@ -3,8 +3,10 @@
 *.pyo
 build*/
 .venv/*
+.vscode
 
 local/
 AGENT.md
 .DS_Store
 CODEBUDDY.md
+.env
