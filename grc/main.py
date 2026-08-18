@@ -77,6 +77,18 @@ def run_gtk(args, log):
     # Delay importing until the logging is setup
     from .gui.Platform import Platform
     from .gui.Application import Application
+    from .agent import env
+
+    # In the "source-tree GRC + conda GNU Radio runtime" setup, two things must
+    # be bridged before building the block library, otherwise no workflows are
+    # found (which breaks the workflow-based options block) and the workflow
+    # generator modules cannot be imported:
+    #   1. register the source-tree ``grc`` package also as ``gnuradio.grc`` so
+    #      the ``generator_module: gnuradio.grc.workflows.*`` references resolve.
+    #   2. include the source-tree ``grc/blocks`` in the block search paths so
+    #      the ``*.workflow.yml`` files are actually loaded.
+    log.debug("Bridging gnuradio.grc package for workflow loading")
+    env.bridge_package_name()
 
     # The platform is loaded differently between QT and GTK, so this is required both places
     log.debug("Loading platform")
@@ -87,7 +99,7 @@ def run_gtk(args, log):
         prefs=gr.prefs(),
         install_prefix=gr.prefix()
     )
-    platform.build_library()
+    platform.build_library(env.block_paths())
 
     log.debug("Loading application")
     app = Application(args.flow_graphs, platform)
@@ -251,3 +263,7 @@ def main():
             run_qt(args, log)
         else:
             run_gtk(args, log)
+
+
+if __name__ == '__main__':
+    main()

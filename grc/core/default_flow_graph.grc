@@ -10,6 +10,8 @@ options:
     author: ''
     copyright: ''
     description: ''
+    output_language: python
+    generate_options: qt_gui
     hier_block_src_path: '.:'
   states:
     coordinate:

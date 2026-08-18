@@ -35,7 +35,19 @@ class Application(Gtk.Application):
     """
 
     def __init__(self, file_paths, platform):
-        Gtk.Application.__init__(self)
+        # On macOS (GTK Quartz backend) a Gtk.Application without an
+        # application_id does not keep the main loop alive after do_activate()
+        # returns: the freshly created window has not been mapped yet, the
+        # application holds no window, so run() returns immediately and the
+        # process exits without ever showing a window. Giving the application a
+        # stable id makes GApplication follow the normal registered
+        # startup/activate lifecycle and hold the main loop while the window is
+        # open.
+        Gtk.Application.__init__(
+            self,
+            application_id="org.gnuradio.grc",
+            flags=Gio.ApplicationFlags.NON_UNIQUE,
+        )
         """
         Application constructor.
         Create the main window, setup the message handler, import the preferences,
@@ -84,6 +96,13 @@ class Application(Gtk.Application):
         self.main_window = MainWindow(self, self.platform)
         self.main_window.connect('delete-event', self._quit)
         self.get_focus_flag = self.main_window.get_focus_flag
+
+        # Explicitly show and raise the window to the front. On macOS (Quartz)
+        # this is required so the freshly created window is actually mapped and
+        # activated before the main loop settles; otherwise the process can exit
+        # before any window becomes visible.
+        self.main_window.show_all()
+        self.main_window.present()
 
         # setup the messages
         Messages.register_messenger(self.main_window.add_console_line)
