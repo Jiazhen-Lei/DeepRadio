@@ -1,11 +1,13 @@
 """narrate.py:按用户画像档位渲染自然语言解说(创新 B 的表达执行体)。
 
 同一份结构化结果(建图/指标/诊断),对 novice/student/expert 渲染出
-繁简、术语密度、是否给公式都不同的文本。这是\"同一后端、分档表达\"
-的落地点,被 design_link / debug_by_metric / explain_block 复用。
+繁简、术语密度、是否给公式都不同的文本。这是"同一后端、分档表达"
+的落地点,被 design_link / debug_by_metric 复用。
 
 纯模板 + 规则,零依赖,离线可复现。有 LLM 时 agent 可在此基础上润色;
 无 LLM 时这就是最终输出。
+
+注:本模块是 tools 层内部的渲染依赖,不注册为可被 LLM 调度的 tool。
 """
 
 from __future__ import annotations
@@ -98,30 +100,6 @@ def narrate_debug(diagnosis: Dict[str, Any], profile) -> str:
     if suggestions:
         s += " 可尝试:"
         s += "; ".join(f"{x['say_student']}" for x in suggestions[:2])
-    return s
-
-
-# ---------------------------------------------------------------------------
-# explain_block 的解说
-# ---------------------------------------------------------------------------
-def narrate_block(info: Dict[str, Any], profile) -> str:
-    lvl = _level(profile)
-    label = info.get("label", info.get("key", "该块"))
-    role = info.get("role", "")
-    params = info.get("key_params", [])
-
-    if lvl == "novice":
-        s = f"「{label}」的作用是:{_plain(role)}"
-        return s
-    if lvl == "expert":
-        ps = ", ".join(p["name"] for p in params[:5])
-        return f"{label}: {role} 关键参数: {ps}."
-    # student
-    s = f"「{label}」:{role}"
-    if params:
-        s += " 主要参数——"
-        s += "; ".join(f"{p['name']}({p.get('meaning', '见文档')})"
-                       for p in params[:3])
     return s
 
 

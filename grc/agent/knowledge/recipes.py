@@ -8,7 +8,7 @@
     - ``metrics``:该链路适合看的指标(evm/ber/eye/spectrum)
     - ``keywords``:意图匹配用的关键词(离线 baseline 无需 LLM 也能选型)
 
-所有块 key 与参数名都取自本仓库已验证的链路(见 core.agent 的 Part B 自检)。
+所有块 key 与参数名都取自本仓库已验证的链路(与 tools/build_tools 的建图动作一致)。
 配方是\"骨架 + 安全默认值\";专家想改的旋钮通过 ``knobs`` 暴露给协商层。
 """
 

@@ -4,17 +4,20 @@
 子模块规划:
     env        环境引导(混搭 conda 运行时时的桥接)
     llm        LLM 后端(function-calling / 文本, 配置来自 GRC_AGENT_*)
-    tools      原子工具层(可被 LLM function-calling 调度)
-    core       DeepAgent 编排内核(schema/context/planner/agent)
-    knowledge  领域知识层(通信任务配方库 recipes)
-    skills     面向子目标的能力(design_link/explain_block/debug_by_metric/adapt_expertise)
-    memory     会话记忆 / 用户画像(创新 B)/ 长期经验库
+    schema     GUI 契约(AgentReply / ToolInvocation, service 层回填给 GUI 渲染)
+    tools      动词壳: 原子工具层(可被 LLM function-calling 调度) +
+               design_link / debug_by_metric / narrate 领域动作
+    skills     喂给 deepagents 的 SKILL markdown 目录(渐进式披露)
+    knowledge  名词料: 领域知识层(通信任务配方库 recipes)
+    runtime    名词料: 无头仿真执行体(simulate)
+    memory     名词料: 用户画像(创新 B, profile)
+    service    ★ deepagents 装配层(create_deep_agent: 主 Agent + subagents + SKILL)
 
 对外高层入口:
-    Agent          分层协商主控(DeepAgent 内核, 见 grc.agent.core)
     UserProfile    三档用户画像(创新 B 数据核心, 见 grc.agent.memory)
-    design_link / explain_block / debug_by_metric / adapt_expertise
-                   四个技能(见 grc.agent.skills)
+    design_link / debug_by_metric   领域动作(见 grc.agent.tools)
+    ServiceAgent   主路径编排器(见 grc.agent.service);
+                   step(text) 返回 AgentReply, GUI 侧渲染逻辑零改动。
     build_flow_graph_from_text(text, platform=None, out_dir=None) -> str(.grc 路径)
         供 GUI(旧版 GTK 的 AgentPanel)调用: 文本意图 -> 建图 -> 存 .grc。
         (保留为兼容旧链路的薄包装, 内部仍走一句话直出 YAML, 作为论文 baseline。)
@@ -27,21 +30,21 @@ import os
 import tempfile
 
 __all__ = [
-    "env", "llm", "Agent", "UserProfile",
-    "design_link", "explain_block", "debug_by_metric", "adapt_expertise",
+    "env", "llm", "UserProfile",
+    "design_link", "debug_by_metric",
     "build_flow_graph_from_text",
+    "ServiceAgent", "build_service_agent",
 ]
 
 logger = logging.getLogger(__name__)
 
-#: 顶层惰性入口名 -> (子模块, 属性名)。避免无 gnuradio 时过早导入 core 链。
+#: 顶层惰性入口名 -> (子模块, 属性名)。避免无 gnuradio 时过早导入依赖链。
 _LAZY = {
-    "Agent": ("core", "Agent"),
     "UserProfile": ("memory", "UserProfile"),
-    "design_link": ("skills", "design_link"),
-    "explain_block": ("skills", "explain_block"),
-    "debug_by_metric": ("skills", "debug_by_metric"),
-    "adapt_expertise": ("skills", "adapt_expertise"),
+    "design_link": ("tools.design_link", "design_link"),
+    "debug_by_metric": ("tools.debug_by_metric", "debug_by_metric"),
+    "ServiceAgent": ("service", "ServiceAgent"),
+    "build_service_agent": ("service", "build_service_agent"),
 }
 
 

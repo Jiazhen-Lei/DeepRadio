@@ -1,4 +1,4 @@
-"""memory:会话记忆 / 用户画像 / 长期记忆。
+"""memory:用户画像(创新 B 的名词料)。
 
 创新 B 的数据核心在 :mod:`profile`——``UserProfile`` 贯穿所有 prompt 渲染,
 实现"同一后端对小白/学生/专家三档自适应表达"。
@@ -13,10 +13,4 @@ def __getattr__(name):
     if name in ("UserProfile", "infer_level_signals", "STYLE_GUIDE"):
         from . import profile
         return getattr(profile, name)
-    if name == "Session":
-        from . import session
-        return getattr(session, name)
-    if name == "FlowGraphStore":
-        from . import store
-        return getattr(store, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

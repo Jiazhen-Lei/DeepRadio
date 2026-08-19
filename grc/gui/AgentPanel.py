@@ -141,11 +141,16 @@ class AgentPanel(Gtk.VBox):
     # Agent 惰性创建
     # ------------------------------------------------------------------ #
     def _ensure_agent(self):
-        """首次交互时创建 Agent, 并把当前档位/输出目录同步进去。"""
+        """首次交互时创建 Agent, 并把当前档位/输出目录同步进去。
+
+        主 Agent 走 deepagents 深度代理(service.ServiceAgent);未装 deepagents
+        或未配置 LLM 时, ServiceAgent 内部自动降级到确定性 design_link 建图。
+        """
         if self._agent is None:
-            from grc.agent.core import Agent
-            self._agent = Agent(platform=self.platform)
-            # 产物统一落到 local/output/。
+            from grc.agent.service import build_service_agent
+            self._agent = build_service_agent()
+            self._agent._platform = self.platform
+            # 产物统一落到 local/output/ (通过 ctx 兼容层)。
             self._agent.ctx.tool_ctx.out_dir = self._out_dir
             # 把当前下拉档位应用到画像。
             self._apply_level_to_agent()

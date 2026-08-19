@@ -1,8 +1,8 @@
 """debug_by_metric:以指标为线索定位问题并给出改参建议。
 
 拿最近一次仿真的指标(EVM/BER/频谱峰)对照阈值判断链路健康度,
-再结合当前配方的 knobs 给出\"调哪个参数、往哪个方向\"的可执行建议。
-这是创新点 C\"仿真在环闭环\"的诊断环节:指标 -> 归因 -> 改参。
+再结合当前配方的 knobs 给出"调哪个参数、往哪个方向"的可执行建议。
+这是创新点 C"仿真在环闭环"的诊断环节:指标 -> 归因 -> 改参。
 
 无 LLM 也能给确定性诊断;有 LLM 时把它当宏工具,让模型据此决定
 下一步 set_param。
@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from ..tools import registry
+from . import registry
 from .narrate import narrate_debug
 
 # EVM(%) 判决阈值:< good 优秀,< usable 可用,否则偏高

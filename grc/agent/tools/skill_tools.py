@@ -50,7 +50,7 @@ def _profile_of(ctx):
 )
 def design_link_tool(ctx, intent: str = "", recipe: str = "",
                      simulate: bool = True, render: bool = True) -> Dict[str, Any]:
-    from ..skills.design_link import design_link
+    from .design_link import design_link
     return design_link(ctx, _profile_of(ctx), intent=intent, recipe=recipe,
                        simulate=simulate, render=render)
 
@@ -77,6 +77,6 @@ def design_link_tool(ctx, intent: str = "", recipe: str = "",
 )
 def debug_by_metric_tool(ctx, metric: str = "evm", probe_id: str = "",
                          modulation: str = "bpsk", sps: int = 4) -> Dict[str, Any]:
-    from ..skills.debug_by_metric import debug_by_metric
+    from .debug_by_metric import debug_by_metric
     return debug_by_metric(ctx, _profile_of(ctx), metric=metric,
                           probe_id=probe_id, modulation=modulation, sps=sps)

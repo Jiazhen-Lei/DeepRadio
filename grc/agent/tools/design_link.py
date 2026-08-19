@@ -5,7 +5,7 @@
 -> 存 .grc(render_grc)。全程用 registry.call 走真实工具链,与 LLM
 function-calling 时模型走的是同一条路,因此这条离线路径也是论文 baseline。
 
-无 LLM 也能完整跑通;有 LLM 时 agent 可把它当\"宏工具\"一步到位。
+无 LLM 也能完整跑通;有 LLM 时 agent 可把它当"宏工具"一步到位。
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 from ..knowledge import recipes as _recipes
-from ..tools import registry
+from . import registry
 from .narrate import narrate_design
 
 
