@@ -33,11 +33,15 @@ logger = logging.getLogger(__name__)
 # .env 加载 (纯标准库, 不引入额外依赖)
 # ---------------------------------------------------------------------------- #
 def _load_env_file(path: str | None = None) -> None:
-    """从 .env 文件把变量注入 os.environ (已存在的变量不覆盖)。
+    """从 .env 文件把变量注入 os.environ。
 
     查找顺序: 显式传入的 path -> 当前工作目录 ./env -> 本文件所在的
-    grc/agent 向上三级(即项目根目录)的 .env。只注入尚未在环境中出现的
-    key, 因此 shell 里已 export 的值优先级更高。
+    grc/agent 向上三级(即项目根目录)的 .env。
+
+    覆盖策略: 仅当 shell 中该变量**缺失或为空串**时, 才用 .env 的值填充;
+    shell 中已存在的**非空**值优先级更高。这样即便 shell 里残留了
+    ``export GRC_AGENT_API_KEY=`` 之类的空导出, .env 里的真实 key 仍能生效,
+    避免误判为"未配置"而降级到 demo。
 
     幂等, 可重复调用。
     """
@@ -77,7 +81,9 @@ def _load_env_file(path: str | None = None) -> None:
         # 去掉成对引号
         if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
             val = val[1:-1]
-        os.environ.setdefault(key, val)
+        # 仅当 shell 中缺失或为空时才填充, 非空 shell 值优先 (避免空导出压过真值)。
+        if not os.environ.get(key):
+            os.environ[key] = val
 
     logger.info("已从 %s 载入 .env 配置", target)
 

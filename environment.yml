@@ -1,0 +1,15 @@
+name: gnuradio
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - gnuradio=3.10
+  - numpy
+  - pip
+  - pip:
+      - deepagents
+      - langchain
+      - langchain-core
+      - langchain-openai
+      - langgraph
+      - openai
