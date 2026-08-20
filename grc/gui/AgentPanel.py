@@ -1,10 +1,18 @@
 """
-Agent 右侧对话框面板 (旧版 GTK 界面)。
+Agent 右侧对话面板 (多轮协商版 GTK 界面)。
 
-在 MainWindow 右侧提供一个人机对话面板: 用户输入自然语言需求
-(如 "生成一个调制方式为 QPSK 的 BLE 波形, 包含信息 xxx"), 面板调用
-后端 ``grc.agent.build_flow_graph_from_text`` 生成 .grc 文件, 再通过
-``open_flow_graph`` 信号通知 MainWindow 载入画布, 用户可继续在 UI 交互。
+在 MainWindow 右侧提供一个人机对话面板:
+
+* **多轮协商 Agent**(默认): 持有一个 ``grc.agent.core.Agent`` 实例, 每轮
+  ``agent.step`` 按 planner 五阶段 (INTENT→PROPOSE→BUILD→SIMULATE→TUNE→DONE)
+  推进, 回显按用户专业度档位渲染的叙述, 并内联展示产物图(星座/频谱/眼图);
+  产出 .grc 时 emit ``open_flow_graph`` 让 MainWindow 载入画布。
+* **一句话直出 (baseline)**: 勾选开关后走 ``build_flow_graph_from_text``,
+  LLM 直接产 .grc, 作为论文对照组。
+* **专业度档位**(创新 B): 下拉可选 自适应 / 小白 / 学生 / 专家; 选具体档位则
+  钉档 (pin), 选"自适应"则放开 (unpin) 让画像随对话自适应。
+
+所有产物统一输出到工程根目录下的 ``local/output/``, 便于查找与管理。
 
 SPDX-License-Identifier: GPL-2.0-or-later
 """
@@ -15,13 +23,42 @@ import threading
 
 import gi
 gi.require_version('Gtk', '3.0')
-from gi.repository import Gtk, GLib, GObject
+from gi.repository import Gtk, GLib, GObject, GdkPixbuf
 
 log = logging.getLogger(__name__)
 
 
+def _project_root():
+    """定位工程根目录 (本文件在 grc/gui/ 下, 向上两级)。"""
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.abspath(os.path.join(here, os.pardir, os.pardir))
+
+
+def _output_dir():
+    """统一产物输出目录: <工程根>/local/output/, 不存在则创建。"""
+    out = os.path.join(_project_root(), "local", "output")
+    os.makedirs(out, exist_ok=True)
+    return out
+
+
+#: 档位下拉项 -> (是否自适应, 钉档档位值)。档位值对应 ExpertiseLevel。
+_LEVEL_CHOICES = [
+    ("自适应", (True, None)),
+    ("小白", (False, "novice")),
+    ("学生", (False, "student")),
+    ("专家", (False, "expert")),
+]
+
+#: 产物图字段 -> 中文标题, 按此顺序内联展示。
+_ARTIFACT_IMAGES = [
+    ("constellation_png", "星座图"),
+    ("spectrum_png", "频谱图"),
+    ("eye_png", "眼图"),
+]
+
+
 class AgentPanel(Gtk.VBox):
-    """右侧 Agent 对话面板。
+    """右侧 Agent 对话面板 (多轮协商 + 档位 + 内联产物图)。
 
     对外发出一个信号:
         open_flow_graph(str): 请求 MainWindow 打开给定路径的 .grc 文件。
@@ -38,26 +75,52 @@ class AgentPanel(Gtk.VBox):
         # 复用 GUI 现成的 platform, 不再 make_platform() 自建块库。
         self.platform = platform
         self._busy = False
-        # 多轮对话历史: [(role, content), ...], role 为 'user' / 'assistant'。
-        self._history = []
+        self._out_dir = _output_dir()
 
-        # ---- 聊天历史显示区 ----
-        self.history = Gtk.TextView()
-        self.history.set_editable(False)
-        self.history.set_cursor_visible(False)
-        self.history.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
-        self._buffer = self.history.get_buffer()
+        # 多轮协商 Agent 实例 (惰性创建, 避免无 gnuradio 时导入报错)。
+        self._agent = None
+        # baseline 一句话直出的历史 [(role, content), ...]。
+        self._baseline_history = []
 
+        # ---- 顶部控制条: 档位下拉 + baseline 开关 + 重置 ----
+        ctrl = Gtk.HBox()
+        ctrl.pack_start(Gtk.Label(label="专业度:"), False, False, 2)
+
+        self.level_combo = Gtk.ComboBoxText()
+        for label, _ in _LEVEL_CHOICES:
+            self.level_combo.append_text(label)
+        self.level_combo.set_active(0)  # 默认"自适应"
+        self.level_combo.connect('changed', self._on_level_changed)
+        ctrl.pack_start(self.level_combo, False, False, 2)
+
+        self.baseline_check = Gtk.CheckButton(label="一句话直出(baseline)")
+        ctrl.pack_start(self.baseline_check, False, False, 2)
+
+        self.reset_button = Gtk.Button(label="重置")
+        self.reset_button.connect('clicked', self._on_reset)
+        ctrl.pack_end(self.reset_button, False, False, 2)
+
+        self.pack_start(ctrl, expand=False, fill=False, padding=2)
+
+        # ---- 聊天历史显示区: 用 VBox 容纳文本气泡 + 内联图片 ----
+        self._log_box = Gtk.VBox()
+        self._log_box.set_spacing(4)
         scroll = Gtk.ScrolledWindow()
         scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        scroll.add(self.history)
+        scroll.add_with_viewport(self._log_box)
+        self._scroll = scroll
         self.pack_start(scroll, expand=True, fill=True, padding=0)
+
+        # ---- 状态栏: 显示当前阶段 / 档位 ----
+        self.status = Gtk.Label(label="就绪")
+        self.status.set_halign(Gtk.Align.START)
+        self.pack_start(self.status, expand=False, fill=False, padding=2)
 
         # ---- 输入区: 文本框 + 发送按钮 ----
         input_box = Gtk.HBox()
         self.entry = Gtk.Entry()
         self.entry.set_placeholder_text(
-            "描述你要的波形, 例如: 生成 QPSK 的 BLE 波形, 包含信息 xxx")
+            "描述你要的链路, 例如: 用 BPSK 过 AWGN 看星座图")
         self.entry.connect('activate', self._on_send)
         input_box.pack_start(self.entry, expand=True, fill=True, padding=0)
 
@@ -68,13 +131,65 @@ class AgentPanel(Gtk.VBox):
 
         self.pack_start(input_box, expand=False, fill=False, padding=2)
 
-        self.set_size_request(320, -1)
+        self.set_size_request(360, -1)
 
-        self._append("Agent", "你好! 请描述你需要的波形, 我会尝试生成流图并载入画布。")
+        self._append("Agent",
+                     "你好! 我会通过多轮协商帮你设计通信链路(建图→仿真→调参)。\n"
+                     "产物统一保存在 local/output/。请描述你的需求。")
+
+    # ------------------------------------------------------------------ #
+    # Agent 惰性创建
+    # ------------------------------------------------------------------ #
+    def _ensure_agent(self):
+        """首次交互时创建 Agent, 并把当前档位/输出目录同步进去。
+
+        主 Agent 走 deepagents 深度代理(service.ServiceAgent);未装 deepagents
+        或未配置 LLM 时, ServiceAgent 内部自动降级到确定性 design_link 建图。
+        """
+        if self._agent is None:
+            from grc.agent.service import build_service_agent
+            self._agent = build_service_agent()
+            self._agent._platform = self.platform
+            # 产物统一落到 local/output/ (通过 ctx 兼容层)。
+            self._agent.ctx.tool_ctx.out_dir = self._out_dir
+            # 把当前下拉档位应用到画像。
+            self._apply_level_to_agent()
+        return self._agent
+
+    def _apply_level_to_agent(self):
+        """把档位下拉的选择应用到 Agent 的 profile / adaptive 开关。"""
+        if self._agent is None:
+            return
+        idx = self.level_combo.get_active()
+        if idx < 0:
+            idx = 0
+        adaptive, pinned = _LEVEL_CHOICES[idx][1]
+        ctx = self._agent.ctx
+        ctx.adaptive = adaptive
+        if pinned is None:
+            ctx.profile.unpin()
+        else:
+            ctx.profile.pin(pinned)
 
     # ------------------------------------------------------------------ #
     # 交互
     # ------------------------------------------------------------------ #
+    def _on_level_changed(self, _combo):
+        self._apply_level_to_agent()
+        idx = self.level_combo.get_active()
+        label = _LEVEL_CHOICES[max(idx, 0)][0]
+        self._set_status("专业度档位: {}".format(label))
+
+    def _on_reset(self, _widget):
+        if self._busy:
+            return
+        self._agent = None
+        self._baseline_history = []
+        for child in self._log_box.get_children():
+            self._log_box.remove(child)
+        self._append("Agent", "已重置会话。请描述新的需求。")
+        self._set_status("就绪")
+
     def _on_send(self, _widget):
         if self._busy:
             return
@@ -83,55 +198,146 @@ class AgentPanel(Gtk.VBox):
             return
         self._append("我", text)
         self.entry.set_text('')
-        self._history.append(("user", text))
         self._set_busy(True)
-        # 耗时的 LLM/建图放到子线程, 避免卡死 GTK 主循环。
-        history = list(self._history)
-        threading.Thread(target=self._handle, args=(text, history),
-                         daemon=True).start()
 
-    def _handle(self, text, history):
-        """子线程: 调后端建图并存 .grc。UI 更新一律回主线程。"""
+        baseline = self.baseline_check.get_active()
+        if baseline:
+            self._baseline_history.append(("user", text))
+            history = list(self._baseline_history)
+            threading.Thread(target=self._handle_baseline,
+                             args=(text, history), daemon=True).start()
+        else:
+            threading.Thread(target=self._handle_agent,
+                             args=(text,), daemon=True).start()
+
+    # -- 多轮协商 Agent 路径 --------------------------------------------- #
+    def _handle_agent(self, text):
+        """子线程: 走 agent.step 多轮协商。UI 更新回主线程。"""
+        try:
+            agent = self._ensure_agent()
+            reply = agent.step(text)
+            GLib.idle_add(self._on_agent_reply, reply)
+        except Exception as e:  # noqa: BLE001
+            log.exception("Agent step 失败")
+            GLib.idle_add(self._on_error, str(e))
+
+    def _on_agent_reply(self, reply):
+        """主线程: 回显 agent 叙述 + 内联产物图 + 载入 .grc。"""
+        self._append("Agent", reply.text or "(无输出)")
+
+        artifacts = reply.artifacts or {}
+        # 内联展示产物图。
+        for key, title in _ARTIFACT_IMAGES:
+            path = artifacts.get(key)
+            if path and os.path.exists(path):
+                self._append_image(title, path)
+        # 指标摘要。
+        metrics = artifacts.get("metrics")
+        if isinstance(metrics, dict) and metrics:
+            summary = ", ".join(
+                "{}={}".format(k, self._fmt(v)) for k, v in metrics.items())
+            self._append("指标", summary)
+        # 产出 .grc -> 载入画布。
+        grc_path = artifacts.get("grc_path") or artifacts.get("path")
+        if grc_path and str(grc_path).endswith(".grc") \
+                and os.path.exists(grc_path):
+            self._append("Agent",
+                         "已生成 {}, 正在载入画布…".format(
+                             os.path.basename(grc_path)))
+            self.emit('open_flow_graph', grc_path)
+
+        # 状态栏: 阶段 + 是否需确认。
+        stage = getattr(reply, "stage", "") or ""
+        tip = " (等待你确认/回复)" if getattr(reply, "needs_confirmation",
+                                            False) else ""
+        level = self._agent.ctx.profile.level if self._agent else "?"
+        self._set_status("阶段: {} | 档位: {}{}".format(stage, level, tip))
+        self._set_busy(False)
+        return False
+
+    # -- baseline 一句话直出路径 ----------------------------------------- #
+    def _handle_baseline(self, text, history):
+        """子线程: 走 build_flow_graph_from_text 直出 .grc。"""
         try:
             from grc.agent import build_flow_graph_from_text
             grc_path = build_flow_graph_from_text(
-                text, self.platform, history=history)
-            GLib.idle_add(self._on_done, grc_path)
+                text, self.platform, out_dir=self._out_dir, history=history)
+            GLib.idle_add(self._on_baseline_done, grc_path)
         except Exception as e:  # noqa: BLE001
-            log.exception("Agent 生成流图失败")
+            log.exception("baseline 生成流图失败")
             GLib.idle_add(self._on_error, str(e))
 
-    def _on_done(self, grc_path):
-        """主线程: 生成成功, 回显并请求打开。"""
+    def _on_baseline_done(self, grc_path):
         msg = "已生成 {}, 正在载入画布…".format(os.path.basename(grc_path))
         self._append("Agent", msg)
-        self._history.append(("assistant", msg))
+        self._baseline_history.append(("assistant", msg))
         self._set_busy(False)
         self.emit('open_flow_graph', grc_path)
-        return False  # idle_add 只跑一次
+        return False
 
     def _on_error(self, message):
-        """主线程: 生成失败, 回显错误。"""
         self._append("Agent", "出错了: {}".format(message))
-        self._history.append(("assistant", "出错了: {}".format(message)))
+        self._set_status("出错")
         self._set_busy(False)
         return False
 
     # ------------------------------------------------------------------ #
     # 辅助
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _fmt(v):
+        try:
+            return "{:.3f}".format(float(v))
+        except (TypeError, ValueError):
+            return str(v)
+
     def _set_busy(self, busy):
         self._busy = busy
         self.entry.set_sensitive(not busy)
         self.send_button.set_sensitive(not busy)
-        self.send_button.set_label("生成中…" if busy else "发送")
+        self.level_combo.set_sensitive(not busy)
+        self.baseline_check.set_sensitive(not busy)
+        self.reset_button.set_sensitive(not busy)
+        self.send_button.set_label("处理中…" if busy else "发送")
+
+    def _set_status(self, text):
+        self.status.set_text(text)
 
     def _append(self, who, text):
-        """把一行对话追加到历史区并滚动到底部。"""
-        end = self._buffer.get_end_iter()
-        self._buffer.insert(end, "{}: {}\n".format(who, text))
-        # 滚动到底部
-        mark = self._buffer.create_mark(None, self._buffer.get_end_iter(),
-                                        False)
-        self.history.scroll_to_mark(mark, 0.0, True, 0.0, 1.0)
-        return False
+        """把一行对话追加为一个文本标签。"""
+        label = Gtk.Label()
+        label.set_markup("<b>{}:</b> {}".format(
+            GLib.markup_escape_text(who), GLib.markup_escape_text(text)))
+        label.set_line_wrap(True)
+        label.set_halign(Gtk.Align.START)
+        label.set_xalign(0.0)
+        label.set_selectable(True)
+        self._log_box.pack_start(label, False, False, 0)
+        label.show()
+        self._scroll_to_bottom()
+
+    def _append_image(self, title, path):
+        """把一张产物图缩放后内联展示。"""
+        try:
+            pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(
+                path, 320, 240, True)
+        except Exception as e:  # noqa: BLE001
+            log.warning("加载产物图失败 %s: %s", path, e)
+            self._append(title, "(图片加载失败: {})".format(path))
+            return
+        cap = Gtk.Label()
+        cap.set_markup("<b>{}</b>".format(GLib.markup_escape_text(title)))
+        cap.set_halign(Gtk.Align.START)
+        self._log_box.pack_start(cap, False, False, 0)
+        img = Gtk.Image.new_from_pixbuf(pixbuf)
+        img.set_halign(Gtk.Align.START)
+        self._log_box.pack_start(img, False, False, 0)
+        cap.show()
+        img.show()
+        self._scroll_to_bottom()
+
+    def _scroll_to_bottom(self):
+        adj = self._scroll.get_vadjustment()
+        if adj is not None:
+            GLib.idle_add(lambda: adj.set_value(
+                adj.get_upper() - adj.get_page_size()) or False)

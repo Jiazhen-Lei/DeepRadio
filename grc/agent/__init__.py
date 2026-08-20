@@ -3,15 +3,24 @@
 本包在 GRC 之上增加一层"意图 -> 流图"的能力，不修改 grc/core。
 子模块规划:
     env        环境引导(混搭 conda 运行时时的桥接)
-    knowledge  块库索引与检索
-    planner    LLM 规划器
-    builder    结构化图谱 -> FlowGraph
-    critic     DSP 规则检查器
-    layout     自动布局
+    llm        LLM 后端(function-calling / 文本, 配置来自 GRC_AGENT_*)
+    schema     GUI 契约(AgentReply / ToolInvocation, service 层回填给 GUI 渲染)
+    tools      动词壳: 原子工具层(可被 LLM function-calling 调度) +
+               design_link / debug_by_metric / narrate 领域动作
+    skills     喂给 deepagents 的 SKILL markdown 目录(渐进式披露)
+    knowledge  名词料: 领域知识层(通信任务配方库 recipes)
+    runtime    名词料: 无头仿真执行体(simulate)
+    memory     名词料: 用户画像(创新 B, profile)
+    service    ★ deepagents 装配层(create_deep_agent: 主 Agent + subagents + SKILL)
 
 对外高层入口:
+    UserProfile    三档用户画像(创新 B 数据核心, 见 grc.agent.memory)
+    design_link / debug_by_metric   领域动作(见 grc.agent.tools)
+    ServiceAgent   主路径编排器(见 grc.agent.service);
+                   step(text) 返回 AgentReply, GUI 侧渲染逻辑零改动。
     build_flow_graph_from_text(text, platform=None, out_dir=None) -> str(.grc 路径)
         供 GUI(旧版 GTK 的 AgentPanel)调用: 文本意图 -> 建图 -> 存 .grc。
+        (保留为兼容旧链路的薄包装, 内部仍走一句话直出 YAML, 作为论文 baseline。)
 """
 
 from __future__ import annotations
@@ -20,9 +29,32 @@ import logging
 import os
 import tempfile
 
-__all__ = ["env", "llm", "build_flow_graph_from_text"]
+__all__ = [
+    "env", "llm", "UserProfile",
+    "design_link", "debug_by_metric",
+    "build_flow_graph_from_text",
+    "ServiceAgent", "build_service_agent",
+]
 
 logger = logging.getLogger(__name__)
+
+#: 顶层惰性入口名 -> (子模块, 属性名)。避免无 gnuradio 时过早导入依赖链。
+_LAZY = {
+    "UserProfile": ("memory", "UserProfile"),
+    "design_link": ("tools.design_link", "design_link"),
+    "debug_by_metric": ("tools.debug_by_metric", "debug_by_metric"),
+    "ServiceAgent": ("service", "ServiceAgent"),
+    "build_service_agent": ("service", "build_service_agent"),
+}
+
+
+def __getattr__(name):
+    """惰性暴露高层入口, 避免在无 gnuradio 运行时的场景下过早导入。"""
+    target = _LAZY.get(name)
+    if target:
+        mod = __import__(f"{__name__}.{target[0]}", fromlist=[target[1]])
+        return getattr(mod, target[1])
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def build_flow_graph_from_text(text, platform=None, out_dir=None, history=None):
