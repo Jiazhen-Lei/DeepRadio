@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import time
 from typing import Any, Dict, List
 
@@ -45,6 +46,55 @@ def session_root(session_id: str) -> str:
     path = os.path.join(sessions_root(), safe)
     os.makedirs(path, exist_ok=True)
     return path
+
+
+def state_path(session_id: str) -> str:
+    return os.path.join(session_root(session_id), "state.json")
+
+
+def snapshots_dir(session_id: str) -> str:
+    path = os.path.join(session_root(session_id), "snapshots")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def export_spec(session_id: str, destination: str) -> str:
+    """Export only RadioSpec for explicit cross-session reuse."""
+    from ..state import SharedState
+
+    state = SharedState.load(state_path(session_id), session_id=session_id)
+    payload = {"schema_version": 1, "spec": state.spec_digest()}
+    parent = os.path.dirname(os.path.abspath(destination))
+    os.makedirs(parent, exist_ok=True)
+    tmp = f"{destination}.tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+    os.replace(tmp, destination)
+    append_session_event(session_id, "spec_export", {"path": destination})
+    return destination
+
+
+def import_spec(session_id: str, source: str) -> None:
+    """Import a validated RadioSpec without carrying project or claim state."""
+    from ..state import Decision, RadioSpec, SharedState
+
+    with open(source, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if payload.get("schema_version") != 1 or not isinstance(
+        payload.get("spec"), dict
+    ):
+        raise ValueError("不支持的 Spec 文件格式")
+    data = payload["spec"]
+    state = SharedState.load(state_path(session_id), session_id=session_id)
+    state.spec = RadioSpec(
+        goals=list(data.get("goals") or []),
+        success_conditions=list(data.get("success_conditions") or []),
+        constraints=dict(data.get("constraints") or {}),
+        decisions=[Decision(**item) for item in data.get("decisions") or []],
+        open_questions=list(data.get("open_questions") or []),
+    )
+    state.save(state_path(session_id))
+    append_session_event(session_id, "spec_import", {"path": source})
 
 
 def _safe_component(name: str) -> str:
@@ -150,6 +200,18 @@ def scan_final_artifacts(session_id: str,
             if os.path.isfile(full):
                 out[name] = full
     return out
+
+
+def publish_artifact(session_id: str, source: str) -> str:
+    """Mirror a user-visible artifact into the session final directory."""
+    if not source or not os.path.isfile(source):
+        return source
+    final_dir = os.path.join(session_root(session_id), "final")
+    os.makedirs(final_dir, exist_ok=True)
+    destination = os.path.join(final_dir, os.path.basename(source))
+    if os.path.abspath(source) != os.path.abspath(destination):
+        shutil.copy2(source, destination)
+    return destination
 
 
 def _jsonable(value: Any) -> Any:

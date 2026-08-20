@@ -87,6 +87,7 @@ _TOOL_MODULES = (
     "build_tools",
     "critic_tools",
     "sim_tools",
+    "state_tools",
     "skill_tools",     # 宏工具:把 skills 编排能力暴露给 function-calling
 )
 

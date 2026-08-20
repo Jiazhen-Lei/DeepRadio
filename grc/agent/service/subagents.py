@@ -1,15 +1,14 @@
-"""subagents:用 deepagents 原生 ``SubAgent`` 装配 4 个专职子代理。
+"""Assemble the six DeepRadio domain subagents.
 
-对齐 ``local/docs/agent_architecture_deepagents.md``:主 Agent 通过内置 ``task``
-工具委派子代理,每个子代理:
+The main agent delegates TaskCards through deepagents' built-in task tool.
+Each domain agent receives:
 
 * 一个 system-prompt(来自 :mod:`system_prompt`);
 * 一组 LangChain 工具(来自 :mod:`tools_lc`,绑定共享 ToolContext);
 * 通过 ``skills`` 绑定专属 SKILL 名,子代理用内置文件工具按需读取
   ``/workspace/skills/<skill>/`` 下的 references(渐进式披露)。
 
-本模块产出的是 deepagents 的 :class:`~deepagents.SubAgent`(TypedDict) 列表,
-不再自研规格类 —— 直接喂给 ``create_deep_agent(subagents=...)``。
+The returned dictionaries are passed directly to ``create_deep_agent``.
 """
 
 from __future__ import annotations
@@ -26,32 +25,52 @@ logger = logging.getLogger(__name__)
 #: subagent 名 -> (描述, prompt 构造器, 绑定的 SKILL 名, 工具名子集)
 _SUBAGENT_DEFS = [
     (
-        "block_knowledge_agent",
-        "检索 GRC 块、解释端口/参数、查找示例链路;只提供知识,不建图。",
-        _sp.build_block_knowledge_prompt,
+        "spec_agent",
+        "维护可追溯 RadioSpec 与成功条件。",
+        _sp.build_spec_prompt,
+        "grc-spec",
+        ["spec_clarify", "spec_commit"],
+    ),
+    (
+        "radio_design_agent",
+        "检索块知识并选择确定性通信配方。",
+        _sp.build_radio_design_prompt,
         "grc-block-rag",
-        [],  # 只读 SKILL references,不需业务工具
+        ["select_recipe", "search_blocks", "describe_block"],
     ),
     (
-        "flowgraph_builder_agent",
-        "按确定性配方选型并建图(design_flowgraph),产物写 build/。",
-        _sp.build_builder_prompt,
+        "flowgraph_agent",
+        "构建或增量修改 GNU Radio 流图。",
+        _sp.build_flowgraph_prompt,
         "grc-build",
-        ["design_flowgraph", "validate_flowgraph"],
+        ["design_flowgraph", "apply_grc_diff"],
     ),
     (
-        "flowgraph_critic_agent",
-        "校验流图合法性,把报错整理为可执行修复建议;不直接改图。",
-        _sp.build_critic_prompt,
+        "verification_agent",
+        "校验、仿真、绘图并将证据绑定到 Claim。",
+        _sp.build_verification_prompt,
         "grc-critic",
-        ["validate_flowgraph"],
+        [
+            "validate_flowgraph",
+            "run_simulation",
+            "read_metric",
+            "plot_spectrum",
+            "verify_claims",
+        ],
     ),
     (
-        "simulation_agent",
-        "对已校验流图无头仿真,读回 EVM/BER 等指标;产物写 sim/。",
-        _sp.build_simulation_prompt,
-        "grc-sim",
-        ["run_simulation", "read_metric"],
+        "diagnosis_agent",
+        "根据指标诊断并提出最小修复。",
+        _sp.build_diagnosis_prompt,
+        "grc-diagnosis",
+        ["diagnose_by_metric", "suggest_fix"],
+    ),
+    (
+        "hardware_agent",
+        "管理 SDR flowgraph 配置；真实硬件操作保持禁用。",
+        _sp.build_hardware_prompt,
+        "grc-hardware",
+        ["configure_sdr", "list_devices"],
     ),
 ]
 
@@ -69,7 +88,7 @@ def build_grc_subagents(ctx: ToolContext) -> List[Dict[str, Any]]:
 
     subagents: List[Dict[str, Any]] = []
     seen = set()
-    for name, desc, prompt_builder, skill, tool_names in _SUBAGENT_DEFS:
+    for name, desc, prompt_builder, _skill, tool_names in _SUBAGENT_DEFS:
         if name in seen:
             raise ValueError(f"subagent 名称重复: {name}")
         seen.add(name)
@@ -78,7 +97,6 @@ def build_grc_subagents(ctx: ToolContext) -> List[Dict[str, Any]]:
             "name": name,
             "description": desc,
             "system_prompt": prompt_builder(),
-            "skills": [skill],
         }
         bound = [all_tools[n] for n in tool_names if n in all_tools]
         if bound:
@@ -89,5 +107,5 @@ def build_grc_subagents(ctx: ToolContext) -> List[Dict[str, Any]]:
 
 
 def subagent_names() -> List[str]:
-    """返回 4 个 subagent 名称(供主 Agent prompt 列举)。"""
+    """返回 6 个 subagent 名称(供主 Agent prompt 列举)。"""
     return [d[0] for d in _SUBAGENT_DEFS]

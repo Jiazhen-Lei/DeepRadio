@@ -44,6 +44,67 @@ def design_link(ctx, profile=None, intent: str = "",
     if rc is None:
         rc = _recipes.match_recipe(intent)
     fid = flowgraph_id or rc.name
+    state = ctx.extra.get("state")
+    if state is not None:
+        from ..state import ALLOW, create_snapshot, gate
+
+        new_modulation = _guess_modulation(rc.name)
+        old_modulation = str(state.project.config.get("modulation") or "")
+        if (
+            "modulation" in state.coordination.locked_constraints
+            and old_modulation
+            and old_modulation != new_modulation
+        ):
+            return {
+                "ok": False,
+                "recipe": rc.name,
+                "valid": False,
+                "error": "PolicyGateway 拒绝修改已锁定的 modulation",
+                "policy": "DENY",
+            }
+        current_recipe = str(state.project.config.get("recipe") or "")
+        scope = (
+            "multi_block_change"
+            if current_recipe and current_recipe != rc.name
+            else "new_flowgraph"
+        )
+        decision = gate(
+            {"target": "flowgraph", "scope": scope, "domain": "dsp"},
+            state.coordination,
+        )
+        pending = next(
+            (
+                item
+                for item in reversed(state.coordination.pending_confirmations)
+                if item.get("action") == "design_link"
+                and item.get("recipe") == rc.name
+            ),
+            None,
+        )
+        if pending and pending.get("approved"):
+            state.coordination.pending_confirmations.remove(pending)
+            decision = ALLOW
+        if decision != ALLOW:
+            if decision in ("PROPOSE", "CONFIRM") and pending is None:
+                state.coordination.pending_confirmations.append(
+                    {
+                        "action": "design_link",
+                        "recipe": rc.name,
+                        "policy": decision,
+                        "approved": False,
+                    }
+                )
+            return {
+                "ok": False,
+                "error": f"PolicyGateway 拒绝建图: {decision}",
+                "policy": decision,
+                "recipe": rc.name,
+                "valid": False,
+            }
+        state_path = str(ctx.extra.get("state_path") or "")
+        snapshots_dir = str(ctx.extra.get("snapshots_dir") or "")
+        if state_path and snapshots_dir:
+            create_snapshot(state, snapshots_dir, state_path)
 
     steps: List[dict] = []
 
@@ -90,18 +151,23 @@ def design_link(ctx, profile=None, intent: str = "",
 
     artifacts: Dict[str, Any] = {}
     metrics: Dict[str, Any] = {}
+    render_ok = not render
+    render_error = ""
 
     # 6) 存 .grc
     if render:
         rr = _c("render_grc")
         if rr.get("ok"):
             artifacts["grc_path"] = rr["path"]
+            render_ok = True
+        else:
+            render_error = str(rr.get("error") or "render_grc 失败")
 
     # 7) 可选仿真 + 取指标 + 画图
     if simulate and valid:
         probe_id = rc.probe_block_id or "sink"
         sim = _c("run_simulation",
-                 probes={probe_id: [probe_path, "complex64"]})
+                 probes={probe_id: [probe_path, rc.probe_dtype]})
         if sim.get("ok"):
             artifacts["out_dir"] = sim.get("out_dir")
             if "evm" in rc.metrics:
@@ -125,7 +191,7 @@ def design_link(ctx, profile=None, intent: str = "",
                     artifacts["eye_png"] = pe["path"]
 
     out = {
-        "ok": valid,
+        "ok": valid and render_ok,
         "recipe": rc.name,
         "recipe_title": rc.title,
         "difficulty": rc.difficulty,
@@ -137,6 +203,23 @@ def design_link(ctx, profile=None, intent: str = "",
         "artifacts": artifacts,
         "steps": steps,
     }
+    if render_error:
+        out["error"] = render_error
+    if state is not None and valid and render_ok:
+        from ..state import ClaimStore
+        from .state_tools import verify_state_claims
+
+        if artifacts.get("grc_path"):
+            state.project.grc_path = artifacts["grc_path"]
+        state.project.config["recipe"] = rc.name
+        state.project.config["modulation"] = _guess_modulation(rc.name)
+        state.project.flowgraph_version += 1
+        ClaimStore(state).invalidate_by_version(
+            state.project.flowgraph_version
+        )
+        ctx.extra.setdefault("artifacts", {}).update(artifacts)
+        ctx.extra.setdefault("metrics", {}).update(metrics)
+        out["claim_updates"] = verify_state_claims(ctx, metrics)
     out["narrative"] = narrate_design(rc, out, profile)
     return out
 
@@ -147,4 +230,6 @@ def _guess_modulation(recipe_name: str) -> str:
         return "qpsk"
     if "bpsk" in n:
         return "bpsk"
-    return "bpsk"
+    if "ofdm" in n:
+        return "ofdm"
+    return ""

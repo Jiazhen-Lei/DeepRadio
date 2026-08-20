@@ -27,6 +27,7 @@ from . import subagents as _subagents
 from . import system_prompt as _sp
 
 logger = logging.getLogger(__name__)
+_CHECKPOINTERS = {}
 
 
 def deepagents_available() -> bool:
@@ -60,7 +61,9 @@ def build_agent(ctx: ToolContext, *, temperature: float = 0.2) -> Optional[Any]:
 
     try:
         from langgraph.checkpoint.memory import InMemorySaver
-        checkpointer = InMemorySaver()
+        state = ctx.extra.get("state")
+        session_id = getattr(state, "session_id", "") or "default"
+        checkpointer = _CHECKPOINTERS.setdefault(session_id, InMemorySaver())
     except ImportError:
         checkpointer = None
 

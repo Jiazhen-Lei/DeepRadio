@@ -25,6 +25,8 @@ def build_common_constraints() -> str:
         "3. 最终交付(汇总解释、发布 .grc 到 final/)由主 Agent 统一负责。\n"
         "4. 需要领域知识时,先读 /workspace/skills/<你的 SKILL>/SKILL.md 与其 references/。\n"
         "5. 完成后用一段简短结论回报主 Agent:做了什么、产物在哪个路径、有无风险。\n"
+        "6. 工具返回的 artifacts 路径在宿主机磁盘上,你的文件工具看不到它们。"
+        "不要用 read_file / ls / glob 去确认产物是否存在,直接如实回报路径。\n"
     )
 
 
@@ -43,20 +45,30 @@ def build_orchestrator_prompt(subagent_names: Iterable[str],
         )
     return (
         "你是 DeepRadio 的主编排 Agent,面向 GNU Radio Companion(GRC)软件无线电建图与仿真。\n"
-        "你自己不写领域细节,而是按下述阶段把任务委派给专职子代理,再把结果收敛为对用户的答复。\n\n"
+        "你只负责闭环路由、TaskCard 分派、冲突汇总和最终交付。\n\n"
         "【可委派的子代理】\n"
         f"  {names}\n\n"
-        "【阶段与编排原则】\n"
-        "  - INTENT:意图不清时先向用户澄清(调制方式/信道/频段/关心指标),清楚则进入下一阶段。\n"
-        "  - RETRIEVE:委派 block_knowledge_agent 检索相关块、端口与参数、示例链路。\n"
-        "  - BUILD:委派 flowgraph_builder_agent 选配方并建图,产物写 /session/work/build/。\n"
-        "  - CRITIC:委派 flowgraph_critic_agent 校验流图合法性;若报错,把修复建议回传 builder 修复。\n"
-        "  - SIMULATE:委派 simulation_agent 无头仿真、读回指标(EVM/BER)、画星座/频谱/眼图。\n"
-        "  - DELIVER:把最终 .grc 发布到 /session/final/,并给用户一段可理解的解释。\n"
+        "【闭环路由】\n"
+        "  - build: Spec→RadioDesign→Flowgraph→Verification。\n"
+        "  - diagnose: Verification→Diagnosis→Flowgraph→Verification。\n"
+        "  - modify: Spec(diff)→Flowgraph(diff)→Verification。\n"
+        "  - observe: RadioDesign→Flowgraph→Verification。\n"
+        "  - spec: 信息不足时仅委派 SpecAgent 并向用户提出 open_questions。\n"
+        "每次委派都传 JSON TaskCard(task_id,loop_mode,target_agent,instruction,inputs,expected_claims)。\n"
+        "子代理必须返回 ResultEnvelope。遇 DENY/CONFIRM、Failed claim 或待确认项时停止执行并向用户汇总。\n\n"
+        "【停止条件(必须遵守)】\n"
+        "  - design_flowgraph 返回 ok=true 且 valid=true,且指标已满足成功条件时,"
+        "立刻停止调用工具,直接输出面向用户的最终答复。\n"
+        "  - 同一个目标不要重复调用 design_flowgraph 或 run_simulation:"
+        "design_flowgraph(simulate=True) 已包含仿真、取指标与绘图。\n"
+        "  - 工具返回的 artifacts 路径在宿主机磁盘上,GUI 会自动展示。"
+        "禁止用 read_file / ls / glob 去确认产物是否存在——你的文件工具只能看到"
+        "会话虚拟目录与 /workspace/skills/,找不到不代表产物缺失。\n"
+        "  - 连续两次工具调用都没带来新信息时,停止探索并如实汇总现状。\n"
         + style_section +
         "\n【交付要求】\n"
         "  - 面向用户的解释要简洁、可理解,按上面 STYLE 档位调整术语密度与讲解粒度。\n"
-        "  - 只有确认建图与校验通过后才进入仿真;仿真是本地无头执行,安全可跑。\n"
+        "  - 所有工程变更只能通过确定性工具并受 PolicyGateway 约束。\n"
         "  - 每一步委派前后都要在会话事件流中留痕(由运行时自动记录)。\n"
     )
 
@@ -64,6 +76,63 @@ def build_orchestrator_prompt(subagent_names: Iterable[str],
 # ---------------------------------------------------------------------------
 # 各 subagent
 # ---------------------------------------------------------------------------
+
+def _domain_prompt(role: str, skill: str, duties: str) -> str:
+    return (
+        build_common_constraints()
+        + f"\n【角色:{role}】\nSKILL: {skill}。\n{duties}\n"
+        "输入必须视为 TaskCard；完成后返回紧凑 JSON ResultEnvelope，"
+        "包含 task_id、ok、produced_claims、proposed_changes、artifacts、note。"
+        "不得绕过 registry/design_link 或 PolicyGateway。\n"
+    )
+
+
+def build_spec_prompt() -> str:
+    return _domain_prompt(
+        "SpecAgent",
+        "grc-spec",
+        "提取目标、成功条件、约束和带来源的决策；信息不足时只产生 open_questions。",
+    )
+
+
+def build_radio_design_prompt() -> str:
+    return _domain_prompt(
+        "RadioDesignAgent",
+        "grc-block-rag",
+        "检索块知识并选择确定性 recipe；只做设计选择，不直接修改流图。",
+    )
+
+
+def build_flowgraph_prompt() -> str:
+    return _domain_prompt(
+        "FlowgraphAgent",
+        "grc-build",
+        "通过 design_flowgraph 或 apply_grc_diff 构建/修改流图，保留快照与版本信息。",
+    )
+
+
+def build_verification_prompt() -> str:
+    return _domain_prompt(
+        "VerificationAgent",
+        "grc-critic, grc-sim",
+        "先校验，再仿真和读指标，最后 verify_claims；每条结论必须绑定 Evidence。",
+    )
+
+
+def build_diagnosis_prompt() -> str:
+    return _domain_prompt(
+        "DiagnosisAgent",
+        "grc-diagnosis",
+        "根据指标定位问题并提出最小、可恢复的修复建议；不直接越权改图。",
+    )
+
+
+def build_hardware_prompt() -> str:
+    return _domain_prompt(
+        "HardwareAgent",
+        "grc-hardware",
+        "一期仅配置 flowgraph 中的 SDR 参数；真实枚举或发射必须报告未启用并请求确认。",
+    )
 
 def build_block_knowledge_prompt() -> str:
     return (
@@ -115,8 +184,10 @@ def build_simulation_prompt() -> str:
 
 #: subagent 名称 -> prompt 构造器,供 subagents.py 装配。
 SUBAGENT_PROMPTS = {
-    "block_knowledge_agent": build_block_knowledge_prompt,
-    "flowgraph_builder_agent": build_builder_prompt,
-    "flowgraph_critic_agent": build_critic_prompt,
-    "simulation_agent": build_simulation_prompt,
+    "spec_agent": build_spec_prompt,
+    "radio_design_agent": build_radio_design_prompt,
+    "flowgraph_agent": build_flowgraph_prompt,
+    "verification_agent": build_verification_prompt,
+    "diagnosis_agent": build_diagnosis_prompt,
+    "hardware_agent": build_hardware_prompt,
 }

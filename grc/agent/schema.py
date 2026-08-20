@@ -83,3 +83,5 @@ class AgentReply:
     tool_invocations: List[ToolInvocation] = field(default_factory=list)
     artifacts: Dict[str, Any] = field(default_factory=dict)
     done: bool = False
+    claims: List[Dict[str, Any]] = field(default_factory=list)
+    spec_digest: Dict[str, Any] = field(default_factory=dict)

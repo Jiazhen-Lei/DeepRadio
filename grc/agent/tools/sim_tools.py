@@ -12,16 +12,77 @@ import os
 from ..runtime import simulate
 from .registry import ToolContext, tool
 
+#: file_sink 的 ``type`` 参数 -> read_probe 支持的 numpy dtype 名。
+_DTYPE_BY_SINK_TYPE = {
+    "complex": "complex64",
+    "float": "float32",
+    "byte": "uint8",
+    "char": "int8",
+}
+
+#: 无样本时给模型的可执行提示,避免它去猜产物路径或反复重跑。
+_NO_SAMPLE_HINT = (
+    "probe 读到 0 个样本。probe 文件路径必须来自流图里 file sink 的 file 参数,"
+    "不要按 probe_id 猜文件名;推荐直接调用 design_flowgraph(simulate=True) 走"
+    "完整链路。"
+)
+
+
+def _strip_quotes(value) -> str:
+    text = str(value).strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
+        return text[1:-1]
+    return text
+
+
+def derive_probes(ctx: ToolContext) -> dict:
+    """从当前流图的 ``blocks_file_sink`` 推导 probe_id -> (路径, dtype)。
+
+    真实落盘路径只写在 file sink 的 ``file`` 参数里。调用方若按 probe_id
+    拼文件名(如 ``<probe_id>_rx.bin``),流图仍写自己的路径,读回就是 0 样本。
+    """
+    probes = {}
+    for block_id, block in (getattr(ctx, "blocks", None) or {}).items():
+        if getattr(block, "key", "") != "blocks_file_sink":
+            continue
+        params = getattr(block, "params", None) or {}
+        if "file" not in params:
+            continue
+        path = _strip_quotes(params["file"].get_value())
+        if not path:
+            continue
+        sink_type = ""
+        if "type" in params:
+            sink_type = str(params["type"].get_value()).strip()
+        probes[block_id] = (path, _DTYPE_BY_SINK_TYPE.get(sink_type,
+                                                          "complex64"))
+    return probes
+
+
+def _require_samples(ctx: ToolContext, probe_id: str = ""):
+    """取出可用的复数样本;不可用时返回 (None, 错误 dict)。"""
+    res = ctx.last_sim
+    if res is None or not res.ok:
+        return None, {"ok": False, "error": "尚无成功的仿真结果,请先 run_simulation"}
+    arr = res._pick_complex(probe_id or None)
+    if arr is None:
+        return None, {"ok": False, "error": "找不到复数 probe 数据",
+                      "hint": _NO_SAMPLE_HINT}
+    if int(getattr(arr, "size", 0)) == 0:
+        return None, {"ok": False, "error": "probe 无样本(0 采样)",
+                      "hint": _NO_SAMPLE_HINT}
+    return arr, None
+
 
 @tool(
     name="run_simulation",
-    description="对当前流图跑一次无头仿真:生成脚本->执行->读回指定 probe 的数据。要求流图里已有 blocks_file_sink 落盘。",
+    description="对当前流图跑一次无头仿真:生成脚本->执行->读回 probe 数据。probes 省略时自动从流图的 blocks_file_sink 推导。",
     parameters={
         "type": "object",
         "properties": {
             "probes": {
                 "type": "object",
-                "description": "probe_id -> [文件路径, dtype]。dtype: complex64/float32/int8/uint8。",
+                "description": "可选。probe_id -> [文件路径, dtype];省略时按流图里的 file sink 自动推导。",
             },
             "timeout": {"type": "number", "description": "墙钟超时秒数,默认 30"},
         },
@@ -41,6 +102,8 @@ def run_simulation(ctx: ToolContext, probes: dict = None, timeout: float = 30.0)
                 norm[pid] = (str(spec[0]), str(spec[1]))
             elif isinstance(spec, dict):
                 norm[pid] = (str(spec.get("path")), str(spec.get("dtype", "complex64")))
+    if not norm:
+        norm = derive_probes(ctx) or None
     result = simulate.run(fg, ctx.platform, probes=norm,
                           out_dir=ctx.out_dir, timeout=timeout)
     ctx.last_sim = result
@@ -49,9 +112,13 @@ def run_simulation(ctx: ToolContext, probes: dict = None, timeout: float = 30.0)
                 "stderr": result.stderr, "summary": result.summary}
     sizes = {pid: int(getattr(arr, "size", 0))
              for pid, arr in result.data.items()}
-    return {"ok": True, "summary": result.summary,
-            "script_path": result.script_path,
-            "out_dir": result.out_dir, "probe_sizes": sizes}
+    payload = {"ok": True, "summary": result.summary,
+               "script_path": result.script_path,
+               "out_dir": result.out_dir, "probe_sizes": sizes,
+               "probes": {pid: path for pid, (path, _) in (norm or {}).items()}}
+    if sizes and not any(sizes.values()):
+        payload["warning"] = _NO_SAMPLE_HINT
+    return payload
 
 
 @tool(
@@ -80,16 +147,25 @@ def read_metric(ctx: ToolContext, kind: str, probe_id: str = "",
     kind = (kind or "").lower().strip()
 
     iq = res._pick_complex(probe_id or None)
-    if kind in ("evm", "ber") and iq is None:
-        return {"ok": False, "error": "找不到复数 probe 数据"}
+    if kind in ("evm", "ber", "spectrum_peak"):
+        iq, err = _require_samples(ctx, probe_id)
+        if err is not None:
+            return err
 
     if kind == "evm":
-        syms = simulate.extract_symbols(iq, sps=sps, skip_symbols=4)
-        evm = simulate.evm_from_symbols(
-            syms, simulate.ideal_points_for(modulation))
+        ideal = simulate.ideal_points_for(modulation)
+        filtered = simulate.matched_filter_rrc(iq, sps=sps)
+        syms, phase = simulate.extract_symbols_best_phase(
+            filtered,
+            sps=sps,
+            ideal_points=ideal,
+            skip_symbols=15 if sps > 1 else 4,
+        )
+        evm = simulate.evm_from_symbols(syms, ideal)
         res.metrics["evm_pct"] = evm
         return {"ok": True, "kind": "evm", "value": evm,
-                "unit": "%", "n_symbols": int(syms.size)}
+                "unit": "%", "n_symbols": int(syms.size),
+                "sample_phase": phase}
 
     if kind == "ber":
         syms = simulate.extract_symbols(iq, sps=sps, skip_symbols=4)
@@ -103,8 +179,6 @@ def read_metric(ctx: ToolContext, kind: str, probe_id: str = "",
         return {"ok": True, "kind": "ber", "value": ber, "delay": delay}
 
     if kind == "spectrum_peak":
-        if iq is None or iq.size == 0:
-            return {"ok": False, "error": "无数据"}
         n = min(len(iq), 4096)
         spec = np.abs(np.fft.fft(iq[:n]))
         return {"ok": True, "kind": "spectrum_peak",
@@ -128,9 +202,10 @@ def read_metric(ctx: ToolContext, kind: str, probe_id: str = "",
 )
 def plot_constellation(ctx: ToolContext, probe_id: str = "",
                        sps: int = 1, path: str = ""):
+    _, err = _require_samples(ctx, probe_id)
+    if err is not None:
+        return err
     res = ctx.last_sim
-    if res is None or not res.ok:
-        return {"ok": False, "error": "尚无成功的仿真结果"}
     out = path or os.path.join(res.out_dir or ".", "constellation.png")
     p = res.plot_constellation(out, probe_id=probe_id or None, sps=sps)
     if p is None:
@@ -153,9 +228,10 @@ def plot_constellation(ctx: ToolContext, probe_id: str = "",
 )
 def plot_spectrum(ctx: ToolContext, probe_id: str = "",
                   samp_rate: float = 1.0, path: str = ""):
+    _, err = _require_samples(ctx, probe_id)
+    if err is not None:
+        return err
     res = ctx.last_sim
-    if res is None or not res.ok:
-        return {"ok": False, "error": "尚无成功的仿真结果"}
     out = path or os.path.join(res.out_dir or ".", "spectrum.png")
     p = res.plot_spectrum(out, probe_id=probe_id or None, samp_rate=samp_rate)
     if p is None:
@@ -177,9 +253,10 @@ def plot_spectrum(ctx: ToolContext, probe_id: str = "",
     group="sim",
 )
 def plot_eye(ctx: ToolContext, probe_id: str = "", sps: int = 4, path: str = ""):
+    _, err = _require_samples(ctx, probe_id)
+    if err is not None:
+        return err
     res = ctx.last_sim
-    if res is None or not res.ok:
-        return {"ok": False, "error": "尚无成功的仿真结果"}
     out = path or os.path.join(res.out_dir or ".", "eye.png")
     p = res.plot_eye(out, probe_id=probe_id or None, sps=sps)
     if p is None:

@@ -3,9 +3,8 @@ Agent 右侧对话面板 (多轮协商版 GTK 界面)。
 
 在 MainWindow 右侧提供一个人机对话面板:
 
-* **多轮协商 Agent**(默认): 持有一个 ``grc.agent.core.Agent`` 实例, 每轮
-  ``agent.step`` 按 planner 五阶段 (INTENT→PROPOSE→BUILD→SIMULATE→TUNE→DONE)
-  推进, 回显按用户专业度档位渲染的叙述, 并内联展示产物图(星座/频谱/眼图);
+* **多轮协商 Agent**(默认): 持有 ``ServiceAgent``，按闭环模式委派六个领域
+  Subagent，并通过 SharedState 展示可追溯 Spec 与 Claim/Evidence；
   产出 .grc 时 emit ``open_flow_graph`` 让 MainWindow 载入画布。
 * **一句话直出 (baseline)**: 勾选开关后走 ``build_flow_graph_from_text``,
   LLM 直接产 .grc, 作为论文对照组。
@@ -24,6 +23,8 @@ import threading
 import gi
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, GLib, GObject, GdkPixbuf
+
+from .ClaimsPanel import ClaimsPanel
 
 log = logging.getLogger(__name__)
 
@@ -111,6 +112,9 @@ class AgentPanel(Gtk.VBox):
         self._scroll = scroll
         self.pack_start(scroll, expand=True, fill=True, padding=0)
 
+        self.claims_panel = ClaimsPanel()
+        self.pack_start(self.claims_panel, expand=False, fill=True, padding=2)
+
         # ---- 状态栏: 显示当前阶段 / 档位 ----
         self.status = Gtk.Label(label="就绪")
         self.status.set_halign(Gtk.Align.START)
@@ -187,6 +191,7 @@ class AgentPanel(Gtk.VBox):
         self._baseline_history = []
         for child in self._log_box.get_children():
             self._log_box.remove(child)
+        self.claims_panel.clear()
         self._append("Agent", "已重置会话。请描述新的需求。")
         self._set_status("就绪")
 
@@ -237,6 +242,10 @@ class AgentPanel(Gtk.VBox):
             summary = ", ".join(
                 "{}={}".format(k, self._fmt(v)) for k, v in metrics.items())
             self._append("指标", summary)
+        self.claims_panel.update_data(
+            getattr(reply, "claims", []),
+            getattr(reply, "spec_digest", {}),
+        )
         # 产出 .grc -> 载入画布。
         grc_path = artifacts.get("grc_path") or artifacts.get("path")
         if grc_path and str(grc_path).endswith(".grc") \
@@ -270,6 +279,7 @@ class AgentPanel(Gtk.VBox):
     def _on_baseline_done(self, grc_path):
         msg = "已生成 {}, 正在载入画布…".format(os.path.basename(grc_path))
         self._append("Agent", msg)
+        self.claims_panel.clear()
         self._baseline_history.append(("assistant", msg))
         self._set_busy(False)
         self.emit('open_flow_graph', grc_path)
@@ -305,10 +315,9 @@ class AgentPanel(Gtk.VBox):
 
     def _append(self, who, text):
         """把一行对话追加为一个文本标签。"""
-        label = Gtk.Label()
-        label.set_markup("<b>{}:</b> {}".format(
-            GLib.markup_escape_text(who), GLib.markup_escape_text(text)))
+        label = Gtk.Label(label="{}: {}".format(who, text or ""))
         label.set_line_wrap(True)
+        label.set_line_wrap_mode(Gtk.WrapMode.WORD_CHAR)
         label.set_halign(Gtk.Align.START)
         label.set_xalign(0.0)
         label.set_selectable(True)
@@ -325,8 +334,7 @@ class AgentPanel(Gtk.VBox):
             log.warning("加载产物图失败 %s: %s", path, e)
             self._append(title, "(图片加载失败: {})".format(path))
             return
-        cap = Gtk.Label()
-        cap.set_markup("<b>{}</b>".format(GLib.markup_escape_text(title)))
+        cap = Gtk.Label(label=title)
         cap.set_halign(Gtk.Align.START)
         self._log_box.pack_start(cap, False, False, 0)
         img = Gtk.Image.new_from_pixbuf(pixbuf)

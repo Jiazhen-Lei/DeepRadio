@@ -220,6 +220,67 @@ def extract_symbols(iq, sps: int, skip_symbols: int = 4):
     return arr[start::int(sps)]
 
 
+def extract_symbols_best_phase(
+    iq, sps: int, ideal_points, skip_symbols: int = 4
+):
+    """Choose the symbol sampling phase with the lowest decision-directed EVM."""
+    import numpy as np
+
+    arr = np.asarray(iq, dtype=np.complex64)
+    if sps <= 1:
+        return arr[skip_symbols:], 0
+    base = int(sps) * int(skip_symbols)
+    best_symbols = arr[base::int(sps)]
+    best_phase = 0
+    best_evm = evm_from_symbols(best_symbols, ideal_points)
+    for phase in range(1, int(sps)):
+        symbols = arr[base + phase::int(sps)]
+        candidate = evm_from_symbols(symbols, ideal_points)
+        if candidate < best_evm:
+            best_symbols = symbols
+            best_phase = phase
+            best_evm = candidate
+    return best_symbols, best_phase
+
+
+def matched_filter_rrc(
+    iq, sps: int, excess_bw: float = 0.35, span_symbols: int = 11
+):
+    """Apply a unit-energy root-raised-cosine receive matched filter."""
+    import numpy as np
+
+    arr = np.asarray(iq, dtype=np.complex64)
+    if sps <= 1:
+        return arr
+    beta = float(excess_bw)
+    time_axis = np.arange(
+        -span_symbols * sps, span_symbols * sps + 1, dtype=float
+    ) / float(sps)
+    taps = np.empty_like(time_axis)
+    for index, value in enumerate(time_axis):
+        if abs(value) < 1e-12:
+            taps[index] = 1 + beta * (4 / math.pi - 1)
+        elif beta and abs(abs(value) - 1 / (4 * beta)) < 1e-9:
+            taps[index] = (beta / math.sqrt(2)) * (
+                (1 + 2 / math.pi) * math.sin(math.pi / (4 * beta))
+                + (1 - 2 / math.pi) * math.cos(math.pi / (4 * beta))
+            )
+        else:
+            numerator = math.sin(math.pi * value * (1 - beta))
+            numerator += (
+                4
+                * beta
+                * value
+                * math.cos(math.pi * value * (1 + beta))
+            )
+            denominator = (
+                math.pi * value * (1 - (4 * beta * value) ** 2)
+            )
+            taps[index] = numerator / denominator
+    taps /= max(float(np.sqrt(np.sum(taps * taps))), 1e-12)
+    return np.convolve(arr, taps, mode="same")
+
+
 # ---------------------------------------------------------------------------
 # 指标提取器
 # ---------------------------------------------------------------------------

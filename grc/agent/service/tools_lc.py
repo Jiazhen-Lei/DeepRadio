@@ -20,11 +20,19 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from ..tools.registry import ToolContext
 
 logger = logging.getLogger(__name__)
+
+#: 产物落在宿主机磁盘上,而内置文件工具(read_file/ls/glob)看到的是 deepagents
+#: 的会话虚拟文件系统。不说清这点,模型会拿真实路径去 read_file,失败后反复
+#: ls/glob 找文件直到撞 recursion_limit。
+_ARTIFACTS_NOTE = (
+    "artifacts 里的路径位于宿主机磁盘,不在你的虚拟文件系统里。"
+    "GUI 会自动展示这些产物,禁止用 read_file / ls / glob 去确认它们是否存在。"
+)
 
 
 def _rec_event(ctx: ToolContext, kind: str, payload: Dict[str, Any]) -> None:
@@ -74,6 +82,9 @@ def build_grc_tools(ctx: ToolContext) -> List[Any]:
             "recipe": result.get("recipe"),
             "valid": result.get("valid"),
             "steps": result.get("steps", []),
+            "policy": result.get("policy"),
+            "requires_confirmation": result.get("requires_confirmation"),
+            "error": result.get("error"),
         })
         _merge_artifacts(ctx, result.get("artifacts", {}))
         if result.get("metrics"):
@@ -90,6 +101,7 @@ def build_grc_tools(ctx: ToolContext) -> List[Any]:
             "metrics": result.get("metrics"),
             "artifacts": list((result.get("artifacts") or {}).keys()),
             "error": result.get("error"),
+            "artifacts_note": _ARTIFACTS_NOTE,
         }, ensure_ascii=False)
 
     @tool
@@ -102,14 +114,14 @@ def build_grc_tools(ctx: ToolContext) -> List[Any]:
 
     @tool
     def run_simulation(probe_id: str = "sink") -> str:
-        """对当前流图跑一次无头仿真,把 probe_id 指定的 sink 落盘取指标。"""
-        probe_path = None
-        if ctx.out_dir:
-            import os
-            probe_path = os.path.join(ctx.out_dir, f"{probe_id}_rx.bin")
-        probes = {probe_id: [probe_path, "complex64"]} if probe_path else {}
-        r = registry.call("run_simulation", {"probes": probes}, ctx)
+        """对当前流图跑一次无头仿真并读回落盘数据。
+
+        probe 文件路径自动取自流图里 file sink 的 file 参数,不要自己指定;
+        probe_id 仅用于事件记录。
+        """
+        r = registry.call("run_simulation", {}, ctx)
         _rec_event(ctx, "simulate", {"ok": r.get("ok"),
+                                     "probe_sizes": r.get("probe_sizes"),
                                      "out_dir": r.get("out_dir")})
         if r.get("out_dir"):
             _merge_artifacts(ctx, {"out_dir": r["out_dir"]})
@@ -123,9 +135,136 @@ def build_grc_tools(ctx: ToolContext) -> List[Any]:
             "kind": kind, "probe_id": probe_id,
             "modulation": modulation, "sps": sps}, ctx)
         if r.get("ok") and r.get("value") is not None:
-            ctx.extra.setdefault("metrics", {})[f"{kind}"] = r["value"]
+            metric_key = "evm_pct" if kind == "evm" else kind
+            ctx.extra.setdefault("metrics", {})[metric_key] = r["value"]
         _rec_event(ctx, "read_metric", {"kind": kind, "ok": r.get("ok"),
                                         "value": r.get("value")})
         return json.dumps(r, ensure_ascii=False)
 
-    return [design_flowgraph, validate_flowgraph, run_simulation, read_metric]
+    def _call(name: str, arguments: Dict[str, Any]) -> str:
+        result = registry.call(name, arguments, ctx)
+        _rec_event(ctx, name, result)
+        return json.dumps(result, ensure_ascii=False)
+
+    @tool
+    def spec_clarify(text: str = "") -> str:
+        """Extract specification gaps and return questions that need user input."""
+        return _call("spec_clarify", {"text": text})
+
+    @tool
+    def spec_commit(text: str) -> str:
+        """Commit user goals, decisions, and success claims to SharedState."""
+        return _call("spec_commit", {"text": text})
+
+    @tool
+    def select_recipe(intent: str = "", recipe: str = "") -> str:
+        """Select a deterministic GNU Radio recipe without building it."""
+        return _call("select_recipe", {"intent": intent, "recipe": recipe})
+
+    @tool
+    def search_blocks(query: str, limit: int = 15) -> str:
+        """Search installed GNU Radio blocks by keyword."""
+        return _call("search_blocks", {"query": query, "limit": limit})
+
+    @tool
+    def describe_block(key: str) -> str:
+        """Describe the parameters and ports of one installed block."""
+        return _call("describe_block", {"key": key})
+
+    @tool
+    def verify_claims() -> str:
+        """Bind current validation and simulation observations to pending claims."""
+        return _call("verify_claims", {})
+
+    @tool
+    def plot_spectrum(probe_id: str = "sink", samp_rate: float = 1e6) -> str:
+        """Render a spectrum artifact from the latest simulation probe."""
+        result = registry.call(
+            "plot_spectrum",
+            {"probe_id": probe_id, "samp_rate": samp_rate},
+            ctx,
+        )
+        if result.get("path"):
+            _merge_artifacts(ctx, {"spectrum_png": result["path"]})
+        _rec_event(ctx, "plot_spectrum", result)
+        return json.dumps(result, ensure_ascii=False)
+
+    @tool
+    def diagnose_by_metric(
+        metric: str = "evm",
+        probe_id: str = "",
+        modulation: str = "bpsk",
+        sps: int = 4,
+    ) -> str:
+        """Diagnose a flowgraph from EVM or spectrum observations."""
+        return _call(
+            "debug_by_metric",
+            {
+                "metric": metric,
+                "probe_id": probe_id,
+                "modulation": modulation,
+                "sps": sps,
+            },
+        )
+
+    @tool
+    def suggest_fix(block_param: str, value: str) -> str:
+        """Apply one diagnosis suggestion to the in-memory flowgraph."""
+        if "." not in block_param:
+            return json.dumps(
+                {"ok": False, "error": "block_param 格式应为 block.parameter"},
+                ensure_ascii=False,
+            )
+        block_id, parameter = block_param.split(".", 1)
+        return _call(
+            "apply_grc_diff",
+            {"block_id": block_id, "parameter": parameter, "value": value},
+        )
+
+    @tool
+    def apply_grc_diff(block_id: str, parameter: str, value: str) -> str:
+        """Apply one recoverable parameter change to the current flowgraph."""
+        return _call(
+            "apply_grc_diff",
+            {"block_id": block_id, "parameter": parameter, "value": value},
+        )
+
+    @tool
+    def configure_sdr(
+        device_type: str,
+        center_freq: Optional[float] = None,
+        sample_rate: Optional[float] = None,
+    ) -> str:
+        """Record SDR block configuration; this never touches real hardware."""
+        return _call(
+            "configure_sdr",
+            {
+                "device_type": device_type,
+                "center_freq": center_freq,
+                "sample_rate": sample_rate,
+            },
+        )
+
+    @tool
+    def list_devices() -> str:
+        """Report whether real SDR discovery is enabled."""
+        return _call("list_devices", {})
+
+    return [
+        design_flowgraph,
+        validate_flowgraph,
+        run_simulation,
+        read_metric,
+        spec_clarify,
+        spec_commit,
+        select_recipe,
+        search_blocks,
+        describe_block,
+        verify_claims,
+        plot_spectrum,
+        diagnose_by_metric,
+        suggest_fix,
+        apply_grc_diff,
+        configure_sdr,
+        list_devices,
+    ]

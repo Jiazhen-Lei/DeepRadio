@@ -36,6 +36,7 @@ class Recipe:
     keywords: List[str] = field(default_factory=list)
     #: 仿真时的 file_sink 探针 id(design_link 会据此配 run_simulation)
     probe_block_id: Optional[str] = None
+    probe_dtype: str = "complex64"
     sps: int = 4
 
     def score(self, text: str) -> int:
@@ -134,6 +135,99 @@ _RECIPE_QPSK_AWGN = Recipe(
 )
 
 # ---------------------------------------------------------------------------
+# T2:Self-contained BPSK receiver chain for receiver construction tasks
+# ---------------------------------------------------------------------------
+_RECIPE_RX_BPSK_AWGN = Recipe(
+    name="rx_bpsk_awgn",
+    title="BPSK AWGN 接收机",
+    difficulty="T2",
+    summary="自包含 BPSK 激励与 AWGN 信道，经星座接收机完成载波跟踪和判决。",
+    blocks=[
+        *_common_vars(),
+        ("variable_constellation", "bpsk_const", {"type": "bpsk"}),
+        (
+            "analog_random_source_x",
+            "src",
+            {
+                "type": "byte",
+                "min": "0",
+                "max": "2",
+                "num_samps": "1000",
+                "repeat": "True",
+            },
+        ),
+        (
+            "digital_constellation_modulator",
+            "mod",
+            {
+                "constellation": "bpsk_const",
+                "differential": "False",
+                "samples_per_symbol": "sps",
+                "excess_bw": "0.35",
+            },
+        ),
+        (
+            "channels_channel_model",
+            "chan",
+            {
+                "noise_voltage": "0.05",
+                "freq_offset": "0.0",
+                "epsilon": "1.0",
+                "taps": "1.0",
+                "seed": "0",
+            },
+        ),
+        (
+            "digital_pfb_clock_sync_xxx",
+            "clock_sync",
+            {
+                "type": "ccf",
+                "sps": "sps",
+                "loop_bw": "0.0628",
+                "taps": (
+                    "firdes.root_raised_cosine(32, 32, "
+                    "1.0/float(sps), 0.35, 11*sps*32)"
+                ),
+                "filter_size": "32",
+                "init_phase": "16",
+                "max_rate_deviation": "1.5",
+                "osps": "1",
+            },
+        ),
+        (
+            "digital_constellation_receiver_cb",
+            "rx",
+            {
+                "constellation": "bpsk_const",
+                "loop_bw": "0.0628",
+                "fmin": "-0.25",
+                "fmax": "0.25",
+            },
+        ),
+        ("blocks_head", "head", {"type": "byte", "num_items": "2048"}),
+        ("blocks_file_sink", "sink", {"type": "byte", "file": "__PROBE__"}),
+    ],
+    connections=[
+        ("src", "mod"),
+        ("mod", "chan"),
+        ("chan", "clock_sync"),
+        ("clock_sync", "rx"),
+        ("rx", "head"),
+        ("head", "sink"),
+    ],
+    knobs={
+        "rx.loop_bw": "载波环路带宽；跟踪速度与噪声抑制折中。",
+        "chan.noise_voltage": "接收机输入噪声强度。",
+        "chan.freq_offset": "用于验证接收机载波跟踪范围。",
+    },
+    metrics=[],
+    keywords=["接收机", "receiver", "rx", "bpsk接收", "解调"],
+    probe_block_id="sink",
+    probe_dtype="uint8",
+    sps=1,
+)
+
+# ---------------------------------------------------------------------------
 # T1:纯基带正弦 + 噪声(最简,给零基础用户\"先看到东西\")
 # ---------------------------------------------------------------------------
 _RECIPE_TONE_NOISE = Recipe(
@@ -213,6 +307,7 @@ RECIPES: Dict[str, Recipe] = {
         _RECIPE_TONE_NOISE,
         _RECIPE_BPSK_AWGN,
         _RECIPE_QPSK_AWGN,
+        _RECIPE_RX_BPSK_AWGN,
         _RECIPE_OFDM,
     )
 }
