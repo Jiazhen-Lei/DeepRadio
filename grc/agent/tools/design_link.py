@@ -37,14 +37,18 @@ def design_link(ctx, profile=None, intent: str = "",
         dict:ok / recipe / blocks / connections / valid / metrics /
         artifacts(grc_path/const_png/...) / narrative。
     """
-    if ctx.platform is None:
-        return {"ok": False, "error": "缺少 platform,无法建图"}
+    if ctx.extra.get("mutation_forbidden"):
+        return {
+            "ok": False,
+            "error": "本轮禁止改图（用户要求只诊断/先不要修改）",
+            "policy": "DENY",
+        }
 
-    rc = _recipes.get_recipe(recipe) if recipe else None
-    if rc is None:
-        rc = _recipes.match_recipe(intent)
+    intent = (intent or "").strip() or str(ctx.extra.get("user_text") or "")
+    rc = _recipes.resolve_recipe(intent=intent, recipe=recipe)
     fid = flowgraph_id or rc.name
     state = ctx.extra.get("state")
+    approved_pending = None
     if state is not None:
         from ..state import ALLOW, create_snapshot, gate
 
@@ -63,9 +67,12 @@ def design_link(ctx, profile=None, intent: str = "",
                 "policy": "DENY",
             }
         current_recipe = str(state.project.config.get("recipe") or "")
+        canvas_dirty = bool(state.project.config.get("canvas_dirty"))
+        has_existing = bool(current_recipe or state.project.grc_path)
+        recipe_changed = bool(current_recipe) and current_recipe != rc.name
         scope = (
             "multi_block_change"
-            if current_recipe and current_recipe != rc.name
+            if has_existing and (recipe_changed or canvas_dirty or not current_recipe)
             else "new_flowgraph"
         )
         decision = gate(
@@ -82,16 +89,32 @@ def design_link(ctx, profile=None, intent: str = "",
             None,
         )
         if pending and pending.get("approved"):
+            if ctx.platform is None:
+                return {"ok": False, "error": "缺少 platform,无法建图"}
+            approved_pending = dict(pending)
             state.coordination.pending_confirmations.remove(pending)
             decision = ALLOW
         if decision != ALLOW:
             if decision in ("PROPOSE", "CONFIRM") and pending is None:
+                proposed = list(ctx.extra.get("proposed_decisions") or [])
+                if new_modulation and not any(
+                    item.get("key") == "modulation" for item in proposed
+                ):
+                    proposed.append(
+                        {
+                            "key": "modulation",
+                            "value": new_modulation,
+                            "source": "user",
+                        }
+                    )
                 state.coordination.pending_confirmations.append(
                     {
                         "action": "design_link",
                         "recipe": rc.name,
+                        "from_recipe": current_recipe,
                         "policy": decision,
                         "approved": False,
+                        "proposed_decisions": proposed,
                     }
                 )
             return {
@@ -99,12 +122,17 @@ def design_link(ctx, profile=None, intent: str = "",
                 "error": f"PolicyGateway 拒绝建图: {decision}",
                 "policy": decision,
                 "recipe": rc.name,
+                "from_recipe": current_recipe,
                 "valid": False,
+                "requires_confirmation": decision in ("PROPOSE", "CONFIRM"),
             }
         state_path = str(ctx.extra.get("state_path") or "")
         snapshots_dir = str(ctx.extra.get("snapshots_dir") or "")
         if state_path and snapshots_dir:
             create_snapshot(state, snapshots_dir, state_path)
+
+    if ctx.platform is None:
+        return {"ok": False, "error": "缺少 platform,无法建图"}
 
     steps: List[dict] = []
 
@@ -177,6 +205,12 @@ def design_link(ctx, profile=None, intent: str = "",
                 if m.get("ok"):
                     metrics["evm_pct"] = m["value"]
                     metrics["n_symbols"] = m.get("n_symbols")
+            if "ber" in rc.metrics:
+                mod = _guess_modulation(rc.name)
+                m = _c("read_metric", kind="ber", probe_id=probe_id,
+                       modulation=mod, sps=rc.sps)
+                if m.get("ok"):
+                    metrics["ber"] = m["value"]
             if "constellation" in rc.metrics:
                 pc = _c("plot_constellation", probe_id=probe_id, sps=rc.sps)
                 if pc.get("ok"):
@@ -213,6 +247,12 @@ def design_link(ctx, profile=None, intent: str = "",
             state.project.grc_path = artifacts["grc_path"]
         state.project.config["recipe"] = rc.name
         state.project.config["modulation"] = _guess_modulation(rc.name)
+        state.project.config["canvas_dirty"] = False
+        from .state_tools import apply_proposed_decisions
+
+        apply_proposed_decisions(
+            state, (approved_pending or {}).get("proposed_decisions") or []
+        )
         state.project.flowgraph_version += 1
         ClaimStore(state).invalidate_by_version(
             state.project.flowgraph_version

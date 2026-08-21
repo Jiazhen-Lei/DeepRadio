@@ -74,7 +74,7 @@ class ServiceAgent:
     Example:
         >>> agent = build_service_agent()
         >>> reply = agent.step("做一个 BPSK over AWGN,看 EVM")
-        >>> reply.artifacts.get("grc_path")   # 供 open_flow_graph 打开
+        >>> reply.artifacts.get("grc_path")   # 供 GUI 原地刷新画布
     """
 
     def __init__(self, session_id: Optional[str] = None,
@@ -123,7 +123,93 @@ class ServiceAgent:
         ctx.extra["artifacts"] = {}
         ctx.extra["events"] = []
         ctx.extra["metrics"] = {}
+        if ctx.flow_graph is None:
+            self._load_session_flowgraph(ctx)
         return ctx
+
+    def _load_session_flowgraph(self, ctx: ToolContext) -> None:
+        """从会话已保存的 .grc 把内存流图灌进 agent 用的 core Platform。"""
+        path = str(self._state.project.grc_path or "")
+        if not path or not os.path.isfile(path) or ctx.platform is None:
+            return
+        try:
+            from grc.core.io import yaml
+
+            with open(path, "r", encoding="utf-8") as handle:
+                data = yaml.safe_load(handle)
+            if not isinstance(data, dict):
+                return
+            flow_graph = ctx.platform.make_flow_graph()
+            flow_graph.import_data(data)
+            ctx.flow_graph = flow_graph
+            ctx.blocks = {}
+            for block in getattr(flow_graph, "blocks", []) or []:
+                try:
+                    bid = str(block.params["id"].get_value())
+                except Exception:  # noqa: BLE001
+                    bid = str(getattr(block, "name", "") or "")
+                if bid and bid != "options":
+                    ctx.blocks[bid] = block
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("加载会话流图失败(%s): %s", path, exc)
+
+    def sync_from_canvas(self, file_path: str) -> Dict[str, Any]:
+        """画布保存 session .grc 后: version+1, Claim 失效, 标记 canvas_dirty。"""
+        path = os.path.abspath(file_path or "")
+        session_path = os.path.abspath(self._state.project.grc_path or "")
+        if not path or not session_path or path != session_path:
+            return {"ok": False, "skipped": True}
+        self._state.project.flowgraph_version += 1
+        self._state.project.config["canvas_dirty"] = True
+        ClaimStore(self._state).invalidate_by_version(
+            self._state.project.flowgraph_version
+        )
+        self._tool_ctx = None
+        try:
+            self._state.save(_store.state_path(self.session_id))
+        except OSError as exc:
+            logger.warning("SharedState 落盘失败: %s", exc)
+            return {"ok": False, "error": str(exc)}
+        return {
+            "ok": True,
+            "version": self._state.project.flowgraph_version,
+            "claims": ClaimStore(self._state).summary(),
+            "spec_digest": self._state.spec_digest(),
+            "canvas_dirty": True,
+        }
+
+    def restore_last_snapshot(self) -> Dict[str, Any]:
+        """把 SharedState 与 .grc 回滚到最近一次改图前快照。"""
+        from ..state import restore_snapshot
+
+        snaps = list(self._state.coordination.snapshots or [])
+        if not snaps:
+            snap_dir = _store.snapshots_dir(self.session_id)
+            if os.path.isdir(snap_dir):
+                snaps = sorted(
+                    os.path.join(snap_dir, name)
+                    for name in os.listdir(snap_dir)
+                    if name.startswith("v")
+                )
+        if not snaps:
+            return {"ok": False, "error": "没有可回滚的快照"}
+        target = snaps[-1]
+        try:
+            restored = restore_snapshot(
+                target, _store.state_path(self.session_id))
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("restore_snapshot 失败")
+            return {"ok": False, "error": str(exc)}
+        self._state = restored
+        self._tool_ctx = None
+        return {
+            "ok": True,
+            "snapshot": target,
+            "grc_path": restored.project.grc_path,
+            "version": restored.project.flowgraph_version,
+            "claims": ClaimStore(restored).summary(),
+            "spec_digest": restored.spec_digest(),
+        }
 
     # ---- 主入口 ------------------------------------------------------
     def step(self, user_text: str, recipe: str = "",
@@ -142,8 +228,16 @@ class ServiceAgent:
             except Exception as exc:  # noqa: BLE001
                 logger.debug("profile.observe 失败,忽略: %s", exc)
         ctx = self._make_ctx()
+        ctx.extra["user_text"] = user_text
         try:
-            from ..tools.state_tools import commit_intent, resolve_confirmation
+            from ..tools.state_tools import (
+                commit_intent,
+                detect_recipe_switch,
+                is_confirmation_utterance,
+                is_read_only_request,
+                redundant_recipe_switch,
+                resolve_confirmation,
+            )
 
             resolution = resolve_confirmation(ctx, user_text)
             if resolution.get("resolved") and not resolution.get("approved"):
@@ -158,7 +252,65 @@ class ServiceAgent:
                     self.session_id, "confirmation_cancelled", {}
                 )
                 return reply
-            commit_intent(ctx, user_text)
+            if resolution.get("resolved") and resolution.get("approved"):
+                pending = list(self._state.coordination.pending_confirmations)
+                last = pending[-1] if pending else {}
+                if last.get("action") == "design_link" and last.get("recipe"):
+                    reply = self._run_deterministic(
+                        ctx, user_text, str(last.get("recipe") or ""),
+                        simulate)
+                    try:
+                        self._state.save(_store.state_path(self.session_id))
+                    except OSError as exc:
+                        logger.warning("SharedState 落盘失败: %s", exc)
+                    return reply
+            if is_read_only_request(user_text):
+                ctx.extra["mutation_forbidden"] = True
+            if not is_confirmation_utterance(user_text):
+                commit_intent(ctx, user_text)
+            target_recipe = detect_recipe_switch(self._state, user_text)
+            if (
+                not target_recipe
+                and not ctx.extra.get("mutation_forbidden")
+            ):
+                already = redundant_recipe_switch(self._state, user_text)
+                if already:
+                    try:
+                        self._state.save(_store.state_path(self.session_id))
+                    except OSError as exc:
+                        logger.warning("SharedState 落盘失败: %s", exc)
+                    reply = AgentReply(
+                        text="当前已经是 {}，无需换配方。".format(already),
+                        stage="DELIVER",
+                        claims=ClaimStore(self._state).summary(),
+                        spec_digest=self._state.spec_digest(),
+                    )
+                    _store.append_session_event(
+                        self.session_id, "recipe_switch_noop",
+                        {"already": already},
+                    )
+                    return reply
+            if target_recipe and not ctx.extra.get("mutation_forbidden"):
+                from ..tools.design_link import design_link
+
+                proposed = design_link(
+                    ctx, profile=self.profile, intent=user_text,
+                    recipe=target_recipe, simulate=False, render=False,
+                )
+                if proposed.get("policy") in ("PROPOSE", "CONFIRM"):
+                    try:
+                        self._state.save(_store.state_path(self.session_id))
+                    except OSError as exc:
+                        logger.warning("SharedState 落盘失败: %s", exc)
+                    _store.append_session_event(
+                        self.session_id, "recipe_switch_propose",
+                        {
+                            "recipe": target_recipe,
+                            "from_recipe": proposed.get("from_recipe"),
+                            "policy": proposed.get("policy"),
+                        },
+                    )
+                    return self._pending_confirm_reply(proposed)
         except Exception as exc:  # noqa: BLE001
             logger.warning("规格提取失败，继续执行原链路: %s", exc)
         _store.append_session_event(self.session_id, "user_input",
@@ -333,9 +485,49 @@ class ServiceAgent:
         reply.needs_confirmation = (
             False if denied else ((not ok) or needs_policy_response)
         )
+        pending_list = []
+        if state is not None:
+            pending_list = list(state.coordination.pending_confirmations or [])
+        elif self._state.coordination.pending_confirmations:
+            pending_list = list(self._state.coordination.pending_confirmations)
+        last_pending = pending_list[-1] if pending_list else {}
+        if last_pending and not last_pending.get("approved"):
+            reply.pending = dict(last_pending)
+            reply.needs_confirmation = True
+            if reply.stage not in ("DENY", "ERROR"):
+                reply.stage = "CONFIRM"
         _store.append_session_event(self.session_id, "reply", {
             "source": source, "stage": reply.stage,
             "has_grc": bool(artifacts.get("grc_path"))})
+        return reply
+
+    def _pending_confirm_reply(self, result: Dict[str, Any]) -> AgentReply:
+        pending = {}
+        items = list(self._state.coordination.pending_confirmations or [])
+        if items:
+            pending = dict(items[-1])
+        from_recipe = (
+            result.get("from_recipe")
+            or pending.get("from_recipe")
+            or self._state.project.config.get("recipe")
+            or "当前工程"
+        )
+        to_recipe = result.get("recipe") or pending.get("recipe") or ""
+        text = (
+            f"将把当前工程从「{from_recipe}」换成「{to_recipe}」。"
+            "确认后才会重建流图；现有 Claim 将在新版本上失效并重验。"
+            "画布保持不变，直到你确认。"
+        )
+        reply = AgentReply(
+            text=text,
+            stage="CONFIRM",
+            needs_confirmation=True,
+            pending=pending,
+            claims=ClaimStore(self._state).summary(),
+            spec_digest=self._state.spec_digest(),
+        )
+        _store.append_session_event(self.session_id, "reply", {
+            "source": "policy-propose", "stage": "CONFIRM", "has_grc": False})
         return reply
 
     # ---- 辅助 --------------------------------------------------------

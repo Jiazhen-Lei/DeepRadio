@@ -13,3 +13,4 @@ dependencies:
       - langchain-openai
       - langgraph
       - openai
+      - markdown

@@ -220,8 +220,12 @@ _RECIPE_RX_BPSK_AWGN = Recipe(
         "chan.noise_voltage": "接收机输入噪声强度。",
         "chan.freq_offset": "用于验证接收机载波跟踪范围。",
     },
-    metrics=[],
-    keywords=["接收机", "receiver", "rx", "bpsk接收", "解调"],
+    metrics=["ber"],
+    keywords=[
+        "接收机", "receiver", "解调",
+        "定时恢复", "时钟同步", "pfb", "判决",
+        "constellation_receiver", "自包含",
+    ],
     probe_block_id="sink",
     probe_dtype="uint8",
     sps=1,
@@ -324,11 +328,50 @@ def get_recipe(name: str) -> Optional[Recipe]:
     return RECIPES.get((name or "").lower().strip())
 
 
+#: 含这些词时优先选 rx_* 接收配方,避免「BPSK/AWGN/星座」把发射 recipe 分打得更高。
+_RX_HINTS = (
+    "接收机", "receiver", "解调", "定时恢复", "时钟同步",
+    "判决", "clock_sync", "constellation_receiver", "pfb_clock",
+)
+_TX_LINK_RECIPES = frozenset({"bpsk_awgn", "qpsk_awgn", "ofdm_awgn"})
+
+
+def wants_receiver(intent: str) -> bool:
+    low = (intent or "").lower()
+    return any(hint.lower() in low for hint in _RX_HINTS)
+
+
 def match_recipe(intent: str, default: str = "bpsk_awgn") -> Recipe:
-    """离线选型:按关键词命中数挑最合适的配方;全不中回落 default。"""
+    """离线选型:按关键词命中数挑最合适的配方;全不中回落 default。
+
+    用户明确要接收机时,给 ``rx_*`` 加分并压低发射链路配方,避免 Task 3
+    那种「BPSK AWGN 接收机」被 ``bpsk_awgn`` 抢走。
+    没有接收机动词时压低 ``rx_*``,避免 Task 1 被误建成接收机。
+    """
+    wants_rx = wants_receiver(intent)
     best, best_score = None, 0
-    for r in RECIPES.values():
-        s = r.score(intent)
-        if s > best_score:
-            best, best_score = r, s
+    for recipe in RECIPES.values():
+        score = recipe.score(intent)
+        if wants_rx:
+            if recipe.name.startswith("rx_"):
+                score += 10
+            elif recipe.name in _TX_LINK_RECIPES:
+                score -= 5
+        elif recipe.name.startswith("rx_"):
+            score -= 20
+        if score > best_score:
+            best, best_score = recipe, score
     return best if best is not None else RECIPES[default]
+
+
+def resolve_recipe(intent: str = "", recipe: str = "") -> Recipe:
+    """显式 recipe 仍受意图约束:没有接收机动词时不允许落到 rx_*。"""
+    selected = get_recipe(recipe) if recipe else None
+    wants_rx = wants_receiver(intent)
+    if selected is None:
+        return match_recipe(intent)
+    if selected.name.startswith("rx_") and not wants_rx:
+        return match_recipe(intent or "bpsk awgn")
+    if wants_rx and selected.name in _TX_LINK_RECIPES:
+        return get_recipe("rx_bpsk_awgn") or selected
+    return selected

@@ -75,6 +75,7 @@ class AgentReply:
         tool_invocations: 本轮执行过的工具调用记录(CHI 埋点/调试用)。
         artifacts: 产物(如 grc 路径、图片路径、指标)。
         done: 会话是否结束。
+        pending: 待用户确认的 Policy 项(若有)。
     """
 
     text: str = ""
@@ -85,3 +86,4 @@ class AgentReply:
     done: bool = False
     claims: List[Dict[str, Any]] = field(default_factory=list)
     spec_digest: Dict[str, Any] = field(default_factory=dict)
+    pending: Dict[str, Any] = field(default_factory=dict)

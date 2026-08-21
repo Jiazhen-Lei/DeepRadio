@@ -130,15 +130,30 @@ def build_grc_tools(ctx: ToolContext) -> List[Any]:
     @tool
     def read_metric(kind: str = "evm", probe_id: str = "sink",
                     modulation: str = "bpsk", sps: int = 4) -> str:
-        """从最近一次仿真结果读指标(kind: evm / spectrum)。"""
+        """从最近一次仿真结果读指标(kind: evm / ber / spectrum 或 spectrum_peak)。"""
+        kind_norm = (kind or "").lower().strip()
+        if kind_norm in ("spectrum", "psd"):
+            kind_norm = "spectrum_peak"
         r = registry.call("read_metric", {
-            "kind": kind, "probe_id": probe_id,
+            "kind": kind_norm, "probe_id": probe_id,
             "modulation": modulation, "sps": sps}, ctx)
-        if r.get("ok") and r.get("value") is not None:
-            metric_key = "evm_pct" if kind == "evm" else kind
-            ctx.extra.setdefault("metrics", {})[metric_key] = r["value"]
-        _rec_event(ctx, "read_metric", {"kind": kind, "ok": r.get("ok"),
-                                        "value": r.get("value")})
+        if r.get("ok"):
+            metrics = ctx.extra.setdefault("metrics", {})
+            if kind_norm == "evm" and r.get("value") is not None:
+                metrics["evm_pct"] = r["value"]
+            elif kind_norm == "ber" and r.get("value") is not None:
+                metrics["ber"] = r["value"]
+            elif kind_norm == "spectrum_peak":
+                if r.get("value") is not None:
+                    metrics["spectrum_peak"] = r["value"]
+                elif r.get("peak") is not None:
+                    metrics["spectrum_peak"] = r["peak"]
+                if r.get("peak_bin") is not None:
+                    metrics["spectrum_peak_bin"] = r["peak_bin"]
+        _rec_event(ctx, "read_metric", {
+            "kind": kind_norm, "ok": r.get("ok"),
+            "value": r.get("value"), "error": r.get("error"),
+        })
         return json.dumps(r, ensure_ascii=False)
 
     def _call(name: str, arguments: Dict[str, Any]) -> str:
@@ -223,7 +238,10 @@ def build_grc_tools(ctx: ToolContext) -> List[Any]:
 
     @tool
     def apply_grc_diff(block_id: str, parameter: str, value: str) -> str:
-        """Apply one recoverable parameter change to the current flowgraph."""
+        """Apply one recoverable parameter change. Modulation/constellation
+        changes are rejected; use design_flowgraph with a new recipe instead.
+        Successful changes resimulate and rebind claims by default.
+        """
         return _call(
             "apply_grc_diff",
             {"block_id": block_id, "parameter": parameter, "value": value},

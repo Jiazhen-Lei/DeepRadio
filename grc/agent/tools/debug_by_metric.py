@@ -28,6 +28,8 @@ def debug_by_metric(ctx, profile=None, metric: str = "evm",
     要求 ``ctx.last_sim`` 已有成功仿真(通常先跑 design_link 或 run_simulation)。
     """
     metric = (metric or "evm").lower().strip()
+    if metric in ("spectrum", "spectrum_peak", "psd"):
+        metric = "spectrum"
 
     if metric == "evm":
         m = registry.call("read_metric",

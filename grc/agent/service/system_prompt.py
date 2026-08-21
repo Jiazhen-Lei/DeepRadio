@@ -65,6 +65,22 @@ def build_orchestrator_prompt(subagent_names: Iterable[str],
         "禁止用 read_file / ls / glob 去确认产物是否存在——你的文件工具只能看到"
         "会话虚拟目录与 /workspace/skills/,找不到不代表产物缺失。\n"
         "  - 连续两次工具调用都没带来新信息时,停止探索并如实汇总现状。\n"
+        "  - 用户要接收机/定时恢复/星座判决时,必须选 rx_bpsk_awgn,"
+        "禁止用 bpsk_awgn 发射配方替代。\n"
+        "  - 用户没有说接收机/解调/定时恢复/判决时,禁止选 rx_*；"
+        "「BPSK 过 AWGN + EVM/星座/频谱」必须用 bpsk_awgn。\n"
+        "  - 换调制(BPSK↔QPSK 等)只能 design_flowgraph(新 recipe),等用户确认;"
+        "禁止 apply_grc_diff 改 const_points / type / sym_map 来绕过确认。"
+        "一旦用户说「改成/换成」另一调制,必须先调用 design_flowgraph,"
+        "不要只口头请用户确认。"
+        "用户回复「确认」后,运行时会按待确认 recipe 自动重建流图并刷新画布,"
+        "不必再追问,也不要用 intent=确认 去重新选型。\n"
+        "  - 用户说「先不要修改 / 只诊断」时禁止 design_flowgraph、"
+        "apply_grc_diff、suggest_fix。\n"
+        "  - 接收机 byte sink 只能读 BER,禁止对 uint8 比特算 EVM。"
+        "频谱指标 kind 用 spectrum 或 spectrum_peak 均可。\n"
+        "  - apply_grc_diff 改完参数后必须仿真并 verify_claims,把新 Evidence "
+        "绑到当前 flowgraph_version。\n"
         + style_section +
         "\n【交付要求】\n"
         "  - 面向用户的解释要简洁、可理解,按上面 STYLE 档位调整术语密度与讲解粒度。\n"
@@ -99,7 +115,10 @@ def build_radio_design_prompt() -> str:
     return _domain_prompt(
         "RadioDesignAgent",
         "grc-block-rag",
-        "检索块知识并选择确定性 recipe；只做设计选择，不直接修改流图。",
+        "检索块知识并选择确定性 recipe；只做设计选择，不直接修改流图。"
+        "没有接收机/解调/定时恢复/判决时禁止选 rx_*；"
+        "「BPSK 过 AWGN + EVM/星座」必须选 bpsk_awgn。"
+        "接收机/定时恢复/判决必须选 rx_bpsk_awgn；换调制选 qpsk_awgn 等完整 recipe。",
     )
 
 
@@ -107,7 +126,9 @@ def build_flowgraph_prompt() -> str:
     return _domain_prompt(
         "FlowgraphAgent",
         "grc-build",
-        "通过 design_flowgraph 或 apply_grc_diff 构建/修改流图，保留快照与版本信息。",
+        "通过 design_flowgraph 或 apply_grc_diff 构建/修改流图，保留快照与版本信息。"
+        "换调制必须 design_flowgraph(新 recipe) 并等待确认，禁止用 apply_grc_diff 改星座点。"
+        "apply_grc_diff 之后要仿真并 verify_claims。",
     )
 
 

@@ -66,12 +66,39 @@ def _require_samples(ctx: ToolContext, probe_id: str = ""):
         return None, {"ok": False, "error": "尚无成功的仿真结果,请先 run_simulation"}
     arr = res._pick_complex(probe_id or None)
     if arr is None:
+        probe = res.data.get(probe_id) if probe_id else None
+        if probe is None and res.data:
+            probe = next(iter(res.data.values()))
+        dtype = str(getattr(probe, "dtype", "") or "")
+        if probe is not None and (
+            "int" in dtype or dtype.startswith("uint")
+        ):
+            return None, {
+                "ok": False,
+                "error": (
+                    f"probe '{probe_id or 'sink'}' 是 {dtype or '整数'} 比特/字节,"
+                    "不能按 IQ 计算 EVM 或频谱。请改用 kind=ber,或换复数 IQ sink。"
+                ),
+            }
         return None, {"ok": False, "error": "找不到复数 probe 数据",
                       "hint": _NO_SAMPLE_HINT}
     if int(getattr(arr, "size", 0)) == 0:
         return None, {"ok": False, "error": "probe 无样本(0 采样)",
                       "hint": _NO_SAMPLE_HINT}
     return arr, None
+
+
+def _pick_integer_bits(res, probe_id: str = ""):
+    import numpy as np
+    if probe_id:
+        arr = res.data.get(probe_id)
+        if arr is not None and np.issubdtype(getattr(arr, "dtype", np.float32), np.integer):
+            return arr
+        return None
+    for arr in res.data.values():
+        if arr is not None and np.issubdtype(getattr(arr, "dtype", np.float32), np.integer):
+            return arr
+    return None
 
 
 @tool(
@@ -127,7 +154,7 @@ def run_simulation(ctx: ToolContext, probes: dict = None, timeout: float = 30.0)
     parameters={
         "type": "object",
         "properties": {
-            "kind": {"type": "string", "description": "'evm' / 'ber' / 'spectrum_peak'"},
+            "kind": {"type": "string", "description": "'evm' / 'ber' / 'spectrum_peak'(也接受 spectrum)"},
             "probe_id": {"type": "string", "description": "用哪个 probe 的数据;默认取第一个复数 probe"},
             "modulation": {"type": "string", "description": "调制方式(算 evm/ber 用),如 'bpsk'/'qpsk'"},
             "sps": {"type": "integer", "description": "每符号样本数,默认 4"},
@@ -145,12 +172,15 @@ def read_metric(ctx: ToolContext, kind: str, probe_id: str = "",
     if res is None or not res.ok:
         return {"ok": False, "error": "尚无成功的仿真结果,请先 run_simulation"}
     kind = (kind or "").lower().strip()
+    if kind in ("spectrum", "psd"):
+        kind = "spectrum_peak"
 
-    iq = res._pick_complex(probe_id or None)
-    if kind in ("evm", "ber", "spectrum_peak"):
+    if kind in ("evm", "spectrum_peak"):
         iq, err = _require_samples(ctx, probe_id)
         if err is not None:
             return err
+    else:
+        iq = res._pick_complex(probe_id or None)
 
     if kind == "evm":
         ideal = simulate.ideal_points_for(modulation)
@@ -168,6 +198,26 @@ def read_metric(ctx: ToolContext, kind: str, probe_id: str = "",
                 "sample_phase": phase}
 
     if kind == "ber":
+        bits = _pick_integer_bits(res, probe_id)
+        if bits is not None:
+            tx = res.data.get(tx_bits_probe) if tx_bits_probe else None
+            if tx is None:
+                return {
+                    "ok": False,
+                    "kind": "ber",
+                    "error": (
+                        "probe 是比特/字节,算 BER 还需要 tx_bits_probe "
+                        "(已知发送比特)。不要对 byte sink 计算 EVM。"
+                    ),
+                    "n_bits": int(getattr(bits, "size", 0)),
+                }
+            ber, delay = simulate.ber_from_bits(np.asarray(tx), np.asarray(bits))
+            res.metrics["ber"] = ber
+            return {"ok": True, "kind": "ber", "value": ber, "delay": delay}
+        if iq is None:
+            iq, err = _require_samples(ctx, probe_id)
+            if err is not None:
+                return err
         syms = simulate.extract_symbols(iq, sps=sps, skip_symbols=4)
         rx_bits = simulate.demod_bits(syms, modulation)
         tx = res.data.get(tx_bits_probe)
@@ -181,8 +231,10 @@ def read_metric(ctx: ToolContext, kind: str, probe_id: str = "",
     if kind == "spectrum_peak":
         n = min(len(iq), 4096)
         spec = np.abs(np.fft.fft(iq[:n]))
-        return {"ok": True, "kind": "spectrum_peak",
-                "peak_bin": int(np.argmax(spec)), "peak": float(spec.max())}
+        peak = float(spec.max())
+        res.metrics["spectrum_peak"] = peak
+        return {"ok": True, "kind": "spectrum_peak", "value": peak,
+                "peak_bin": int(np.argmax(spec)), "peak": peak}
 
     return {"ok": False, "error": f"未知指标: {kind}"}
 

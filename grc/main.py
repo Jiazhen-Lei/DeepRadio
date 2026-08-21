@@ -102,7 +102,11 @@ def run_gtk(args, log):
     platform.build_library(env.block_paths())
 
     log.debug("Loading application")
-    app = Application(args.flow_graphs, platform)
+    env_fresh = (os.environ.get('GRC_DEEPRADIO_FRESH') or '').strip().lower()
+    skip_restore = bool(getattr(args, 'fresh', False)) or env_fresh in (
+        '1', 'true', 'yes', 'on')
+    app = Application(
+        args.flow_graphs, platform, skip_restore_files=skip_restore)
     log.debug("Running")
     sys.exit(app.run())
 
@@ -227,6 +231,11 @@ def main():
                                      help="GNU Radio Companion (QT)")
     gui_group_exclusive.add_argument("--gtk", dest='framework', action='store_const', const='gtk',
                                      help="GNU Radio Companion (GTK)")
+
+    parser.add_argument(
+        '--fresh', action='store_true',
+        help='Start DeepRadio with a blank canvas (do not restore previously open files)',
+    )
 
     # Default options if not already set with add_argument()
     args = parser.parse_args()

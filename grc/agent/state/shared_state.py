@@ -130,12 +130,24 @@ class SharedState:
             return state
 
     def spec_digest(self) -> Dict[str, Any]:
+        decided = {item.key: item.value for item in self.spec.decisions}
         return {
             "goals": list(self.spec.goals),
             "success_conditions": list(self.spec.success_conditions),
             "constraints": dict(self.spec.constraints),
             "decisions": [asdict(item) for item in self.spec.decisions],
             "open_questions": list(self.spec.open_questions),
+            "recipe": str(self.project.config.get("recipe") or ""),
+            "modulation": str(
+                self.project.config.get("modulation")
+                or decided.get("modulation")
+                or ""
+            ),
+            "channel": str(
+                self.project.config.get("channel")
+                or decided.get("channel")
+                or ""
+            ),
         }
 
 

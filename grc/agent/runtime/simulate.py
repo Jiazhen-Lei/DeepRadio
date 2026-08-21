@@ -49,6 +49,16 @@ DEFAULT_TIMEOUT = 30.0
 DEFAULT_MAX_ITEMS = 65536
 
 
+def _is_complex_array(arr) -> bool:
+    if arr is None:
+        return False
+    import numpy as np
+    dtype = getattr(arr, "dtype", None)
+    if dtype is None:
+        return False
+    return np.issubdtype(dtype, np.complexfloating)
+
+
 # ---------------------------------------------------------------------------
 # 结果数据结构
 # ---------------------------------------------------------------------------
@@ -172,13 +182,13 @@ class SimResult:
         return path
 
     def _pick_complex(self, probe_id: Optional[str]):
-        import numpy as np
         if probe_id is None:
             for v in self.data.values():
-                if getattr(v, "dtype", None) == np.complex64:
+                if _is_complex_array(v):
                     return v
             return None
-        return self.data.get(probe_id)
+        arr = self.data.get(probe_id)
+        return arr if _is_complex_array(arr) else None
 
 
 # ---------------------------------------------------------------------------
