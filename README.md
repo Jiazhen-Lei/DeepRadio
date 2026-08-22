@@ -109,6 +109,35 @@ pip install markdown
 ```
 ---
 
+### 连接 USRP B210
+
+1. 使用支持数据传输的 USB 3.x 线缆连接 B210，尽量直连电脑。发射前，在 `TX/RX` 端接好天线或 50 Ω 负载。
+
+2. 激活 gnuradio 后下载 UHD 镜像：
+
+   ```bash
+   conda activate gnuradio
+   uhd_images_downloader
+   ```
+
+3. 检查设备：
+
+   ```bash
+   uhd_find_devices --args "type=b200"
+   uhd_usrp_probe --args "type=b200"
+   ```
+
+   正常情况下应显示 `product: B210`、序列号和 `type: b200`。
+
+4. GNU Radio 的 **UHD: USRP Sink/Source** 使用：
+
+   - Device Address：`type=b200`
+   - Antenna：`TX/RX`
+   - Sample Rate：与基带信号一致
+   - Center Frequency：按实验频率设置
+   - Gain：从较低值开始
+
+如果出现 `No devices found`，优先检查 USB 3.x 线缆、接口和 UHD 镜像，不需要修改流图的调制参数。
 
 
 ## GUI 任务测试
