@@ -396,6 +396,12 @@ def configure_sdr(
             "error": "本轮禁止改图（用户要求只诊断/先不要修改）",
             "policy": "DENY",
         }
+    if center_freq is None or sample_rate is None:
+        return {
+            "ok": False,
+            "outcome": "failed",
+            "error": "SDR 配置需要中心频率和采样率",
+        }
     state = _state(ctx)
     policy = gate(
         {
@@ -406,7 +412,7 @@ def configure_sdr(
         state.coordination,
     )
     if policy != ALLOW and not _workflow_checkpoint_approved(
-        ctx, "hardware_confirmation"
+        ctx, "hardware_confirmation", "rf_plan_confirmation"
     ):
         state.coordination.pending_confirmations.append(
             {
@@ -456,21 +462,39 @@ def list_devices(ctx: ToolContext):
 def hardware_preflight(ctx: ToolContext, device_type: str = ""):
     state = _state(ctx)
     configured = dict(state.project.config.get("device") or {})
+    workflow_slots = dict(
+        ((ctx.extra.get("workflow") or {}).get("intent") or {}).get("slots") or {}
+    )
     requested = (device_type or configured.get("type") or "").lower()
+    center_freq = configured.get("center_freq")
+    if center_freq is None:
+        center_freq = workflow_slots.get("carrier_frequency")
+    sample_rate = configured.get("sample_rate")
+    if sample_rate is None:
+        sample_rate = workflow_slots.get("sample_rate")
     driver = "uhd_find_devices" if requested in ("usrp", "b210", "b200") else ""
     checks = {
         "device_type_present": bool(requested),
         "driver_command_available": bool(driver and shutil.which(driver)),
-        "center_frequency_present": configured.get("center_freq") is not None,
-        "sample_rate_present": configured.get("sample_rate") is not None,
+        "center_frequency_present": center_freq is not None,
+        "sample_rate_present": sample_rate is not None,
         "real_hardware_actions_enabled": False,
     }
+    complete = all(
+        checks[name]
+        for name in (
+            "device_type_present",
+            "center_frequency_present",
+            "sample_rate_present",
+        )
+    )
     return {
-        "ok": bool(requested),
-        "outcome": "passed" if checks["device_type_present"] else "failed",
+        "ok": complete,
+        "outcome": "passed" if complete else "failed",
         "device_type": requested,
         "checks": checks,
-        "note": "仅完成只读预检；真实发射、启动和停止能力未启用。",
+        "missing": [name for name, value in checks.items() if not value and name != "real_hardware_actions_enabled"],
+        "note": "仅完成配置与驱动只读预检；真实发射、启动和停止能力未启用。",
     }
 
 

@@ -11,6 +11,9 @@ EXECUTION_STATUSES = frozenset(
 )
 OUTCOMES = frozenset({"passed", "failed", "inconclusive", "cancelled", ""})
 DECISIONS = frozenset({"pending", "approved", "rejected"})
+TURN_RELATIONS = frozenset(
+    {"new_task", "answer", "adjustment", "feedback", "approval", "rejection", "cancel"}
+)
 
 
 @dataclass
@@ -21,17 +24,33 @@ class WorkflowIntent:
     confidence: float = 0.0
     slots: Dict[str, Any] = field(default_factory=dict)
     missing_slots: List[str] = field(default_factory=list)
+    capabilities: List[str] = field(default_factory=list)
+    slot_sources: Dict[str, str] = field(default_factory=dict)
+    context: Dict[str, Any] = field(default_factory=dict)
+    validation_errors: List[str] = field(default_factory=list)
+
+    def validate(self) -> None:
+        if self.turn_relation not in TURN_RELATIONS:
+            raise ValueError(f"非法 turn_relation: {self.turn_relation}")
+        if not 0.0 <= self.confidence <= 1.0:
+            raise ValueError("Intent confidence 必须位于 0~1")
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "WorkflowIntent":
-        return cls(
+        item = cls(
             raw_text=str(data.get("raw_text") or ""),
             turn_relation=str(data.get("turn_relation") or "new_task"),
             task_type=str(data.get("task_type") or "END_TO_END_SIM"),
             confidence=float(data.get("confidence", 0.0)),
             slots=dict(data.get("slots") or {}),
             missing_slots=list(data.get("missing_slots") or []),
+            capabilities=list(data.get("capabilities") or []),
+            slot_sources=dict(data.get("slot_sources") or {}),
+            context=dict(data.get("context") or {}),
+            validation_errors=list(data.get("validation_errors") or []),
         )
+        item.validate()
+        return item
 
 
 @dataclass
@@ -39,6 +58,9 @@ class Checkpoint:
     id: str
     decision_status: str = "pending"
     reason: str = ""
+    action: str = ""
+    payload_ref: str = ""
+    resume_stage: bool = False
 
     def validate(self) -> None:
         if self.decision_status not in DECISIONS:
@@ -50,6 +72,9 @@ class Checkpoint:
             id=str(data.get("id") or ""),
             decision_status=str(data.get("decision_status") or "pending"),
             reason=str(data.get("reason") or ""),
+            action=str(data.get("action") or ""),
+            payload_ref=str(data.get("payload_ref") or ""),
+            resume_stage=bool(data.get("resume_stage", False)),
         )
         item.validate()
         return item
@@ -68,6 +93,10 @@ class Stage:
     transitions: Dict[str, str] = field(default_factory=dict)
     checkpoint: Optional[Checkpoint] = None
     result: Dict[str, Any] = field(default_factory=dict)
+    result_history: List[Dict[str, Any]] = field(default_factory=list)
+    when: Dict[str, Any] = field(default_factory=dict)
+    depends_on: List[str] = field(default_factory=list)
+    resume_pending: bool = False
 
     def validate(self) -> None:
         if not self.id:
@@ -84,6 +113,9 @@ class Stage:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Stage":
         checkpoint = data.get("checkpoint")
+        when = data.get("when") or {}
+        if isinstance(when, list):
+            when = {"any": when}
         item = cls(
             id=str(data.get("id") or ""),
             interaction=str(data.get("interaction") or "autonomous"),
@@ -96,6 +128,10 @@ class Stage:
             transitions=dict(data.get("transitions") or data.get("on") or {}),
             checkpoint=Checkpoint.from_dict(checkpoint) if checkpoint else None,
             result=dict(data.get("result") or {}),
+            result_history=list(data.get("result_history") or []),
+            when=dict(when),
+            depends_on=list(data.get("depends_on") or []),
+            resume_pending=bool(data.get("resume_pending", False)),
         )
         item.validate()
         return item
@@ -122,6 +158,9 @@ class Workflow:
             raise ValueError(f"非法 Workflow execution_status: {self.execution_status}")
         if self.outcome not in OUTCOMES:
             raise ValueError(f"非法 Workflow outcome: {self.outcome}")
+        if self.revision < 1 or self.base_project_version < 0:
+            raise ValueError("Workflow revision/base_project_version 非法")
+        self.intent.validate()
         ids = [stage.id for stage in self.stages]
         if len(ids) != len(set(ids)):
             raise ValueError("Workflow Stage id 重复")

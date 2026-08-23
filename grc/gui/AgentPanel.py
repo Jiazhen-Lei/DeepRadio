@@ -488,10 +488,38 @@ class AgentPanel(Gtk.VBox):
                 short or "(空)"))
 
     def _on_confirm_pending(self, _panel):
-        self._submit_agent_text("确认", force_agent=True)
+        self._submit_checkpoint_decision("approved")
 
     def _on_cancel_pending(self, _panel):
-        self._submit_agent_text("取消修改", force_agent=True)
+        self._submit_checkpoint_decision("rejected")
+
+    def _submit_checkpoint_decision(self, decision):
+        if self._busy:
+            return
+        agent = self._ensure_agent()
+        digest = agent._workflow.digest()
+        checkpoint_id = str(digest.get("checkpoint_id") or "")
+        if not checkpoint_id:
+            self._append("DeepRadio", "当前没有待确认的 Checkpoint。")
+            return
+        self._append("我", "确认" if decision == "approved" else "取消修改")
+        self._set_busy(True)
+        command = {
+            "action": "checkpoint_decision",
+            "checkpoint_id": checkpoint_id,
+            "decision": decision,
+        }
+        threading.Thread(
+            target=self._handle_agent_command, args=(command,), daemon=True
+        ).start()
+
+    def _handle_agent_command(self, command):
+        try:
+            reply = self._ensure_agent().step_command(command)
+            GLib.idle_add(self._on_agent_reply, reply)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Agent command 失败")
+            GLib.idle_add(self._on_error, str(exc))
 
     def notify_canvas_saved(self, file_path):
         """画布保存 session 工程后，把版本与 Claim 标脏。"""

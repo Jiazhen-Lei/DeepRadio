@@ -36,6 +36,7 @@ class ClaimsPanel(Gtk.Frame):
         root.pack_start(self._build_activity_bar(), False, False, 2)
         root.pack_start(self._build_metrics_row(), False, False, 0)
         root.pack_start(self._build_spec_bar(), False, False, 0)
+        root.pack_start(self._build_workflow_inspector(), False, False, 0)
 
         self._store = Gtk.ListStore(str, str, str, int)
         self._view = Gtk.TreeView(model=self._store)
@@ -89,6 +90,39 @@ class ClaimsPanel(Gtk.Frame):
         detail_scroll.add(self._details)
         root.pack_start(detail_scroll, False, True, 0)
         self._apply_font()
+
+    def _build_workflow_inspector(self):
+        box = Gtk.VBox(spacing=2)
+        expander = Gtk.Expander(label="Workflow 详情")
+        self._workflow_details = Gtk.TextView()
+        self._workflow_details.set_editable(False)
+        self._workflow_details.set_cursor_visible(False)
+        self._workflow_details.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self._workflow_details.set_size_request(-1, 110)
+        expander.add(self._workflow_details)
+        self._workflow_expander = expander
+        box.pack_start(expander, False, False, 0)
+
+        timeline = Gtk.Expander(label="执行时间线")
+        self._timeline_store = Gtk.ListStore(str, str, str, str)
+        view = Gtk.TreeView(model=self._timeline_store)
+        view.set_headers_visible(True)
+        for index, title in enumerate(("Seq", "Event", "Stage", "Actor")):
+            renderer = Gtk.CellRendererText()
+            renderer.set_property("ellipsize", Pango.EllipsizeMode.END)
+            column = Gtk.TreeViewColumn(title, renderer, text=index)
+            column.set_resizable(True)
+            if index == 1:
+                column.set_expand(True)
+            view.append_column(column)
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_min_content_height(72)
+        scroll.add(view)
+        timeline.add(scroll)
+        self._timeline_expander = timeline
+        box.pack_start(timeline, False, False, 0)
+        return box
 
     def _build_activity_bar(self):
         box = Gtk.VBox(spacing=2)
@@ -213,8 +247,19 @@ class ClaimsPanel(Gtk.Frame):
         self._set_combo(self._recipe_combo, recipe_names, spec.get("recipe"))
         self._spec_summary.set_text("规格: " + self._summary_text(spec))
         self._set_activity(activity or {}, workflow or {})
+        self._set_workflow_details(workflow or {})
+        self._set_timeline((workflow or {}).get("timeline") or [])
         self._set_metrics(metrics, self._claims)
-        self._set_pending(pending or {})
+        pending_view = dict(pending or {})
+        workflow_view = workflow or {}
+        if not pending_view and workflow_view.get("checkpoint_id"):
+            pending_view = {
+                "action": "workflow_checkpoint",
+                "reason": workflow_view.get("waiting_reason") or "继续当前 Workflow",
+                "checkpoint_id": workflow_view.get("checkpoint_id"),
+                "approved": False,
+            }
+        self._set_pending(pending_view)
         empty = (
             not self._claims
             and not spec.get("recipe")
@@ -240,6 +285,8 @@ class ClaimsPanel(Gtk.Frame):
         self._metrics_label.set_text("测量: —")
         self._set_details("")
         self._set_pending({})
+        self._set_workflow_details({})
+        self._set_timeline([])
         self._hint.set_visible(True)
         self._spec_revealer.set_reveal_child(False)
         self._updating = False
@@ -271,6 +318,58 @@ class ClaimsPanel(Gtk.Frame):
         if status:
             text += "  ·  " + status
         self._activity_label.set_text(text)
+
+    def _set_workflow_details(self, workflow):
+        buffer_ = self._workflow_details.get_buffer()
+        if not workflow:
+            buffer_.set_text("尚无活动 Workflow")
+            return
+        lines = [
+            "workflow_id={}  revision={}  project_version={}".format(
+                workflow.get("workflow_id") or "—",
+                workflow.get("revision") or "—",
+                workflow.get("base_project_version") or 0,
+            )
+        ]
+        capabilities = workflow.get("capabilities") or []
+        if capabilities:
+            lines.append("capabilities=" + ", ".join(capabilities))
+        blockers = list(workflow.get("missing_slots") or []) + list(
+            workflow.get("validation_errors") or []
+        )
+        if blockers:
+            lines.append("blockers=" + ", ".join(blockers))
+        for stage in workflow.get("stages") or []:
+            marker = "▶" if stage.get("id") == workflow.get("current_stage") else "•"
+            completion = stage.get("completion") or []
+            results = stage.get("completion_result") or {}
+            passed = sum(1 for name in completion if results.get(name) is True)
+            lines.append(
+                "{} {}  {}  attempt {}/{}  completion {}/{}".format(
+                    marker,
+                    stage.get("label") or stage.get("id") or "—",
+                    stage.get("outcome") or stage.get("execution_status") or "—",
+                    stage.get("attempt") or 0,
+                    stage.get("max_attempts") or 1,
+                    passed,
+                    len(completion),
+                )
+            )
+        buffer_.set_text("\n".join(lines))
+
+    def _set_timeline(self, events):
+        if not hasattr(self, "_timeline_store"):
+            return
+        self._timeline_store.clear()
+        for item in events or []:
+            self._timeline_store.append(
+                [
+                    str(item.get("seq") or ""),
+                    str(item.get("event") or ""),
+                    str(item.get("stage_id") or ""),
+                    str(item.get("actor") or ""),
+                ]
+            )
 
     def _set_metrics(self, metrics, claims):
         parts = []

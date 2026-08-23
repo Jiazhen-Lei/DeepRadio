@@ -88,6 +88,8 @@ class ResultEnvelope:
     stage_id: str = ""
     workflow_revision: int = 0
     base_project_version: int = 0
+    completion: Dict[str, bool] = field(default_factory=dict)
+    invocations: List[Dict[str, Any]] = field(default_factory=list)
 
     def validate(self) -> None:
         if not all((self.task_id, self.workflow_id, self.stage_id)):
@@ -96,6 +98,8 @@ class ResultEnvelope:
             raise ValueError(f"ResultEnvelope outcome 非法: {self.outcome}")
         if self.workflow_revision < 1 or self.base_project_version < 0:
             raise ValueError("ResultEnvelope Workflow/Project 版本非法")
+        if any(not isinstance(value, bool) for value in self.completion.values()):
+            raise ValueError("ResultEnvelope completion 必须为布尔映射")
 
 
 @dataclass

@@ -315,6 +315,93 @@ def build_grc_tools(
         """Run a read-only SDR capability and safety precheck; never starts transmission."""
         return _call("hardware_preflight", {"device_type": device_type})
 
+    @tool
+    def build_ble_advertising_pdu(local_name: str, channel: int = 37) -> str:
+        """Build a BLE advertising PDU with Complete Local Name."""
+        return _call("build_ble_advertising_pdu", {"local_name": local_name, "channel": channel})
+
+    @tool
+    def generate_ble_1m_waveform(
+        local_name: str, channel: int = 37,
+        sample_rate: float = 2e6, interval_ms: float = 100.0,
+    ) -> str:
+        """Generate an offline BLE 1M GFSK waveform without hardware access."""
+        return _call("generate_ble_1m_waveform", {
+            "local_name": local_name, "channel": channel,
+            "sample_rate": sample_rate, "interval_ms": interval_ms,
+        })
+
+    @tool
+    def verify_ble_packet_bits(local_name: str, channel: int = 37) -> str:
+        """Verify BLE advertising PDU, CRC, whitening, and local name."""
+        return _call("verify_ble_packet_bits", {"local_name": local_name, "channel": channel})
+
+    @tool
+    def build_ble_uhd_tx_flowgraph(
+        waveform_path: str, channel: int = 37, sample_rate: float = 2e6,
+        gain: float = 0.0, device_args: str = "type=b200",
+    ) -> str:
+        """Build and validate, but never start, a BLE UHD TX flowgraph."""
+        result = registry.call("build_ble_uhd_tx_flowgraph", {
+            "waveform_path": waveform_path, "channel": channel,
+            "sample_rate": sample_rate, "gain": gain, "device_args": device_args,
+        }, ctx)
+        if result.get("grc_path"):
+            _merge_artifacts(ctx, {"grc_path": result["grc_path"]})
+        _rec_event(ctx, "build_ble_uhd_tx_flowgraph", result)
+        return json.dumps(result, ensure_ascii=False)
+
+    @tool
+    def build_usrp_rx_spectrum_flowgraph(
+        center_freq: float,
+        sample_rate: float,
+        gain: float = 20.0,
+        device_args: str = "type=b200",
+        antenna: str = "RX2",
+    ) -> str:
+        """Build a USRP RX + QT frequency sink flowgraph without starting RF."""
+        return _call("build_usrp_rx_spectrum_flowgraph", {
+            "center_freq": center_freq,
+            "sample_rate": sample_rate,
+            "gain": gain,
+            "device_args": device_args,
+            "antenna": antenna,
+        })
+
+    @tool
+    def discover_devices(device_type: str = "b210", device_args: str = "") -> str:
+        """Run read-only discovery for the selected SDR family."""
+        return _call("discover_devices", {
+            "device_type": device_type, "device_args": device_args,
+        })
+
+    @tool
+    def probe_device(device_type: str = "b210", device_args: str = "") -> str:
+        """Run a read-only probe for the selected SDR family."""
+        return _call("probe_device", {
+            "device_type": device_type, "device_args": device_args,
+        })
+
+    @tool
+    def start_flowgraph(grc_path: str, duration_seconds: float = 30.0) -> str:
+        """Start an explicitly approved RF flowgraph; disabled unless feature flag is set."""
+        return _call("start_flowgraph", {"grc_path": grc_path, "duration_seconds": duration_seconds})
+
+    @tool
+    def query_runtime_status() -> str:
+        """Read bounded hardware runtime status."""
+        return _call("query_runtime_status", {})
+
+    @tool
+    def stop_flowgraph() -> str:
+        """Stop the current hardware flowgraph."""
+        return _call("stop_flowgraph", {})
+
+    @tool
+    def emergency_stop() -> str:
+        """Immediately stop the current hardware flowgraph."""
+        return _call("emergency_stop", {})
+
     tools = [
         design_flowgraph,
         validate_flowgraph,
@@ -339,6 +426,17 @@ def build_grc_tools(
         configure_sdr,
         list_devices,
         hardware_preflight,
+        build_ble_advertising_pdu,
+        generate_ble_1m_waveform,
+        verify_ble_packet_bits,
+        build_ble_uhd_tx_flowgraph,
+        build_usrp_rx_spectrum_flowgraph,
+        discover_devices,
+        probe_device,
+        start_flowgraph,
+        query_runtime_status,
+        stop_flowgraph,
+        emergency_stop,
     ]
     allowed_set = set(allowed or ())
     return [item for item in tools if not allowed_set or item.name in allowed_set]

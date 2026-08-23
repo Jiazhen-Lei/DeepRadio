@@ -28,6 +28,55 @@ from . import system_prompt as _sp
 
 logger = logging.getLogger(__name__)
 _CHECKPOINTERS = {}
+_STAGE_TOOLS = {
+    "spec_alignment": {"spec_clarify", "spec_commit"},
+    "rx_spec_alignment": {"spec_clarify", "spec_commit"},
+    "inspect_and_plan": {"inspect_flowgraph", "spec_clarify", "spec_commit"},
+    "inspect_and_diagnose": {
+        "inspect_flowgraph", "validate_flowgraph", "run_simulation", "read_metric",
+        "plot_spectrum", "plot_constellation", "plot_eye", "diagnose_by_metric",
+        "explain_error",
+    },
+    "inspect_and_measure": {
+        "inspect_flowgraph", "validate_flowgraph", "run_simulation", "read_metric",
+        "plot_spectrum", "plot_constellation", "plot_eye", "verify_claims",
+    },
+    "repair_and_verify": {
+        "apply_grc_diff", "apply_flowgraph_patch", "validate_flowgraph",
+        "run_simulation", "read_metric", "verify_claims", "explain_error",
+    },
+    "rx_build_and_verify": {
+        "select_recipe", "design_flowgraph", "build_usrp_rx_spectrum_flowgraph",
+        "validate_flowgraph", "inspect_flowgraph",
+    },
+    "tx_build_and_validate": {
+        "select_recipe", "design_flowgraph", "validate_flowgraph",
+    },
+    "build_and_verify": {
+        "select_recipe", "design_flowgraph", "validate_flowgraph",
+        "run_simulation", "read_metric", "plot_spectrum",
+    },
+    "apply_and_verify": {
+        "design_flowgraph", "apply_grc_diff", "apply_flowgraph_patch",
+        "validate_flowgraph", "run_simulation", "read_metric", "plot_spectrum",
+        "plot_constellation", "plot_eye", "verify_claims", "explain_error",
+    },
+    "hardware_precheck": {"hardware_preflight", "list_devices", "inspect_flowgraph"},
+    "configure_and_check": {"configure_sdr", "hardware_preflight", "inspect_flowgraph"},
+    "protocol_spec_alignment": {"spec_clarify", "spec_commit"},
+    "build_ble_advertiser": {
+        "build_ble_advertising_pdu", "generate_ble_1m_waveform",
+        "build_ble_uhd_tx_flowgraph", "validate_flowgraph",
+    },
+    "offline_protocol_verify": {"verify_ble_packet_bits", "validate_flowgraph"},
+    "discover_and_probe_device": {"discover_devices", "probe_device"},
+    "discover_and_probe_hardware": {"discover_devices", "probe_device"},
+    "configure_device": {"configure_sdr", "hardware_preflight"},
+    "transmit_bounded": {"start_flowgraph", "query_runtime_status", "emergency_stop"},
+    "stop_and_finalize": {"stop_flowgraph", "emergency_stop", "query_runtime_status"},
+    "run_bounded": {"start_flowgraph", "query_runtime_status", "emergency_stop"},
+    "stop_runtime": {"stop_flowgraph", "emergency_stop", "query_runtime_status"},
+}
 
 
 def deepagents_available() -> bool:
@@ -72,17 +121,25 @@ def build_agent(
     chat = _model.build_chat_model(temperature=temperature)
     agent_names = list(getattr(stage, "recommended_agents", None) or [])
     tool_names = _subagents.tool_names_for_agents(agent_names)
+    allowed_stage_tools = _STAGE_TOOLS.get(getattr(stage, "id", ""))
+    if allowed_stage_tools is not None:
+        tool_names = [name for name in tool_names if name in allowed_stage_tools]
     tools = _import_tools(ctx, tool_names)
-    subs = _subagents.build_grc_subagents(ctx, agent_names)
+    subs = _subagents.build_grc_subagents(ctx, agent_names, tool_names)
     be = _backend.build_backend()
     style_prompt = _resolve_style_prompt(ctx)
     orch_prompt = _sp.build_orchestrator_prompt(
         agent_names or _subagents.subagent_names(), style_prompt=style_prompt)
     if stage is not None:
+        workflow_data = dict(ctx.extra.get("workflow") or {})
+        intent_data = dict(workflow_data.get("intent") or {})
         orch_prompt += (
             "\n【当前 Workflow Stage】\n"
             f"stage_id={stage.id}; completion={stage.completion}; "
             f"只允许委派: {', '.join(agent_names)}。\n"
+            f"capabilities={intent_data.get('capabilities') or []}; "
+            f"slot_sources={intent_data.get('slot_sources') or {}}。"
+            "raw_text 是目标原文；context 只能作为待验证背景，不能覆盖用户本轮参数。\n"
         )
 
     agent: Any = create_deep_agent(

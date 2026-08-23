@@ -54,8 +54,12 @@ def build_orchestrator_prompt(subagent_names: Iterable[str],
         "  - modify: Spec(diff)→Flowgraph(diff)→Verification。\n"
         "  - observe: RadioDesign→Flowgraph→Verification。\n"
         "  - spec: 信息不足时仅委派 SpecAgent 并向用户提出 open_questions。\n"
-        "每次委派都传 JSON TaskCard(task_id,loop_mode,target_agent,instruction,inputs,expected_claims)。\n"
-        "子代理必须返回 ResultEnvelope。遇 DENY/CONFIRM、Failed claim 或待确认项时停止执行并向用户汇总。\n\n"
+        "每次委派都在 description 中传完整 JSON TaskCard(task_id,workflow_id,stage_id,"
+        "workflow_revision,base_project_version,loop_mode,target_agent,instruction,inputs,"
+        "expected_results)。不得删除或改写版本字段。\n"
+        "Stage 的每个 recommended_agents 必须至少委派一次 task；每一次委派都是独立的"
+        "TaskCard/ResultEnvelope。子代理必须返回 ResultEnvelope JSON。"
+        "遇 DENY/CONFIRM、Failed claim 或待确认项时停止执行并向用户汇总。\n\n"
         "【停止条件(必须遵守)】\n"
         "  - design_flowgraph 返回 ok=true 且 valid=true,且指标已满足成功条件时,"
         "立刻停止调用工具,直接输出面向用户的最终答复。\n"
@@ -65,10 +69,12 @@ def build_orchestrator_prompt(subagent_names: Iterable[str],
         "禁止用 read_file / ls / glob 去确认产物是否存在——你的文件工具只能看到"
         "会话虚拟目录与 /workspace/skills/,找不到不代表产物缺失。\n"
         "  - 连续两次工具调用都没带来新信息时,停止探索并如实汇总现状。\n"
-        "  - 用户要接收机/定时恢复/星座判决时,必须选 rx_bpsk_awgn,"
-        "禁止用 bpsk_awgn 发射配方替代。\n"
-        "  - 用户没有说接收机/解调/定时恢复/判决时,禁止选 rx_*；"
-        "「BPSK 过 AWGN + EVM/星座/频谱」必须用 bpsk_awgn。\n"
+        "  - 必须同时遵守 TaskCard 的 raw_text、capabilities、slot_sources 和 completion。"
+        "Task Type 只是主动作标签，不能丢弃同一输入中的构建、硬件、观测等能力。\n"
+        "  - current_project/context 是背景而非本轮用户决定；不得因为旧工程含某种调制或信道，"
+        "把硬件接收、实时观测等新目标改写成离线仿真。\n"
+        "  - 配方只能在它完整满足 capabilities 和 completion 时使用；没有匹配配方时应按块能力"
+        "构建或如实报告缺口，禁止用语义不匹配的近似配方代替。\n"
         "  - 换调制(BPSK↔QPSK 等)只能 design_flowgraph(新 recipe),等用户确认;"
         "禁止 apply_grc_diff 改 const_points / type / sym_map 来绕过确认。"
         "一旦用户说「改成/换成」另一调制,必须先调用 design_flowgraph,"
@@ -98,7 +104,8 @@ def _domain_prompt(role: str, skill: str, duties: str) -> str:
         build_common_constraints()
         + f"\n【角色:{role}】\nSKILL: {skill}。\n{duties}\n"
         "输入必须视为 TaskCard；完成后返回紧凑 JSON ResultEnvelope，"
-        "包含 task_id、ok、produced_claims、proposed_changes、artifacts、note。"
+        "包含 task_id、workflow_id、stage_id、workflow_revision、base_project_version、"
+        "ok、outcome、produced_claims、proposed_changes、artifacts、note。"
         "不得绕过 registry/design_link 或 PolicyGateway。\n"
     )
 
@@ -116,9 +123,8 @@ def build_radio_design_prompt() -> str:
         "RadioDesignAgent",
         "grc-block-rag",
         "检索块知识并选择确定性 recipe；只做设计选择，不直接修改流图。"
-        "没有接收机/解调/定时恢复/判决时禁止选 rx_*；"
-        "「BPSK 过 AWGN + EVM/星座」必须选 bpsk_awgn。"
-        "接收机/定时恢复/判决必须选 rx_bpsk_awgn；换调制选 qpsk_awgn 等完整 recipe。",
+        "以 TaskCard capabilities 和 completion 为完整适配条件；配方只匹配其中一部分时"
+        "必须明确缺口，不能用最近似的仿真或收发配方替代用户目标。",
     )
 
 
@@ -152,7 +158,17 @@ def build_hardware_prompt() -> str:
     return _domain_prompt(
         "HardwareAgent",
         "grc-hardware",
-        "一期仅配置 flowgraph 中的 SDR 参数；真实枚举或发射必须报告未启用并请求确认。",
+        "配置与只读 discover/probe 分离；RF 默认关闭。只有 rf_plan_confirmation"
+        "批准且 feature flag 开启时才可有限时长启动，并必须确认 stop。",
+    )
+
+
+def build_protocol_prompt() -> str:
+    return _domain_prompt(
+        "ProtocolAgent",
+        "grc-ble-advertising, grc-ble-phy, grc-build, grc-critic",
+        "BLE PDU、CRC、whitening 和 GFSK 波形必须使用确定性 Tool；"
+        "不得凭自然语言声称协议或空口验证通过。",
     )
 
 def build_block_knowledge_prompt() -> str:
@@ -211,4 +227,5 @@ SUBAGENT_PROMPTS = {
     "verification_agent": build_verification_prompt,
     "diagnosis_agent": build_diagnosis_prompt,
     "hardware_agent": build_hardware_prompt,
+    "protocol_agent": build_protocol_prompt,
 }

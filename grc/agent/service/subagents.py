@@ -69,17 +69,37 @@ _SUBAGENT_DEFS = [
         ["diagnose_by_metric", "explain_error", "suggest_fix"],
     ),
     (
+        "protocol_agent",
+        "构建并离线验证 BLE Advertising PDU、PHY 波形和 UHD TX 流图。",
+        _sp.build_protocol_prompt,
+        ["grc-ble-advertising", "grc-ble-phy", "grc-build", "grc-critic"],
+        [
+            "build_ble_advertising_pdu",
+            "generate_ble_1m_waveform",
+            "verify_ble_packet_bits",
+            "build_ble_uhd_tx_flowgraph",
+            "validate_flowgraph",
+        ],
+    ),
+    (
         "hardware_agent",
         "管理 SDR flowgraph 配置；真实硬件操作保持禁用。",
         _sp.build_hardware_prompt,
         ["grc-hardware", "grc-build"],
-        ["hardware_preflight", "configure_sdr", "list_devices", "inspect_flowgraph"],
+        [
+            "hardware_preflight", "configure_sdr", "list_devices",
+            "discover_devices", "probe_device", "start_flowgraph",
+            "query_runtime_status", "stop_flowgraph", "emergency_stop",
+            "inspect_flowgraph", "build_usrp_rx_spectrum_flowgraph",
+        ],
     ),
 ]
 
 
 def build_grc_subagents(
-    ctx: ToolContext, allowed_agents: List[str] | None = None
+    ctx: ToolContext,
+    allowed_agents: List[str] | None = None,
+    allowed_tools: List[str] | None = None,
 ) -> List[Dict[str, Any]]:
     """按共享 ctx 生成 deepagents ``SubAgent`` 列表。
 
@@ -105,7 +125,9 @@ def build_grc_subagents(
             "system_prompt": prompt_builder(),
             "skills": [f"/workspace/skills/{skill}/" for skill in skills],
         }
-        bound = tools_lc.build_grc_tools(ctx, allowed=tool_names)
+        stage_tools = set(allowed_tools or ())
+        names = [name for name in tool_names if not stage_tools or name in stage_tools]
+        bound = tools_lc.build_grc_tools(ctx, allowed=names) if names else []
         if bound:
             sub["tools"] = bound
         subagents.append(sub)

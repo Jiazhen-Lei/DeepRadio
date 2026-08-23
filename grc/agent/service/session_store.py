@@ -19,6 +19,7 @@ import logging
 import os
 import shutil
 import time
+import uuid
 from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
@@ -178,20 +179,58 @@ def _extract_content(value: Any):
     return value
 
 
+_EVENT_CONTROL_KEYS = (
+    "workflow_id",
+    "workflow_revision",
+    "task_type",
+    "stage_id",
+    "attempt",
+    "profile_level",
+)
+
+
 def append_session_event(session_id: str, event: str,
                          payload: Dict[str, Any] | None = None) -> None:
     """向会话事件流 ``events.jsonl`` 追加一条事件(JSONL)。"""
-    record = {
-        "ts": time.time(),
-        "event": event,
-        "payload": _jsonable(payload or {}),
-    }
+    payload_data = _jsonable(payload or {})
     path = os.path.join(session_root(session_id), "events.jsonl")
+    record = {
+        "event_id": f"evt-{uuid.uuid4().hex}",
+        "session_id": session_id,
+        "ts": time.time(),
+        "seq": _next_event_seq(path),
+        "event": event,
+        "payload": payload_data,
+    }
+    for key in _EVENT_CONTROL_KEYS:
+        value = payload_data.get(key)
+        if value is not None:
+            record[key] = value
     try:
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
     except OSError as exc:
         logger.warning("写会话事件失败: %s", exc)
+
+
+def _next_event_seq(path: str) -> int:
+    if not os.path.isfile(path):
+        return 1
+    last = ""
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip():
+                    last = line
+    except OSError:
+        return 1
+    if not last:
+        return 1
+    try:
+        data = json.loads(last)
+        return int(data.get("seq") or 0) + 1
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return 1
 
 
 def scan_final_artifacts(session_id: str,
@@ -217,6 +256,45 @@ def scan_final_artifacts(session_id: str,
             if os.path.isfile(full):
                 out[name] = full
     return out
+
+
+def recent_events(session_id: str, limit: int = 40) -> List[Dict[str, Any]]:
+    """Return the newest session events for GUI timeline rendering."""
+    path = os.path.join(session_root(session_id), "events.jsonl")
+    if not os.path.isfile(path) or limit <= 0:
+        return []
+    lines: List[str] = []
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip():
+                    lines.append(line)
+    except OSError:
+        return []
+    items: List[Dict[str, Any]] = []
+    for line in lines[-int(limit):]:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+        items.append(
+            {
+                "seq": record.get("seq"),
+                "event": record.get("event"),
+                "ts": record.get("ts"),
+                "workflow_id": record.get("workflow_id") or payload.get("workflow_id"),
+                "stage_id": record.get("stage_id") or payload.get("stage_id"),
+                "attempt": record.get("attempt") if record.get("attempt") is not None else payload.get("attempt"),
+                "actor": payload.get("target_agent") or payload.get("tool") or payload.get("source") or "",
+                "ok": (
+                    (payload.get("result") or {}).get("ok")
+                    if isinstance(payload.get("result"), dict)
+                    else payload.get("ok")
+                ),
+            }
+        )
+    return items
 
 
 def publish_artifact(session_id: str, source: str) -> str:

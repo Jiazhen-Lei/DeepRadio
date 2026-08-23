@@ -94,6 +94,25 @@ def design_link(ctx, profile=None, intent: str = "",
             approved_pending = dict(pending)
             state.coordination.pending_confirmations.remove(pending)
             decision = ALLOW
+        workflow = ctx.extra.get("workflow") or {}
+        workflow_approved = any(
+            (stage.get("checkpoint") or {}).get("decision_status") == "approved"
+            for stage in workflow.get("stages") or []
+            if isinstance(stage, dict)
+            and stage.get("id") in ("change_confirmation", "repair_confirmation")
+        )
+        if decision != ALLOW and workflow_approved:
+            proposed = list(ctx.extra.get("proposed_decisions") or [])
+            if new_modulation and not any(
+                item.get("key") == "modulation" for item in proposed
+            ):
+                proposed.append(
+                    {"key": "modulation", "value": new_modulation, "source": "user"}
+                )
+            approved_pending = {
+                "proposed_decisions": proposed
+            }
+            decision = ALLOW
         if decision != ALLOW:
             if decision in ("PROPOSE", "CONFIRM") and pending is None:
                 proposed = list(ctx.extra.get("proposed_decisions") or [])
