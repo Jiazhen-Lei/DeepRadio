@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from ..tools.registry import ToolContext
 
@@ -48,7 +48,9 @@ def _merge_artifacts(ctx: ToolContext, artifacts: Dict[str, Any]) -> None:
             store[k] = v
 
 
-def build_grc_tools(ctx: ToolContext) -> List[Any]:
+def build_grc_tools(
+    ctx: ToolContext, allowed: Optional[Iterable[str]] = None
+) -> List[Any]:
     """按共享 ctx 生成绑定后的 LangChain 工具列表。
 
     Args:
@@ -187,6 +189,16 @@ def build_grc_tools(ctx: ToolContext) -> List[Any]:
         return _call("describe_block", {"key": key})
 
     @tool
+    def list_examples(keyword: str = "") -> str:
+        """List bundled flowgraph examples matching an optional keyword."""
+        return _call("list_examples", {"keyword": keyword})
+
+    @tool
+    def inspect_flowgraph() -> str:
+        """Return current path/version plus compact blocks, connections and parameters."""
+        return _call("inspect_flowgraph", {})
+
+    @tool
     def verify_claims() -> str:
         """Bind current validation and simulation observations to pending claims."""
         return _call("verify_claims", {})
@@ -203,6 +215,31 @@ def build_grc_tools(ctx: ToolContext) -> List[Any]:
             _merge_artifacts(ctx, {"spectrum_png": result["path"]})
         _rec_event(ctx, "plot_spectrum", result)
         return json.dumps(result, ensure_ascii=False)
+
+    @tool
+    def plot_constellation(probe_id: str = "sink", sps: int = 4) -> str:
+        """Render a constellation artifact from the latest complex probe."""
+        result = registry.call(
+            "plot_constellation", {"probe_id": probe_id, "sps": sps}, ctx
+        )
+        if result.get("path"):
+            _merge_artifacts(ctx, {"constellation_png": result["path"]})
+        _rec_event(ctx, "plot_constellation", result)
+        return json.dumps(result, ensure_ascii=False)
+
+    @tool
+    def plot_eye(probe_id: str = "sink", sps: int = 4) -> str:
+        """Render an eye-diagram artifact from the latest complex probe."""
+        result = registry.call("plot_eye", {"probe_id": probe_id, "sps": sps}, ctx)
+        if result.get("path"):
+            _merge_artifacts(ctx, {"eye_png": result["path"]})
+        _rec_event(ctx, "plot_eye", result)
+        return json.dumps(result, ensure_ascii=False)
+
+    @tool
+    def explain_error(errors: Optional[List[str]] = None) -> str:
+        """Explain structural/runtime errors and return concrete repair hints."""
+        return _call("explain_error", {"errors": errors} if errors is not None else {})
 
     @tool
     def diagnose_by_metric(
@@ -248,6 +285,11 @@ def build_grc_tools(ctx: ToolContext) -> List[Any]:
         )
 
     @tool
+    def apply_flowgraph_patch(operations: List[Dict[str, Any]]) -> str:
+        """Atomically apply add/remove/set/connect/disconnect operations, validate, save or roll back."""
+        return _call("apply_flowgraph_patch", {"operations": operations})
+
+    @tool
     def configure_sdr(
         device_type: str,
         center_freq: Optional[float] = None,
@@ -268,7 +310,12 @@ def build_grc_tools(ctx: ToolContext) -> List[Any]:
         """Report whether real SDR discovery is enabled."""
         return _call("list_devices", {})
 
-    return [
+    @tool
+    def hardware_preflight(device_type: str = "") -> str:
+        """Run a read-only SDR capability and safety precheck; never starts transmission."""
+        return _call("hardware_preflight", {"device_type": device_type})
+
+    tools = [
         design_flowgraph,
         validate_flowgraph,
         run_simulation,
@@ -278,11 +325,20 @@ def build_grc_tools(ctx: ToolContext) -> List[Any]:
         select_recipe,
         search_blocks,
         describe_block,
+        list_examples,
+        inspect_flowgraph,
         verify_claims,
         plot_spectrum,
+        plot_constellation,
+        plot_eye,
+        explain_error,
         diagnose_by_metric,
         suggest_fix,
         apply_grc_diff,
+        apply_flowgraph_patch,
         configure_sdr,
         list_devices,
+        hardware_preflight,
     ]
+    allowed_set = set(allowed or ())
+    return [item for item in tools if not allowed_set or item.name in allowed_set]

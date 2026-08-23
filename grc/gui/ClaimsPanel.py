@@ -193,7 +193,7 @@ class ClaimsPanel(Gtk.Frame):
             widget.override_font(small)
 
     def update_data(self, claims, spec_digest, pending=None,
-                    metrics=None, activity=None):
+                    metrics=None, activity=None, workflow=None):
         self._updating = True
         self._claims = list(claims or [])
         self._store.clear()
@@ -212,7 +212,7 @@ class ClaimsPanel(Gtk.Frame):
         recipe_names = [item["name"] for item in self._recipes]
         self._set_combo(self._recipe_combo, recipe_names, spec.get("recipe"))
         self._spec_summary.set_text("规格: " + self._summary_text(spec))
-        self._set_activity(activity or {})
+        self._set_activity(activity or {}, workflow or {})
         self._set_metrics(metrics, self._claims)
         self._set_pending(pending or {})
         empty = (
@@ -244,7 +244,24 @@ class ClaimsPanel(Gtk.Frame):
         self._spec_revealer.set_reveal_child(False)
         self._updating = False
 
-    def _set_activity(self, activity):
+    def _set_activity(self, activity, workflow=None):
+        workflow = workflow or {}
+        if workflow:
+            task = str(
+                workflow.get("task_label") or workflow.get("task_type") or "—"
+            )
+            stage = str(
+                workflow.get("stage_label") or workflow.get("current_stage") or "—"
+            )
+            index = workflow.get("stage_index") or 0
+            total = workflow.get("stage_total") or 0
+            status = str(workflow.get("execution_status") or "")
+            outcome = str(workflow.get("outcome") or "")
+            text = "任务: {}  |  阶段: {} {}/{}  |  状态: {}".format(
+                task, stage, index, total, outcome or status or "—"
+            )
+            self._activity_label.set_text(text)
+            return
         loop = str(activity.get("loop") or "—")
         agent = str(activity.get("agent") or "")
         action = str(activity.get("action") or "就绪")
@@ -341,6 +358,10 @@ class ClaimsPanel(Gtk.Frame):
             if action == "design_link" and recipe:
                 text = "待确认: {} → {}".format(
                     from_recipe or "当前工程", recipe)
+            elif action == "workflow_checkpoint":
+                text = "待确认: {}".format(
+                    pending.get("reason") or "继续当前 Workflow"
+                )
             else:
                 text = "待确认: {}".format(action)
             self._pending_label.set_text(text)

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import copy
+import os
 import re
+import shutil
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -398,11 +401,13 @@ def configure_sdr(
         {
             "target": "device",
             "scope": "configuration",
-            "domain": "flowgraph",
+            "domain": "hardware",
         },
         state.coordination,
     )
-    if policy != ALLOW:
+    if policy != ALLOW and not _workflow_checkpoint_approved(
+        ctx, "hardware_confirmation"
+    ):
         state.coordination.pending_confirmations.append(
             {
                 "action": "configure_sdr",
@@ -436,6 +441,36 @@ def list_devices(ctx: ToolContext):
         "enabled": False,
         "requires_confirmation": True,
         "error": "一期不枚举真实 SDR；仅支持 flowgraph 配置",
+    }
+
+
+@tool(
+    name="hardware_preflight",
+    description="Read-only SDR configuration and local-driver precheck. Never starts a flowgraph or transmits RF.",
+    parameters={
+        "type": "object",
+        "properties": {"device_type": {"type": "string"}},
+    },
+    group="hardware",
+)
+def hardware_preflight(ctx: ToolContext, device_type: str = ""):
+    state = _state(ctx)
+    configured = dict(state.project.config.get("device") or {})
+    requested = (device_type or configured.get("type") or "").lower()
+    driver = "uhd_find_devices" if requested in ("usrp", "b210", "b200") else ""
+    checks = {
+        "device_type_present": bool(requested),
+        "driver_command_available": bool(driver and shutil.which(driver)),
+        "center_frequency_present": configured.get("center_freq") is not None,
+        "sample_rate_present": configured.get("sample_rate") is not None,
+        "real_hardware_actions_enabled": False,
+    }
+    return {
+        "ok": bool(requested),
+        "outcome": "passed" if checks["device_type_present"] else "failed",
+        "device_type": requested,
+        "checks": checks,
+        "note": "仅完成只读预检；真实发射、启动和停止能力未启用。",
     }
 
 
@@ -515,6 +550,180 @@ def apply_grc_diff(
         if resimulate:
             result["reverify"] = _resimulate_and_verify(ctx, state)
     return result
+
+
+@tool(
+    name="apply_flowgraph_patch",
+    description="Atomically apply add/remove/set/connect/disconnect operations, then validate and save; restore the in-memory graph on any failure.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "operations": {
+                "type": "array",
+                "items": {"type": "object"},
+                "maxItems": 100,
+            }
+        },
+        "required": ["operations"],
+    },
+    group="build",
+)
+def apply_flowgraph_patch(ctx: ToolContext, operations: List[Dict[str, Any]]):
+    from . import registry
+
+    if ctx.extra.get("mutation_forbidden"):
+        return {"ok": False, "error": "本轮禁止改图"}
+    if ctx.flow_graph is None:
+        return {"ok": False, "error": "当前 session 没有已加载的流图"}
+    if not isinstance(operations, list) or not operations or len(operations) > 100:
+        return {"ok": False, "error": "operations 必须是 1~100 项的列表"}
+    allowed = {"add", "remove", "set", "connect", "disconnect"}
+    for index, operation in enumerate(operations):
+        if not isinstance(operation, dict) or operation.get("op") not in allowed:
+            return {"ok": False, "error": f"operations[{index}] 的 op 非法"}
+
+    state = _state(ctx)
+    scope = (
+        "single_block_change"
+        if len(operations) == 1 and operations[0].get("op") == "set"
+        else "multi_block_change"
+    )
+    policy = gate(
+        {"target": "flowgraph", "scope": scope, "domain": "dsp"},
+        state.coordination,
+    )
+    if policy == "DENY":
+        return {"ok": False, "policy": policy, "error": "PolicyGateway 拒绝 patch"}
+    if policy != ALLOW and not _workflow_checkpoint_approved(
+        ctx, "change_confirmation", "repair_confirmation"
+    ):
+        return {
+            "ok": False,
+            "policy": policy,
+            "requires_confirmation": True,
+            "error": "多块 patch 需要 Workflow Checkpoint 批准",
+        }
+    backup = copy.deepcopy(ctx.flow_graph.export_data())
+    state_path = str(ctx.extra.get("state_path") or "")
+    snapshots_dir = str(ctx.extra.get("snapshots_dir") or "")
+    if state_path and snapshots_dir:
+        create_snapshot(state, snapshots_dir, state_path)
+
+    def restore_graph():
+        restored = ctx.platform.make_flow_graph()
+        restored.import_data(copy.deepcopy(backup))
+        ctx.flow_graph = restored
+        ctx.blocks = {
+            str(block.name): block
+            for block in restored.blocks
+            if block is not restored.options_block
+        }
+
+    applied = []
+    for index, operation in enumerate(operations):
+        op = operation["op"]
+        if op == "add":
+            result = registry.call("add_block", {
+                "key": operation.get("key"),
+                "id": operation.get("id"),
+                "params": operation.get("params") or {},
+            }, ctx)
+        elif op == "set":
+            result = registry.call("set_param", {
+                "id": operation.get("id"),
+                "name": operation.get("name"),
+                "value": operation.get("value"),
+            }, ctx)
+        elif op == "connect":
+            result = registry.call("connect", {
+                "src_id": operation.get("src_id"),
+                "src_port": int(operation.get("src_port", 0)),
+                "dst_id": operation.get("dst_id"),
+                "dst_port": int(operation.get("dst_port", 0)),
+            }, ctx)
+        elif op == "remove":
+            block_id = str(operation.get("id") or "")
+            block = ctx.blocks.get(block_id)
+            if block is None:
+                result = {"ok": False, "error": f"块 id 不存在: {block_id}"}
+            else:
+                ctx.flow_graph.remove_element(block)
+                ctx.blocks.pop(block_id, None)
+                result = {"ok": True, "id": block_id}
+        else:
+            result = _disconnect_exact(ctx, operation)
+        if not result.get("ok"):
+            restore_graph()
+            return {
+                "ok": False,
+                "error": f"patch 第 {index + 1} 项失败: {result.get('error')}",
+                "rolled_back": True,
+            }
+        applied.append({"op": op, "result": result})
+
+    validation = registry.call("validate_flowgraph", {}, ctx)
+    if not validation.get("ok") or not validation.get("valid"):
+        restore_graph()
+        return {
+            "ok": False,
+            "error": "patch 后结构校验失败",
+            "errors": validation.get("errors") or [],
+            "rolled_back": True,
+        }
+
+    target = str(state.project.grc_path or "")
+    if not target:
+        flowgraph_id = ctx.flow_graph.get_option("id") or "flow_graph"
+        target = os.path.join(ctx.out_dir or os.getcwd(), f"{flowgraph_id}.grc")
+    temp = f"{target}.patch.tmp.grc"
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(target)), exist_ok=True)
+        ctx.platform.save_flow_graph(temp, ctx.flow_graph)
+        os.replace(temp, target)
+    except Exception as exc:  # noqa: BLE001
+        restore_graph()
+        if os.path.isfile(temp):
+            os.unlink(temp)
+        return {"ok": False, "error": f"patch 存盘失败: {exc}", "rolled_back": True}
+
+    state.project.grc_path = target
+    state.project.flowgraph_version += 1
+    state.project.config["canvas_dirty"] = False
+    ClaimStore(state).invalidate_by_version(state.project.flowgraph_version)
+    return {
+        "ok": True,
+        "outcome": "passed",
+        "path": target,
+        "flowgraph_version": state.project.flowgraph_version,
+        "applied": applied,
+    }
+
+
+def _disconnect_exact(ctx: ToolContext, operation: Dict[str, Any]) -> Dict[str, Any]:
+    src_id = str(operation.get("src_id") or "")
+    dst_id = str(operation.get("dst_id") or "")
+    src_port = str(operation.get("src_port", 0))
+    dst_port = str(operation.get("dst_port", 0))
+    match = next((
+        connection for connection in ctx.flow_graph.connections
+        if str(connection.source_block.name) == src_id
+        and str(connection.sink_block.name) == dst_id
+        and str(connection.source_port.key) == src_port
+        and str(connection.sink_port.key) == dst_port
+    ), None)
+    if match is None:
+        return {"ok": False, "error": "指定连接不存在"}
+    ctx.flow_graph.remove_element(match)
+    return {"ok": True, "connection": f"{src_id}[{src_port}] -> {dst_id}[{dst_port}]"}
+
+
+def _workflow_checkpoint_approved(ctx: ToolContext, *stage_ids: str) -> bool:
+    workflow = ctx.extra.get("workflow") or {}
+    return any(
+        (stage.get("checkpoint") or {}).get("decision_status") == "approved"
+        for stage in workflow.get("stages") or []
+        if isinstance(stage, dict) and stage.get("id") in stage_ids
+    )
 
 
 def _resimulate_and_verify(ctx: ToolContext, state) -> Dict[str, Any]:

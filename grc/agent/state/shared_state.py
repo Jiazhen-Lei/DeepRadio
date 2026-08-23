@@ -62,6 +62,17 @@ class TaskCard:
     instruction: str
     inputs: Dict[str, Any] = field(default_factory=dict)
     expected_claims: List[str] = field(default_factory=list)
+    expected_results: List[str] = field(default_factory=list)
+    workflow_id: str = ""
+    stage_id: str = ""
+    workflow_revision: int = 0
+    base_project_version: int = 0
+
+    def validate(self) -> None:
+        if not all((self.task_id, self.workflow_id, self.stage_id, self.target_agent)):
+            raise ValueError("TaskCard 缺少 task/workflow/stage/agent 标识")
+        if self.workflow_revision < 1 or self.base_project_version < 0:
+            raise ValueError("TaskCard Workflow/Project 版本非法")
 
 
 @dataclass
@@ -70,8 +81,21 @@ class ResultEnvelope:
     ok: bool
     produced_claims: List[str] = field(default_factory=list)
     proposed_changes: List[Dict[str, Any]] = field(default_factory=list)
-    artifacts: Dict[str, str] = field(default_factory=dict)
+    artifacts: Dict[str, Any] = field(default_factory=dict)
     note: str = ""
+    outcome: str = ""
+    workflow_id: str = ""
+    stage_id: str = ""
+    workflow_revision: int = 0
+    base_project_version: int = 0
+
+    def validate(self) -> None:
+        if not all((self.task_id, self.workflow_id, self.stage_id)):
+            raise ValueError("ResultEnvelope 缺少 task/workflow/stage 标识")
+        if self.outcome not in ("passed", "failed", "inconclusive"):
+            raise ValueError(f"ResultEnvelope outcome 非法: {self.outcome}")
+        if self.workflow_revision < 1 or self.base_project_version < 0:
+            raise ValueError("ResultEnvelope Workflow/Project 版本非法")
 
 
 @dataclass

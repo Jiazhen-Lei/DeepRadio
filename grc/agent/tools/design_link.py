@@ -152,6 +152,7 @@ def design_link(ctx, profile=None, intent: str = "",
     out_dir = ctx.out_dir or os.getcwd()
     os.makedirs(out_dir, exist_ok=True)
     probe_path = os.path.join(out_dir, f"{fid}_rx.bin")
+    tx_probe_path = os.path.join(out_dir, f"{fid}_tx.bin")
 
     # 3) 逐块添加
     for key, bid, params in rc.blocks:
@@ -159,6 +160,8 @@ def design_link(ctx, profile=None, intent: str = "",
         for k, v in list(p.items()):
             if v == "__PROBE__":
                 p[k] = repr(probe_path)
+            elif v == "__TX_PROBE__":
+                p[k] = repr(tx_probe_path)
         _c("add_block", key=key, id=bid, params=p)
 
     # 4) 逐条连接(支持 (src,dst) 或 (src,dst,sp,dp))
@@ -194,8 +197,10 @@ def design_link(ctx, profile=None, intent: str = "",
     # 7) 可选仿真 + 取指标 + 画图
     if simulate and valid:
         probe_id = rc.probe_block_id or "sink"
-        sim = _c("run_simulation",
-                 probes={probe_id: [probe_path, rc.probe_dtype]})
+        probes = {probe_id: [probe_path, rc.probe_dtype]}
+        if rc.tx_probe_block_id:
+            probes[rc.tx_probe_block_id] = [tx_probe_path, "uint8"]
+        sim = _c("run_simulation", probes=probes)
         if sim.get("ok"):
             artifacts["out_dir"] = sim.get("out_dir")
             if "evm" in rc.metrics:
@@ -208,7 +213,8 @@ def design_link(ctx, profile=None, intent: str = "",
             if "ber" in rc.metrics:
                 mod = _guess_modulation(rc.name)
                 m = _c("read_metric", kind="ber", probe_id=probe_id,
-                       modulation=mod, sps=rc.sps)
+                       modulation=mod, sps=rc.sps,
+                       tx_bits_probe=rc.tx_probe_block_id or "")
                 if m.get("ok"):
                     metrics["ber"] = m["value"]
             if "constellation" in rc.metrics:

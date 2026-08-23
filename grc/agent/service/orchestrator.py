@@ -39,7 +39,9 @@ def deepagents_available() -> bool:
         return False
 
 
-def build_agent(ctx: ToolContext, *, temperature: float = 0.2) -> Optional[Any]:
+def build_agent(
+    ctx: ToolContext, *, stage: Any = None, temperature: float = 0.2
+) -> Optional[Any]:
     """组装并返回一个 deepagents 深度代理(``CompiledStateGraph``)。
 
     Args:
@@ -68,20 +70,27 @@ def build_agent(ctx: ToolContext, *, temperature: float = 0.2) -> Optional[Any]:
         checkpointer = None
 
     chat = _model.build_chat_model(temperature=temperature)
-    tools = _import_tools(ctx)
-    subs = _subagents.build_grc_subagents(ctx)
+    agent_names = list(getattr(stage, "recommended_agents", None) or [])
+    tool_names = _subagents.tool_names_for_agents(agent_names)
+    tools = _import_tools(ctx, tool_names)
+    subs = _subagents.build_grc_subagents(ctx, agent_names)
     be = _backend.build_backend()
-    skills_dir = _backend.skills_root()
     style_prompt = _resolve_style_prompt(ctx)
     orch_prompt = _sp.build_orchestrator_prompt(
-        _subagents.subagent_names(), style_prompt=style_prompt)
+        agent_names or _subagents.subagent_names(), style_prompt=style_prompt)
+    if stage is not None:
+        orch_prompt += (
+            "\n【当前 Workflow Stage】\n"
+            f"stage_id={stage.id}; completion={stage.completion}; "
+            f"只允许委派: {', '.join(agent_names)}。\n"
+        )
 
     agent: Any = create_deep_agent(
         model=chat,
         tools=tools,
         system_prompt=orch_prompt,
         subagents=subs,
-        skills=[skills_dir],
+        skills=[_backend.SKILLS_MOUNT],
         backend=be,
         checkpointer=checkpointer,
     )
@@ -90,10 +99,10 @@ def build_agent(ctx: ToolContext, *, temperature: float = 0.2) -> Optional[Any]:
     return agent
 
 
-def _import_tools(ctx: ToolContext) -> list:
+def _import_tools(ctx: ToolContext, allowed: list[str] | None = None) -> list:
     """主 Agent 也持有建图工具(可不委派直接建简单图)。"""
     from . import tools_lc
-    return tools_lc.build_grc_tools(ctx)
+    return tools_lc.build_grc_tools(ctx, allowed=allowed)
 
 
 def _resolve_style_prompt(ctx: ToolContext) -> str:

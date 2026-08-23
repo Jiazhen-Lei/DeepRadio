@@ -481,6 +481,7 @@ class AgentPanel(Gtk.VBox):
         self.claims_panel.update_data(
             ClaimStore(state).summary(), state.spec_digest(), pending=pending,
             activity={"loop": "规格", "agent": "Spec", "action": "写入规格"},
+            workflow=agent._workflow.digest(),
         )
         self._set_status(
             "已写入工作流 {}。换配方需确认后才会重建流图。".format(
@@ -512,6 +513,7 @@ class AgentPanel(Gtk.VBox):
                 "action": "画布已保存",
                 "status": "Claim 待重验",
             },
+            workflow=result.get("workflow_digest") or {},
         )
         self._set_status(
             "画布已保存，工程版本 {}，Claim 待重验。".format(
@@ -604,6 +606,11 @@ class AgentPanel(Gtk.VBox):
     def _on_reset(self, _widget):
         if self._busy:
             return
+        if self._agent is not None:
+            try:
+                self._agent.archive_workflow()
+            except OSError as exc:
+                log.warning("归档 Workflow 失败: %s", exc)
         self._agent = None
         self._baseline_history = []
         for child in self._log_box.get_children():
@@ -667,6 +674,7 @@ class AgentPanel(Gtk.VBox):
             pending=getattr(reply, "pending", None) or {},
             metrics=metrics,
             activity=_activity_from_reply(reply),
+            workflow=getattr(reply, "workflow_digest", None) or {},
         )
         # CONFIRM / DENY 不上画布；交付阶段原地刷新当前页。
         stage = getattr(reply, "stage", "") or ""
@@ -683,8 +691,18 @@ class AgentPanel(Gtk.VBox):
         tip = " (等待你确认/回复)" if getattr(reply, "needs_confirmation",
                                             False) else ""
         level = self._agent.ctx.profile.level if self._agent else "?"
+        digest = getattr(reply, "workflow_digest", None) or {}
+        workflow_note = ""
+        if digest:
+            workflow_note = "任务: {} | Stage: {}/{} {}".format(
+                digest.get("task_label") or digest.get("task_type") or "?",
+                digest.get("stage_index") or 0,
+                digest.get("stage_total") or 0,
+                digest.get("stage_label") or digest.get("current_stage") or "—",
+            )
         parts = [p for p in (
             canvas_note,
+            workflow_note,
             "阶段: {} | 档位: {}{}".format(stage, level, tip),
         ) if p]
         self._set_status(" | ".join(parts))
@@ -755,6 +773,7 @@ class AgentPanel(Gtk.VBox):
                 "action": "回滚快照",
                 "status": "已回到上一版本",
             },
+            workflow=result.get("workflow_digest") or {},
         )
         grc_path = result.get("grc_path")
         if grc_path and os.path.exists(grc_path):

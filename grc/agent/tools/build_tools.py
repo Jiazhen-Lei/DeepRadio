@@ -193,3 +193,49 @@ def render_grc(ctx: ToolContext, path: str = ""):
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": f"存盘失败: {exc}"}
     return {"ok": True, "path": path}
+
+
+@tool(
+    name="inspect_flowgraph",
+    description="Return a compact, read-only summary of the current flowgraph, project path, parameters, ports, connections, and version.",
+    parameters={"type": "object", "properties": {}},
+    group="build",
+)
+def inspect_flowgraph(ctx: ToolContext):
+    flow_graph = ctx.flow_graph
+    if flow_graph is None:
+        return {"ok": False, "error": "当前 session 没有已加载的流图"}
+    flow_graph.rewrite()
+    blocks = []
+    for block in flow_graph.blocks:
+        if block is flow_graph.options_block:
+            continue
+        params = {
+            name: str(param.get_value())
+            for name, param in (getattr(block, "params", None) or {}).items()
+        }
+        blocks.append({
+            "id": str(getattr(block, "name", "") or params.get("id") or ""),
+            "key": str(getattr(block, "key", "") or ""),
+            "params": params,
+            "sources": len(getattr(block, "sources", []) or []),
+            "sinks": len(getattr(block, "sinks", []) or []),
+        })
+    connections = [
+        {
+            "src_id": str(connection.source_block.name),
+            "src_port": str(connection.source_port.key),
+            "dst_id": str(connection.sink_block.name),
+            "dst_port": str(connection.sink_port.key),
+        }
+        for connection in flow_graph.connections
+    ]
+    state = ctx.extra.get("state")
+    project = getattr(state, "project", None)
+    return {
+        "ok": True,
+        "path": str(getattr(project, "grc_path", "") or ""),
+        "project_version": int(getattr(project, "flowgraph_version", 0)),
+        "blocks": blocks,
+        "connections": connections,
+    }

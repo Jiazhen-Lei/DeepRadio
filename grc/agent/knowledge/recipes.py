@@ -36,6 +36,7 @@ class Recipe:
     keywords: List[str] = field(default_factory=list)
     #: 仿真时的 file_sink 探针 id(design_link 会据此配 run_simulation)
     probe_block_id: Optional[str] = None
+    tx_probe_block_id: Optional[str] = None
     probe_dtype: str = "complex64"
     sps: int = 4
 
@@ -156,6 +157,8 @@ _RECIPE_RX_BPSK_AWGN = Recipe(
                 "repeat": "True",
             },
         ),
+        ("blocks_head", "tx_head", {"type": "byte", "num_items": "2048"}),
+        ("blocks_file_sink", "tx_sink", {"type": "byte", "file": "__TX_PROBE__"}),
         (
             "digital_constellation_modulator",
             "mod",
@@ -208,6 +211,8 @@ _RECIPE_RX_BPSK_AWGN = Recipe(
         ("blocks_file_sink", "sink", {"type": "byte", "file": "__PROBE__"}),
     ],
     connections=[
+        ("src", "tx_head"),
+        ("tx_head", "tx_sink"),
         ("src", "mod"),
         ("mod", "chan"),
         ("chan", "clock_sync"),
@@ -227,6 +232,7 @@ _RECIPE_RX_BPSK_AWGN = Recipe(
         "constellation_receiver", "自包含",
     ],
     probe_block_id="sink",
+    tx_probe_block_id="tx_sink",
     probe_dtype="uint8",
     sps=1,
 )

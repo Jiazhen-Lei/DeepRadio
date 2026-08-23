@@ -87,3 +87,4 @@ class AgentReply:
     claims: List[Dict[str, Any]] = field(default_factory=list)
     spec_digest: Dict[str, Any] = field(default_factory=dict)
     pending: Dict[str, Any] = field(default_factory=dict)
+    workflow_digest: Dict[str, Any] = field(default_factory=dict)

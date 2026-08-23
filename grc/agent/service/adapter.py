@@ -16,13 +16,15 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import uuid
 from typing import Any, Dict, Optional
 
 from ..schema import AgentReply, ToolInvocation
 from ..memory.profile import UserProfile
-from ..state import ClaimStore, SharedState
+from ..state import ClaimStore, ResultEnvelope, SharedState, TaskCard
 from ..tools.registry import ToolContext
+from ..workflow import WorkflowEngine
 from . import orchestrator as _orch
 from . import session_store as _store
 
@@ -88,6 +90,19 @@ class ServiceAgent:
             _store.state_path(self.session_id), session_id=self.session_id
         )
         self._tool_ctx: Optional[ToolContext] = None
+        event_sink = lambda event, payload: _store.append_session_event(
+            self.session_id, event, payload
+        )
+        try:
+            self._workflow = WorkflowEngine(
+                _store.workflow_path(self.session_id), event_sink=event_sink
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            logger.warning("workflow.yaml 无法恢复，已归档: %s", exc)
+            _store.archive_workflow(self.session_id)
+            self._workflow = WorkflowEngine(
+                _store.workflow_path(self.session_id), event_sink=event_sink
+            )
         # GUI 兼容层:agent.ctx.{tool_ctx.out_dir, adaptive, profile}
         self.ctx = _CtxShim(self)
 
@@ -170,12 +185,16 @@ class ServiceAgent:
         except OSError as exc:
             logger.warning("SharedState 落盘失败: %s", exc)
             return {"ok": False, "error": str(exc)}
+        self._workflow.invalidate(
+            "flowgraph_changed", self._state.project.flowgraph_version
+        )
         return {
             "ok": True,
             "version": self._state.project.flowgraph_version,
             "claims": ClaimStore(self._state).summary(),
             "spec_digest": self._state.spec_digest(),
             "canvas_dirty": True,
+            "workflow_digest": self._workflow.digest(),
         }
 
     def restore_last_snapshot(self) -> Dict[str, Any]:
@@ -202,6 +221,9 @@ class ServiceAgent:
             return {"ok": False, "error": str(exc)}
         self._state = restored
         self._tool_ctx = None
+        self._workflow.invalidate(
+            "snapshot_restored", restored.project.flowgraph_version
+        )
         return {
             "ok": True,
             "snapshot": target,
@@ -209,19 +231,28 @@ class ServiceAgent:
             "version": restored.project.flowgraph_version,
             "claims": ClaimStore(restored).summary(),
             "spec_digest": restored.spec_digest(),
+            "workflow_digest": self._workflow.digest(),
         }
+
+    def archive_workflow(self) -> str:
+        """Archive only the active control-plane file for GUI reset."""
+        return _store.archive_workflow(self.session_id)
 
     # ---- 主入口 ------------------------------------------------------
     def step(self, user_text: str, recipe: str = "",
              simulate: bool = True) -> AgentReply:
-        """执行一轮:优先走 deepagents 深度代理,否则确定性降级。"""
+        """Consume one user turn through WorkflowEngine, then execute its Stage."""
         if getattr(self._state, "_load_failed", False):
             backup = getattr(self._state, "_corrupt_backup", "")
             return self._error_reply(
                 "会话 SharedState 已损坏，已停止写入以保护原数据。"
                 f"备份: {backup or '创建失败'}"
             )
-        # 创新 B:自适应档位下,每轮据用户话语平滑更新画像;钉档时 pin 优先。
+        try:
+            workflow = self._workflow.consume_turn(user_text, self._state)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Workflow consume_turn 失败")
+            return self._error_reply(f"Workflow 状态错误: {exc}")
         if getattr(self.ctx, "adaptive", True):
             try:
                 self.profile.observe(user_text)
@@ -229,6 +260,45 @@ class ServiceAgent:
                 logger.debug("profile.observe 失败,忽略: %s", exc)
         ctx = self._make_ctx()
         ctx.extra["user_text"] = user_text
+        ctx.extra["workflow_digest"] = self._workflow.digest()
+        if workflow.execution_status == "completed" and workflow.outcome == "cancelled":
+            try:
+                from ..tools.state_tools import resolve_confirmation
+                resolve_confirmation(ctx, user_text)
+                self._state.save(_store.state_path(self.session_id))
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("取消 Workflow 时清理旧 Policy pending 失败: %s", exc)
+            return self._workflow_cancelled_reply()
+        current = self._workflow.current_stage()
+        if current and current.execution_status == "waiting":
+            return self._workflow_waiting_reply()
+        stage = self._workflow.start_stage()
+        if stage is None:
+            return self._error_reply("Workflow 没有可执行 Stage")
+        ctx.extra["workflow"] = workflow.to_dict()
+        ctx.extra["stage_id"] = stage.id
+        task_card = TaskCard(
+            task_id=f"task-{uuid.uuid4().hex[:8]}",
+            loop_mode=workflow.task_type,
+            target_agent=(stage.recommended_agents or ["main_agent"])[0],
+            instruction=user_text,
+            inputs={"intent": workflow.intent.slots},
+            expected_results=list(stage.completion),
+            workflow_id=workflow.workflow_id,
+            stage_id=stage.id,
+            workflow_revision=workflow.revision,
+            base_project_version=workflow.base_project_version,
+        )
+        task_card.validate()
+        self._state.coordination.active_task = task_card
+        ctx.extra["task_card"] = vars(task_card)
+        _store.append_session_event(
+            self.session_id, "task_card_created", {
+                "target_agent": task_card.target_agent,
+                "task_id": task_card.task_id,
+                "stage_id": task_card.stage_id,
+            }
+        )
         try:
             from ..tools.state_tools import (
                 commit_intent,
@@ -242,6 +312,7 @@ class ServiceAgent:
             resolution = resolve_confirmation(ctx, user_text)
             if resolution.get("resolved") and not resolution.get("approved"):
                 self._state.save(_store.state_path(self.session_id))
+                self._workflow.finish("cancelled")
                 reply = AgentReply(
                     text="已取消待执行的工程修改。",
                     stage="CANCELLED",
@@ -251,14 +322,16 @@ class ServiceAgent:
                 _store.append_session_event(
                     self.session_id, "confirmation_cancelled", {}
                 )
+                reply.workflow_digest = self._workflow.digest()
                 return reply
             if resolution.get("resolved") and resolution.get("approved"):
                 pending = list(self._state.coordination.pending_confirmations)
                 last = pending[-1] if pending else {}
                 if last.get("action") == "design_link" and last.get("recipe"):
-                    reply = self._run_deterministic(
+                    reply = self._run_stage_deterministic(
                         ctx, user_text, str(last.get("recipe") or ""),
-                        simulate)
+                        simulate, stage.id)
+                    self._finish_workflow_reply(reply)
                     try:
                         self._state.save(_store.state_path(self.session_id))
                     except OSError as exc:
@@ -289,6 +362,8 @@ class ServiceAgent:
                         self.session_id, "recipe_switch_noop",
                         {"already": already},
                     )
+                    self._workflow.finish("passed")
+                    reply.workflow_digest = self._workflow.digest()
                     return reply
             if target_recipe and not ctx.extra.get("mutation_forbidden"):
                 from ..tools.design_link import design_link
@@ -310,13 +385,15 @@ class ServiceAgent:
                             "policy": proposed.get("policy"),
                         },
                     )
-                    return self._pending_confirm_reply(proposed)
+                    reply = self._pending_confirm_reply(proposed)
+                    self._finish_workflow_reply(reply, ok=True, outcome="passed")
+                    return reply
         except Exception as exc:  # noqa: BLE001
             logger.warning("规格提取失败，继续执行原链路: %s", exc)
         _store.append_session_event(self.session_id, "user_input",
                                     {"text": user_text})
         try:
-            agent = _orch.build_agent(ctx)
+            agent = _orch.build_agent(ctx, stage=stage)
         except Exception as exc:  # noqa: BLE001
             logger.warning("组装 deepagents 失败,降级到确定性骨架: %s", exc)
             agent = None
@@ -325,14 +402,15 @@ class ServiceAgent:
             if agent is not None:
                 reply = self._run_deep(agent, ctx, user_text)
             else:
-                reply = self._run_deterministic(
-                    ctx, user_text, recipe, simulate
+                reply = self._run_stage_deterministic(
+                    ctx, user_text, recipe, simulate, stage.id
                 )
         except Exception as exc:  # noqa: BLE001
             logger.exception("编排执行异常")
             reply = self._error_reply(
                 f"编排出错: {type(exc).__name__}: {exc}"
             )
+        self._finish_workflow_reply(reply)
         try:
             self._state.save(_store.state_path(self.session_id))
         except OSError as exc:
@@ -364,11 +442,33 @@ class ServiceAgent:
                               ok=done)
 
         narrative = self._extract_final_text(result)
+        self._record_deep_delegations(result)
         # deepagents 把会话文件放在 state 的 "files" 键:镜像到磁盘
         files = result.get("files") if isinstance(result, dict) else None
         if files:
             _store.mirror_session_files(self.session_id, files)
         return self._fold(ctx, narrative, source="deepagents")
+
+    def _record_deep_delegations(self, result: Any) -> None:
+        if not isinstance(result, dict):
+            return
+        for message in result.get("messages") or []:
+            calls = getattr(message, "tool_calls", None)
+            if calls is None and isinstance(message, dict):
+                calls = message.get("tool_calls")
+            for call in calls or []:
+                name = call.get("name") if isinstance(call, dict) else ""
+                args = call.get("args") if isinstance(call, dict) else {}
+                if name == "task":
+                    _store.append_session_event(
+                        self.session_id,
+                        "subagent_invoked",
+                        {
+                            "target_agent": (args or {}).get("subagent_type"),
+                            "description": (args or {}).get("description"),
+                            "mode": "deepagents",
+                        },
+                    )
 
     @staticmethod
     def _extract_final_text(result: Any) -> str:
@@ -421,6 +521,342 @@ class ServiceAgent:
         narrative = result.get("narrative") or self._fallback_text(result)
         return self._fold(ctx, narrative, source="deterministic",
                           ok=bool(result.get("ok")))
+
+    def _run_stage_deterministic(
+        self,
+        ctx: ToolContext,
+        user_text: str,
+        recipe: str,
+        simulate: bool,
+        stage_id: str,
+    ) -> AgentReply:
+        """Minimal deterministic handlers sharing the same Stage semantics as LLM."""
+        from ..tools import registry
+
+        active = self._state.coordination.active_task
+        _store.append_session_event(
+            self.session_id,
+            "subagent_invoked",
+            {
+                "target_agent": active.target_agent if active else "stage_handler",
+                "stage_id": stage_id,
+                "mode": "deterministic",
+            },
+        )
+
+        if stage_id in {
+            "build_and_verify", "tx_build_and_validate", "rx_build_and_verify"
+        }:
+            return self._run_deterministic(ctx, user_text, recipe, simulate)
+        if stage_id == "apply_and_verify":
+            if recipe:
+                return self._run_deterministic(ctx, user_text, recipe, simulate)
+            request_text = (
+                self._workflow.workflow.intent.raw_text
+                if self._workflow.workflow else user_text
+            )
+            change = re.search(
+                r"([A-Za-z_]\w*)\.([A-Za-z_]\w*)\s*(?:改为|设为|改成|=)\s*([^，。\s]+)",
+                request_text,
+            )
+            if not change:
+                return self._fold(
+                    ctx, "无法从修改请求中确定 block.parameter 和新值。",
+                    source="deterministic-stage", ok=False,
+                )
+            result = registry.call("apply_grc_diff", {
+                "block_id": change.group(1),
+                "parameter": change.group(2),
+                "value": change.group(3),
+                "resimulate": simulate,
+            }, ctx)
+            self._record_tool_result(ctx, "apply_grc_diff", result)
+            if result.get("path"):
+                ctx.extra.setdefault("artifacts", {})["grc_path"] = result["path"]
+            return self._fold(
+                ctx,
+                result.get("error") or (
+                    f"已修改 {change.group(1)}.{change.group(2)}，完成重验。"
+                ),
+                source="deterministic-stage",
+                ok=bool(result.get("ok")),
+            )
+        if stage_id == "inspect_and_plan":
+            result = registry.call("inspect_flowgraph", {}, ctx)
+            self._record_tool_result(ctx, "inspect_flowgraph", result)
+            note = (
+                "已检查当前工程并形成变更计划；确认后才会应用并重验。"
+                if result.get("ok") else result.get("error", "工程检查失败")
+            )
+            return self._fold(
+                ctx, note, source="deterministic-stage", ok=bool(result.get("ok"))
+            )
+        if stage_id in ("inspect_and_measure", "inspect_and_diagnose"):
+            return self._inspect_measure_stage(
+                ctx, diagnose=stage_id == "inspect_and_diagnose"
+            )
+        if stage_id == "hardware_precheck":
+            hardware = str(
+                (self._workflow.workflow.intent.slots if self._workflow.workflow else {}).get("hardware") or ""
+            )
+            result = registry.call(
+                "hardware_preflight", {"device_type": hardware}, ctx
+            )
+            self._record_tool_result(ctx, "hardware_preflight", result)
+            return self._fold(
+                ctx, result.get("note") or "硬件预检完成。",
+                source="deterministic-stage", ok=bool(result.get("ok")),
+            )
+        if stage_id == "configure_and_check":
+            slots = self._workflow.workflow.intent.slots if self._workflow.workflow else {}
+            result = registry.call("configure_sdr", {
+                "device_type": slots.get("hardware") or "sdr",
+                "center_freq": slots.get("carrier_frequency"),
+                "sample_rate": slots.get("sample_rate"),
+            }, ctx)
+            self._record_tool_result(ctx, "configure_sdr", result)
+            return self._fold(
+                ctx,
+                result.get("error") or "SDR 参数已记录；真实硬件操作保持禁用。",
+                source="deterministic-stage", ok=bool(result.get("ok")),
+            )
+        if stage_id == "repair_and_verify":
+            diagnosed = self._workflow.workflow.stage("inspect_and_diagnose")
+            changes = list((diagnosed.result if diagnosed else {}).get("proposed_changes") or [])
+            if not changes:
+                return self._fold(
+                    ctx, "没有可确定执行的修复参数，请先补充修改目标。",
+                    source="deterministic-stage", ok=False,
+                )
+            change = changes[0]
+            result = registry.call("apply_grc_diff", {
+                "block_id": change.get("block_id"),
+                "parameter": change.get("parameter"),
+                "value": change.get("value"),
+                "resimulate": simulate,
+            }, ctx)
+            self._record_tool_result(ctx, "apply_grc_diff", result)
+            if result.get("path"):
+                ctx.extra.setdefault("artifacts", {})["grc_path"] = result["path"]
+            return self._fold(
+                ctx, result.get("error") or "已应用最小修复并完成重验。",
+                source="deterministic-stage", ok=bool(result.get("ok")),
+            )
+        return self._fold(
+            ctx, f"Stage {stage_id} 没有可安全自动执行的确定性修改。",
+            source="deterministic-stage", ok=False,
+        )
+
+    def _inspect_measure_stage(
+        self, ctx: ToolContext, *, diagnose: bool = False
+    ) -> AgentReply:
+        from ..tools import registry
+
+        inspected = registry.call("inspect_flowgraph", {}, ctx)
+        self._record_tool_result(ctx, "inspect_flowgraph", inspected)
+        validation = registry.call("validate_flowgraph", {}, ctx)
+        self._record_tool_result(ctx, "validate", validation)
+        if not inspected.get("ok") or not validation.get("ok"):
+            return self._fold(
+                ctx, inspected.get("error") or validation.get("error") or "工程检查失败",
+                source="deterministic-stage", ok=False,
+            )
+        if not validation.get("valid"):
+            explained = registry.call(
+                "explain_error", {"errors": validation.get("errors") or []}, ctx
+            )
+            self._record_tool_result(ctx, "explain_error", explained)
+            return self._fold(
+                ctx, "结构校验未通过，已给出具体错误与修复建议。",
+                source="deterministic-stage", ok=False,
+            )
+        simulated = registry.call("run_simulation", {}, ctx)
+        self._record_tool_result(ctx, "simulate", simulated)
+        if not simulated.get("ok"):
+            return self._fold(
+                ctx, simulated.get("error") or "仿真失败",
+                source="deterministic-stage", ok=False,
+            )
+        workflow = self._workflow.workflow
+        slots = workflow.intent.slots if workflow else {}
+        requested = list(slots.get("requested_metrics") or [])
+        if diagnose and not requested:
+            requested = ["evm"]
+        if not requested:
+            requested = ["spectrum"]
+        modulation = str(
+            self._state.project.config.get("modulation") or slots.get("modulation") or "bpsk"
+        )
+        sps = 1 if str(self._state.project.config.get("recipe") or "").startswith("rx_") else 4
+        metrics = ctx.extra.setdefault("metrics", {})
+        for kind in requested:
+            if kind in ("evm", "ber", "spectrum"):
+                args = {
+                    "kind": kind,
+                    "modulation": modulation,
+                    "sps": sps,
+                }
+                if kind == "ber":
+                    args.update({"probe_id": "sink", "tx_bits_probe": "tx_sink"})
+                measured = registry.call("read_metric", args, ctx)
+                self._record_tool_result(ctx, "read_metric", measured)
+                if measured.get("ok") and measured.get("value") is not None:
+                    metrics["evm_pct" if kind == "evm" else (
+                        "spectrum_peak" if kind == "spectrum" else "ber"
+                    )] = measured["value"]
+                    if measured.get("peak_bin") is not None:
+                        metrics["spectrum_peak_bin"] = measured["peak_bin"]
+            plot_name = {
+                "spectrum": "plot_spectrum",
+                "constellation": "plot_constellation",
+                "eye": "plot_eye",
+            }.get(kind)
+            if plot_name:
+                plotted = registry.call(plot_name, {"sps": sps} if plot_name != "plot_spectrum" else {}, ctx)
+                self._record_tool_result(ctx, plot_name, plotted)
+                if plotted.get("path"):
+                    key = {
+                        "plot_spectrum": "spectrum_png",
+                        "plot_constellation": "constellation_png",
+                        "plot_eye": "eye_png",
+                    }[plot_name]
+                    ctx.extra.setdefault("artifacts", {})[key] = plotted["path"]
+        if diagnose:
+            diagnosis = registry.call("debug_by_metric", {
+                "metric": "evm" if "evm" in requested else "spectrum",
+                "modulation": modulation,
+                "sps": sps,
+            }, ctx)
+            self._record_tool_result(ctx, "debug_by_metric", diagnosis)
+            issue = "偏高" in str(diagnosis.get("verdict") or "")
+            reply = self._fold(
+                ctx,
+                diagnosis.get("narrative") or diagnosis.get("error") or "诊断完成。",
+                source="deterministic-stage", ok=not issue and bool(diagnosis.get("ok")),
+            )
+            if issue:
+                block = ctx.blocks.get("chan")
+                parameter = (getattr(block, "params", None) or {}).get("noise_voltage")
+                try:
+                    value = max(float(parameter.get_value()) / 2.0, 0.0)
+                except (AttributeError, TypeError, ValueError):
+                    value = 0.02
+                reply.pending = {
+                    "action": "workflow_checkpoint",
+                    "reason": "EVM 偏高，应用最小噪声参数修复",
+                    "approved": False,
+                    "proposed_changes": [{
+                        "block_id": "chan",
+                        "parameter": "noise_voltage",
+                        "value": value,
+                    }],
+                }
+            return reply
+        return self._fold(
+            ctx, "工程检查与测量完成。", source="deterministic-stage", ok=True
+        )
+
+    @staticmethod
+    def _record_tool_result(
+        ctx: ToolContext, kind: str, result: Dict[str, Any]
+    ) -> None:
+        ctx.extra.setdefault("events", []).append(
+            {"kind": kind, "payload": dict(result or {})}
+        )
+
+    def _finish_workflow_reply(
+        self,
+        reply: AgentReply,
+        *,
+        ok: Optional[bool] = None,
+        outcome: str = "",
+    ) -> None:
+        stage = self._workflow.current_stage()
+        if stage and stage.execution_status in ("running", "errored"):
+            succeeded = (
+                reply.stage not in ("ERROR", "CRITIC", "DENY")
+                if ok is None else bool(ok)
+            )
+            active = self._state.coordination.active_task
+            envelope = ResultEnvelope(
+                task_id=active.task_id if active else f"task-{uuid.uuid4().hex[:8]}",
+                workflow_id=self._workflow.workflow.workflow_id,
+                stage_id=stage.id,
+                workflow_revision=self._workflow.workflow.revision,
+                base_project_version=self._workflow.workflow.base_project_version,
+                ok=succeeded,
+                outcome=outcome or ("passed" if succeeded else "failed"),
+                artifacts=reply.artifacts,
+                produced_claims=[claim.get("id") for claim in reply.claims if claim.get("id")],
+                proposed_changes=list(reply.pending.get("proposed_changes") or []),
+                note=reply.text,
+            )
+            envelope.validate()
+            result = vars(envelope)
+            result["errored"] = reply.stage == "ERROR"
+            result["improvement_available"] = any(
+                invocation.name in ("explain_error", "debug_by_metric", "diagnose_by_metric")
+                for invocation in reply.tool_invocations
+            )
+            self._workflow.accept_result(result)
+            self._state.coordination.active_task = None
+            self._workflow.workflow.base_project_version = int(
+                self._state.project.flowgraph_version
+            )
+            self._workflow.save()
+        current = self._workflow.current_stage()
+        if current and current.execution_status == "waiting" and current.checkpoint:
+            reply.stage = "CONFIRM"
+            reply.needs_confirmation = True
+            if not reply.pending:
+                reply.pending = {
+                    "action": "workflow_checkpoint",
+                    "reason": current.checkpoint.reason,
+                    "approved": False,
+                }
+        digest = self._workflow.digest()
+        reply.workflow_digest = digest
+        reply.done = digest.get("execution_status") == "completed"
+
+    def _workflow_waiting_reply(self) -> AgentReply:
+        stage = self._workflow.current_stage()
+        intent = self._workflow.workflow.intent if self._workflow.workflow else None
+        missing = list(getattr(intent, "missing_slots", None) or [])
+        if missing:
+            labels = {
+                "modulation": "请说明调制方式（如 BPSK、QPSK 或 OFDM）。",
+                "current_project": "当前没有可供检查的工程，请先构建或打开一个 .grc。",
+                "hardware": "请说明 SDR 设备类型（如 USRP B210）。",
+            }
+            text = "\n".join(labels.get(item, f"请补充 {item}。") for item in missing)
+            pending = {}
+        else:
+            pending_items = list(self._state.coordination.pending_confirmations or [])
+            pending = dict(pending_items[-1]) if pending_items else {
+                "action": "workflow_checkpoint",
+                "reason": stage.checkpoint.reason if stage and stage.checkpoint else "",
+                "approved": False,
+            }
+            text = "当前 Stage 等待你的确认；确认后继续，取消则保留现有工程。"
+        return AgentReply(
+            text=text,
+            stage="CONFIRM",
+            needs_confirmation=True,
+            claims=ClaimStore(self._state).summary(),
+            spec_digest=self._state.spec_digest(),
+            pending=pending,
+            workflow_digest=self._workflow.digest(),
+        )
+
+    def _workflow_cancelled_reply(self) -> AgentReply:
+        return AgentReply(
+            text="已取消当前 Workflow，现有工程保持不变。",
+            stage="CANCELLED",
+            done=True,
+            claims=ClaimStore(self._state).summary(),
+            spec_digest=self._state.spec_digest(),
+            workflow_digest=self._workflow.digest(),
+        )
 
     # ---- 统一折叠:ctx -> AgentReply ---------------------------------
     def _fold(self, ctx: ToolContext, narrative: str, *,
@@ -539,6 +975,7 @@ class ServiceAgent:
         reply.needs_confirmation = True
         reply.claims = ClaimStore(self._state).summary()
         reply.spec_digest = self._state.spec_digest()
+        reply.workflow_digest = self._workflow.digest()
         return reply
 
     @staticmethod
