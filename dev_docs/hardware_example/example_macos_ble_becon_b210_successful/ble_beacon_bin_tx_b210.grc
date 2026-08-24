@@ -1,0 +1,151 @@
+options:
+  parameters:
+    author: DeepRadio
+    catch_exceptions: 'True'
+    category: '[DeepRadio]'
+    cmake_opt: ''
+    comment: 'Transmit the supplied BLE beacon complex-IQ .bin file with a USRP B210 on macOS/RadioConda.'
+    copyright: ''
+    description: 'The input file is little-endian interleaved float32 I/Q: 200000 complex samples at 2 MS/s. It contains one BLE advertising-channel-38 waveform followed by zero padding to 100 ms, and is repeated continuously.'
+    gen_cmake: 'On'
+    gen_linking: dynamic
+    generate_options: no_gui
+    hier_block_src_path: '.:'
+    id: ble_beacon_bin_tx_b210
+    max_nouts: '0'
+    output_language: python
+    placement: (0,0)
+    qt_qss_theme: ''
+    realtime_scheduling: ''
+    run: 'True'
+    run_command: '{python} -u {filename}'
+    run_options: prompt
+    sizing_mode: fixed
+    thread_safe_setters: ''
+    title: 'BLE Beacon BIN TX - USRP B210 - Channel 38'
+    window_size: 1280, 720
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [8, 8]
+    rotation: 0
+    state: enabled
+
+blocks:
+- name: samp_rate
+  id: variable
+  parameters:
+    comment: 'Must match the .bin waveform sample rate; do not change unless the file is regenerated.'
+    value: 2e6
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [16, 24]
+    rotation: 0
+    state: enabled
+- name: center_freq
+  id: variable
+  parameters:
+    comment: 'BLE advertising channel 38 center frequency.'
+    value: 2426e6
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [160, 24]
+    rotation: 0
+    state: enabled
+- name: tx_gain
+  id: variable
+  parameters:
+    comment: 'Original UHD implementation used 65 dB. Reduce for cabled or close-range tests.'
+    value: '65'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [320, 24]
+    rotation: 0
+    state: enabled
+- name: waveform_samples
+  id: variable
+  parameters:
+    comment: '200000 samples / 2 MS/s = 100 ms repeat period.'
+    value: '200000'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [448, 24]
+    rotation: 0
+    state: enabled
+- name: blocks_file_source_0
+  id: blocks_file_source
+  parameters:
+    affinity: ''
+    alias: ''
+    begin_tag: pmt.PMT_NIL
+    comment: 'Complex64 source: each sample is two native little-endian float32 values (I then Q). Repeat preserves the embedded 100 ms beacon interval.'
+    file: /Users/decade/Library/CloudStorage/OneDrive-个人/iiot/5_academia/DeepRadio/experiment/example_macos_ble_becon/ble_beacon_localname_radiomaster.bin
+    length: waveform_samples
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    offset: '0'
+    repeat: 'True'
+    type: complex
+    vlen: '1'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [48, 176]
+    rotation: 0
+    state: enabled
+- name: uhd_usrp_sink_0
+  id: uhd_usrp_sink
+  parameters:
+    affinity: ''
+    alias: ''
+    ant0: TX/RX
+    bw0: samp_rate
+    center_freq0: center_freq
+    clock_rate: '0.0'
+    clock_source0: internal
+    comment: 'USRP B210 channel A. CPU format fc32 and over-the-wire format sc16 match the previous UHD transmitter.'
+    dev_addr: '"type=b200"'
+    dev_args: '""'
+    gain0: tx_gain
+    gain_type0: default
+    len_tag_name: '""'
+    lo_export0: 'False'
+    lo_source0: internal
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    nchan: '1'
+    num_mboards: '1'
+    otw: sc16
+    samp_rate: samp_rate
+    sd_spec0: ''
+    show_lo_controls: 'False'
+    start_time: '-1.0'
+    stream_args: ''
+    stream_chans: '[]'
+    sync: none
+    time_source0: internal
+    type: fc32
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [560, 152]
+    rotation: 0
+    state: enabled
+
+connections:
+- [blocks_file_source_0, '0', uhd_usrp_sink_0, '0']
+
+metadata:
+  file_format: 1
+  grc_version: 3.10.12.0

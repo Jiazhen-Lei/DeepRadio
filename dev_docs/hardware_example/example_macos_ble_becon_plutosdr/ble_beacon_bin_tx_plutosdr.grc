@@ -1,0 +1,144 @@
+options:
+  parameters:
+    author: DeepRadio
+    catch_exceptions: 'True'
+    category: '[DeepRadio]'
+    cmake_opt: ''
+    comment: Transmit the supplied BLE beacon complex-IQ .bin file with a PlutoSDR
+      on macOS/RadioConda.
+    copyright: ''
+    description: 'The input file is little-endian interleaved float32 I/Q: 200000
+      complex samples at 2 MS/s. It contains one BLE advertising-channel-38 waveform
+      followed by zero padding to 100 ms, and is repeated continuously.'
+    gen_cmake: 'On'
+    gen_linking: dynamic
+    generate_options: no_gui
+    hier_block_src_path: '.:'
+    id: ble_beacon_bin_tx_plutosdr
+    max_nouts: '0'
+    output_language: python
+    placement: (0,0)
+    qt_qss_theme: ''
+    realtime_scheduling: ''
+    run: 'True'
+    run_command: '{python} -u {filename}'
+    run_options: prompt
+    sizing_mode: fixed
+    thread_safe_setters: ''
+    title: BLE Beacon BIN TX - PlutoSDR - Channel 38
+    window_size: 1280, 720
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [8, 8]
+    rotation: 0
+    state: enabled
+
+blocks:
+- name: center_freq
+  id: variable
+  parameters:
+    comment: BLE advertising channel 38 center frequency.
+    value: '2426000000'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [160, 24]
+    rotation: 0
+    state: enabled
+- name: samp_rate
+  id: variable
+  parameters:
+    comment: Must match the .bin waveform sample rate; do not change unless the file
+      is regenerated.
+    value: '2000000'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [16, 24]
+    rotation: 0
+    state: enabled
+- name: tx_attenuation
+  id: variable
+  parameters:
+    comment: PlutoSDR TX attenuation in dB. Larger values produce lower RF output
+      power.
+    value: '30'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [320, 24]
+    rotation: 0
+    state: enabled
+- name: waveform_samples
+  id: variable
+  parameters:
+    comment: 200000 samples / 2 MS/s = 100 ms repeat period.
+    value: '200000'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [448, 24]
+    rotation: 0
+    state: enabled
+- name: blocks_file_source_0
+  id: blocks_file_source
+  parameters:
+    affinity: ''
+    alias: ''
+    begin_tag: pmt.PMT_NIL
+    comment: 'Complex64 source: each sample is two native little-endian float32 values
+      (I then Q). Repeat preserves the embedded 100 ms beacon interval.'
+    file: ble_beacon_localname_radiomaster.bin
+    length: waveform_samples
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    offset: '0'
+    repeat: 'True'
+    type: complex
+    vlen: '1'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [48, 176]
+    rotation: 0
+    state: enabled
+- name: iio_pluto_sink_0
+  id: iio_pluto_sink
+  parameters:
+    affinity: ''
+    alias: ''
+    attenuation1: tx_attenuation
+    bandwidth: samp_rate
+    buffer_size: '32768'
+    comment: PlutoSDR transmitter using the standard USB-network IIO context.
+    cyclic: 'False'
+    filter: ''
+    filter_source: '''Auto'''
+    fpass: '0'
+    frequency: center_freq
+    fstop: '0'
+    len_tag_key: '""'
+    samplerate: samp_rate
+    type: fc32
+    uri: ''
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [560, 152]
+    rotation: 0
+    state: enabled
+
+connections:
+- [blocks_file_source_0, '0', iio_pluto_sink_0, '0']
+
+metadata:
+  file_format: 1
+  grc_version: 3.10.12.0
