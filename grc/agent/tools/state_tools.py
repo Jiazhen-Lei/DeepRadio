@@ -125,7 +125,6 @@ def redundant_recipe_switch(state, text: str) -> Optional[str]:
 
 
 def resolve_confirmation(ctx: ToolContext, text: str) -> Dict[str, Any]:
-    state = _state(ctx)
     normalized = (text or "").strip().lower()
     reject = any(
         phrase in normalized
@@ -146,16 +145,26 @@ def resolve_confirmation(ctx: ToolContext, text: str) -> Dict[str, Any]:
             for phrase in ("确认执行", "确认修改", "同意修改", "继续执行")
         )
     )
+    if affirm:
+        return resolve_confirmation_decision(ctx, approved=True)
+    if reject:
+        return resolve_confirmation_decision(ctx, approved=False)
+    return {"ok": True, "resolved": False}
+
+
+def resolve_confirmation_decision(
+    ctx: ToolContext, *, approved: bool
+) -> Dict[str, Any]:
+    """Synchronize a structured GUI decision with the Policy pending record."""
+    state = _state(ctx)
     if not state.coordination.pending_confirmations:
         return {"ok": True, "resolved": False}
     pending = state.coordination.pending_confirmations[-1]
-    if affirm:
+    if approved:
         pending["approved"] = True
-        return {"ok": True, "resolved": True, "approved": True}
-    if reject:
+    else:
         state.coordination.pending_confirmations.pop()
-        return {"ok": True, "resolved": True, "approved": False}
-    return {"ok": True, "resolved": False}
+    return {"ok": True, "resolved": True, "approved": bool(approved)}
 
 
 def commit_intent(ctx: ToolContext, text: str) -> Dict[str, Any]:
@@ -472,18 +481,26 @@ def hardware_preflight(ctx: ToolContext, device_type: str = ""):
     sample_rate = configured.get("sample_rate")
     if sample_rate is None:
         sample_rate = workflow_slots.get("sample_rate")
-    driver = "uhd_find_devices" if requested in ("usrp", "b210", "b200") else ""
+    if requested in ("usrp", "b210", "b200") or "b210" in requested or "usrp" in requested:
+        driver = "uhd_find_devices"
+    elif "pluto" in requested:
+        driver = "iio_info"
+    else:
+        driver = ""
     checks = {
         "device_type_present": bool(requested),
         "driver_command_available": bool(driver and shutil.which(driver)),
         "center_frequency_present": center_freq is not None,
         "sample_rate_present": sample_rate is not None,
-        "real_hardware_actions_enabled": False,
+        "real_hardware_actions_enabled": (
+            os.environ.get("GRC_AGENT_ENABLE_RF") == "1"
+        ),
     }
     complete = all(
         checks[name]
         for name in (
             "device_type_present",
+            "driver_command_available",
             "center_frequency_present",
             "sample_rate_present",
         )
@@ -494,7 +511,11 @@ def hardware_preflight(ctx: ToolContext, device_type: str = ""):
         "device_type": requested,
         "checks": checks,
         "missing": [name for name, value in checks.items() if not value and name != "real_hardware_actions_enabled"],
-        "note": "仅完成配置与驱动只读预检；真实发射、启动和停止能力未启用。",
+        "note": (
+            "配置与驱动只读预检完成；RF 运行功能已由系统管理员启用。"
+            if checks["real_hardware_actions_enabled"]
+            else "配置与驱动只读预检完成；RF 运行功能尚未启用。"
+        ),
     }
 
 

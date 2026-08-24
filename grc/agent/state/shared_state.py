@@ -90,6 +90,7 @@ class ResultEnvelope:
     base_project_version: int = 0
     completion: Dict[str, bool] = field(default_factory=dict)
     invocations: List[Dict[str, Any]] = field(default_factory=list)
+    acceptance: Dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
         if not all((self.task_id, self.workflow_id, self.stage_id)):

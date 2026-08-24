@@ -70,7 +70,7 @@ _SUBAGENT_DEFS = [
     ),
     (
         "protocol_agent",
-        "构建并离线验证 BLE Advertising PDU、PHY 波形和 UHD TX 流图。",
+        "构建并离线验证 BLE Advertising PDU、PHY 波形和 TX 流图（B210 或 PlutoSDR）。",
         _sp.build_protocol_prompt,
         ["grc-ble-advertising", "grc-ble-phy", "grc-build", "grc-critic"],
         [
@@ -78,6 +78,7 @@ _SUBAGENT_DEFS = [
             "generate_ble_1m_waveform",
             "verify_ble_packet_bits",
             "build_ble_uhd_tx_flowgraph",
+            "build_ble_pluto_tx_flowgraph",
             "validate_flowgraph",
         ],
     ),
@@ -90,6 +91,7 @@ _SUBAGENT_DEFS = [
             "hardware_preflight", "configure_sdr", "list_devices",
             "discover_devices", "probe_device", "start_flowgraph",
             "query_runtime_status", "stop_flowgraph", "emergency_stop",
+            "arm_hardware_flowgraph",
             "inspect_flowgraph", "build_usrp_rx_spectrum_flowgraph",
         ],
     ),

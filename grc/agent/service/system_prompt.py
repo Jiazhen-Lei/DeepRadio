@@ -57,8 +57,8 @@ def build_orchestrator_prompt(subagent_names: Iterable[str],
         "每次委派都在 description 中传完整 JSON TaskCard(task_id,workflow_id,stage_id,"
         "workflow_revision,base_project_version,loop_mode,target_agent,instruction,inputs,"
         "expected_results)。不得删除或改写版本字段。\n"
-        "Stage 的每个 recommended_agents 必须至少委派一次 task；每一次委派都是独立的"
-        "TaskCard/ResultEnvelope。子代理必须返回 ResultEnvelope JSON。"
+        "recommended_agents 是路由建议；选择足以完成 completion 的最小子代理集合。"
+        "每一次实际委派都是独立的 TaskCard/ResultEnvelope，子代理必须返回 ResultEnvelope JSON。"
         "遇 DENY/CONFIRM、Failed claim 或待确认项时停止执行并向用户汇总。\n\n"
         "【停止条件(必须遵守)】\n"
         "  - design_flowgraph 返回 ok=true 且 valid=true,且指标已满足成功条件时,"
@@ -105,7 +105,9 @@ def _domain_prompt(role: str, skill: str, duties: str) -> str:
         + f"\n【角色:{role}】\nSKILL: {skill}。\n{duties}\n"
         "输入必须视为 TaskCard；完成后返回紧凑 JSON ResultEnvelope，"
         "包含 task_id、workflow_id、stage_id、workflow_revision、base_project_version、"
-        "ok、outcome、produced_claims、proposed_changes、artifacts、note。"
+        "ok、outcome、produced_claims、proposed_changes、artifacts、completion、note。"
+        "outcome 只能是 passed/failed/inconclusive；artifacts 必须是对象；"
+        "completion 必须是 expected_results 名称到布尔值的映射。"
         "不得绕过 registry/design_link 或 PolicyGateway。\n"
     )
 

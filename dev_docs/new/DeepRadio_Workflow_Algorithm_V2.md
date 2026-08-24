@@ -1,431 +1,312 @@
 # DeepRadio Workflow 算法 V2
 
-> 日期：2026-08-23  
-> 读者：工作流设计、控制面语义  
-> 本文写 Turn / Intent / Task / Workflow / Stage / Invocation，以及完成契约、确认点、失效与重试。  
-> 代码路径、GUI 控件、点击 SOP 不在本文。落地文件见工程文档。
->
-> 同族文档：
-> - 产品：`DeepRadio_Product_V2.md`
-> - 算法：`DeepRadio_Workflow_Algorithm_V2.md`（本文）
-> - 工程：`DeepRadio_Engineering_V2.md`
-> - 测试：`DeepRadio_Test_and_Experiment_V2.md`
+> 日期：2026-08-24
+> 读者：算法、Agent、Workflow 与评测开发人员
+> 范围：文本到 Workflow、状态模型、执行选择、完成判定、反馈传播和硬件闭环
 
 ---
 
-## 1. 目标
+## 1. 算法目标
 
-把 DeepRadio 从「一次对话直接建图」升级为 Task 驱动的 Dynamic Workflow：识别任务类型，从候选库取得建议 Stage 骨架，结合当前工程实例化本次 Workflow，并在每个 Stage 内调度一个或多个领域 Subagent。
+DeepRadio 将用户自然语言转换成可执行、可确认、可恢复、可审计的通信工程流程：
 
-约束：
+```text
+用户文本
+→ User Turn 关系判断
+→ Intent 结构化
+→ Task 选择与 Stage 实例化
+→ Stage 执行器和能力装配
+→ Completion 判定
+→ Workflow 转移
+→ SharedState、Claims、Evidence 与 GUI 同步
+```
 
-- 七类 Task，不要加第八类。调制方式、信道、频率、采样率是槽位。
-- 单一活动 Workflow，串行 Stage。
-- 代码控制状态迁移；模型只做受约束的意图补全、Stage 内协作和结果叙述。
-- 有 LLM 与确定性降级两条路径，写入同一套 Stage 状态、outcome、Checkpoint 和事件。
-- BLE 空口不是新 Task，而是 `HARDWARE_CONFIGURE` 且 `operation=deploy` 的条件 Stage。
+下一步由三类输入共同决定：
+
+```text
+Next = F(当前 Workflow/工程状态，用户本轮决定，反馈影响范围)
+```
+
+算法需要同时保证：
+
+- 用户原始目标和显式参数保持最高优先级；
+- Task 按终态产物、验收方式和安全边界选择；
+- Stage 对应可判定的中间产物或必须由用户表态的边界；
+- Subagent、Skill 和 Tool 由能力约束动态装配；
+- 每个通过状态都有 Completion 与 Evidence 支撑；
+- 工程修改、设备操作和 RF 发射受 Policy 与 Checkpoint 约束；
+- 失败只回退受影响范围，保留仍然有效的上游事实和证据。
 
 ---
 
-## 2. 核心概念
+## 2. 核心对象
 
-```text
-User Turn
-└── Intent
-    └── Task Candidate
-        └── Workflow Instance
-            └── Stage
-                └── Subagent Invocation
-                    └── Skill + Tool
+### 2.1 Intent
+
+Intent 表达用户本轮的结构化语义：
+
+```json
+{
+  "turn_relation": "new_task | answer | confirm | reject | feedback | cancel",
+  "task_type": "HARDWARE_CONFIGURE",
+  "operation": "deploy",
+  "capabilities": ["protocol", "hardware_runtime", "deploy"],
+  "slots": {
+    "protocol": "ble",
+    "hardware": "pluto",
+    "center_freq": 2402000000,
+    "local_name": "loveu",
+    "duration_seconds": 30
+  },
+  "slot_sources": {
+    "local_name": "user"
+  },
+  "missing_slots": [],
+  "confidence": 0.96
+}
 ```
 
-| 概念 | 含义 |
-|---|---|
-| User Turn | 本轮用户输入，以及它与当前 Workflow 的关系 |
-| Intent | 结构化解释：任务类型、槽位、置信度、待补信息 |
-| Task Candidate | 一类用户目标的建议模板：必要上下文、Stage、完成条件、分支、重试 |
-| Workflow Instance | 针对本次请求和当前工程实例化后的运行对象 |
-| Stage | 两个用户交互点之间的连续执行，以完成契约结束 |
-| Subagent Invocation | Stage 内一次委派：TaskCard 描述任务，ResultEnvelope 返回结果 |
+`slot_sources=user` 的字段受保护，规则补全、LLM 补全和默认值均不得覆盖。低置信输入可由 Intent LLM 输出结构化补充；响应无效或模型不可用时使用规则结果。
 
-### 2.1 User Turn 关系
+### 2.2 Workflow
+
+Workflow 保存一个活动任务的执行状态：
+
+- `workflow_id`、`task_type`、`revision`；
+- `base_project_version`；
+- Intent、capabilities、missing slots；
+- 当前 Stage 和完整 Stage 列表；
+- Workflow/Stage 的状态、attempt、outcome；
+- Completion 结果；
+- Checkpoint 与等待原因。
+
+### 2.3 SharedState
+
+SharedState 保存跨 Stage 共享的领域事实：
+
+- RadioSpec 和用户锁定约束；
+- 当前 GRC 工程、版本、语义哈希和快照；
+- Tool 产生的工件；
+- Claim、Evidence 和验证版本；
+- 设备身份、RF armed 状态和 runtime 摘要。
+
+### 2.4 TaskCard 与 ResultEnvelope
+
+TaskCard 是 Main Agent 给执行器的最小任务边界，至少包含：
 
 ```text
-new_task     创建新任务
-answer       回答规格问题
-adjustment   调整尚未执行的方案
-feedback     对已有产物提出修改
-approval     批准待执行操作
-rejection    拒绝待执行操作
-cancel       终止当前 Workflow
+task_id、workflow_id、workflow_revision、stage_id、attempt
+目标、允许能力、推荐 Agent、允许 Tool、输入事实、Completion 条件
 ```
 
-存在活动 Workflow 时，先判断本轮属于哪一种关系，再决定继续、回退、失效或归档。低置信续跑保持同一 `workflow_id`；只有口头「新任务」或强 Task 类型切换才覆盖。缺规格补充和失败反馈必须保持 `workflow_id`。
+ResultEnvelope 是执行器返回的严格结果：
+
+```text
+task_id、workflow_id、workflow_revision、stage_id
+ok、outcome、protocol_valid、tool_calls、artifacts、claims、errors
+```
+
+所有执行模式使用相同 Envelope。ID、revision 或 Stage 不匹配时，结果被拒绝提交。
 
 ---
 
-## 3. 总体结构
+## 3. 七类 Task 候选库
 
-```text
-GRC Workspace
-  → ServiceAgent（GUI 契约、会话、主/降级路由）
-    → WorkflowEngine（Intent、实例化、Stage 迁移、Checkpoint、恢复）
-         ├─ Task Catalog（建议 Stage 与分支）
-         └─ StageExecutor（TaskCard / ResultEnvelope）
-              → Domain Subagents
-                   → Skill + Deterministic Tools
-                        → GNU Radio Core
-```
-
-`WorkflowEngine` 是唯一控制面。不要另造第二套状态机。GUI 只消费摘要，不自己推进 Stage。
-
-单轮逻辑：
-
-```text
-ServiceAgent.step(user_text)
-  → WorkflowEngine.consume_turn
-  → 创建或恢复 Workflow
-  → 处理 Checkpoint / 调整 / 反馈
-  → 获取 current_stage
-  → StageExecutor.execute
-  → 校验 ResultEnvelope
-  → WorkflowEngine.accept_result
-  → 保存控制状态与工程事实
-  → ServiceAgent._fold
-  → AgentReply
-```
-
-一个用户轮次可以连续完成同一 autonomous Stage 内的多个 Subagent 调用。遇到 Checkpoint、外部等待、重试上限或 Workflow 终态时返回 GUI。
-
----
-
-## 4. Task 候选库
-
-### 4.1 七类 Task
-
-| Task Type | 用户目标 | 主要产物 |
+| Task | 终态产物 | 核心 Stage |
 |---|---|---|
-| `END_TO_END_SIM` | 构建通信系统并完成仿真验证 | `.grc`、指标、图、Claims |
-| `TX_BUILD` | 构建发射链路 | 发射机 `.grc`、结构校验 |
-| `RX_BUILD` | 构建接收链路 | 接收机 `.grc`、接收质量结果 |
-| `DIAGNOSE` | 定位当前工程问题 | 诊断结论、Evidence、修复建议 |
-| `MODIFY_PROJECT` | 修改已有工程 | 新 Flowgraph version、重验结果 |
-| `OBSERVE` | 查看结构、频谱、星座或指标 | 测量结果和图片 |
-| `HARDWARE_CONFIGURE` | 规划、配置或受控部署 SDR | 硬件配置、预检、或受控发射状态 |
+| `END_TO_END_SIM` | 完整流图、测量与 Claims | 规格对齐 → 构建与验证 |
+| `TX_BUILD` | 发射链路与结构校验 | 规格对齐 → TX 构建与校验 |
+| `RX_BUILD` | 接收链路、BER/质量证据 | RX 规格对齐 → 构建与验证 |
+| `DIAGNOSE` | 诊断、证据、可选修复 | 检查诊断 → 修复确认 → 修复验证 |
+| `MODIFY_PROJECT` | 新工程版本和重验结果 | 检查计划 → 修改确认 → 应用验证 |
+| `OBSERVE` | 图、指标或结构观察 | 检查与测量 |
+| `HARDWARE_CONFIGURE` | 配置、运行或空口 Evidence | 按 operation 选择配置、运行或部署 Stage |
 
-新增 Task Type 的依据是：最终产物变化、验收标准变化、或用户确认/安全边界变化。BPSK/QPSK/QAM/OFDM 共享 `END_TO_END_SIM`。
+分类采用以下顺序：
 
-### 4.2 建议 Stage
+1. 提取显式操作词、期望产物、验收方式和硬件安全范围；
+2. 识别复合请求中的最终目标；
+3. 选择覆盖最终目标且能容纳前置能力的 Task；
+4. 使用 capabilities 添加条件 Stage；
+5. 对低置信或冲突槽位发起澄清。
 
-| Task Type | 建议 Stage |
+调制方式、协议、设备型号和频率属于槽位或能力。它们驱动 Stage 参数与 Tool 选择，不扩张顶层 Task 数量。
+
+---
+
+## 4. User Turn 与活动 Workflow
+
+每轮文本先判断和活动 Workflow 的关系：
+
+| 关系 | 处理 |
 |---|---|
-| `END_TO_END_SIM` | `spec_alignment? → build_and_verify` |
-| `TX_BUILD` | `spec_alignment? → tx_build_and_validate` |
-| `RX_BUILD` | `rx_spec_alignment? → rx_build_and_verify` |
-| `DIAGNOSE` | `inspect_and_diagnose → repair_confirmation? → repair_and_verify?` |
-| `MODIFY_PROJECT` | `inspect_and_plan → change_confirmation? → apply_and_verify` |
-| `OBSERVE` | `inspect_and_measure` |
-| `HARDWARE_CONFIGURE`（configure） | `hardware_precheck → hardware_confirmation → configure_and_check` |
-| `HARDWARE_CONFIGURE`（deploy） | 见 §12 |
+| `new_task` | 创建 Workflow；明确终止当前任务时先归档和停止 runtime |
+| `answer` | 填补当前缺失槽位，保持 `workflow_id` |
+| `confirm` | 仅解决当前 `checkpoint_id` |
+| `reject` | 执行该 Checkpoint 的拒绝分支 |
+| `feedback` | 计算影响范围并失效相关 Stage/Claim |
+| `cancel` | 取消 Workflow，停止 runtime，清除 armed 状态 |
 
-`?` 表示按领域槽位、Policy 或执行结果动态启用的条件 Stage。
-
-实例化顺序：
-
-1. 识别 User Turn 与当前 Workflow 的关系；
-2. 提取 Task Type 和领域槽位；
-3. 读取对应 Task Candidate；
-4. 按现有工程、缺失槽位和 Policy 裁剪条件 Stage；
-5. 填充 Stage 输入、完成契约和最大尝试次数；
-6. 校验 Task、Stage 和 Subagent 名称；
-7. 原子写入 Workflow 实例；
-8. 激活第一个 Stage。
-
-MainAgent 可在候选库允许的范围内激活条件 Stage、填写参数和选择推荐 Subagent。WorkflowEngine 负责状态写入、转移和恢复。
-
-Catalog 示例（`MODIFY_PROJECT`）：
-
-```yaml
-stages:
-  - id: inspect_and_plan
-    interaction: autonomous
-    recommended_agents: [spec_agent, flowgraph_agent]
-    completion: [change_plan_created]
-    on:
-      completed: change_confirmation
-      errored: stop
-
-  - id: change_confirmation
-    interaction: conditional_checkpoint
-    when: [modulation_change, multi_block_change, hardware_change]
-    on:
-      approved: apply_and_verify
-      rejected: cancelled
-      not_required: apply_and_verify
-
-  - id: apply_and_verify
-    interaction: autonomous
-    recommended_agents: [flowgraph_agent, verification_agent, diagnosis_agent]
-    completion:
-      - flowgraph_saved
-      - structural_validation_completed
-      - affected_claims_evaluated
-    max_attempts: 2
-    on:
-      passed: completed
-      failed_with_improvement: apply_and_verify
-      failed_without_improvement: waiting_user
-      errored: stop
-```
+简单的“继续”“确认”和参数补充需要结合当前等待点解析。缺少活动 Checkpoint 的裸确认不触发受限操作。低置信关系判断优先保持当前 Workflow，并请求澄清。
 
 ---
 
-## 5. Intent
+## 5. 状态模型
 
-### 5.1 输出契约
+### 5.1 Workflow 与 Stage 状态
 
-```yaml
-turn_relation: new_task
-task_type: END_TO_END_SIM
-confidence: 0.94
-slots:
-  direction: transceiver
-  modulation: bpsk
-  channel: awgn
-  carrier_frequency: 2400000000
-  sample_rate: null
-  hardware: null
-  requested_metrics: [evm, spectrum]
-  success_conditions: ["EVM < 10%"]
-missing_slots: []
-```
-
-### 5.2 识别策略
-
-1. 运行时优先处理确认、拒绝、取消、只读分析和显式换配方；
-2. 规则解析调制、频率、采样率、带宽、符号率、信道、指标阈值和硬件类型；
-3. 低置信时可用结构化 LLM 补全任务类型、关系和剩余语义；未配置或失败时回退规则；
-4. 不覆盖 `slot_sources == user` 的槽位；
-5. 输出经过 Schema 和 Task Catalog 校验；
-6. 影响架构或硬件安全的缺失槽位进入 `spec_alignment` Checkpoint；
-7. 展示偏好和专业度画像独立于技术意图。
-
-### 5.3 与活动 Workflow 的关系
-
-先判断本轮是：当前 Checkpoint 的回答、对当前方案的调整、对当前产物的反馈、新任务、或取消。该判断决定继续、回退、失效或归档。
-
----
-
-## 6. 状态模型
-
-### 6.1 执行状态
-
-Workflow 和 Stage 使用：
+当前最小状态集合：
 
 ```text
-pending | running | waiting | completed | errored | invalidated
+pending      尚未进入
+running      正在执行
+waiting_user 等待输入或 Checkpoint
+completed    完成条件全部通过
+failed       执行完成且验收失败
+cancelled    用户取消或拒绝终止
+errored      执行器、工具或协议异常
+stale        上游事实变化，需要重验
 ```
 
-| 状态 | 含义 |
-|---|---|
-| `pending` | 已创建，等待成为当前 Stage |
-| `running` | 正在执行 Subagent 或 Tool |
-| `waiting` | 等待用户、Policy 或外部条件 |
-| `completed` | Stage 已正常产生符合契约的结果 |
-| `errored` | 工具异常、超时或结果协议校验失败 |
-| `invalidated` | 上游输入或工程版本变化，已有结果需要更新 |
-
-首版采用单一 `current_stage`。调度器直接判断当前 Stage 是否可执行，因此无需持久化 `ready`。
-
-CONFIRM 不会把 Workflow 标成 `completed`。所有 Stage completion 为 true 后才能 `completed`。空 Invocation 不得 vacuously pass。
-
-### 6.2 用户确认状态
-
-Checkpoint 使用 `pending | approved | rejected`。
-
-| Checkpoint | Stage execution_status | 含义 |
-|---|---|---|
-| `pending` | `waiting` | 等待用户决定 |
-| `approved` | `completed` | 确认完成，进入批准分支 |
-| `rejected` | `completed` | 确认完成，进入拒绝或取消分支 |
-
-同一次 Checkpoint 只有一个 `checkpoint_id`。GUI 确认/取消提交结构化决定，不走自然语言猜测。
-
-### 6.3 验证结论
-
-产生领域判断的 Stage 使用 `outcome`: `passed | failed | inconclusive`。
-
-```yaml
-execution_status: completed
-outcome: failed          # 校验进程正常，发现端口类型错误
-```
-
-```yaml
-execution_status: errored
-outcome: inconclusive    # 校验进程超时
-```
-
-三类字段分别表达执行生命周期、用户决定和领域结论。
-
----
-
-## 7. WorkflowEngine
-
-对外接口：
+用户确认由 Checkpoint 独立表达：
 
 ```text
-consume_turn(user_text, shared_state)
-instantiate(intent, shared_state)
-current_stage()
-start_stage()
-accept_result(result_envelope)
-resolve_checkpoint(decision)
-invalidate(cause, project_version)
-save()
+open → approved | rejected | cancelled
 ```
 
-职责：保存执行状态、执行状态迁移、管理 Checkpoint、校验 TaskCard 与 ResultEnvelope、处理版本/重试/失效、维护当前 Stage。
+执行状态、用户决定和验证结论分开保存。`approved` 只表示允许进入下一阶段；Stage 仍需 CompletionEvaluator 判定。
 
-MainAgent 职责：解释 Intent、选择候选、为当前 Stage 组织 TaskCard、在推荐范围内选择 Subagent、汇总冲突/证据/产物、生成面向用户的说明。
+### 5.2 Runtime 状态
 
-StageExecutor 职责：按 Stage 范围装配 MainAgent 和候选 Subagent、注入共享 ToolContext、记录委派和 Tool 调用、将模型输出收敛为 ResultEnvelope、无 LLM 时调用确定性 Stage handler。
-
-主 Agent 的工具权限按当前 Stage 收敛。领域写操作由 Subagent 工具白名单和 PolicyGateway 共同约束。
-
-### 7.1 Stage 转移
+硬件运行作为独立事务管理：
 
 ```text
-execution completed + outcome passed
-→ 下一 Stage 或 Workflow completed
-
-execution completed + outcome failed + 有改进空间
-→ 当前 Stage attempt + 1
-
-execution completed + outcome failed + 无改进
-→ waiting，向用户报告证据和选择
-
-execution errored + attempt 未达上限
-→ 重试当前 Stage
-
-execution errored + attempt 达上限
-→ Workflow errored
+prepared → armed → starting → running → stopped/exited
+                              └──────→ crashed
 ```
 
-### 7.2 版本检查
-
-TaskCard 与 ResultEnvelope 携带 `workflow_id`、`stage_id`、`workflow_revision`、`base_project_version`。接收结果时比较 Workflow revision 和 Flowgraph version；版本变化时将结果记为 stale event，并重新计算当前 Stage。
-
----
-
-## 8. TaskCard 与 ResultEnvelope
-
-TaskCard 描述一次委派：目标 Subagent、指令、输入、期望结果、以及 Workflow/Stage/版本。
-
-ResultEnvelope 返回：`ok`、`outcome`、产物、Claims、拟议修改、说明，以及相同的版本字段。写入 SharedState 和 Workflow 前执行结构校验、版本校验和 Policy 检查。`protocol_valid` 必须为 True。
-
-确定性路径按 `recommended_agents` 合成 TaskCard/ResultEnvelope。deepagents 路径按每次 `task` 委派绑定信封；缺委派不得用确定性信封充数，且必须覆盖全部 `recommended_agents`。
-
----
-
-## 9. Completion 硬门槛
-
-每个 Stage 声明 completion 列表。Evaluator 按契约检查产物、校验、Claims 版本和安全条件。不满足时不得 `passed`，Workflow 不得正常 `completed`。
-
-例如 `apply_and_verify` 需要流图已保存、结构校验完成、受影响 Claims 已评估。硬件 deploy 还需要停止得到确认：没有 `transmit_stopped=true` 时不得正常完成；无法确认停止时必须 `errored` 并触发紧急停止。
-
----
-
-## 10. Checkpoint 与 Policy
-
-默认生成用户 Checkpoint 的情况：
-
-- 缺少会改变链路结构的关键槽位；
-- 修改已有工程的调制方式或 recipe；
-- 多块结构修改；
-- 硬件配置和真实设备操作；
-- 诊断后准备实施较大范围修复；
-- 连续尝试未改善结果。
-
-Policy 决策：
+关键字段为：
 
 ```text
-ALLOW    允许当前操作
-PROPOSE  生成修改方案并创建 Checkpoint
-CONFIRM  等待明确批准
-DENY     终止该操作并记录原因
+run_id、pid、program、interpreter、started_at、deadline
+ready、startup_health_passed、running、return_code、crashed
 ```
 
-WorkflowEngine 将 Policy 结果转换为 Stage 状态和 Checkpoint。Checkpoint 与 Policy pending 通过 `checkpoint_id` 关联。
+一次空口 Evidence、停止结果和 runtime Claim 必须引用同一 `run_id`。
 
 ---
 
-## 11. 失效、重试与恢复
+## 6. Stage 规划与能力装配
 
-### 11.1 失效传播
+Stage 的建立准则：
 
-`invalidate()` 优先匹配 Catalog `depends_on`。
+1. 存在明确中间产物及可判定 Completion；
+2. 存在用户决策、风险授权或硬件连接边界；
+3. 失败需要形成独立回退范围；
+4. 所需能力、权限或运行环境发生变化。
 
-| 变化 | 影响范围 |
-|---|---|
-| 规格架构字段变化 | 设计、建图、验证 Stage |
-| recipe 或调制变化 | 建图、验证 Stage 和相关 Claims |
-| Flowgraph 保存 | 验证 Stage 和工程 Claims |
-| 成功条件变化 | 对应 Claim Evaluation |
-| 表达档位变化 | 用户叙述和 GUI 展示 |
-
-失效时保留旧 Stage 结果与事件，并提升 Workflow revision。
-
-### 11.2 循环控制
+每个 Stage 通过 `recommended_agents` 描述能力责任，通过 Tool 白名单限制动作范围。一个 Subagent 可以绑定多个 Skill，一个 Skill 也可被多个 Subagent 复用。装配关系为：
 
 ```text
-build_and_verify
-  ├─ passed → completed
-  ├─ failed + 有明确改进 → attempt + 1
-  └─ failed + 无改进或达到上限 → waiting_user
+Stage.required_capabilities
+→ Subagent capability match
+→ Skill instruction set
+→ Tool allowlist
+→ TaskCard
 ```
 
-默认 `max_attempts: 2`。每次尝试需产生新的参数、结构或 Evidence。相同结果指纹不再空转重试；连续结果无变化时提前停止。`errored` 在 `max_attempts` 内可 retry。
+当前主要 Subagent：
 
-### 11.3 会话恢复
+- `spec_agent`：意图、规格、缺失槽位；
+- `radio_design_agent`：通信链路和参数设计；
+- `flowgraph_agent`：GRC 结构和原子修改；
+- `verification_agent`：结构、仿真、协议和测量验收；
+- `diagnosis_agent`：失败解释与修复建议；
+- `hardware_agent`：设备、配置、运行和停止；
+- `protocol_agent`：BLE PDU、PHY 和协议验证。
 
-1. 加载工程事实；
-2. 加载并校验 Workflow；
-3. 比较 `base_project_version`；
-4. 对 `running` Stage 执行中断恢复；
-5. 恢复 Checkpoint 或当前 Stage；
-6. 写入恢复事件。
-
-进程中断时的 `running` Stage 恢复为 `pending`，attempt 保留并重新执行。
-
----
-
-## 12. 主路径与确定性路径
-
-两条路径均通过 WorkflowEngine 写入相同语义。
-
-| Stage | 确定性 handler 语义 |
-|---|---|
-| `build_and_verify` | 选型建图并验证 |
-| `inspect_and_measure` | 校验 + 仿真 + 指标 + 绘图 |
-| `inspect_and_diagnose` | 校验 + 按指标诊断 |
-| `apply_and_verify` | recipe 切换或原子 patch + 重验 |
-| `hardware_precheck` | 当前配置检查与能力报告 |
-
-deepagents 路径：StageExecutor 按当前 Stage 过滤 Subagent，传入 TaskCard；MainAgent 在推荐范围内协作；Subagent 通过确定性工具操作同一 ToolContext。
-
-六个领域角色：`spec_agent`、`radio_design_agent`、`flowgraph_agent`、`verification_agent`、`diagnosis_agent`、`hardware_agent`。实现可增加 `protocol_agent`，只承担 BLE 离线协议与 TX 流图，不成为第八类 Task。
-
-Skill 负责领域规则、步骤、输入输出契约和边界。Tool 白名单负责实际执行权限。Stage 通过 Subagent 间接获得 Skill。
+Task 候选库无需穷举所有文本。Text 数据集覆盖同义表达、参数顺序、否定约束、补充轮次和复合目标；Intent 将它们归一化为稳定槽位。
 
 ---
 
-## 13. BLE deploy 作为条件 Stage
-
-`HARDWARE_CONFIGURE` 在 `operation=configure` 时保持三 Stage。`operation=deploy` 且 `protocol=ble` 时动态插入：
+## 7. 执行模式选择
 
 ```text
-protocol_spec_alignment
-→ build_ble_advertiser
+if Stage 具有注册的确定性 handler:
+    mode = deterministic
+elif Stage 需要语义推理且模型可用:
+    mode = llm_subagent
+else:
+    返回 waiting_user 或 errored
+```
+
+适合确定性执行的任务包括：
+
+- PDU/CRC/白化/GFSK 生成与回环校验；
+- GRC 原子构建和结构检查；
+- 设备发现、身份探测和能力范围检查；
+- 解释器解析、Flowgraph 启动、状态查询和停止；
+- Manifest、哈希和 Claim 事务。
+
+LLM Subagent 负责语义不确定性、方案解释和开放式诊断。安全关键 Stage 的顺序和 Completion 由 Catalog 与 Engine 固定约束。
+
+确定性 Stage 的快速完成表示通用算法在当前输入参数上执行成功。事件应记录 `mode`、实际 `executor_id`、Tool 调用和耗时，使实验能够区分 LLM 推理与代码执行。
+
+---
+
+## 8. Completion 硬门槛
+
+Stage 进入 `completed` 前逐项验证 Catalog 的 Completion：
+
+```text
+passed = all(
+    产物存在且可解析，
+    Tool 返回 ok，
+    Claim 绑定当前工程版本，
+    ResultEnvelope 协议有效，
+    运行状态满足本 Stage 的安全条件
+)
+```
+
+关键硬件门槛：
+
+- `transmit_started`：`ok && running && ready && startup_health_passed && run_id`；
+- `over_air_observed`：runtime 仍在运行、未超 deadline、目标名称精确匹配、Evidence 绑定同一 `run_id`；
+- `transmit_stopped`：同一运行已终止、return code 合法、`crashed=false`。
+
+Checkpoint 解决路径当前已记录 decision 和 Evidence 字段。Inspector 的 Completion 计数仍需由结构化 Completion 结果补齐，这是当前算法接口的 P0 项。
+
+---
+
+## 9. 反馈、失效与重试
+
+反馈影响范围由字段依赖图和 Stage 的 `depends_on` 计算：
+
+```text
+changed_fields
+→ direct dependent stages
+→ downstream stages
+→ affected claims/evidence
+```
+
+处理规则：
+
+1. 更新 Intent/SharedState 并递增 revision；
+2. 将直接依赖和下游 Stage 标为 `stale` 或 `pending`；
+3. 失效绑定相应工程版本、设备身份或运行标识的 Claim；
+4. 保留无依赖关系的 Stage、产物和 Evidence；
+5. 从最早受影响 Stage 恢复执行。
+
+自动重试受 `max_attempts` 限制。只有检测到改进或输入发生有效变化时继续；相同结果指纹停止循环并进入 `waiting_user`。工程修改使用 snapshot 支持回滚。
+
+---
+
+## 10. BLE 部署算法
+
+BLE 部署属于 `HARDWARE_CONFIGURE`，由 `operation=deploy` 和 `protocol=ble` 选择以下 Stage：
+
+```text
+build_ble_advertiser
 → offline_protocol_verify
 → discover_and_probe_device
 → rf_plan_confirmation
@@ -435,60 +316,82 @@ protocol_spec_alignment
 → stop_and_finalize
 ```
 
-仍保持单 Workflow、串行 Stage、单一 Checkpoint 控制面。Intent 可保留 37/38/39 目标；当前构建语义只取列表中的第一个信道 37。三信道轮询是尚未落地的算法扩展，不能把单信道结果登记为三信道通过。
+### 10.1 离线协议
 
-LLM 只提取 `local_name` 等意图。PDU、CRC、whitening、GFSK 参数和 Flowgraph 必须由确定性代码生成。
+1. 从 local name、地址、广告类型等槽位构造 Advertising PDU；
+2. 根据 PDU Header 和 Payload 计算 BLE CRC24；
+3. 根据广告信道生成白化序列；
+4. 组装 preamble、access address、白化后的 PDU+CRC；
+5. 以 Gaussian filter 和调制指数参数生成 GFSK IQ；
+6. 独立解析、解白化、CRC 重算、IQ 解调进行回环验收；
+7. 把协议字段、波形参数和校验结果写入 Artifact/Claim。
 
-deploy Completion 包括：`ble_packet_valid`、`ble_waveform_generated`、`flowgraph_saved`、`structural_validation_completed`、`device_discovered`、`device_probed`、`rf_plan_approved`、`transmit_started`、`over_air_observed`、`transmit_stopped`。空口观察必须来自人工或独立接收，不得由发射端自证。
+这套算法对 local name、地址和信道参数化，验收条件来自协议关系与解码结果。
 
-只读发现/probe 不需要发射授权。`start_flowgraph` 需要 RF Checkpoint。`stop_flowgraph` 与 `emergency_stop` 始终允许，后者最高优先级。
+### 10.2 设备与受控发射
 
----
+设备名称先映射到声明式 HardwareProfile。Pluto 使用 USB IIO 扫描并提取 URI，再对精确 URI 执行 probe；B210 使用 UHD 发现和 probe。流图 Builder 由 Profile 选择。
 
-## 14. 三类持久化的语义分工
+批准 RF 计划后，系统根据当前语义哈希创建 `.armed.grc`。Runtime 解析可导入所需 GNU Radio 模块的 Python 解释器，生成代码并有限时长启动。启动宽限期内退出会直接返回失败。
 
-| 存储 | 回答的问题 |
-|---|---|
-| 工程事实（`state.json`） | 当前无线电工程是什么 |
-| 执行控制（`workflow.yaml`） | 系统为了完成当前目标正在做什么 |
-| 追加历史（`events.jsonl`） | 本轮发生过哪些 Turn、委派、工具和转移 |
+### 10.3 空口 Evidence
 
-工程事实保存 RadioSpec、ProjectState、`.grc` 路径和 version、Claims/Evidence、锁定约束、snapshot 索引、工程配置。
-
-执行控制保存 Task Type、Workflow/Stage 状态、Intent 和槽位、Checkpoint、attempt/outcome/结果摘要、当前工程版本引用。
-
-事件保存用户输入与决定、Workflow 创建和转移、Stage 开始/完成/等待/错误/失效、Subagent 委派、Tool 调用、Policy 决策、产物发布、stale 和恢复。事件外层含单调 `seq` 以及 `workflow_id` / `stage_id` / `attempt` / `profile_level`。
-
-Skill 内容、Tool Schema 和完整调用历史不写入 Workflow 实例正文。
-
----
-
-## 15. 工作区摘要契约
-
-返回 GUI 的紧凑摘要至少包括：`workflow_id`、`task_type`、`execution_status`、`current_stage`、`stage_index`、`stage_total`、`waiting_reason`，以及 Stage 列表、revision、attempt、completion 计数和时间线。GUI 用该摘要显示进度，用结构化 `checkpoint_id` 提交确认，不另建状态机。
-
----
-
-## 16. 首版边界与可量化事件
-
-首版：单会话、单活动 Workflow、单一主要 Task Type、串行 Stage、Stage 内顺序调用多个 Subagent、条件 Stage、Checkpoint、重试和失效恢复、仿真优先、硬件配置与预检。
-
-后续才考虑：多 Workflow 排队、并行只读 Stage、跨工程任务、完整 SDR 生命周期管理。仍不需要通用 DAG。
-
-统一事件名可用于后续实验：
+人工在 LightBlue 中观察目标 local name。点击“已看到目标名称”时，服务端执行：
 
 ```text
-intent_classified
-workflow_created
-stage_started
-subagent_invoked
-tool_called
-checkpoint_opened
-checkpoint_resolved
-stage_completed
-stage_errored
-stage_invalidated
-workflow_completed
-workflow_cancelled
-stale_result_discarded
+query_runtime_status
+→ 校验 running、deadline、run_id
+→ 校验 expected_name == observed_name
+→ 记录 observed_at 和 evidence_kind
+→ 可选复制截图到 final/evidence
+→ 创建 over_air_observed Claim
 ```
+
+随后 `stop_and_finalize` 停止同一运行并验证干净退出。`duration_seconds` 是最大运行窗口，空口确认可提前结束运行。
+
+---
+
+## 11. 持久化与恢复
+
+三类文件的语义分工：
+
+| 文件 | 语义 |
+|---|---|
+| `state.json` | 当前可用的领域事实与工程状态 |
+| `workflow.yaml` | 活动任务的执行控制状态 |
+| `events.jsonl` | 可追加、可计时、可审计的事件轨迹 |
+
+恢复时按以下顺序：
+
+1. 载入 SharedState；
+2. 载入 Workflow 并校验 schema/revision；
+3. 对比 `base_project_version` 和当前工程版本；
+4. 查询硬件 runtime；
+5. 将中断的 `running` Stage 收敛为可重试、等待用户或失败；
+6. 刷新 Claims 和 GUI digest。
+
+路径应以 session 根目录为基准持久化。导出 Manifest 应根据本轮显式产物集合生成，逐项写入相对路径、大小和 SHA-256。
+
+---
+
+## 12. 当前算法完善项
+
+### P0
+
+1. Checkpoint 决策形成完整 ResultEnvelope 和 Completion 结果。
+2. 导出 Artifact 集合由执行事务显式维护，Manifest 只消费该集合。
+3. Evidence 附件与 Claim、`run_id`、观察时间原子提交。
+4. GUI/Event 中分别展示 capability owner、execution mode 和 executor。
+
+### P1
+
+1. BLE 广告信道 37/38/39 调度、每信道白化和空口验收。
+2. runtime 超时、进程崩溃、重复启动和 emergency-stop 的模型化故障注入。
+3. 多轮反馈对 Stage 依赖图的覆盖率度量。
+4. Intent 数据集加入否定约束、模糊硬件名、复合操作和对抗性表达。
+
+### P2
+
+1. 多 Task 排队和跨 Workflow 依赖；
+2. 可并行 Stage 的资源锁与合并规则；
+3. 依据事件轨迹学习 Task/Stage 规划策略，同时保留 Catalog 安全约束。

@@ -35,9 +35,18 @@ _ARTIFACTS_NOTE = (
 )
 
 
-def _rec_event(ctx: ToolContext, kind: str, payload: Dict[str, Any]) -> None:
+def _rec_event(
+    ctx: ToolContext,
+    kind: str,
+    payload: Dict[str, Any],
+    args: Dict[str, Any] | None = None,
+) -> None:
     """把一次工具事件记进 ctx.extra['events'](供 adapter 折叠为事件流)。"""
-    ctx.extra.setdefault("events", []).append({"kind": kind, "payload": payload})
+    ctx.extra.setdefault("events", []).append({
+        "kind": kind,
+        "args": dict(args or {}),
+        "payload": payload,
+    })
 
 
 def _merge_artifacts(ctx: ToolContext, artifacts: Dict[str, Any]) -> None:
@@ -160,7 +169,7 @@ def build_grc_tools(
 
     def _call(name: str, arguments: Dict[str, Any]) -> str:
         result = registry.call(name, arguments, ctx)
-        _rec_event(ctx, name, result)
+        _rec_event(ctx, name, result, arguments)
         return json.dumps(result, ensure_ascii=False)
 
     @tool
@@ -324,11 +333,15 @@ def build_grc_tools(
     def generate_ble_1m_waveform(
         local_name: str, channel: int = 37,
         sample_rate: float = 2e6, interval_ms: float = 100.0,
+        bt: float = 0.5, modulation_index: float = 0.5,
+        digital_amplitude: float = 0.5,
     ) -> str:
         """Generate an offline BLE 1M GFSK waveform without hardware access."""
         return _call("generate_ble_1m_waveform", {
             "local_name": local_name, "channel": channel,
             "sample_rate": sample_rate, "interval_ms": interval_ms,
+            "bt": bt, "modulation_index": modulation_index,
+            "digital_amplitude": digital_amplitude,
         })
 
     @tool
@@ -340,15 +353,45 @@ def build_grc_tools(
     def build_ble_uhd_tx_flowgraph(
         waveform_path: str, channel: int = 37, sample_rate: float = 2e6,
         gain: float = 0.0, device_args: str = "type=b200",
+        duration_seconds: float = 30.0,
     ) -> str:
         """Build and validate, but never start, a BLE UHD TX flowgraph."""
         result = registry.call("build_ble_uhd_tx_flowgraph", {
             "waveform_path": waveform_path, "channel": channel,
             "sample_rate": sample_rate, "gain": gain, "device_args": device_args,
+            "duration_seconds": duration_seconds,
         }, ctx)
         if result.get("grc_path"):
             _merge_artifacts(ctx, {"grc_path": result["grc_path"]})
         _rec_event(ctx, "build_ble_uhd_tx_flowgraph", result)
+        return json.dumps(result, ensure_ascii=False)
+
+    @tool
+    def build_ble_pluto_tx_flowgraph(
+        waveform_path: str, channel: int = 37, sample_rate: float = 2e6,
+        attenuation: float = 30.0, uri: str = "",
+        duration_seconds: float = 30.0,
+    ) -> str:
+        """Build and validate, but never start, a BLE PlutoSDR TX flowgraph."""
+        result = registry.call("build_ble_pluto_tx_flowgraph", {
+            "waveform_path": waveform_path, "channel": channel,
+            "sample_rate": sample_rate, "attenuation": attenuation, "uri": uri,
+            "duration_seconds": duration_seconds,
+        }, ctx)
+        if result.get("grc_path"):
+            _merge_artifacts(ctx, {"grc_path": result["grc_path"]})
+        _rec_event(ctx, "build_ble_pluto_tx_flowgraph", result)
+        return json.dumps(result, ensure_ascii=False)
+
+    @tool
+    def arm_hardware_flowgraph(grc_path: str, device_identity: str = "") -> str:
+        """Arm a validated session flowgraph after hardware and RF gates pass."""
+        result = registry.call("arm_hardware_flowgraph", {
+            "grc_path": grc_path, "device_identity": device_identity,
+        }, ctx)
+        if result.get("grc_path"):
+            _merge_artifacts(ctx, {"grc_path": result["grc_path"]})
+        _rec_event(ctx, "arm_hardware_flowgraph", result)
         return json.dumps(result, ensure_ascii=False)
 
     @tool
@@ -430,6 +473,8 @@ def build_grc_tools(
         generate_ble_1m_waveform,
         verify_ble_packet_bits,
         build_ble_uhd_tx_flowgraph,
+        build_ble_pluto_tx_flowgraph,
+        arm_hardware_flowgraph,
         build_usrp_rx_spectrum_flowgraph,
         discover_devices,
         probe_device,

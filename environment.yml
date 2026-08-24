@@ -5,6 +5,7 @@ dependencies:
   - python=3.11
   - gnuradio=3.10
   - numpy
+  - pytest
   - pip
   - pip:
       - deepagents

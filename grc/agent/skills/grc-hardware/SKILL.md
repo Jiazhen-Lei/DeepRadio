@@ -6,9 +6,10 @@ description: Configure SDR blocks while enforcing confirmation for real hardware
 # GRC hardware
 
 `configure_sdr` remains configuration-only. `discover_devices` and
-`probe_device` are read-only UHD checks. `build_usrp_rx_spectrum_flowgraph`
+`probe_device` are read-only checks (`uhd_find_devices` for B210, `iio_info`
+for PlutoSDR). `build_usrp_rx_spectrum_flowgraph`
 builds a B210 `uhd_usrp_source` + `qtgui_freq_sink_x` receiver without starting
-it. Building a UHD flowgraph does not mean it was started. RF start is disabled
+it. Building a UHD or Pluto flowgraph does not mean it was started. RF start is disabled
 by default and requires the dedicated Workflow checkpoint,
 `GRC_AGENT_ENABLE_RF=1`, a session-owned `.grc`, bounded duration, and a
 verified stop. Realtime spectrum appears in the GNU Radio QT window, not as a

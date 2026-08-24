@@ -307,6 +307,14 @@ class ClaimsPanel(Gtk.Frame):
             text = "任务: {}  |  阶段: {} {}/{}  |  状态: {}".format(
                 task, stage, index, total, outcome or status or "—"
             )
+            wait_kind = str(workflow.get("wait_kind") or "")
+            if wait_kind:
+                wait_labels = {
+                    "approval": "等待批准",
+                    "input": "等待补充",
+                    "recovery": "等待恢复选择",
+                }
+                text += "  ·  " + wait_labels.get(wait_kind, wait_kind)
             self._activity_label.set_text(text)
             return
         loop = str(activity.get("loop") or "—")
@@ -339,6 +347,25 @@ class ClaimsPanel(Gtk.Frame):
         )
         if blockers:
             lines.append("blockers=" + ", ".join(blockers))
+        interaction = workflow.get("interaction_request") or {}
+        if interaction:
+            lines.append(
+                "interaction={}  reason={}".format(
+                    interaction.get("kind") or "—",
+                    interaction.get("reason") or "—",
+                )
+            )
+        runtime = workflow.get("runtime") or {}
+        if runtime:
+            lines.append(
+                "runtime={}  run_id={}  remaining={:.1f}s  return_code={}".format(
+                    runtime.get("status") or "—",
+                    runtime.get("run_id") or "—",
+                    float(runtime.get("remaining_seconds") or 0.0),
+                    runtime.get("return_code")
+                    if runtime.get("return_code") is not None else "—",
+                )
+            )
         for stage in workflow.get("stages") or []:
             marker = "▶" if stage.get("id") == workflow.get("current_stage") else "•"
             completion = stage.get("completion") or []
@@ -457,6 +484,10 @@ class ClaimsPanel(Gtk.Frame):
             if action == "design_link" and recipe:
                 text = "待确认: {} → {}".format(
                     from_recipe or "当前工程", recipe)
+            elif action == "over_air_verification":
+                text = "空口验收: 请确认 LightBlue 实际显示目标广播名称"
+            elif action == "rf_plan_confirmation":
+                text = "RF 安全确认: 批准后将启动有限时长受控发射"
             elif action == "workflow_checkpoint":
                 text = "待确认: {}".format(
                     pending.get("reason") or "继续当前 Workflow"
@@ -464,6 +495,15 @@ class ClaimsPanel(Gtk.Frame):
             else:
                 text = "待确认: {}".format(action)
             self._pending_label.set_text(text)
+            if action == "over_air_verification":
+                self._confirm_btn.set_label("已看到目标名称")
+                self._cancel_btn.set_label("未看到")
+            elif action == "rf_plan_confirmation":
+                self._confirm_btn.set_label("批准有限时长发射")
+                self._cancel_btn.set_label("取消")
+            else:
+                self._confirm_btn.set_label("确认")
+                self._cancel_btn.set_label("取消")
         else:
             self._pending_label.set_text("")
         self._pending_row.set_visible(visible)

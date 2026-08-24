@@ -1,510 +1,474 @@
 # DeepRadio 测试与实验 V2
 
-> 日期：2026-08-23  
-> 读者：QA、实验执行  
-> 本文写怎么测、自动测试证明什么、七类 Task 怎么点、E0–E3 和 HIL。  
-> 不解释控制面「为什么这样设计」。语义见算法文档，落地见工程文档。
->
-> 同族文档：
-> - 产品：`DeepRadio_Product_V2.md`
-> - 算法：`DeepRadio_Workflow_Algorithm_V2.md`
-> - 工程：`DeepRadio_Engineering_V2.md`
-> - 测试：`DeepRadio_Test_and_Experiment_V2.md`（本文）
-
-测试 Dynamic Workflow 时不要勾选「一句话直出 baseline」。七类 Task 够用，不要加第八类。RF 默认关闭。自动测试通过不等于 GUI 抽检或真实空口通过。
+> 日期：2026-08-24
+> 读者：测试、实验、CHI、算法与工程人员
+> 范围：自动回归、七类 Task 交互实验、GUI 验收、Pluto/B210 硬件实验和证据标准
 
 ---
 
-## 1. 当前自动测试
+## 1. 测试分层
 
-当前 48 项。无设备时 HIL 1 项 skip。统一运行：
+DeepRadio 的验收分为四层：
+
+| 层级 | 执行者 | 验证目标 | 主要证据 |
+|---|---|---|---|
+| A. 单元与契约 | 自动 | Intent、状态迁移、工具算法、Completion、Policy | unittest 输出 |
+| B. ServiceAgent 集成 | 自动 | 七类 Task、Stage 顺序、产物、Claim、恢复 | 临时会话与断言 |
+| C. GUI 人机交互 | 人工 | 文本理解、确认行为、Inspector、画布刷新 | 截图、会话文件 |
+| D. HIL 空口 | 人工＋自动记录 | 真实设备、受控运行、手机/接收机观察、停止 | runtime、Evidence、截图 |
+
+一次能力声明必须落到对应层级。A/B 层通过可证明控制面和算法契约；手机扫描结果由 D 层证明。
+
+---
+
+## 2. 当前自动回归基线
+
+在仓库根目录执行：
 
 ```bash
-cd /Users/cindysha/Desktop/private/LLMGroup/deepradio/DeepRadio
 conda activate gnuradio
-python scripts/jensen/run_workflow_v2_checks.py
+PYTHONPATH=$PWD:$PWD/scripts/jensen python -m unittest \
+  scripts.jensen.test_ble_deploy_contracts \
+  scripts.jensen.test_dynamic_workflow_v2_contracts \
+  scripts.jensen.test_hardware_runtime_contracts \
+  scripts.jensen.test_intent_llm \
+  scripts.jensen.test_seven_task_service_agent \
+  scripts.jensen.test_seven_task_text_variants \
+  scripts.jensen.test_seven_task_texts \
+  scripts.jensen.test_usrp_rx_spectrum_contracts \
+  scripts.test_ble_protocol_safety \
+  scripts.test_chat_markup \
+  scripts.test_workflow_capability_composition \
+  scripts.test_v3_hardware_workflow_regressions
+```
+
+2026-08-24 验证结果：
+
+```text
+Ran 79 tests in 9.543s
+OK (skipped=1)
+```
+
+运行中可能出现 GNU Radio double-mapped buffer 分配告警并回退到其他 buffer 实现。本次命令退出码为 0，所有断言通过。验收时以最后的 `Ran ...`、`OK` 和 shell 退出码为准，同时保存完整日志以便判断告警是否影响特定平台。
+
+### 2.1 自动覆盖范围
+
+- 七类 Task 的代表文本与 7×10 文本变体分类；
+- 多轮补槽、低置信续跑、确认/拒绝/取消、新任务切换；
+- Workflow revision、Stage attempt、Completion、失效和停止循环；
+- TaskCard/ResultEnvelope 协议与 Agent/Tool 范围；
+- BLE PDU、CRC、白化、IQ 回环和参数变化；
+- BLE Pluto/B210 Flowgraph 结构与安全默认值；
+- HardwareProfile、Pluto IIO 扫描/URI probe、B210 UHD 探测；
+- RF Policy、环境开关、语义哈希、armed flowgraph；
+- 解释器选择、启动健康检查、run_id、运行状态、停止和 crash；
+- OTA 确认与活动 runtime、目标名称、run_id 的绑定；
+- Manifest 相对路径、会话导出和 GUI markup 回归。
+
+### 2.2 自动测试边界
+
+自动回归不产生真实 RF，无法单独证明：
+
+- 指定 SDR 已经由当前主机打开；
+- 天线端存在符合预期的空口波形；
+- 手机 LightBlue 或独立 sniffer 已看到目标广播；
+- GTK 布局、按钮可用性和用户理解符合要求；
+- 移动整个会话目录后所有外部绝对路径均可恢复。
+
+---
+
+## 3. 自动测试的人工复核方法
+
+### 3.1 命令级复核
+
+1. 确认使用 `gnuradio` conda 环境。
+2. 从仓库根目录执行 §2 的完整命令。
+3. 检查最后一行是 `OK`，并记录测试数量和 skipped 数量。
+4. 检查命令退出码：
+
+```bash
 echo $?
 ```
 
-必须同时满足：
+期望为 `0`。
+
+### 3.2 单用例定位
+
+失败时按测试类或测试方法运行：
+
+```bash
+PYTHONPATH=$PWD:$PWD/scripts/jensen python -m unittest -v \
+  scripts.test_v3_hardware_workflow_regressions
+```
+
+保留首次失败日志、复现命令、环境信息和相关临时会话。避免仅以重跑成功覆盖偶发错误。
+
+### 3.3 产物复核
+
+对会话目录检查：
 
 ```text
-Ran 48 tests
-OK (skipped=1)
-Overall: PASS
-shell 返回码为 0
+state.json        JSON 可解析，当前工程和 Claim 版本一致
+workflow.yaml     当前 Stage、状态、attempt、Completion 合理
+events.jsonl      seq 单调，关键 Tool/Checkpoint/run_id 可追踪
+final/*.grc       GRC 可打开，结构与用户槽位一致
+final/manifest    相对路径存在，size 和 SHA-256 匹配
+runtime_status    start/stop/run_id/return_code 与事件一致
+runtime.log       有进程输出，异常时包含诊断信息
 ```
 
-机器可读结果：`scripts/jensen/results/latest.json`
-
-```json
-{
-  "test_count": 48,
-  "return_code": 0,
-  "passed": true
-}
-```
-
-### 1.1 覆盖了什么
-
-- 七类 Task Catalog 和基础 Text 分类；
-- 完整规格跳过澄清；缺规格后的回答与恢复；
-- 修改批准和拒绝；retry 与 waiting_user；
-- 中断恢复；stale ResultEnvelope；画布保存后的失效；
-- 低置信续跑保持 `workflow_id`；强 Task 切换才覆盖；
-- 结果指纹相同则不再空转重试；
-- completion 硬门槛；空 Invocation 不再 vacuously pass；
-- feedback 保持 workflow_id；复合构建＋硬件请求；工程版本重基；
-- 事件外层 `seq` / `workflow_id` / `stage_id` / `attempt`；
-- 确定性 `ServiceAgent.step()`：E2E 建图后诊断/观察/修改、TX、RX、硬件配置-only；
-- BLE deploy Intent 和动态 Stage；PDU/波形自洽；UHD TX 流图离线构建；RF 默认关闭；
-- Workflow Inspector digest；事件时间线进入 `workflow_digest.timeline`；
-- Intent LLM 低置信补全（未配置则回退规则）；
-- 70 条 Text 变体分类；
-- B210 RX `uhd_usrp_source` + `qtgui_freq_sink_x` 离线建图，且不调用 `start_flowgraph`。
-
-测试文件：
-
-```text
-scripts/jensen/test_agent_workflow.py
-scripts/jensen/test_dynamic_workflow_v2_contracts.py
-scripts/jensen/test_seven_task_texts.py
-scripts/jensen/test_seven_task_text_variants.py
-scripts/jensen/test_intent_llm.py
-scripts/jensen/test_seven_task_service_agent.py
-scripts/jensen/test_ble_deploy_contracts.py
-scripts/jensen/test_usrp_rx_spectrum_contracts.py
-```
-
-### 1.2 没有证明什么
-
-没有证明：LLM 稳定性、GTK 视觉行为、停止能力在真实子进程下可靠、SDR 空口发射/接收成功、BLE 相对独立标准向量合规、Channel 37/38/39 轮询。
-
-不要把 `local/agent_sessions` 当实验数据集。它是运行目录。实验结束后按 manifest 复制所需状态和事件。
+导出检查必须使用独立空目录。当前导出函数会扫描目标目录，复用宽目录会把无关文件加入 Manifest。
 
 ---
 
-## 2. 会话文件检查清单
+## 4. 七类 Task 的 GUI 代表实验
 
-启动：
+通用启动：
 
 ```bash
 conda activate gnuradio
 PYTHONPATH=$PWD python -m grc --gtk --fresh
 ```
 
-每个独立任务先点「重置」。需要当前工程的 Task 先完成 Task 1，或打开规定的 `.grc`。
+每个用例使用新 session。记录输入、全部系统回复、按钮选择、画布截图、Claims/Inspector 截图以及 session 路径。
 
-```bash
-ls -td local/agent_sessions/gui-* | head -1
-```
+### 4.1 `END_TO_END_SIM`
 
-每个会话至少检查：
+输入：
 
 ```text
-state.json       工程事实、配置、Claims、版本
-workflow.yaml    Task、Stage、Checkpoint、状态和结果
-events.jsonl     User Turn、Tool、Subagent 和状态事件
-final/           最终 .grc 和图片等产物
-snapshots/       修改前快照
+做一个 BPSK 过 AWGN 的基带链路，EVM 小于 10%，显示星座图和频谱。
 ```
 
-完整性：
+交互：规格完整时允许自动执行；若系统询问阈值，回答“10%”。
 
-```text
-state.json 可解析
-workflow.yaml 可解析且 Schema 合法
-events.jsonl 每行可解析
-event seq 单调递增
-每个 stage_started 有 completed/errored/waiting/invalidated 后继
-每个 subagent_invoked 有 completed 或 interrupted
-每个 passed Stage 的 completion 全满足
-每个 Claim Evidence 属于当前或明确历史版本
-Workflow 当前版本与 SharedState 工程版本一致
-GUI digest 与最终 Workflow 一致
-```
+正确过程与产物：Task 为 `END_TO_END_SIM`；经过规格对齐、构建与验证；生成 `.grc`、EVM、星座图、频谱图和当前版本 Claims。EVM 达标才可完成。
 
-存在状态不一致的 session 不进入效果统计，进入实现缺陷统计。
+检查方式：结构、文件存在性和 EVM 可自动检查；图像内容和 GUI 刷新人工抽检。
 
-「自动检查」：脚本对 JSON、事件和文件做确定性断言。「人工检查」：必须在 GUI、画布、语言或外部设备上观察。
+### 4.2 `TX_BUILD`
 
----
-
-## 3. 七类 Task 首轮 GUI 测试
-
-### 3.1 END_TO_END_SIM
-
-```text
-做一个 BPSK 过 AWGN 的基带链路，EVM 要小于 10%，并显示星座图和频谱。
-```
-
-规格完整时不应询问调制方式，应直接进入 `build_and_verify`。EVM 不满足可自动重试一次；仍失败应 waiting_user，不能伪报成功。
-
-正确产物：`final/*.grc`；结构校验 valid；`metrics.evm_pct`；星座图和频谱图；`EVM < 10%` Claim 绑定当前版本；全部 Stage completion 为 true 后才能 completed。
-
-- 自动：Task/Stage、文件、validate、EVM、Claim version、completion。
-- 人工：画布结构、图片可读、回复没有错误解释指标。
-
-### 3.2 TX_BUILD
+输入：
 
 ```text
 构建一个 QPSK 基带发射链路，只做仿真，不接真实硬件。
 ```
 
-应识别为 `TX_BUILD`，不能选成 RX 或硬件 Task。不出现 UHD Sink、设备发现或发射事件。不要求 BER。
+交互：保持“只做仿真”约束；任何 RF 确认均判失败。
 
-- 自动：Task Type、Stage、`.grc`、结构校验、没有硬件事件。
-- 人工：画布是 TX 链路，回复明确是基带/仿真。
+正确过程与产物：Task 为 `TX_BUILD`；生成 TX `.grc` 和结构校验；事件中无设备发现、配置或 start 调用。
 
-### 3.3 RX_BUILD
+检查方式：可自动检查；人工打开 GRC 确认画布可读。
+
+### 4.3 `RX_BUILD`
+
+输入：
 
 ```text
 构建一个自包含的 BPSK AWGN 接收机，包含定时恢复和判决，并测 BER。
 ```
 
-缺少必要规格时进入 `rx_spec_alignment`。补充后必须同一 `workflow_id`。可用：
+交互：如缺少 Eb/N0，回答“8 dB”；补充后应保持同一 `workflow_id`。
+
+正确过程与产物：Task 为 `RX_BUILD`；生成接收流图；BER 证据同时引用发送参考和接收判决 probe。
+
+检查方式：结构与双 probe 自动检查；人工确认补槽轮次没有新建 Workflow。
+
+### 4.4 `DIAGNOSE`
+
+前置：打开一个已有工程。
+
+输入：
 
 ```text
-采样率 1 MHz，每符号 4 个采样点，使用 AWGN。
+诊断当前链路的 EVM，解释主要原因并给出最小修改建议，先保持工程不变。
 ```
 
-BER 使用发送参考和接收判决两个数据来源。`metrics.ber` 存在，Evidence 属于当前版本。
+交互：诊断后若出现修复询问，选择拒绝。
 
-- 自动：Task/Stage、双 probe、BER、Claim version、文件。
-- 人工：画布不是只有发射链路，检查恢复和判决连线。
+正确过程与产物：Task 为 `DIAGNOSE`；有诊断与 Evidence；`.grc` 哈希、Project version 和画布保持不变。
 
-### 3.4 DIAGNOSE
+检查方式：哈希与版本自动检查；解释质量人工评分。
 
-先完成 Task 1，保留当前工程。
+### 4.5 `MODIFY_PROJECT`
+
+前置：打开 BPSK 工程。
+
+输入：
 
 ```text
-诊断当前链路的 EVM，解释主要原因并给出最小修改建议，先不要修改工程。
+把当前 BPSK 工程改成 QPSK，其余条件保持一致。
 ```
 
-只读。`flowgraph_version` 前后不变。不产生新 Snapshot，不覆盖 `.grc`。
+交互：先检查方案和待修改范围，再点击确认。
 
-- 自动：Task、Stage、version 不变、无 mutation Tool、诊断结果存在。
-- 人工：诊断与指标一致，建议具体且没有偷偷改图。
+正确过程与产物：Task 为 `MODIFY_PROJECT`；确认前工程不变；确认后 Project version 增加，流图变为 QPSK，受影响 Claim 重新验证。
 
-### 3.5 MODIFY_PROJECT
+检查方式：版本、语义差异和 Claim 可自动检查；画布刷新人工检查。
 
-先完成 BPSK Task 1。
+### 4.6 `OBSERVE`
+
+前置：打开可仿真的接收工程。
+
+输入：
 
 ```text
-把当前 BPSK 工程改成 QPSK，其余条件不变。
+查看当前接收信号的频谱和星座图，给出主峰，只观察工程。
 ```
 
-先 `inspect_and_plan`，停在 `change_confirmation`。批准点「确认」；拒绝点「取消」。
+交互：无需修改确认。
 
-批准：`inspect_and_plan → change_confirmation → apply_and_verify → completed`。确认前画布不变；确认后 Snapshot；recipe 变为 `qpsk_awgn`；version +1；旧 Claim 失效。
+正确过程与产物：Task 为 `OBSERVE`；输出图和指标；工程哈希与版本保持不变。
 
-拒绝：工程、版本和画布不变；outcome 为 cancelled。
+检查方式：不变性与文件存在性自动检查；主峰、图像和交互自然度人工检查。
 
-- 自动：checkpoint_id、状态迁移、Snapshot、版本、Claim 失效。
-- 人工：确认前画布保持、按钮文案和等待原因、确认后画布刷新。
+### 4.7 `HARDWARE_CONFIGURE`
 
-### 3.6 OBSERVE
-
-保留一个已经生成的工程。
+无 RF 的配置代表输入：
 
 ```text
-查看当前接收信号的频谱和星座图，给出主峰，只观察不要修改。
+为 PlutoSDR 配置 2.402 GHz、2 Msps 的发射流图，保存配置并停在发射确认。
 ```
 
-失败时 waiting_user，不得以旧图片冒充本轮产物。version 不变，不创建 Snapshot。
+交互：批准配置，拒绝发射。
 
-- 自动：Task/Stage、图片、指标、version 不变、无 mutation Tool。
-- 人工：图片不是空白/旧图，主峰解释与图像大致一致。
+正确过程与产物：Task 为 `HARDWARE_CONFIGURE`；发现与 probe 精确设备；生成禁用发射的基础 `.grc`；无 `start_flowgraph` 成功事件。
 
-### 3.7 HARDWARE_CONFIGURE（configuration-only）
-
-第一轮：
-
-```text
-帮我配置 USRP B210。
-```
-
-缺少中心频率和采样率，不得 completed。
-
-第二轮：
-
-```text
-中心频率 2.4 GHz，采样率 1 MHz。
-```
-
-同一 `workflow_id`，经过 `hardware_precheck`，进入 `hardware_confirmation`。批准只保存 flowgraph 配置；拒绝工程不变且 outcome=cancelled。
-
-批准后 `state.json` 的 device 应为 `mode: flowgraph_config_only`，含 type/center_freq/sample_rate。不得声称设备已发现、已打开、已启动、已发射、手机已收到。
-
-- 自动：slots、workflow_id、Checkpoint、配置内容、没有启动事件。
-- 人工：确认按钮、风险说明、没有把配置成功说成真实部署成功。
+检查方式：设备探测和流图结构可自动检查；真实连接和 GUI 确认人工检查。
 
 ---
 
-## 4. UI 抽检
+## 5. Text 数据集实验
 
-已经可以看到：任务名称、当前 Stage、序号/总数、execution_status 或 outcome、等待原因、确认/取消、Claims/指标/规格摘要、可折叠 Inspector、完整 Stage 列表、workflow_id/revision/project version、attempt、completion 计数、执行时间线、底部状态栏。
+七类 Task 每类至少 10 条文本，合计 70 条。每类包含：
 
-仍不够完整：逐项失败原因；stale/retry/invalidation 可视化历史；阶段执行中的逐秒刷新。
+1. 标准完整表达；
+2. 参数顺序变化；
+3. 中文同义表达；
+4. 英文或中英混合；
+5. 缺槽位输入；
+6. 多轮补充；
+7. 否定约束；
+8. 复合目标；
+9. 模糊指代；
+10. 容易与相邻 Task 混淆的表达。
 
-Inspector 实现路径：
+每条记录：
 
-```text
-grc/agent/workflow/engine.py          Workflow.digest().stages
-grc/gui/ClaimsPanel.py                Workflow 详情 Expander
-grc/gui/AgentPanel.py                 digest 刷新和结构化 Checkpoint 命令
-scripts/jensen/test_ble_deploy_contracts.py
-  test_workflow_digest_contains_full_stage_inspector_data
+```json
+{
+  "case_id": "HW-07",
+  "turns": ["用户第一轮", "用户补充或决定"],
+  "expected_task": "HARDWARE_CONFIGURE",
+  "expected_operation": "deploy",
+  "expected_slots": {"hardware": "pluto", "protocol": "ble"},
+  "forbidden_events": ["unapproved_rf_start"],
+  "manual_checks": ["回复没有歪曲目标"]
+}
 ```
 
-Gate 4 人工必须核对：Task/Stage/进度/原因正确；Checkpoint 与画布保持一致；交付后刷新画布；保存、撤销、重置同步；Claims 和指标属于当前 Flowgraph version。GTK 面板，不能用浏览器代替。
+评测指标：Task accuracy、slot exact match、缺槽识别率、同一 Workflow 延续率、受限操作违规率、完成率、平均轮次、平均 Stage 数、端到端时延。
+
+LLM 条件至少重复 5 次，报告均值、标准差和失败样例。确定性条件执行一次全量回归，再对关键边界做重复运行。
 
 ---
 
-## 5. 验收门槛（Gate）
+## 6. GUI 与人机交互验收
 
-真人实验前：
+### 6.1 Inspector
 
-### Gate 1：控制面
+人工确认以下信息实时更新：
 
-七类 Task 分类；answer/feedback/new_task 连续性；approve/reject/cancel；retry/no-progress；restart recovery；stale/invalidation；Catalog 非法输入。
+- Task 名称和类型；
+- 当前 Stage、序号和总数；
+- Stage 状态、attempt 和 Completion；
+- 等待原因、确认和取消按钮；
+- 执行时间线的 seq、Stage、执行模式、执行者和 Tool；
+- runtime 的 `run_id`、状态、剩余时间和 return code。
 
-### Gate 2：确定性 ServiceAgent
+当前检查重点：确定性执行应显示真实 `mode`；Checkpoint 解决后 Completion 应显示完成；managed runtime 的日志和自动启动状态应足够醒目。
 
-七类 Task 的 Stage 路径；completion 硬验收；state/workflow/events 一致；deterministic handler 不依赖 LLM。
+### 6.2 交互行为
 
-### Gate 3：Deepagents 协议
+至少覆盖：
 
-Stage 只暴露允许的 Subagent/Tool；每次委派携带完整 TaskCard；非法 ResultEnvelope 被拒绝；多 Subagent 结果可聚合；LLM 和确定性路径状态语义一致。
+- 缺参数后补充；
+- 确认、拒绝、取消；
+- 失败后修改参数并重试；
+- 活动 Workflow 中插入无关新任务；
+- 用户保存画布导致 Claim stale；
+- reset 时硬件进程紧急停止；
+- 小白、学生、专家三档语言风格。
 
-### Gate 4：GUI
-
-见 §4。
-
-### Gate 5：硬件
-
-当前自动门槛只要求配置与预检状态、RF 默认拒绝。真实 HIL 必须另行完成设备发现、启动、停止和紧急停止后才能开放。
-
-原规范验收场景（Workflow / 领域 / GUI）仍可作为抽检清单，见算法文档对应语义；操作时按本节脚本执行。
+技术验收阈值在三个专业度档位保持一致。
 
 ---
 
-## 6. 实验分类
+## 7. PlutoSDR BLE 端到端实验
 
-### 6.1 执行环境
+### 7.1 环境与安全
 
-| 编号 | 类型 | 自动 | LLM | 真人 | 硬件 |
-|---|---|---:|---:|---:|---:|
-| E0 | 确定性离线 | 是 | 否 | 否 | 否 |
-| E1 | LLM＋脚本化用户 | 是 | 是 | 否 | 否 |
-| E2 | 真人语言交互 | 部分 | 是 | 是 | 否 |
-| E3 | Hardware-in-the-loop | 部分 | 可选 | 可选 | 是 |
+- PlutoSDR 通过 USB 连接；
+- 手机安装 LightBlue；
+- 使用合法、低功率、可控实验环境；
+- 安装并可调用 GNU Radio IIO blocks 与 `iio_info`。
 
-E0 证明状态机和工具正确。E1 测量模型路由稳定性、调用成本和随机性。不要混在一起报「自动全过」。
+### 7.2 启动
 
-### 6.2 交互路径
+```bash
+conda activate gnuradio
+iio_info -S
+export GRC_AGENT_ENABLE_RF=1
+PYTHONPATH=$PWD python -m grc --gtk --fresh
+```
 
-| 编号 | 路径 | 核心验证 |
-|---|---|---|
-| P0 | autonomous | 规格完整时直接完成 |
-| P1 | clarification | 缺槽位、回答、继续 |
-| P2 | checkpoint | 批准、拒绝、取消、画布保持 |
-| P3 | feedback/retry | 失败、诊断、修改、重验、无进展停止 |
-| P4 | recovery/invalidation | 重启、stale、画布保存、版本变化 |
+`iio_info -S` 应显示 Pluto/ADALM 设备及 USB URI。出现错误时先处理驱动、USB、权限或 IIO 环境。
 
-标记例：`E0-P4`、`E2-P2`、`E3-P2`。
+### 7.3 输入与交互
 
-### 6.3 研究条件
+输入：
 
-| 条件 | 描述 |
+```text
+用 PlutoSDR 发射一段 2.402 GHz 的 BLE 广播，local name 为 DRTEST24，
+目标是用手机 LightBlue 扫描到，最长发射 30 秒。
+```
+
+操作：
+
+1. 检查 Workflow 为 `HARDWARE_CONFIGURE`，operation 为 `deploy`。
+2. 查看离线协议校验、设备发现和精确 URI probe 通过。
+3. 在 RF 计划确认处核对频率、采样率、增益、设备和最长时长。
+4. 点击“批准有限时长发射”。
+5. Inspector 应出现新的 `run_id`、running/ready 和剩余时长。
+6. 在 LightBlue 扫描 `DRTEST24`。
+7. 扫描到后点击“已看到目标名称”；未扫描到则点击“未看到”。
+8. 确认 Workflow 进入停止阶段，runtime 终止且 return code 合法。
+
+### 7.4 通过标准
+
+- 输入 local name 动态出现在 PDU、离线解码结果和手机扫描中；
+- 设备 probe 绑定发现阶段获得的同一 URI；
+- RF 启动发生在用户批准之后；
+- `start_flowgraph` 返回 `running=true`、`ready=true`、`startup_health_passed=true` 和 `run_id`；
+- 空口确认时 runtime 仍在 deadline 内，Evidence 引用同一 `run_id`；
+- `stop_flowgraph` 返回 `running=false`、`crashed=false`，return code 合法；
+- `runtime_status.json`、`runtime.log`、事件和 Claim 相互一致；
+- 截图保存到 `final/evidence/` 并进入 Manifest。
+
+当前 Evidence 文件选择需要人工核对。若截图只留在会话文件夹外，本轮记录为“手机观察通过、Evidence 附件缺失”。
+
+### 7.5 2026-08-24 V6 结果
+
+会话：`local/agent_sessions/0824_V6/gui-9edd1171`<br>
+导出：`local/output/0824_V6`
+
+实测结果：LightBlue 扫描到 `loveu`；managed runtime 使用 `run-f646528e87c5`，启动健康检查通过，空口确认时仍在运行，随后以 `return_code=0`、`crashed=false` 停止。
+
+复核结论：
+
+- BLE 动态名称、Pluto 探测、自动启动、活动运行空口确认和停止链路通过；
+- 自动 Stage 的高速度来自确定性通用算法与工具链；
+- 用户随后手动点击 GRC 运行箭头，说明自动运行状态和日志的 GUI 可见性仍需增强；
+- 导出 Manifest 含其他目录条目，导出隔离检查未通过；
+- 手机截图未与 Claim 一起归档，Evidence 附件检查未通过；
+- Checkpoint Completion 计数、路径可迁移性和 BLE 专用摘要需要继续验证。
+
+---
+
+## 8. B210 硬件实验
+
+### 8.1 只读预检
+
+```bash
+conda activate gnuradio
+uhd_find_devices
+uhd_usrp_probe --args="type=b200"
+```
+
+记录 serial、USB 速率、FPGA/Firmware 信息和命令完整输出。Workflow 中发现的设备身份必须与 probe 一致。
+
+### 8.2 BLE TX HIL
+
+使用与 Pluto 相同的 §7 流程，将输入设备改为 USRP B210。检查 Builder 选择 `uhd_usrp_sink`、设备 args 绑定目标 B210、采样率和增益处于批准范围。完成屏蔽/低功率实验并用 LightBlue 或独立 BLE sniffer验收。
+
+B210 BLE TX HIL 当前需要执行并落盘 Evidence，登记状态为待验证。
+
+### 8.3 RX 实时频谱
+
+输入：
+
+```text
+用 B210 在 2.402 GHz、2 Msps 查看实时频谱，先生成流图并停在运行确认。
+```
+
+通过标准：流图含 `uhd_usrp_source` 与 `qtgui_freq_sink_x`；批准前没有运行；批准后 QT 频谱窗口有实时刷新；停止/重置后设备释放。屏幕截图、runtime 状态和事件一并保存。
+
+---
+
+## 9. 故障注入矩阵
+
+| 场景 | 期望结果 |
 |---|---|
-| C0 | 一句话直出 baseline |
-| C1 | 自由 Prompt 的 Deepagents 路由 |
-| C2 | Task Catalog Dynamic Workflow |
+| RF 环境变量缺失 | start 被 Policy 拒绝 |
+| 设备发现为空 | 停在 waiting_user，无 armed 流图 |
+| probe 身份不匹配 | 配置和发射均被阻止 |
+| 生成代码导入失败 | startup health 失败，Stage 不通过 |
+| 进程立即退出 | crashed，运行 Claim 失败 |
+| 同 session 重复 start | 第二次启动被拒绝 |
+| 用户取消/reset/archive | emergency stop，armed 清除 |
+| 到达 deadline | 自动停止并持久化终态 |
+| OTA 确认时进程已停 | over_air_observed 不通过 |
+| OTA 名称不匹配 | Evidence 拒绝提交 |
+| Flowgraph 语义变化 | 原批准和 armed 状态失效 |
+| 导出目录预置其他文件 | Manifest 仅含显式本轮产物 |
+| 会话目录移动 | 相对路径仍可解析 |
 
-小白/学生/专家是用户画像，不是新 Task Type。技术验收标准相同。
-
-### 6.4 用例文件建议
-
-```text
-local/experiments/workflow_v2/
-├── cases/
-│   ├── intent_cases.yaml
-│   ├── workflow_cases.yaml
-│   ├── interaction_cases.yaml
-│   └── hardware_cases.yaml
-├── runs/<run_id>/
-│   ├── manifest.json
-│   ├── summary.csv
-│   ├── sessions/
-│   └── screenshots/
-└── README.md
-```
-
-单条用例必须声明：初始工程、专业度、每轮输入、期望 relation/Task/slots/Stage/状态、是否 Checkpoint、允许的 Subagent/Tool、最终产物/指标/Claim/版本、是否允许 inconclusive、超时和最大尝试次数。
-
-每类 Task 至少 10 条 Text 变体：标准完整、同义、省略槽位、无关信息、冲突约束、中英混合、已有工程、对前一结果反馈、明确取消、复合目标。分类测试已有 70 条；全链 E1/E2 仍未做。
+每个故障必须同时断言 Workflow 状态、runtime、Claim、事件和 GUI 回复，防止错误被后续停止动作覆盖。
 
 ---
 
-## 7. E0：确定性离线
+## 10. 发布门槛
 
-目的：先证明状态机、Catalog、Completion、Tool 和持久化正确。
+### Gate 1：自动回归
 
-```bash
-conda activate gnuradio
-python -c '
-from grc.agent import env
-p = env.make_platform()
-print("blocks=", len(p.blocks))
-assert len(p.blocks) > 0
-'
-python scripts/jensen/run_workflow_v2_checks.py
-```
+- §2 全量命令退出码为 0；
+- flaky 重跑率为 0；
+- skipped 项有明确平台原因。
 
-必须断言：relation 正确；workflow_id 连续；revision 和 attempt 正确；completion 不满足时不得 passed；CONFIRM 时不得 completed；stale 被记录并重新调度；版本变化按影响范围失效；旧结果可追溯。
+### Gate 2：七类 Task
 
-七类 Task 主路径已由 `test_seven_task_service_agent.py` 覆盖。通过标准：控制面 100%；七类主路径 100%；预期失败分支进入指定 waiting/errored/cancelled；重复执行状态一致，数值允许预设容差。
+- 每类代表用例通过；
+- 70 条 Text 数据集达到约定阈值；
+- 否定约束与只读任务无越权动作。
 
-当前状态：E0 代表链 **完成**。E1/E2 与真实 HIL 不在本项。
+### Gate 3：GUI
 
----
+- Workflow Inspector、Checkpoint、画布刷新、运行状态和日志可理解；
+- 三种专业度完成任务，技术结论一致；
+- 人工可从 session 文件复核每个关键回复。
 
-## 8. E1：LLM＋脚本化用户
+### Gate 4：硬件安全
 
-目的：Task/Stage 路由稳定性、Subagent 选择、无效 Tool、Envelope 合规率、重复运行方差、相对确定性路径的时延和成本。
+- discover/probe/start/status/stop/emergency-stop 故障矩阵通过；
+- RF 默认关闭；
+- 所有运行有唯一 `run_id` 和 deadline；
+- reset/archive 不留存运行进程。
 
-设置：每条 Text 至少重复 5 次；temperature、model、prompt version 固定并写入 manifest；每次新 session；同一 case 在 C1、C2 使用相同初始状态；自动用户只按 case 提供预定义回答，不允许自由补救。
+### Gate 5：空口
 
-```yaml
-on_checkpoint:
-  missing_modulation: 使用 QPSK
-  modulation_change: approved
-  hardware_confirmation: rejected
-on_failure:
-  first: 把噪声参数降低一半后重试
-  second: stop
-```
-
-步骤：记录 Git commit、模型名、参数和 Catalog version → 创建 run_id → 新 session → 发首轮 Text → 按 Checkpoint/状态选择脚本回答 → 终态/等待/超时停止 → 复制 state/workflow/events 和产物 → 事件完整性校验 → 汇总重复结果。
-
-指标：Task Type accuracy；首次 Workflow 命中率；completion rate；Envelope 合规率；非法 Subagent/Tool 调用率；平均 Turn/Stage/attempt/Tool；no-progress stop 率；状态事件一致率；总时延和模型时延；多次重复的 Stage path 一致率。
-
-当前状态：**未做**。70 条变体只证明分类。
+- Pluto HIL 用新 local name 重复通过；
+- B210 HIL 完成并落盘；
+- Evidence 附件、Claim、run_id、Manifest 完整一致；
+- 三信道用例只在 37/38/39 调度实现后登记通过。
 
 ---
 
-## 9. E2：真人语言交互
+## 11. 当前执行顺序
 
-只有 Gate 1～4 全部通过后才能开始。否则测到的是实现 Bug，不是交互设计差异。
-
-参与者：`novice` / `student` / `expert`。技术验收标准相同。
-
-每位完成四类代表任务：新建端到端仿真；缺规格的接收机；诊断但不修改；修改已有工程并经过确认。OBSERVE 和硬件可按研究重点加入。全分支覆盖由 E0/E1 完成。
-
-流程：说明目标，不提供推荐术语或标准 Prompt → 匿名 participant_id → 记录背景 → 每任务重置到规定初始状态 → 自由输入 → 系统自动记录 → 观察者只记卡点，中途不教表达 → 任务结束后检查真实产物，不以 Agent 自述为准 → 单题难度/信心 → 导出 session。
-
-成功判定：
-
-```text
-系统成功：Workflow completed + completion 全满足
-交互成功：参与者理解结果，并能判断下一步或确认内容
-安全成功：未经确认没有执行受限修改或硬件操作
-```
-
-记录：是否完成、完成时间、Turn 数、澄清和确认次数、用户主动修正次数、错误恢复、最终工程和指标、是否理解当前 Stage、是否能预测确认后影响、主观难度/信心/信任。比较 C0/C1/C2 时平衡任务顺序。
-
-当前状态：**未做**。
-
----
-
-## 10. E3 与 B210 / BLE
-
-### 10.1 当前可测范围
-
-离线 BLE 构建、Flowgraph 校验、B210 只读 discover/probe 可执行。代码中已有有限时长 start，但在 stop/Policy 故障注入和实验室验收完成前，不应设置 `GRC_AGENT_ENABLE_RF=1` 做空口发射。
-
-configuration-only 仍按 §3.7。不得把配置成功登记为部署成功。
-
-### 10.2 BLE 离线与 HIL 步骤
-
-安全：合法授权环境；优先屏蔽箱或合规极低功率近距离；正确天线、50 Ω 负载或规定衰减；不允许 Agent 自行选择高增益；先验证 stop 和 emergency stop，再开放发射。
-
-只读发现：
-
-```bash
-conda activate gnuradio
-uhd_find_devices --args "type=b200"
-uhd_usrp_probe --args "type=b200"
-```
-
-用户输入：
-
-```text
-帮我用 B210 发射 BLE Advertising 信号，Complete Local Name 为 deepradio，
-使用 BLE 1M PHY，先在广告信道 37 上运行 30 秒；
-生成和离线校验完成后先让我确认，再开始发射。
-```
-
-交互：展示 BLE/B210/RF 参数 → 生成 PDU/波形/`.grc` → 离线校验 → 只读发现并 probe → GUI 展示 RF 计划 → 用户明确「确认发射」→ 手机打开 LightBlue → 有限时长启动 → 用户提交观察和截图 → 到期或停止 → 验证进程已停止后结束。
-
-当前只实现 Channel 37。不能把单信道结果登记为三信道通过。
-
-正确结果：LightBlue 显示 `deepradio`；离线校验通过；B210 身份与配置有 Evidence；未经确认没有发射；运行时间受限；stop 事件和进程退出得到确认；state/workflow/events/截图关联同一 workflow_id/revision；任何一步失败如实进入 waiting/failed/inconclusive。
-
-LightBlue 人工 Evidence：扫描 → 看到 local name=`deepradio` → 核对地址和时间 → 保存截图 → GUI 提交「已观察到/未观察到」→ 截图路径写入 Envelope/Evidence。未观察到不得 passed。全自动验收需要第二个 SDR 或 sniffer，不能让发射端自证。
-
-### 10.3 Opt-in 命令
-
-自动测试 **不会** 打开 RF。无设备时 `test_rf_and_hil_remain_opt_in` skip。
-
-只读 discover/probe（仍不发射）：
-
-```bash
-conda activate gnuradio
-export GRC_AGENT_HIL=1
-python -m unittest scripts.jensen.test_usrp_rx_spectrum_contracts.B210HilGateTest -v
-```
-
-找到 B210 则 `device_found` / `device_probed` 为真；找不到则 skip，不得改成失败。
-
-RX 实时频谱（QT 窗口，不是对话 PNG）：
-
-```text
-使用usrpb210构建接收机，在2.402GHz绘制出实时的频谱图
-```
-
-离线第一步应生成含 `uhd_usrp_source` 与 `qtgui_freq_sink_x` 的 `.grc`，并停在 `hardware_precheck` / RF Checkpoint。只有同时满足用户确认 RF 计划、`GRC_AGENT_ENABLE_RF=1`、屏蔽箱或合规低功率环境，才允许有限时长 `start_flowgraph`。
-
-### 10.4 BLE 实施顺序状态
-
-| # | 任务 | 当前状态 |
-|---:|---|---|
-| 1 | 七类 Task 确定性 ServiceAgent 集成 | **完成（E0 代表链）** |
-| 2 | 7×10 Text 变体分类 | **完成（分类-only）** |
-| 3 | Workflow Inspector + 时间线 | **完成** |
-| 4 | BLE PDU/PHY 离线生成与校验 | **部分完成**（缺独立标准向量） |
-| 5 | BLE UHD TX Flowgraph，不允许启动 | **完成（Channel 37）** |
-| 6 | discover/probe/stop/emergency_stop | **部分完成**（缺真实/假进程故障注入） |
-| 7 | 有限时长 start | **部分完成，尚未开放验收** |
-| 8 | 屏蔽/低功率实验室 | **未开始** |
-| 9 | LightBlue Evidence 或 sniffer | **未开始** |
-
-`latest.json` 只能支持表中已经列明的自动范围，不能支持第 8、9 项，也不能把第 6、7 项的真实硬件行为标记为通过。
-
----
-
-## 11. 下一步严格顺序
-
-```text
-A. E1：LLM 重复运行与 C1/C2 对照
-B. Gate 4 级 GUI 抽检（含执行时间线）
-C. 用独立标准向量验证 BLE PDU/CRC/whitening/GFSK
-D. 用无 RF 假进程完成 stop/emergency-stop/超时/崩溃测试
-E. 连接 B210，只做 discover/probe，不发射
-F. 在屏蔽或合规低功率环境验证有限时长 start/stop
-G. 实现 Channel 37/38/39 调度
-H. 加入 LightBlue 截图 Evidence 或独立 BLE sniffer
-```
-
-在 E 完成前不要访问真实 TX；在 F 完成前不要把 `GRC_AGENT_ENABLE_RF` 作为默认配置；在 H 完成前不能声称「LightBlue 已收到 deepradio」。
+1. 修复导出目录隔离、显式 Artifact Manifest 和相对路径恢复。
+2. 补齐 Checkpoint Completion 与 Evidence 附件原子提交。
+3. 增强 GUI 的 managed runtime 状态、日志、执行模式和受控重跑。
+4. 重跑 79 项自动测试及故障注入矩阵。
+5. 用随机新 local name 重复 Pluto HIL，并完整归档截图。
+6. 执行 B210 只读预检、BLE TX HIL 和 RX 频谱 HIL。
+7. 实现并验证 BLE 37/38/39 三信道调度。

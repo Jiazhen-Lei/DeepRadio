@@ -66,12 +66,15 @@ _STAGE_TOOLS = {
     "protocol_spec_alignment": {"spec_clarify", "spec_commit"},
     "build_ble_advertiser": {
         "build_ble_advertising_pdu", "generate_ble_1m_waveform",
-        "build_ble_uhd_tx_flowgraph", "validate_flowgraph",
+        "build_ble_uhd_tx_flowgraph", "build_ble_pluto_tx_flowgraph",
+        "validate_flowgraph",
     },
     "offline_protocol_verify": {"verify_ble_packet_bits", "validate_flowgraph"},
     "discover_and_probe_device": {"discover_devices", "probe_device"},
     "discover_and_probe_hardware": {"discover_devices", "probe_device"},
-    "configure_device": {"configure_sdr", "hardware_preflight"},
+    "configure_device": {
+        "configure_sdr", "hardware_preflight", "arm_hardware_flowgraph",
+    },
     "transmit_bounded": {"start_flowgraph", "query_runtime_status", "emergency_stop"},
     "stop_and_finalize": {"stop_flowgraph", "emergency_stop", "query_runtime_status"},
     "run_bounded": {"start_flowgraph", "query_runtime_status", "emergency_stop"},

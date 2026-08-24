@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import shutil
@@ -307,6 +308,142 @@ def publish_artifact(session_id: str, source: str) -> str:
     if os.path.abspath(source) != os.path.abspath(destination):
         shutil.copy2(source, destination)
     return destination
+
+
+def export_artifact(source: str, destination_dir: str) -> str:
+    """Copy a canonical session artifact to an optional user export folder."""
+    if not source or not os.path.isfile(source) or not destination_dir:
+        return ""
+    os.makedirs(destination_dir, exist_ok=True)
+    normalized = os.path.abspath(source)
+    marker = f"{os.sep}final{os.sep}"
+    relative = (
+        normalized.split(marker, 1)[1]
+        if marker in normalized
+        else os.path.basename(source)
+    )
+    destination = os.path.join(destination_dir, relative)
+    os.makedirs(os.path.dirname(destination), exist_ok=True)
+    if os.path.abspath(source) != os.path.abspath(destination):
+        shutil.copy2(source, destination)
+    return destination
+
+
+def attach_evidence(session_id: str, source: str) -> str:
+    """Copy a user-supplied evidence file into the canonical session bundle."""
+    if not source or not os.path.isfile(source):
+        return ""
+    evidence_dir = os.path.join(session_root(session_id), "final", "evidence")
+    os.makedirs(evidence_dir, exist_ok=True)
+    base = _safe_component(os.path.basename(source)) or "evidence"
+    stem, suffix = os.path.splitext(base)
+    destination = os.path.join(
+        evidence_dir, f"{stem}-{uuid.uuid4().hex[:8]}{suffix}"
+    )
+    shutil.copy2(source, destination)
+    return destination
+
+
+def write_artifact_manifest(
+    session_id: str, artifacts: Dict[str, Any] | None = None
+) -> str:
+    """Write relocatable artifact references and content hashes for a session."""
+    root = session_root(session_id)
+    final_dir = os.path.join(root, "final")
+    os.makedirs(final_dir, exist_ok=True)
+    roles = {
+        os.path.abspath(value): key
+        for key, value in (artifacts or {}).items()
+        if isinstance(value, str) and os.path.isfile(value)
+    }
+    entries = []
+    for current_root, _, names in os.walk(final_dir):
+        for name in sorted(names):
+            path = os.path.join(current_root, name)
+            if name == "manifest.json":
+                continue
+            try:
+                with open(path, "rb") as handle:
+                    digest = hashlib.sha256(handle.read()).hexdigest()
+                size = os.path.getsize(path)
+            except OSError:
+                continue
+            entries.append({
+                "role": roles.get(os.path.abspath(path), "artifact"),
+                "path": os.path.relpath(path, root),
+                "size": size,
+                "sha256": digest,
+            })
+    path = os.path.join(final_dir, "manifest.json")
+    payload = {
+        "schema_version": 1,
+        "session_id": session_id,
+        "path_base": "session_root",
+        "artifacts": entries,
+    }
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+    return path
+
+
+def rewrite_exported_grc_paths(session_id: str, destination_dir: str) -> None:
+    """Make exported GRC companion-artifact references relocatable."""
+    source_final = os.path.join(session_root(session_id), "final")
+    for name in os.listdir(destination_dir) if os.path.isdir(destination_dir) else []:
+        if not name.endswith(".grc"):
+            continue
+        path = os.path.join(destination_dir, name)
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                text = handle.read()
+            rewritten = text.replace(f"{source_final}{os.sep}", "")
+            rewritten = rewritten.replace(
+                f"{os.path.abspath(destination_dir)}{os.sep}", ""
+            )
+            if rewritten != text:
+                tmp = f"{path}.tmp"
+                with open(tmp, "w", encoding="utf-8") as handle:
+                    handle.write(rewritten)
+                os.replace(tmp, path)
+        except OSError:
+            continue
+
+
+def write_export_manifest(session_id: str, destination_dir: str) -> str:
+    """Create a manifest that describes the files actually present in export."""
+    os.makedirs(destination_dir, exist_ok=True)
+    entries = []
+    for current_root, _, names in os.walk(destination_dir):
+        for name in sorted(names):
+            if name == "manifest.json":
+                continue
+            path = os.path.join(current_root, name)
+            try:
+                with open(path, "rb") as handle:
+                    digest = hashlib.sha256(handle.read()).hexdigest()
+                size = os.path.getsize(path)
+            except OSError:
+                continue
+            entries.append({
+                "role": "artifact",
+                "path": os.path.relpath(path, destination_dir),
+                "size": size,
+                "sha256": digest,
+            })
+    path = os.path.join(destination_dir, "manifest.json")
+    payload = {
+        "schema_version": 1,
+        "session_id": session_id,
+        "path_base": "export_root",
+        "artifacts": entries,
+    }
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+    return path
 
 
 def _jsonable(value: Any) -> Any:

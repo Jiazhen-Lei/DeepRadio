@@ -140,6 +140,42 @@ pip install markdown
 如果出现 `No devices found`，优先检查 USB 3.x 线缆、接口和 UHD 镜像，不需要修改流图的调制参数。
 
 
+### PlutoSDR BLE 硬件测试
+
+1. 接入 PlutoSDR BLE 硬件。
+
+2. 激活 GNU Radio 环境：
+
+   ```bash
+   conda activate gnuradio
+   ```
+
+3. 检查设备连接：
+
+   ```bash
+   iio_info -S
+   ```
+
+   没有报错则继续；有报错请阅读《DeepRadio硬件连接指南.md》。
+
+4. 启用受控 RF 并启动 DeepRadio：
+
+   ```bash
+   export GRC_AGENT_ENABLE_RF=1
+   PYTHONPATH=$PWD python -m grc --gtk --fresh
+   ```
+
+5. 点击 DeepRadio 交互栏，输入：
+
+   ```text
+   用plutosdr发射一段2.402GHz的ble信号，local name为xxx，目标实现是人工可以用手机软件接收到
+   ```
+
+   其中 `xxx` 可以替换为任意广播名称。
+
+6. 等待交互。交互过程中会提供确认或取消选项，确认实验条件无误后点击确认。最后输出的流图如果没有自动发射，请点击 GRC 中的运行箭头；看到左下方进度中出现 `UUU…` 字样后，使用手机端 LightBlue 抓取 BLE 信号，应能发现 local name 为 `xxx` 的信号。
+
+
 ## GUI 任务测试
 
 先激活环境并进入仓库根目录，再启动 DeepRadio。右侧 **DeepRadio** 面板**不要勾选**「一句话直出(baseline)」。

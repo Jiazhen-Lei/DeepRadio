@@ -20,6 +20,7 @@ import logging
 import math
 import os
 import threading
+import time
 
 import gi
 gi.require_version('Gtk', '3.0')
@@ -502,13 +503,26 @@ class AgentPanel(Gtk.VBox):
         if not checkpoint_id:
             self._append("DeepRadio", "当前没有待确认的 Checkpoint。")
             return
-        self._append("我", "确认" if decision == "approved" else "取消修改")
+        current_stage = str(digest.get("current_stage") or "")
+        is_ota = current_stage == "over_air_verification"
+        self._append(
+            "我",
+            ("已看到目标名称" if is_ota else "确认")
+            if decision == "approved" else "未看到/取消",
+        )
         self._set_busy(True)
         command = {
             "action": "checkpoint_decision",
             "checkpoint_id": checkpoint_id,
             "decision": decision,
         }
+        if is_ota:
+            slots = agent._workflow.workflow.intent.slots
+            command["observation"] = {
+                "observed_name": str(slots.get("local_name") or ""),
+                "observed_at": time.time(),
+                "evidence_kind": "human_confirmation",
+            }
         threading.Thread(
             target=self._handle_agent_command, args=(command,), daemon=True
         ).start()

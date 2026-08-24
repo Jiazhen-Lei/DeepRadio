@@ -13,9 +13,15 @@ def synthesize_deterministic_invocations(
     parent: TaskCard,
     stage: Any,
     reply: Any,
+    executor_id: str = "deterministic_stage_handler",
 ) -> list[dict[str, Any]]:
-    """One TaskCard/ResultEnvelope pair per recommended Subagent."""
-    agents = list(stage.recommended_agents or [parent.target_agent])
+    """Record the one executor that actually ran the deterministic handler.
+
+    ``recommended_agents`` is routing advice for an LLM orchestrator.  Creating
+    one synthetic record per recommendation made the audit trail claim work
+    that never happened and hid differences between deterministic and
+    deep-agent execution.
+    """
     tools = [
         {
             "name": getattr(item, "name", ""),
@@ -31,40 +37,50 @@ def synthesize_deterministic_invocations(
         "CONFIRM",
         "CANCELLED",
     )
-    invocations: list[dict[str, Any]] = []
-    for agent in agents:
-        card = make_invocation_card(parent, agent)
-        envelope = ResultEnvelope(
-            task_id=card.task_id,
-            ok=reply_ok,
-            outcome="passed" if reply_ok else "failed",
-            artifacts=dict(getattr(reply, "artifacts", None) or {}),
-            note=str(getattr(reply, "text", "") or ""),
-            workflow_id=parent.workflow_id,
-            stage_id=parent.stage_id,
-            workflow_revision=parent.workflow_revision,
-            base_project_version=parent.base_project_version,
-        )
-        envelope.validate()
-        record = vars(card)
-        record["protocol_valid"] = True
-        record["result"] = {
-            "task_id": envelope.task_id,
-            "ok": envelope.ok,
-            "outcome": envelope.outcome,
-            "workflow_id": envelope.workflow_id,
-            "stage_id": envelope.stage_id,
-            "workflow_revision": envelope.workflow_revision,
-            "base_project_version": envelope.base_project_version,
-        }
-        record["tools"] = tools
-        invocations.append(record)
-    return invocations
+    card = make_invocation_card(parent, executor_id)
+    envelope = ResultEnvelope(
+        task_id=card.task_id,
+        ok=reply_ok,
+        outcome="passed" if reply_ok else "failed",
+        artifacts=dict(getattr(reply, "artifacts", None) or {}),
+        note=str(getattr(reply, "text", "") or ""),
+        workflow_id=parent.workflow_id,
+        stage_id=parent.stage_id,
+        workflow_revision=parent.workflow_revision,
+        base_project_version=parent.base_project_version,
+    )
+    envelope.validate()
+    record = vars(card)
+    record["protocol_valid"] = True
+    record["result"] = {
+        "task_id": envelope.task_id,
+        "ok": envelope.ok,
+        "outcome": envelope.outcome,
+        "workflow_id": envelope.workflow_id,
+        "stage_id": envelope.stage_id,
+        "workflow_revision": envelope.workflow_revision,
+        "base_project_version": envelope.base_project_version,
+    }
+    record["tools"] = tools
+    return [record]
 
 
 def make_task_card(workflow: Any, stage: Any, state: Any, user_text: str) -> TaskCard:
     prior = [
-        {"stage_id": item.id, "outcome": item.outcome, "result": item.result}
+        {
+            "stage_id": item.id,
+            "outcome": item.outcome,
+            "artifact_refs": {
+                key: value
+                for key, value in dict(item.result.get("artifacts") or {}).items()
+                if isinstance(value, str)
+            },
+            "produced_claims": list(item.result.get("produced_claims") or []),
+            "failure_codes": list(
+                (item.result.get("acceptance") or {}).get("failure_codes") or []
+            ),
+            "result_digest": str(item.result.get("fingerprint") or ""),
+        }
         for item in workflow.stages
         if item.result
     ]
@@ -120,8 +136,21 @@ def bind_invocation_result(
     parent: TaskCard | None = None,
 ) -> dict[str, Any]:
     """Mark one Subagent ResultEnvelope as protocol-valid or not."""
+    shape_valid = bool(
+        parsed
+        and parsed.get("outcome") in {"passed", "failed", "inconclusive"}
+        and isinstance(parsed.get("artifacts", {}), dict)
+        and isinstance(parsed.get("produced_claims", []), list)
+        and isinstance(parsed.get("proposed_changes", []), list)
+        and isinstance(parsed.get("completion", {}), dict)
+        and all(
+            isinstance(value, bool)
+            for value in (parsed.get("completion") or {}).values()
+        )
+    )
     protocol_valid = bool(
         parsed
+        and shape_valid
         and isinstance(parsed.get("ok"), bool)
         and parsed.get("task_id")
         in {
@@ -147,19 +176,11 @@ def make_result_envelope(
     invocations: list[dict[str, Any]],
 ) -> ResultEnvelope:
     completion = evaluate(stage, workflow, state, reply)
-    required_agents = [
-        name for name in (getattr(stage, "recommended_agents", None) or []) if name
-    ]
-    seen_agents = {
-        str(item.get("target_agent") or "")
-        for item in invocations
-    }
-    coverage_ok = not required_agents or all(
-        name in seen_agents for name in required_agents
-    )
+    # Validate only work that actually happened.  Recommendations influence
+    # routing, not acceptance; a future separation-of-duties requirement must
+    # use an explicit ``required_agents`` contract.
     protocol_ok = (
         bool(invocations)
-        and coverage_ok
         and all(item.get("protocol_valid") is True for item in invocations)
     )
     reply_ok = getattr(reply, "stage", "") not in (
@@ -171,6 +192,18 @@ def make_result_envelope(
     )
     succeeded = reply_ok and protocol_ok and complete(completion)
     errored = getattr(reply, "stage", "") == "ERROR"
+    failure_codes = []
+    if not reply_ok:
+        failure_codes.append("REPLY_STATUS_REJECTED")
+    if not invocations:
+        failure_codes.append("MISSING_EXECUTION_INVOCATION")
+    elif not protocol_ok:
+        failure_codes.append("INVALID_EXECUTION_INVOCATION")
+    failure_codes.extend(
+        f"MISSING_COMPLETION:{name}"
+        for name, passed in completion.items()
+        if not passed
+    )
     envelope = ResultEnvelope(
         task_id=task_card.task_id,
         workflow_id=workflow.workflow_id,
@@ -191,6 +224,12 @@ def make_result_envelope(
         note=str(getattr(reply, "text", "") or ""),
         completion=completion,
         invocations=list(invocations or []),
+        acceptance={
+            "reply_ok": reply_ok,
+            "execution_protocol_ok": protocol_ok,
+            "completion_ok": complete(completion),
+            "failure_codes": failure_codes,
+        },
     )
     envelope.validate()
     return envelope

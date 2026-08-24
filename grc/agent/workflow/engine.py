@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, Optional
 
 from .completion import KNOWN_COMPLETIONS
 from .schema import Checkpoint, Stage, Workflow, WorkflowIntent
+from ..tools.hardware_profiles import resolve_hardware_profile
 
 
 _TERMINALS = {"completed", "errored"}
@@ -56,7 +57,7 @@ _STAGE_LABELS = {
     "protocol_spec_alignment": "BLE 规格对齐",
     "build_ble_advertiser": "构建 BLE 广播",
     "offline_protocol_verify": "BLE 离线协议校验",
-    "discover_and_probe_device": "发现并探测 B210",
+    "discover_and_probe_device": "发现并探测所选 SDR",
     "rf_plan_confirmation": "RF 计划确认",
     "configure_device": "配置设备参数",
     "transmit_bounded": "有限时长发射",
@@ -200,7 +201,12 @@ class WorkflowEngine:
                     "approved" if relation == "approval" else "rejected"
                 )
                 return self.workflow
-            if current and current.execution_status == "waiting" and current.checkpoint:
+            if (
+                current
+                and current.execution_status == "waiting"
+                and current.checkpoint
+                and relation != "new_task"
+            ):
                 if current.id in _ALIGNMENT_STAGES:
                     self._merge_turn_slots(text, shared_state)
                     if not self.workflow.intent.missing_slots and not self.workflow.intent.validation_errors:
@@ -218,12 +224,36 @@ class WorkflowEngine:
                 self._merge_turn_slots(text, shared_state)
                 if current and self.workflow.execution_status == "waiting":
                     self._remember_result(current, "user_feedback")
-                    current.execution_status = "pending"
-                    current.outcome = ""
-                    current.result = {}
+                    resume_stage = current
+                    failure_codes = list(
+                        (current.result.get("acceptance") or {}).get(
+                            "failure_codes"
+                        )
+                        or []
+                    )
+                    project_config = getattr(
+                        getattr(shared_state, "project", None), "config", {}
+                    ) or {}
+                    if (
+                        current.id == "transmit_bounded"
+                        and not project_config.get("rf_armed")
+                        and any(
+                            code == "MISSING_COMPLETION:transmit_started"
+                            for code in failure_codes
+                        )
+                    ):
+                        configured = self.workflow.stage("configure_device")
+                        if configured is not None:
+                            resume_stage = configured
+                            self.workflow.current_stage = configured.id
+                    resume_stage.execution_status = "pending"
+                    resume_stage.outcome = ""
+                    resume_stage.result = {}
+                    # A user-authorized retry resumes the selected Stage even
+                    # when its ordinary autonomous attempt budget was spent.
+                    resume_stage.resume_pending = True
                 self.workflow.execution_status = "pending"
                 self.workflow.revision += 1
-                self.workflow.intent.raw_text = text
                 self.save()
                 return self.workflow
             if relation != "new_task":
@@ -248,16 +278,26 @@ class WorkflowEngine:
                 return "approval" if decision == "approved" else "rejection"
         if self._is_explicit_new_task(low):
             return "new_task"
-        classified = self.classify(text, shared_state)
-        if self._is_strong_task_switch(classified):
-            return "new_task"
         if current and current.execution_status == "waiting" and current.checkpoint:
+            # A checkpoint pauses the current workflow; it does not capture all
+            # subsequent user turns.  A clearly classified request for another
+            # capability must be allowed to supersede it (for example, moving
+            # from diagnosis to a read-only observation).
+            classified = self.classify(text, shared_state)
+            if self._is_strong_task_switch(classified):
+                return "new_task"
             if current.id in _ALIGNMENT_STAGES:
                 return "answer"
             return "adjustment"
-        if self.workflow and self.workflow.execution_status == "waiting":
+        if self.workflow and self.workflow.execution_status == "waiting" and (
+            bool(self._decision(text))
+            or low in {"启动", "继续", "重试", "再试", "resume", "retry"}
+        ):
             return "feedback"
-        if any(hint in low for hint in ("继续", "重试", "再试", "resume", "retry")):
+        classified = self.classify(text, shared_state)
+        if self._is_strong_task_switch(classified):
+            return "new_task"
+        if self.workflow and self.workflow.execution_status == "waiting":
             return "feedback"
         if current and current.execution_status in ("pending", "invalidated"):
             if any(hint in low for hint in ("调整", "改一下方案", "补充", "其余条件")):
@@ -303,9 +343,9 @@ class WorkflowEngine:
         self.workflow.intent.slot_sources.update(
             {key: "user" for key in updates}
         )
-        for capability in update.capabilities:
-            if capability not in self.workflow.intent.capabilities:
-                self.workflow.intent.capabilities.append(capability)
+        # Capabilities describe the instantiated plan and stay stable during
+        # ordinary feedback.  A material capability change is a replan/new
+        # task decision, not an append-only merge from a short control turn.
         self.workflow.intent.missing_slots = self._missing_slots(
             self.workflow.task_type,
             self.workflow.intent.slots,
@@ -340,6 +380,37 @@ class WorkflowEngine:
             task_type = "END_TO_END_SIM"
         project_config = getattr(getattr(shared_state, "project", None), "config", {})
         slot_sources = {key: "user" for key, value in slots.items() if value not in (None, "", [])}
+        if slots.get("protocol") == "ble":
+            # Protocol-derived defaults are not fresh user decisions.  Keep
+            # provenance precise so replanning may change defaults without
+            # silently overriding an explicit constraint.
+            for key in (
+                "ble_mode", "modulation", "advertising_channels",
+                "carrier_frequency", "sample_rate",
+            ):
+                if key in slots:
+                    slot_sources[key] = "protocol_default"
+            if "duration_seconds" in slots:
+                slot_sources["duration_seconds"] = (
+                    "user" if re.search(
+                        r"(?:运行|持续|时长|duration)\s*[:=为]?\s*"
+                        r"\d+(?:\.\d+)?\s*(?:秒|s|sec(?:onds?)?)",
+                        low,
+                    ) else "safety_default"
+                )
+            if "tx_gain" in slots:
+                slot_sources["tx_gain"] = "safety_default"
+            if "tx_attenuation" in slots:
+                slot_sources["tx_attenuation"] = "safety_default"
+            explicit_frequency = bool(re.search(
+                r"(?<![0-9.])\d+(?:\.\d+)?\s*[gmk]?hz(?![A-Za-z0-9_])",
+                low,
+            ))
+            if explicit_frequency:
+                slot_sources["carrier_frequency"] = "user"
+                slot_sources["advertising_channels"] = "derived"
+            if re.search(r"(?:采样率|sample rate)", low):
+                slot_sources["sample_rate"] = "user"
         context = {
             "current_project": {
                 "grc_path": str(getattr(getattr(shared_state, "project", None), "grc_path", "") or ""),
@@ -527,7 +598,20 @@ class WorkflowEngine:
                     slots["carrier_frequency"] = (
                         float(parsed.group(1)) * units[parsed.group(2).lower()]
                     )
-        device = next((name for name in ("b210", "usrp", "hackrf", "pluto", "limesdr") if name in low), "")
+        device = next(
+            (
+                name
+                for name, pattern in (
+                    ("b210", r"(?<![a-z0-9])(?:usrp\s*)?b2(?:00|10)(?![a-z0-9])"),
+                    ("hackrf", r"(?<![a-z0-9])hackrf(?:\s+one)?(?![a-z0-9])"),
+                    ("pluto", r"(?<![a-z0-9])(?:adalm[-\s]*)?pluto(?:sdr)?(?![a-z0-9])"),
+                    ("limesdr", r"(?<![a-z0-9])lime\s*sdr(?![a-z0-9])"),
+                    ("usrp", r"(?<![a-z0-9])usrp(?![a-z0-9])"),
+                )
+                if re.search(pattern, low)
+            ),
+            "",
+        )
         if device:
             slots["hardware"] = device
         switch = re.search(
@@ -547,6 +631,23 @@ class WorkflowEngine:
         success = re.findall(r"(?:evm|ber)\s*(?:小于|低于|<|≤)\s*\d+(?:\.\d+)?\s*%?", low)
         if success:
             slots["success_conditions"] = success
+        if slots.get("protocol") == "ble":
+            ghz = re.search(r"(?<![0-9.])(\d+(?:\.\d+)?)\s*ghz", low)
+            if ghz:
+                slots["carrier_frequency"] = float(ghz.group(1)) * 1e9
+            freq = slots.get("carrier_frequency")
+            if freq is not None:
+                for channel, center in (
+                    (37, 2_402_000_000.0),
+                    (38, 2_426_000_000.0),
+                    (39, 2_480_000_000.0),
+                ):
+                    if abs(float(freq) - center) < 5e5:
+                        slots["advertising_channels"] = [channel]
+                        slots["carrier_frequency"] = center
+                        break
+            if str(slots.get("hardware") or "") == "pluto":
+                slots.setdefault("tx_attenuation", 30.0)
         return slots
 
     @staticmethod
@@ -588,10 +689,11 @@ class WorkflowEngine:
                     errors.append("carrier_frequency_invalid")
                 # This is a capability guard, not a task classifier. Known
                 # radios can add ranges without changing workflow semantics.
-                hardware = str(slots.get("hardware") or "").lower()
-                ranges = {"b210": (70e6, 6e9)}
-                if hardware in ranges:
-                    low, high = ranges[hardware]
+                profile = resolve_hardware_profile(
+                    str(slots.get("hardware") or "")
+                )
+                if profile:
+                    low, high = profile.frequency_range
                     if not low <= value <= high:
                         errors.append("carrier_frequency_out_of_device_range")
         for key in ("sample_rate", "bandwidth", "symbol_rate"):
@@ -819,6 +921,7 @@ class WorkflowEngine:
                 "proposed_changes",
                 "completion",
                 "invocations",
+                "acceptance",
             )
             if data.get(key)
         }
@@ -857,7 +960,13 @@ class WorkflowEngine:
                 transition_key = "failed_without_improvement"
             else:
                 transition_key = "errored"
-            self._event("stage_completed", {"stage_id": stage.id, "outcome": stage.outcome, "attempt": stage.attempt})
+            self._event("stage_completed", {
+                "stage_id": stage.id,
+                "outcome": stage.outcome,
+                "attempt": stage.attempt,
+                "acceptance": dict(data.get("acceptance") or {}),
+                "missing_completion": missing_completion,
+            })
         target = stage.transitions.get(transition_key)
         if target is None and transition_key == "passed":
             target = stage.transitions.get("completed")
@@ -1035,9 +1144,31 @@ class WorkflowEngine:
             return {}
         stage = self.current_stage()
         index = next((i for i, item in enumerate(self.workflow.stages, 1) if item.id == self.workflow.current_stage), 0)
+        wait_kind = (
+            "input"
+            if self.workflow.intent.missing_slots
+            or self.workflow.intent.validation_errors
+            else "approval"
+            if stage and stage.checkpoint
+            else "recovery"
+            if self.workflow.execution_status == "waiting"
+            else ""
+        )
         waiting_reason = ""
-        if stage and stage.checkpoint:
+        if wait_kind == "approval" and stage and stage.checkpoint:
             waiting_reason = stage.checkpoint.reason
+        elif wait_kind == "input":
+            waiting_reason = "待补充或修正：{}".format(
+                ", ".join(
+                    list(self.workflow.intent.missing_slots)
+                    + list(self.workflow.intent.validation_errors)
+                )
+            )
+        elif wait_kind == "recovery":
+            waiting_reason = str(
+                ((stage.result if stage else {}) or {}).get("note")
+                or "当前 Stage 未满足完成条件，请重试、调整方案或取消。"
+            )
         return {
             "workflow_id": self.workflow.workflow_id,
             "task_type": self.workflow.task_type,
@@ -1051,8 +1182,24 @@ class WorkflowEngine:
             "stage_index": index,
             "stage_total": len(self.workflow.stages),
             "waiting_reason": waiting_reason,
+            "wait_kind": wait_kind,
+            "interaction_request": (
+                {
+                    "kind": wait_kind,
+                    "reason": waiting_reason,
+                    "checkpoint_id": (
+                        stage.checkpoint.id
+                        if wait_kind == "approval" and stage and stage.checkpoint
+                        else ""
+                    ),
+                }
+                if wait_kind
+                else {}
+            ),
             "checkpoint_id": (
-                stage.checkpoint.id if stage and stage.checkpoint else ""
+                stage.checkpoint.id
+                if wait_kind == "approval" and stage and stage.checkpoint
+                else ""
             ),
             "revision": self.workflow.revision,
             "base_project_version": self.workflow.base_project_version,

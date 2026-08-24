@@ -23,6 +23,7 @@ KNOWN_COMPLETIONS = frozenset(
         "hardware_precheck_completed",
         "hardware_decision_recorded",
         "configuration_recorded",
+        "flowgraph_armed",
         "hardware_check_completed",
         "ble_packet_created",
         "ble_waveform_generated",
@@ -59,6 +60,26 @@ def evaluate(stage: Any, workflow: Any, state: Any, reply: Any) -> Dict[str, boo
     capabilities = set(
         getattr(getattr(workflow, "intent", None), "capabilities", None) or []
     )
+    runtime_state = dict(getattr(project, "config", {}).get("runtime") or {})
+
+    def runtime_start_accepted(item: Dict[str, Any]) -> bool:
+        return bool(
+            item.get("ok")
+            and item.get("running")
+            and item.get("ready")
+            and item.get("startup_health_passed")
+            and item.get("run_id")
+        )
+
+    def runtime_stop_accepted(item: Dict[str, Any]) -> bool:
+        return bool(
+            item.get("ok")
+            and not item.get("running")
+            and not item.get("crashed")
+            and item.get("run_id")
+            and item.get("reason") in {"stopped", "emergency_stop", "exited"}
+            and item.get("return_code") in (0, -15, -9)
+        )
 
     def flowgraph_blocks() -> list[Dict[str, Any]]:
         inspected = tool_results.get("inspect_flowgraph", [])
@@ -146,6 +167,14 @@ def evaluate(stage: Any, workflow: Any, state: Any, reply: Any) -> Dict[str, boo
     def checked(name: str) -> bool:
         return any(bool(result.get("ok", True)) for result in tool_results.get(name, []))
 
+    def stage_passed(stage_id: str) -> bool:
+        return any(
+            getattr(item, "id", "") == stage_id
+            and getattr(item, "execution_status", "") == "completed"
+            and getattr(item, "outcome", "") == "passed"
+            for item in (getattr(workflow, "stages", None) or [])
+        )
+
     def structural_validation() -> bool:
         results = tool_results.get("validate", []) + tool_results.get("validate_flowgraph", [])
         if any(bool(item.get("ok", True)) and bool(item.get("valid")) for item in results):
@@ -160,6 +189,7 @@ def evaluate(stage: Any, workflow: Any, state: Any, reply: Any) -> Dict[str, boo
             for name in (
                 "build_usrp_rx_spectrum_flowgraph",
                 "build_ble_uhd_tx_flowgraph",
+                "build_ble_pluto_tx_flowgraph",
             )
             for item in tool_results.get(name, [])
         )
@@ -222,6 +252,13 @@ def evaluate(stage: Any, workflow: Any, state: Any, reply: Any) -> Dict[str, boo
         "configuration_recorded": bool(
             getattr(project, "config", {}).get("device")
         ),
+        "flowgraph_armed": bool(
+            getattr(project, "config", {}).get("rf_armed")
+            and any(
+                bool(item.get("ok")) and bool(item.get("armed"))
+                for item in tool_results.get("arm_hardware_flowgraph", [])
+            )
+        ),
         "hardware_check_completed": bool(
             getattr(project, "config", {}).get("device", {}).get("mode")
             == "flowgraph_config_only"
@@ -240,14 +277,18 @@ def evaluate(stage: Any, workflow: Any, state: Any, reply: Any) -> Dict[str, boo
             bool(item.get("device_probed"))
             for item in tool_results.get("probe_device", [])
         ),
-        "rf_plan_approved": True,
+        "rf_plan_approved": stage_passed("rf_plan_confirmation"),
         "transmit_started": any(
-            bool(item.get("running"))
+            runtime_start_accepted(item)
             for item in tool_results.get("start_flowgraph", [])
         ),
-        "over_air_observed": True,
+        "over_air_observed": bool(
+            slots.get("over_air_observed")
+            and (slots.get("ota_observation") or {}).get("run_id")
+            == runtime_state.get("run_id")
+        ),
         "transmit_stopped": any(
-            bool(item.get("ok")) and not bool(item.get("running"))
+            runtime_stop_accepted(item)
             for name in ("stop_flowgraph", "emergency_stop", "query_runtime_status")
             for item in tool_results.get(name, [])
         ),
@@ -257,12 +298,12 @@ def evaluate(stage: Any, workflow: Any, state: Any, reply: Any) -> Dict[str, boo
             "qtgui_freq_sink_x", "qtgui_waterfall_sink_x",
         })),
         "runtime_started": any(
-            bool(item.get("running"))
+            runtime_start_accepted(item)
             for item in tool_results.get("start_flowgraph", [])
         ),
         "runtime_observation_recorded": True,
         "runtime_stopped": any(
-            bool(item.get("ok")) and not bool(item.get("running"))
+            runtime_stop_accepted(item)
             for name in ("stop_flowgraph", "emergency_stop", "query_runtime_status")
             for item in tool_results.get(name, [])
         ),

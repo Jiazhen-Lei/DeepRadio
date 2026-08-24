@@ -41,7 +41,15 @@ class ClaimStore:
         claim = self.get(claim_id)
         if claim is None:
             raise KeyError(f"未知 claim: {claim_id}")
-        claim.evidence.append(evidence)
+        duplicate = any(
+            item.test == evidence.test
+            and item.observation == evidence.observation
+            and item.project_version == evidence.project_version
+            and item.artifact == evidence.artifact
+            for item in claim.evidence
+        )
+        if not duplicate:
+            claim.evidence.append(evidence)
         claim.project_version = evidence.project_version
         if passed is True:
             claim.status = "Passed"
