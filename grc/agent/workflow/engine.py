@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import json
 import os
 import re
+import time
 import uuid
 from typing import Any, Callable, Dict, Optional
 
 from .completion import KNOWN_COMPLETIONS
 from .schema import Checkpoint, Stage, Workflow, WorkflowIntent
 from ..tools.hardware_profiles import resolve_hardware_profile
+
+logger = logging.getLogger(__name__)
 
 
 _TERMINALS = {"completed", "errored"}
@@ -72,10 +76,23 @@ _STAGE_LABELS = {
 _ALIGNMENT_STAGES = frozenset(
     {"spec_alignment", "rx_spec_alignment", "protocol_spec_alignment"}
 )
-_BUILD_HINTS = ("构建", "生成", "创建", "做一个", "build", "create")
+_BUILD_HINTS = (
+    "构建", "生成", "创建", "做一个", "搭一个", "搭建", "build", "create",
+)
 _MODIFY_HINTS = ("修改", "改成", "改为", "换成", "调参", "设为", "modify", "change")
 _OBSERVE_HINTS = ("观察", "查看", "频谱", "星座图", "眼图", "measure", "spectrum")
-_HARDWARE_HINTS = ("硬件", "usrp", "b210", "hackrf", "pluto", "limesdr", "sdr")
+_DEVICE_HINTS = (
+    "usrp", "b210", "b200", "hackrf", "pluto", "limesdr", "adalm", "ettus",
+)
+_HW_CAPABILITIES = ("hardware_configure", "hardware_runtime", "deploy")
+_NEGATION = re.compile(
+    r"(?:不(?:要|用|接|做|上|含)?|别|禁止|勿|without|no(?![a-z])|not\s+)",
+    re.I,
+)
+_SIM_ONLY = re.compile(
+    r"(?<!不)(?:只|仅).{0,16}(?:仿真|模拟|simulat)|simulation[\s-]*only",
+    re.I,
+)
 _CAUSE_DEPENDENCIES = {
     "flowgraph_changed": {"project.flowgraph"},
     "snapshot_restored": {"project.flowgraph"},
@@ -85,6 +102,62 @@ _CAUSE_DEPENDENCIES = {
     "recipe_changed": {"spec.architecture", "project.flowgraph"},
     "success_conditions_changed": {"success_conditions"},
 }
+
+
+def _negated_span(text: str, start: int, width: int = 18) -> bool:
+    window = (text or "")[max(0, start - width): start + width]
+    return bool(_NEGATION.search(window))
+
+
+def _hardware_affirmed(text: str) -> bool:
+    low = (text or "").lower()
+    for hint in _DEVICE_HINTS + ("sdr",):
+        index = low.find(hint)
+        while index >= 0:
+            if not _negated_span(low, index):
+                return True
+            index = low.find(hint, index + 1)
+    for match in re.finditer(
+        r"(?:配置|接入|接上|连接).{0,16}(?:硬件|电台|sdr)",
+        text or "",
+        flags=re.I,
+    ):
+        if not _negated_span(text or "", match.start()):
+            return True
+    return False
+
+
+_HW_OBJECT = re.compile(r"硬件|射频|sdr|usrp|电台|板子|空口", re.I)
+
+
+def _offline_forbidden(text: str) -> set[str]:
+    forbidden: set[str] = set()
+    if _SIM_ONLY.search(text or ""):
+        forbidden.update(_HW_CAPABILITIES)
+    for match in _HW_OBJECT.finditer(text or ""):
+        if _negated_span(text or "", match.start()):
+            forbidden.update(_HW_CAPABILITIES)
+            break
+    return forbidden
+
+
+def _task_type_from_capabilities(capabilities: list[str], current: str) -> str:
+    caps = set(capabilities or [])
+    if "diagnose" in caps:
+        return "DIAGNOSE"
+    if "modify_project" in caps:
+        return "MODIFY_PROJECT"
+    if "build_rx" in caps:
+        return "RX_BUILD"
+    if "build_tx" in caps:
+        return "TX_BUILD"
+    if "hardware_configure" in caps:
+        return "HARDWARE_CONFIGURE"
+    if current == "HARDWARE_CONFIGURE":
+        return "END_TO_END_SIM"
+    if current in _TASK_TYPES:
+        return current
+    return "END_TO_END_SIM"
 
 
 class WorkflowEngine:
@@ -148,6 +221,9 @@ class WorkflowEngine:
             return None
         with open(self.path, "r", encoding="utf-8") as handle:
             data = json.load(handle)
+        from ..state.shared_state import resolve_tree_paths
+
+        data = resolve_tree_paths(os.path.dirname(os.path.abspath(self.path)), data)
         return Workflow.from_dict(data)
 
     def _recover_interrupted(self) -> None:
@@ -265,7 +341,9 @@ class WorkflowEngine:
             )
 
         intent = self.classify(text, shared_state)
-        return self.instantiate(intent, shared_state)
+        return self.instantiate(
+            self._reconcile_intent(intent, text, shared_state), shared_state
+        )
 
     def _turn_relation(self, text: str, shared_state: Any) -> str:
         low = (text or "").lower().strip()
@@ -398,6 +476,8 @@ class WorkflowEngine:
                         low,
                     ) else "safety_default"
                 )
+                slot_sources["max_duration_seconds"] = slot_sources["duration_seconds"]
+                slots["max_duration_seconds"] = slots["duration_seconds"]
             if "tx_gain" in slots:
                 slot_sources["tx_gain"] = "safety_default"
             if "tx_attenuation" in slots:
@@ -449,14 +529,31 @@ class WorkflowEngine:
             context=context,
             validation_errors=validation_errors,
         )
-        if intent.confidence < 0.9:
-            from .intent_llm import complete_intent
+        return intent
 
+    def _reconcile_intent(
+        self, intent: WorkflowIntent, text: str, shared_state: Any
+    ) -> WorkflowIntent:
+        """Let LLM (or an offline fallback) drop capabilities that contradict constraints."""
+        intent.context.setdefault("forbidden_capabilities", sorted(_offline_forbidden(text)))
+        try:
+            from ..llm import is_configured
+            configured = is_configured()
+        except Exception:  # noqa: BLE001
+            configured = False
+        if configured:
             intent = complete_intent(intent, text, shared_state)
-            intent.missing_slots = self._missing_slots(
-                intent.task_type, intent.slots, shared_state, intent.capabilities
-            )
-            intent.validation_errors = self._validate_slots(intent.slots)
+        intent.capabilities = [
+            name for name in intent.capabilities
+            if name not in set(intent.context.get("forbidden_capabilities") or ())
+        ]
+        intent.task_type = _task_type_from_capabilities(
+            intent.capabilities, intent.task_type
+        )
+        intent.missing_slots = self._missing_slots(
+            intent.task_type, intent.slots, shared_state, intent.capabilities
+        )
+        intent.validation_errors = self._validate_slots(intent.slots)
         return intent
 
     @staticmethod
@@ -475,7 +572,7 @@ class WorkflowEngine:
         build = any(word in low for word in _BUILD_HINTS)
         rx = slots.get("direction") == "rx"
         tx = slots.get("direction") == "tx"
-        hardware = bool(slots.get("hardware")) or any(word in low for word in _HARDWARE_HINTS)
+        hardware = bool(slots.get("hardware")) or _hardware_affirmed(text)
         observe = bool(slots.get("requested_metrics")) or any(word in low for word in _OBSERVE_HINTS)
         realtime = any(word in low for word in ("实时", "live", "real-time", "realtime"))
 
@@ -497,7 +594,8 @@ class WorkflowEngine:
             or slots.get("operation") == "deploy"
             or any(word in low for word in ("启动", "运行", "run", "start"))
         ))
-        return capabilities
+        forbidden = _offline_forbidden(text)
+        return [name for name in capabilities if name not in forbidden]
 
     @staticmethod
     def _parse_slots(text: str) -> Dict[str, Any]:
@@ -534,6 +632,7 @@ class WorkflowEngine:
         )
         if duration:
             slots["duration_seconds"] = float(duration.group(1))
+            slots["max_duration_seconds"] = float(duration.group(1))
         if any(word in low for word in ("实时", "live", "real-time", "realtime")):
             slots["observation_mode"] = "realtime"
         if "ble" in low or "bluetooth low energy" in low or "低功耗蓝牙" in text:
@@ -549,6 +648,7 @@ class WorkflowEngine:
                     "carrier_frequency": 2_402_000_000.0,
                     "sample_rate": 2_000_000.0,
                     "duration_seconds": slots.get("duration_seconds", 30.0),
+                    "max_duration_seconds": slots.get("duration_seconds", 30.0),
                     "tx_gain": 0.0,
                 }
             )
@@ -931,17 +1031,12 @@ class WorkflowEngine:
             stage.result["missing_completion"] = missing_completion
         if data.get("errored"):
             self._event("stage_errored", {"stage_id": stage.id, "attempt": stage.attempt})
-            if stage.attempt < stage.max_attempts:
-                self._remember_result(stage, "errored_retry")
-                stage.execution_status = "pending"
-                stage.outcome = ""
-                stage.result = {}
-                self.workflow.execution_status = "pending"
-                self.save()
-                return True
-            stage.execution_status = "errored"
+            self._remember_result(stage, "errored")
+            stage.execution_status = "waiting"
             stage.outcome = "inconclusive"
-            transition_key = "errored"
+            self.workflow.execution_status = "waiting"
+            self.save()
+            return True
         else:
             stage.execution_status = "completed"
             stage.outcome = outcome if outcome in ("passed", "failed", "inconclusive") else ("passed" if ok else "failed")
@@ -1025,6 +1120,7 @@ class WorkflowEngine:
             return
         if stage.checkpoint.resume_stage and normalized == "rejected":
             checkpoint_id = stage.checkpoint.id
+            stage.result = self._checkpoint_result(stage, normalized)
             stage.execution_status = "completed"
             stage.outcome = "cancelled"
             self.workflow.execution_status = "completed"
@@ -1035,11 +1131,46 @@ class WorkflowEngine:
             )
             self.save()
             return
+        stage.result = self._checkpoint_result(stage, normalized)
         stage.execution_status = "completed"
         stage.outcome = "passed" if normalized == "approved" else "cancelled"
         self._event("checkpoint_resolved", {"stage_id": stage.id, "decision": normalized})
         self._transition(stage.transitions.get(normalized, "completed"))
         self.save()
+
+    def _checkpoint_result(self, stage: Stage, decision: str) -> Dict[str, Any]:
+        approved = decision == "approved"
+        checkpoint = stage.checkpoint
+        slots = self.workflow.intent.slots if self.workflow else {}
+        observation = dict(slots.get("ota_observation") or {})
+        completion = {}
+        for name in stage.completion:
+            if name == "rf_plan_approved":
+                completion[name] = approved
+            elif name == "over_air_observed":
+                completion[name] = bool(approved and slots.get("over_air_observed"))
+            elif name == "runtime_observation_recorded":
+                completion[name] = bool(approved and slots.get("runtime_observed"))
+            elif name == "required_slots_complete":
+                completion[name] = not list(self.workflow.intent.missing_slots or [])
+            elif name in ("hardware_decision_recorded", "change_decision_recorded"):
+                completion[name] = True
+            else:
+                completion[name] = approved
+        return {
+            "completion": completion,
+            "acceptance": {
+                "decision": decision,
+                "checkpoint_id": checkpoint.id if checkpoint else "",
+                "decided_at": time.time(),
+                "run_id": observation.get("run_id") or "",
+                "evidence_id": observation.get("artifact") or "",
+                "evidence_sha256": observation.get("sha256")
+                or observation.get("artifact_sha256")
+                or "",
+            },
+            "note": (checkpoint.reason if checkpoint else "") or stage.id,
+        }
 
     def invalidate(self, cause: str, project_version: int) -> None:
         if not self.workflow:
@@ -1133,9 +1264,12 @@ class WorkflowEngine:
         self.workflow.validate()
         parent = os.path.dirname(os.path.abspath(self.path))
         os.makedirs(parent, exist_ok=True)
+        from ..state.shared_state import relativize_tree_paths
+
+        payload = relativize_tree_paths(parent, self.workflow.to_dict())
         tmp = f"{self.path}.tmp"
         with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump(self.workflow.to_dict(), handle, ensure_ascii=False, indent=2)
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
         os.replace(tmp, self.path)
         return self.path
 
@@ -1206,6 +1340,10 @@ class WorkflowEngine:
             "capabilities": list(self.workflow.intent.capabilities),
             "missing_slots": list(self.workflow.intent.missing_slots),
             "validation_errors": list(self.workflow.intent.validation_errors),
+            "max_duration_seconds": (
+                self.workflow.intent.slots.get("max_duration_seconds")
+                or self.workflow.intent.slots.get("duration_seconds")
+            ),
             "stages": [
                 {
                     "id": item.id,
@@ -1238,6 +1376,11 @@ class WorkflowEngine:
             if stage.interaction == "conditional_checkpoint" and not self._checkpoint_required(stage):
                 stage.execution_status = "completed"
                 stage.outcome = "passed"
+                stage.result = {
+                    "completion": {name: True for name in stage.completion},
+                    "acceptance": {"decision": "not_required", "decided_at": time.time()},
+                    "note": "not_required",
+                }
                 self._event("stage_skipped", {"stage_id": stage.id, "reason": "not_required"})
                 self._transition(stage.transitions.get("not_required", "completed"))
                 return
@@ -1324,3 +1467,151 @@ def _result_fingerprint(result: Dict[str, Any], ok: bool, outcome: str) -> str:
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
+
+
+_TASK_TYPES = frozenset(
+    {
+        "END_TO_END_SIM",
+        "TX_BUILD",
+        "RX_BUILD",
+        "DIAGNOSE",
+        "MODIFY_PROJECT",
+        "OBSERVE",
+        "HARDWARE_CONFIGURE",
+    }
+)
+_CAPABILITIES = frozenset(
+    {
+        "diagnose",
+        "modify_project",
+        "build_rx",
+        "build_tx",
+        "build_signal",
+        "hardware_configure",
+        "observe",
+        "realtime_observe",
+        "signal_agnostic_observe",
+        "protocol",
+        "deploy",
+        "hardware_runtime",
+    }
+)
+_PROMPT = """你是 DeepRadio 的 Intent 校正器。只输出一个 JSON 对象。
+字段:
+- task_type: END_TO_END_SIM / TX_BUILD / RX_BUILD / DIAGNOSE / MODIFY_PROJECT / OBSERVE / HARDWARE_CONFIGURE
+- capabilities: 用户最终要做的事，只能用给定集合
+- forbidden_capabilities: 用户明确不要的能力
+- slots: 文本里明确出现的参数
+- confidence: 0~1
+规则:
+- 否定、只仿真、不要硬件/射频 优先于关键词；不要因为出现「硬件」就打开 hardware_configure
+- 不得把实时硬件观察改写成离线仿真
+- 不得因为 2.4GHz 就判定 BLE，除非用户说了 ble/蓝牙/发射广播
+- 用户已给出的槽位不得覆盖
+- 不要发明 local_name 或 operation=deploy
+"""
+
+
+def complete_intent(
+    rules_intent: WorkflowIntent, text: str, shared_state: Any
+) -> WorkflowIntent:
+    """Merge rules Intent with an optional LLM patch (may drop forbidden capabilities)."""
+    try:
+        from ..llm import chat, is_configured
+    except Exception:  # noqa: BLE001
+        return rules_intent
+    if not is_configured():
+        return rules_intent
+    payload = {
+        "text": text,
+        "rules_intent": {
+            "task_type": rules_intent.task_type,
+            "confidence": rules_intent.confidence,
+            "slots": rules_intent.slots,
+            "missing_slots": rules_intent.missing_slots,
+            "capabilities": rules_intent.capabilities,
+            "forbidden_capabilities": list(
+                (rules_intent.context or {}).get("forbidden_capabilities") or []
+            ),
+            "slot_sources": rules_intent.slot_sources,
+        },
+        "allowed_task_types": sorted(_TASK_TYPES),
+        "allowed_capabilities": sorted(_CAPABILITIES),
+        "has_project": bool(
+            getattr(getattr(shared_state, "project", None), "grc_path", "")
+        ),
+    }
+    try:
+        content = chat(
+            [
+                {"role": "system", "content": _PROMPT},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ]
+        )
+        parsed = _parse_json_object(content)
+    except Exception as exc:  # noqa: BLE001
+        logger.info("Intent LLM 补全失败，沿用规则分类: %s", exc)
+        return rules_intent
+    return _merge(rules_intent, parsed)
+
+
+def _merge(rules: WorkflowIntent, parsed: dict[str, Any]) -> WorkflowIntent:
+    task_type = str(parsed.get("task_type") or rules.task_type)
+    if task_type not in _TASK_TYPES:
+        task_type = rules.task_type
+    forbidden = {
+        name for name in list(parsed.get("forbidden_capabilities") or [])
+        + list((rules.context or {}).get("forbidden_capabilities") or [])
+        if name in _CAPABILITIES
+    }
+    raw_caps = parsed.get("capabilities")
+    if isinstance(raw_caps, list) and raw_caps:
+        capabilities = [name for name in raw_caps if name in _CAPABILITIES]
+    else:
+        capabilities = list(rules.capabilities)
+    capabilities = [name for name in capabilities if name not in forbidden]
+    slots = dict(rules.slots)
+    sources = dict(rules.slot_sources)
+    for key, value in dict(parsed.get("slots") or {}).items():
+        if value in (None, "", []):
+            continue
+        if sources.get(key) == "user":
+            continue
+        slots[key] = value
+        sources[key] = "llm"
+    try:
+        confidence = float(parsed.get("confidence", rules.confidence))
+    except (TypeError, ValueError):
+        confidence = rules.confidence
+    confidence = min(1.0, max(rules.confidence, confidence, 0.0))
+    context = dict(rules.context)
+    if forbidden:
+        context["forbidden_capabilities"] = sorted(forbidden)
+    return WorkflowIntent(
+        raw_text=rules.raw_text,
+        turn_relation=rules.turn_relation,
+        task_type=task_type,
+        confidence=confidence,
+        slots=slots,
+        missing_slots=list(rules.missing_slots),
+        capabilities=capabilities,
+        slot_sources=sources,
+        context=context,
+        validation_errors=list(rules.validation_errors),
+    )
+
+
+def _parse_json_object(content: str) -> dict[str, Any]:
+    text = (content or "").strip()
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL)
+    if fenced:
+        text = fenced.group(1)
+    else:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            text = text[start : end + 1]
+    data = json.loads(text)
+    if not isinstance(data, dict):
+        raise ValueError("Intent LLM 返回值不是对象")
+    return data

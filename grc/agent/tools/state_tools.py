@@ -392,6 +392,8 @@ def verify_claims(ctx: ToolContext):
         "required": ["device_type"],
     },
     group="hardware",
+    origin="deepradio_state",
+    runtime="shared_state",
 )
 def configure_sdr(
     ctx: ToolContext,
@@ -439,24 +441,10 @@ def configure_sdr(
         "type": device_type,
         "center_freq": center_freq,
         "sample_rate": sample_rate,
-        "mode": "flowgraph_config_only",
+        "configuration_mode": "recorded",
+        "mode": "configuration_recorded",
     }
     return {"ok": True, "device": state.project.config["device"]}
-
-
-@tool(
-    name="list_devices",
-    description="Report hardware discovery availability.",
-    parameters={"type": "object", "properties": {}},
-    group="hardware",
-)
-def list_devices(ctx: ToolContext):
-    return {
-        "ok": False,
-        "enabled": False,
-        "requires_confirmation": True,
-        "error": "一期不枚举真实 SDR；仅支持 flowgraph 配置",
-    }
 
 
 @tool(
@@ -467,6 +455,8 @@ def list_devices(ctx: ToolContext):
         "properties": {"device_type": {"type": "string"}},
     },
     group="hardware",
+    origin="deepradio_state",
+    runtime="shared_state",
 )
 def hardware_preflight(ctx: ToolContext, device_type: str = ""):
     state = _state(ctx)

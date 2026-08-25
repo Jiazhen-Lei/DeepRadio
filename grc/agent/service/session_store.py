@@ -58,6 +58,100 @@ def workflow_path(session_id: str) -> str:
     return os.path.join(session_root(session_id), "workflow.yaml")
 
 
+def archive_session(session_id: str, destination: str) -> str:
+    """Copy a session tree and rewrite leftover absolute session paths."""
+    source = os.path.abspath(session_root(session_id))
+    dest = os.path.abspath(destination)
+    if os.path.isdir(dest) and os.path.isfile(os.path.join(dest, "state.json")):
+        raise ValueError(f"归档目标已存在会话文件: {dest}")
+    if os.path.isdir(dest):
+        dest = os.path.join(dest, _safe_component(session_id))
+    if os.path.exists(dest):
+        raise ValueError(f"归档目标已存在: {dest}")
+    shutil.copytree(source, dest)
+    from ..state.shared_state import relativize_tree_paths, rewrite_root_prefix
+
+    for current_root, dirnames, names in os.walk(dest):
+        dirnames[:] = [name for name in dirnames if name != "__pycache__"]
+        for name in names:
+            path = os.path.join(current_root, name)
+            if name.endswith(".jsonl"):
+                _rewrite_jsonl_session_paths(path, source, dest)
+                continue
+            if not name.endswith((".json", ".yaml", ".yml")):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    payload = json.load(handle)
+            except (OSError, json.JSONDecodeError, TypeError):
+                continue
+            rewritten = relativize_tree_paths(
+                dest, rewrite_root_prefix(payload, source, dest)
+            )
+            tmp = f"{path}.tmp"
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump(rewritten, handle, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+    append_session_event(session_id, "session_archived", {"destination": dest})
+    return dest
+
+
+def _rewrite_jsonl_session_paths(path: str, old_root: str, new_root: str) -> None:
+    from ..state.shared_state import relativize_tree_paths, rewrite_root_prefix
+
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            lines = handle.readlines()
+    except OSError:
+        return
+    rewritten_lines = []
+    changed = False
+    for line in lines:
+        raw = line.strip()
+        if not raw:
+            rewritten_lines.append(line)
+            continue
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            rewritten_lines.append(line)
+            continue
+        updated = relativize_tree_paths(
+            new_root, rewrite_root_prefix(payload, old_root, new_root)
+        )
+        encoded = json.dumps(updated, ensure_ascii=False)
+        rewritten_lines.append(encoded + "\n")
+        changed = changed or encoded != raw
+    if not changed:
+        return
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.writelines(rewritten_lines)
+    os.replace(tmp, path)
+
+
+def nested_export_dir(session_id: str, base: str) -> str:
+    """Put each session's export under ``<base>/<session_id>/``."""
+    if not base:
+        return ""
+    safe = _safe_component(session_id)
+    abs_base = os.path.abspath(base)
+    if os.path.basename(abs_base) == safe:
+        path = abs_base
+    else:
+        path = os.path.join(abs_base, safe)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def resolve_session_path(session_id: str, path: str) -> str:
+    if not path:
+        return ""
+    from ..state.shared_state import to_abspath
+
+    return to_abspath(session_root(session_id), path)
+
+
 def archive_workflow(session_id: str) -> str:
     """Archive the active workflow without touching project facts/artifacts."""
     source = workflow_path(session_id)
@@ -287,7 +381,8 @@ def recent_events(session_id: str, limit: int = 40) -> List[Dict[str, Any]]:
                 "workflow_id": record.get("workflow_id") or payload.get("workflow_id"),
                 "stage_id": record.get("stage_id") or payload.get("stage_id"),
                 "attempt": record.get("attempt") if record.get("attempt") is not None else payload.get("attempt"),
-                "actor": payload.get("target_agent") or payload.get("tool") or payload.get("source") or "",
+                "actor": _event_actor(payload),
+                "mode": payload.get("mode") or payload.get("executor") or "",
                 "ok": (
                     (payload.get("result") or {}).get("ok")
                     if isinstance(payload.get("result"), dict)
@@ -296,6 +391,18 @@ def recent_events(session_id: str, limit: int = 40) -> List[Dict[str, Any]]:
             }
         )
     return items
+
+
+def _event_actor(payload: Dict[str, Any]) -> str:
+    target = str(
+        payload.get("target_agent")
+        or payload.get("tool")
+        or payload.get("source")
+        or ""
+    )
+    origin = str(payload.get("origin") or "")
+    mode = str(payload.get("mode") or payload.get("executor") or "")
+    return " · ".join(part for part in (target, origin, mode) if part)
 
 
 def publish_artifact(session_id: str, source: str) -> str:
@@ -329,11 +436,16 @@ def export_artifact(source: str, destination_dir: str) -> str:
     return destination
 
 
-def attach_evidence(session_id: str, source: str) -> str:
-    """Copy a user-supplied evidence file into the canonical session bundle."""
+def attach_evidence(
+    session_id: str, source: str, run_id: str = ""
+) -> Dict[str, Any]:
+    """Copy a user-supplied evidence file into ``final/evidence/<run_id>/``."""
     if not source or not os.path.isfile(source):
-        return ""
-    evidence_dir = os.path.join(session_root(session_id), "final", "evidence")
+        return {}
+    safe_run = _safe_component(run_id) or "unbound"
+    evidence_dir = os.path.join(
+        session_root(session_id), "final", "evidence", safe_run
+    )
     os.makedirs(evidence_dir, exist_ok=True)
     base = _safe_component(os.path.basename(source)) or "evidence"
     stem, suffix = os.path.splitext(base)
@@ -341,7 +453,34 @@ def attach_evidence(session_id: str, source: str) -> str:
         evidence_dir, f"{stem}-{uuid.uuid4().hex[:8]}{suffix}"
     )
     shutil.copy2(source, destination)
-    return destination
+    digest = ""
+    size = 0
+    try:
+        with open(destination, "rb") as handle:
+            payload = handle.read()
+        digest = hashlib.sha256(payload).hexdigest()
+        size = len(payload)
+    except OSError:
+        size = os.path.getsize(destination)
+    relative = os.path.relpath(destination, session_root(session_id))
+    meta = {
+        "run_id": run_id,
+        "source_name": os.path.basename(source),
+        "path": relative,
+        "artifact": destination,
+        "sha256": digest,
+        "size": size,
+        "observed_at": time.time(),
+    }
+    meta_path = os.path.join(
+        evidence_dir, f"{os.path.splitext(os.path.basename(destination))[0]}.meta.json"
+    )
+    try:
+        with open(meta_path, "w", encoding="utf-8") as handle:
+            json.dump(meta, handle, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+    return meta
 
 
 def write_artifact_manifest(
@@ -357,10 +496,11 @@ def write_artifact_manifest(
         if isinstance(value, str) and os.path.isfile(value)
     }
     entries = []
-    for current_root, _, names in os.walk(final_dir):
+    for current_root, dirnames, names in os.walk(final_dir):
+        dirnames[:] = [name for name in dirnames if not _skip_manifest_name(name)]
         for name in sorted(names):
             path = os.path.join(current_root, name)
-            if name == "manifest.json":
+            if _skip_manifest_name(name):
                 continue
             try:
                 with open(path, "rb") as handle:
@@ -411,28 +551,43 @@ def rewrite_exported_grc_paths(session_id: str, destination_dir: str) -> None:
             continue
 
 
-def write_export_manifest(session_id: str, destination_dir: str) -> str:
-    """Create a manifest that describes the files actually present in export."""
+def write_export_manifest(
+    session_id: str,
+    destination_dir: str,
+    exported_paths: List[str] | None = None,
+) -> str:
+    """Create a manifest for this round's exported files only."""
     os.makedirs(destination_dir, exist_ok=True)
+    destination = os.path.abspath(destination_dir)
+    if exported_paths is None:
+        candidates = []
+        for current_root, dirnames, names in os.walk(destination):
+            dirnames[:] = [name for name in dirnames if not _skip_manifest_name(name)]
+            for name in sorted(names):
+                candidates.append(os.path.join(current_root, name))
+    else:
+        candidates = list(exported_paths)
     entries = []
-    for current_root, _, names in os.walk(destination_dir):
-        for name in sorted(names):
-            if name == "manifest.json":
-                continue
-            path = os.path.join(current_root, name)
-            try:
-                with open(path, "rb") as handle:
-                    digest = hashlib.sha256(handle.read()).hexdigest()
-                size = os.path.getsize(path)
-            except OSError:
-                continue
-            entries.append({
-                "role": "artifact",
-                "path": os.path.relpath(path, destination_dir),
-                "size": size,
-                "sha256": digest,
-            })
-    path = os.path.join(destination_dir, "manifest.json")
+    for path in candidates:
+        name = os.path.basename(path)
+        if _skip_manifest_name(name) or not os.path.isfile(path):
+            continue
+        abs_path = os.path.abspath(path)
+        if os.path.commonpath([destination, abs_path]) != destination:
+            continue
+        try:
+            with open(abs_path, "rb") as handle:
+                digest = hashlib.sha256(handle.read()).hexdigest()
+            size = os.path.getsize(abs_path)
+        except OSError:
+            continue
+        entries.append({
+            "role": "artifact",
+            "path": os.path.relpath(abs_path, destination),
+            "size": size,
+            "sha256": digest,
+        })
+    path = os.path.join(destination, "manifest.json")
     payload = {
         "schema_version": 1,
         "session_id": session_id,
@@ -444,6 +599,14 @@ def write_export_manifest(session_id: str, destination_dir: str) -> str:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
     return path
+
+
+def _skip_manifest_name(name: str) -> bool:
+    return (
+        name in {"manifest.json", "__pycache__"}
+        or name.endswith(".pyc")
+        or name.endswith(".pyo")
+    )
 
 
 def _jsonable(value: Any) -> Any:

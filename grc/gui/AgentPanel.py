@@ -287,6 +287,7 @@ class AgentPanel(Gtk.VBox):
         self._busy = False
         self._out_dir = _output_dir()
         self._font_pt = _DEFAULT_FONT_PT
+        self._runtime_poll_id = None
 
         # 多轮协商 Agent 实例 (惰性创建, 避免无 gnuradio 时导入报错)。
         self._agent = None
@@ -363,6 +364,7 @@ class AgentPanel(Gtk.VBox):
         self.claims_panel.connect("apply-workflow", self._on_apply_workflow)
         self.claims_panel.connect("confirm-pending", self._on_confirm_pending)
         self.claims_panel.connect("cancel-pending", self._on_cancel_pending)
+        self.claims_panel.connect("retry-transmit", self._on_retry_transmit)
         split = Gtk.Paned.new(Gtk.Orientation.VERTICAL)
         if hasattr(split, "set_wide_handle"):
             split.set_wide_handle(True)
@@ -410,7 +412,7 @@ class AgentPanel(Gtk.VBox):
 
         self._append("DeepRadio",
                      "你好! 我会通过多轮协商帮你设计通信链路(建图→仿真→调参)。\n"
-                     "产物统一保存在 local/output/。请描述你的需求。")
+                     "产物保存在 local/output/<session_id>/，会话记录在 local/agent_sessions/。请描述你的需求。")
 
     # ------------------------------------------------------------------ #
     # Agent 惰性创建
@@ -494,6 +496,17 @@ class AgentPanel(Gtk.VBox):
     def _on_cancel_pending(self, _panel):
         self._submit_checkpoint_decision("rejected")
 
+    def _on_retry_transmit(self, _panel):
+        if self._busy:
+            return
+        self._append("我", "受控重试发射")
+        self._set_busy(True)
+        threading.Thread(
+            target=self._handle_agent_command,
+            args=({"action": "retry_transmit"},),
+            daemon=True,
+        ).start()
+
     def _submit_checkpoint_decision(self, decision):
         if self._busy:
             return
@@ -518,10 +531,12 @@ class AgentPanel(Gtk.VBox):
         }
         if is_ota:
             slots = agent._workflow.workflow.intent.slots
+            artifact = str(getattr(self.claims_panel, "evidence_path", "") or "")
             command["observation"] = {
                 "observed_name": str(slots.get("local_name") or ""),
                 "observed_at": time.time(),
-                "evidence_kind": "human_confirmation",
+                "evidence_kind": "screenshot" if artifact else "human_confirmation",
+                "artifact": artifact,
             }
         threading.Thread(
             target=self._handle_agent_command, args=(command,), daemon=True
@@ -596,7 +611,7 @@ class AgentPanel(Gtk.VBox):
         if self._split_inited or allocation.height < 240:
             return
         self._split_inited = True
-        paned.set_position(max(160, allocation.height - 220))
+        paned.set_position(max(160, allocation.height - 150))
 
     def _on_chat_size_allocate(self, _widget, allocation):
         width = int(allocation.width)
@@ -661,6 +676,7 @@ class AgentPanel(Gtk.VBox):
         self.emit('reset_workspace')
         self._append("DeepRadio", "已重置会话与画布。请描述新的需求。")
         self._set_status("就绪")
+        self._stop_runtime_poll()
 
     def _on_send(self, _widget):
         if self._busy:
@@ -749,7 +765,35 @@ class AgentPanel(Gtk.VBox):
         ) if p]
         self._set_status(" | ".join(parts))
         self._set_busy(False)
+        self._schedule_runtime_poll(digest)
         return False
+
+    def _schedule_runtime_poll(self, digest):
+        running = bool((digest or {}).get("runtime", {}).get("running"))
+        if running and self._runtime_poll_id is None:
+            self._runtime_poll_id = GLib.timeout_add(1000, self._on_runtime_poll)
+        if not running:
+            self._stop_runtime_poll()
+
+    def _stop_runtime_poll(self):
+        if self._runtime_poll_id is not None:
+            GLib.source_remove(self._runtime_poll_id)
+            self._runtime_poll_id = None
+
+    def _on_runtime_poll(self):
+        if self._agent is None:
+            return True
+        try:
+            digest = self._agent.peek_runtime_digest()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("runtime poll failed: %s", exc)
+            return True
+        self.claims_panel.refresh_runtime(digest)
+        running = bool((digest.get("runtime") or {}).get("running"))
+        if not running and not self._busy:
+            self._runtime_poll_id = None
+            return False
+        return True
 
     # -- baseline 一句话直出路径 ----------------------------------------- #
     def _handle_baseline(self, text, history):
@@ -776,6 +820,7 @@ class AgentPanel(Gtk.VBox):
         self._append("DeepRadio", "出错了: {}".format(message))
         self._set_status("出错")
         self._set_busy(False)
+        self._stop_runtime_poll()
         return False
 
     def _on_undo(self, _widget):
@@ -844,6 +889,8 @@ class AgentPanel(Gtk.VBox):
         self.undo_button.set_sensitive(not busy)
         self.font_combo.set_sensitive(not busy)
         self.send_button.set_label("处理中…" if busy else "发送")
+        if busy and self._runtime_poll_id is None:
+            self._runtime_poll_id = GLib.timeout_add(1000, self._on_runtime_poll)
 
     def _set_status(self, text):
         self.status.set_markup(

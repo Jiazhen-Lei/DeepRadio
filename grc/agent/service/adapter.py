@@ -1,21 +1,13 @@
-"""adapter:GUI 适配层 —— deepagents 运行结果 -> AgentReply / .grc 路径。
+"""adapter: GUI 守门 —— ServiceAgent.step -> AgentReply / .grc。
 
-本层是 DeepAgents 编排层与现有 GUI 之间的**契约守门人**:
-
-* 对外只暴露 :class:`ServiceAgent`,其 :meth:`ServiceAgent.step` 返回现有
-  :class:`grc.agent.schema.AgentReply`(GUI 侧渲染逻辑零改动)。
-* **主路径**:用 :func:`orchestrator.build_agent` 组装的 deepagents 深度代理运行
-  一轮(``invoke``),从共享 ToolContext 收集工具产物与事件,折叠为一次
-  AgentReply,并把产物镜像到 ``local/agent_sessions/<id>/final/``。
-* **降级路径**(红线 4):未装 deepagents 或未配置 LLM 时,直接跑确定性
-  ``design_link`` 宏建图 —— 无 LLM 也能产出 .grc(论文 baseline)。
-* 任一路径的异常都收敛为 AgentReply(stage=ERROR)而非崩溃。
+主路径: WorkflowEngine 驱动 Stage；主机控制面执行 BLE/硬件门；
+可选 deepagents。未装 LLM 时走确定性 handler / design_link。
 """
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import logging
 import os
 import re
@@ -28,7 +20,7 @@ from ..memory.profile import UserProfile
 from ..state import Claim, ClaimStore, Decision, Evidence, SharedState
 from ..tools.registry import ToolContext
 from ..tools.hardware_tools import normalize_sdr_hardware
-from ..tools.hardware_profiles import resolve_hardware_profile
+from ..tools.hardware_profiles import device_args_for, resolve_hardware_profile
 from ..workflow import WorkflowEngine
 from . import orchestrator as _orch
 from . import session_store as _store
@@ -36,8 +28,6 @@ from . import stage_executor as _stage_executor
 
 logger = logging.getLogger(__name__)
 
-#: 一轮编排允许的 LangGraph 超步数上限(可用 GRC_AGENT_RECURSION_LIMIT 覆盖)。
-#: 6 个 subagent 的闭环路由 + 工具调用远超 50 步,过小会在正常流程中途撞限。
 DEFAULT_RECURSION_LIMIT = 150
 MAX_AUTONOMOUS_STAGES_PER_TURN = 16
 
@@ -95,6 +85,38 @@ def _recursion_limit() -> int:
     return value if value > 0 else DEFAULT_RECURSION_LIMIT
 
 
+_DETERMINISTIC_PROGRESS = {
+    "build_ble_advertising_pdu": "✓ BLE PDU generated",
+    "generate_ble_1m_waveform": "✓ IQ waveform generated",
+    "verify_ble_packet_bits": "✓ Offline verification passed",
+    "validate_flowgraph": "✓ Flowgraph structure validated",
+    "build_ble_pluto_tx_flowgraph": "✓ PlutoSDR TX flowgraph generated",
+    "build_ble_uhd_tx_flowgraph": "✓ B210 TX flowgraph generated",
+    "discover_devices": "✓ SDR discovered",
+    "probe_device": "✓ SDR probed",
+    "configure_sdr": "✓ SDR configuration recorded",
+    "arm_hardware_flowgraph": "✓ Flowgraph armed",
+    "start_flowgraph": "✓ Bounded TX started",
+    "stop_flowgraph": "✓ Bounded TX stopped",
+}
+
+
+def _read_log_tail(path: str, limit: int = 20) -> str:
+    if not path or not os.path.isfile(path):
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            log_lines = handle.readlines()
+    except OSError:
+        return ""
+    return "".join(log_lines[-limit:]).strip()
+
+
+def _merge(dst: Dict[str, Any], src: Dict[str, Any]) -> None:
+    for k, v in (src or {}).items():
+        if v:
+            dst[k] = v
+
 class _ToolCtxShim:
     """兼容 GUI 写法 ``agent.ctx.tool_ctx.out_dir = ...`` 的最小载体。"""
 
@@ -121,14 +143,9 @@ class _CtxShim:
         return self._agent.profile
 
 
-class ServiceAgent:
-    """DeepRadio 服务级 Agent,对 GUI 暴露 AgentReply 契约。
 
-    Example:
-        >>> agent = build_service_agent()
-        >>> reply = agent.step("做一个 BPSK over AWGN,看 EVM")
-        >>> reply.artifacts.get("grc_path")   # 供 GUI 原地刷新画布
-    """
+class ServiceAgent:
+    """DeepRadio 服务级 Agent,对 GUI 暴露 AgentReply 契约。"""
 
     def __init__(self, session_id: Optional[str] = None,
                  profile: Any = None, platform: Any = None):
@@ -165,7 +182,9 @@ class ServiceAgent:
         Tool 永远写入会话 ``final/``；GUI 指定目录只接收导出副本。这样运行
         白名单、恢复路径和用户可见路径不会指向不同根目录。
         """
-        export_dir = (self.ctx.tool_ctx.out_dir or "").strip()
+        export_dir = _store.nested_export_dir(
+            self.session_id, (self.ctx.tool_ctx.out_dir or "").strip()
+        )
         out_dir = os.path.join(_store.session_root(self.session_id), "final")
         os.makedirs(out_dir, exist_ok=True)
         platform = self._platform
@@ -192,6 +211,7 @@ class ServiceAgent:
         ctx.extra["metrics"] = {}
         ctx.extra["subagent_invocations"] = []
         ctx.extra["export_dir"] = export_dir
+        ctx.extra["session_id"] = self.session_id
         if ctx.flow_graph is None:
             self._load_session_flowgraph(ctx)
         return ctx
@@ -215,7 +235,9 @@ class ServiceAgent:
             )
             if condition not in self._state.spec.success_conditions:
                 self._state.spec.success_conditions.append(condition)
-        for key in ("modulation", "channel", "hardware", "protocol"):
+        for key in (
+            "modulation", "channel", "hardware", "protocol", "local_name"
+        ):
             value = intent.slots.get(key)
             if value in (None, "", []):
                 continue
@@ -231,6 +253,17 @@ class ServiceAgent:
             else:
                 existing.value = value
                 existing.source = source
+        for key in (
+            "protocol", "hardware", "local_name", "carrier_frequency",
+            "sample_rate", "duration_seconds", "max_duration_seconds",
+        ):
+            value = intent.slots.get(key)
+            if value not in (None, "", []):
+                self._state.project.config[key] = value
+        channels = intent.slots.get("advertising_channels") or []
+        if channels:
+            self._state.project.config["advertising_channels"] = list(channels)
+            self._state.project.config["ble_channel"] = channels[0]
         self._state.spec.open_questions = list(
             dict.fromkeys(
                 list(intent.missing_slots) + list(intent.validation_errors)
@@ -240,6 +273,7 @@ class ServiceAgent:
     def _load_session_flowgraph(self, ctx: ToolContext) -> None:
         """从会话已保存的 .grc 把内存流图灌进 agent 用的 core Platform。"""
         path = str(self._state.project.grc_path or "")
+        path = _store.resolve_session_path(self.session_id, path) or path
         if not path or not os.path.isfile(path) or ctx.platform is None:
             return
         try:
@@ -367,7 +401,6 @@ class ServiceAgent:
             )
         return _store.archive_workflow(self.session_id)
 
-    # ---- 主入口 ------------------------------------------------------
     def step(self, user_text: str, recipe: str = "",
              simulate: bool = True) -> AgentReply:
         """Consume one user Turn and run autonomous Stages to a boundary."""
@@ -555,31 +588,56 @@ class ServiceAgent:
                     return reply
         except Exception as exc:  # noqa: BLE001
             logger.warning("规格提取失败，继续执行原链路: %s", exc)
-        agent = None
-        if stage.id not in _HOST_CONTROLLED_STAGES:
-            try:
-                agent = _orch.build_agent(ctx, stage=stage)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("组装 deepagents 失败,降级到确定性骨架: %s", exc)
-
-        try:
-            if agent is not None:
-                reply = self._run_deep(agent, ctx, stage_text)
-            else:
-                reply = self._run_stage_deterministic(
-                    ctx, stage_text, recipe, simulate, stage.id
-                )
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("编排执行异常")
-            reply = self._error_reply(
-                f"编排出错: {type(exc).__name__}: {exc}"
-            )
+        reply = self._execute_stage(ctx, stage, stage_text, recipe, simulate)
         self._finish_workflow_reply(reply)
         try:
             self._state.save(_store.state_path(self.session_id))
         except OSError as exc:
             logger.warning("SharedState 落盘失败: %s", exc)
         return reply
+
+    def _execute_stage(
+        self, ctx: ToolContext, stage: Any, stage_text: str, recipe: str, simulate: bool
+    ) -> AgentReply:
+        if stage.id in _HOST_CONTROLLED_STAGES:
+            return self._run_stage_deterministic(
+                ctx, stage_text, recipe, simulate, stage.id
+            )
+        covering = None
+        if "flowgraph_saved" in (stage.completion or []):
+            from ..knowledge.recipes import covering_recipe
+
+            covering = covering_recipe(
+                stage_text,
+                list(
+                    self._workflow.workflow.intent.capabilities
+                    if self._workflow.workflow else []
+                ),
+                recipe,
+            )
+        if covering is not None:
+            return self._run_stage_deterministic(
+                ctx, stage_text, covering.name, simulate, stage.id
+            )
+        agent = None
+        try:
+            agent = _orch.build_agent(ctx, stage=stage)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("组装 deepagents 失败,改走确定性骨架: %s", exc)
+        try:
+            if agent is not None:
+                return self._run_deep(agent, ctx, stage_text)
+            return self._run_stage_deterministic(
+                ctx, stage_text, recipe, simulate, stage.id
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("编排执行异常")
+            recovered = self._recover_partial_stage(ctx, exc)
+            if recovered is not None:
+                return recovered
+            return self._error_reply(
+                f"编排出错: {type(exc).__name__}: {exc}"
+            )
 
     def _continue_autonomous(
         self, first: AgentReply, *, recipe: str, simulate: bool
@@ -589,8 +647,10 @@ class ServiceAgent:
         for _ in range(MAX_AUTONOMOUS_STAGES_PER_TURN):
             workflow = self._workflow.workflow
             if workflow is None or workflow.execution_status in (
-                "completed", "errored"
+                "completed", "errored", "waiting"
             ):
+                return reply
+            if reply.stage in ("ERROR", "CRITIC") and not reply.done:
                 return reply
             stage = self._workflow.current_stage()
             if stage is None or stage.execution_status == "waiting":
@@ -617,10 +677,18 @@ class ServiceAgent:
         current.tool_invocations = list(previous.tool_invocations or []) + list(
             current.tool_invocations or []
         )
+        previous_text = (previous.text or "").strip()
+        current_text = (current.text or "").strip()
+        if previous_text and current_text and previous_text not in current_text:
+            current.text = previous_text + "\n" + current_text
+        elif previous_text and not current_text:
+            current.text = previous_text
 
     def step_command(self, command: Dict[str, Any]) -> AgentReply:
         """Structured GUI command entry; text remains a compatibility transport."""
         action = str((command or {}).get("action") or "")
+        if action == "retry_transmit":
+            return self._retry_transmit()
         if action != "checkpoint_decision":
             return self._error_reply(f"未知 GUI command: {action or '(empty)'}")
         stage = self._workflow.current_stage()
@@ -655,6 +723,8 @@ class ServiceAgent:
                     "tool_called",
                     self._workflow_event_payload({
                         "tool": "query_runtime_status",
+                        "origin": registry.origin_of("query_runtime_status"),
+                        "runtime": registry.runtime_of("query_runtime_status"),
                         "args": {},
                         "result": status,
                     }),
@@ -687,8 +757,15 @@ class ServiceAgent:
                         f"收到 {observed_name or '(未填写)'}。"
                     )
                     return reply
-                artifact = _store.attach_evidence(
-                    self.session_id, str(observation.get("artifact") or "")
+                attached = _store.attach_evidence(
+                    self.session_id,
+                    str(observation.get("artifact") or ""),
+                    run_id=str(status.get("run_id") or ""),
+                )
+                artifact = str(attached.get("artifact") or "")
+                evidence_kind = str(
+                    observation.get("evidence_kind")
+                    or ("screenshot" if artifact else "human_confirmation")
                 )
                 ota_observation = {
                     "observed": decision == "approved",
@@ -696,10 +773,10 @@ class ServiceAgent:
                     "expected_name": expected_name,
                     "observed_at": now,
                     "run_id": status.get("run_id"),
-                    "evidence_kind": str(
-                        observation.get("evidence_kind") or "human_confirmation"
-                    ),
+                    "evidence_kind": evidence_kind,
                     "artifact": artifact,
+                    "sha256": attached.get("sha256") or "",
+                    "evidence_id": attached.get("path") or "",
                 }
                 self._workflow.workflow.intent.slots["ota_observation"] = ota_observation
                 self._workflow.workflow.intent.slots[key] = decision == "approved"
@@ -729,7 +806,45 @@ class ServiceAgent:
         )
         return self._continue_autonomous(reply, recipe="", simulate=True)
 
-    # ---- 主路径:deepagents ------------------------------------------
+    def _retry_transmit(self) -> AgentReply:
+        stage = self._workflow.current_stage()
+        if stage is None or stage.id not in (
+            "over_air_verification", "runtime_observation", "transmit_bounded",
+            "run_bounded",
+        ):
+            return self._error_reply("当前 Stage 不能受控重试发射。")
+        from ..tools import registry
+
+        ctx = self._make_ctx()
+        if self._workflow.workflow:
+            ctx.extra["workflow"] = self._workflow.workflow.to_dict()
+            ctx.extra["stage_id"] = stage.id
+        ctx.extra["force_hardware_start"] = True
+        slots = self._workflow.workflow.intent.slots if self._workflow.workflow else {}
+        start_args = {
+            "grc_path": self._state.project.grc_path,
+            "duration_seconds": slots.get("max_duration_seconds")
+            or slots.get("duration_seconds")
+            or 30.0,
+        }
+        result = registry.call("start_flowgraph", start_args, ctx)
+        self._record_tool_result(ctx, "start_flowgraph", result, start_args)
+        max_duration = start_args["duration_seconds"]
+        reply = self._fold(
+            ctx,
+            result.get("error")
+            or (
+                f"已受控重试发射（最大时长 {max_duration:g} 秒；"
+                "OTA 确认或取消后会提前停止）。"
+                f" run_id={result.get('run_id')} pid={result.get('pid')}。"
+                "无需在 GRC 中点击运行。"
+            ),
+            source="deterministic-stage",
+            ok=bool(result.get("running") and result.get("ready")),
+        )
+        self._project_tool_results(stage, reply)
+        self._finish_workflow_reply(reply, ok=bool(result.get("running")))
+        return reply
     def _run_deep(self, agent: Any, ctx: ToolContext,
                   user_text: str) -> AgentReply:
         ctx.extra["execution_mode"] = "deepagents"
@@ -751,28 +866,55 @@ class ServiceAgent:
                 config,
             )
         except Exception as exc:  # noqa: BLE001
-            if type(exc).__name__ != "GraphRecursionError":
-                raise
-            # 撞步数上限本身不代表任务失败:工具产物与 Claim 都已落在 ctx/state
-            # 里,按已完成的部分如实交付,而不是把成功结果显示成 ERROR。
-            logger.warning("编排达到步数上限,按已产出结果交付: %s", exc)
-            _store.append_session_event(
-                self.session_id, "recursion_limit",
-                {"limit": config["recursion_limit"]})
-            done = bool(ctx.extra.get("artifacts", {}).get("grc_path")) or bool(
-                self._state.project.grc_path)
-            note = ("编排步数达到上限,已中止后续探索。"
-                    if done else "编排步数达到上限,尚未产出可用流图。")
-            return self._fold(ctx, note, source="deepagents-truncated",
-                              ok=done)
+            if type(exc).__name__ == "GraphRecursionError":
+                logger.warning("编排达到步数上限,按已产出结果交付: %s", exc)
+                _store.append_session_event(
+                    self.session_id, "recursion_limit",
+                    {"limit": config["recursion_limit"]})
+                done = bool(ctx.extra.get("artifacts", {}).get("grc_path")) or bool(
+                    self._state.project.grc_path)
+                note = ("编排步数达到上限,已中止后续探索。"
+                        if done else "编排步数达到上限,尚未产出可用流图。")
+                return self._fold(ctx, note, source="deepagents-truncated",
+                                  ok=done)
+            recovered = self._recover_partial_stage(ctx, exc)
+            if recovered is not None:
+                return recovered
+            raise
 
         narrative = self._extract_final_text(result)
         self._record_deep_delegations(result, ctx)
-        # deepagents 把会话文件放在 state 的 "files" 键:镜像到磁盘
         files = result.get("files") if isinstance(result, dict) else None
         if files:
             _store.mirror_session_files(self.session_id, files)
         return self._fold(ctx, narrative, source="deepagents")
+
+    def _recover_partial_stage(
+        self, ctx: ToolContext, exc: BaseException
+    ) -> AgentReply | None:
+        timeout = "timeout" in type(exc).__name__.lower()
+        artifacts = dict(ctx.extra.get("artifacts") or {})
+        try:
+            final = _store.scan_final_artifacts(self.session_id)
+        except Exception:  # noqa: BLE001
+            final = {}
+        for name, path in (final or {}).items():
+            if str(name).endswith(".grc"):
+                artifacts.setdefault("grc_path", path)
+            artifacts.setdefault(name, path)
+        if artifacts:
+            ctx.extra["artifacts"] = artifacts
+        if not timeout and not artifacts.get("grc_path"):
+            return None
+        has_grc = bool(artifacts.get("grc_path"))
+        note = (
+            "编排超时，已保留已产出的流图。"
+            if timeout and has_grc
+            else "编排中断（{}）。".format(type(exc).__name__)
+        )
+        return self._fold(
+            ctx, note, source="deepagents-partial", ok=has_grc
+        )
 
     def _record_deep_delegations(self, result: Any, ctx: ToolContext) -> None:
         if not isinstance(result, dict):
@@ -799,13 +941,14 @@ class ServiceAgent:
                     ctx.extra.setdefault("subagent_invocations", []).append(invocation)
                     _store.append_session_event(
                         self.session_id,
-                        "subagent_invoked",
+                        "llm_subagent_invoked",
                         self._workflow_event_payload({
                             "target_agent": target,
                             "description": (args or {}).get("description"),
                             "task_id": invocation.get("task_id"),
                             "call_id": call_id,
-                            "mode": "deepagents",
+                            "mode": "llm",
+                            "executor": "deepagents",
                         }),
                     )
         for message in result.get("messages") or []:
@@ -908,7 +1051,6 @@ class ServiceAgent:
         narrative = result.get("narrative") or self._fallback_text(result)
         return self._fold(ctx, narrative, source="deterministic",
                           ok=bool(result.get("ok")))
-
     def _run_stage_deterministic(
         self,
         ctx: ToolContext,
@@ -923,11 +1065,22 @@ class ServiceAgent:
         active = self._state.coordination.active_task
         _store.append_session_event(
             self.session_id,
-            "subagent_invoked",
+            "stage_routed",
             self._workflow_event_payload({
                 "target_agent": active.target_agent if active else "stage_handler",
                 "stage_id": stage_id,
                 "mode": "deterministic",
+                "executor": "deterministic_stage_handler",
+            }),
+        )
+        _store.append_session_event(
+            self.session_id,
+            "deterministic_handler_started",
+            self._workflow_event_payload({
+                "target_agent": active.target_agent if active else "stage_handler",
+                "stage_id": stage_id,
+                "mode": "deterministic",
+                "executor": "deterministic_stage_handler",
             }),
         )
 
@@ -1053,6 +1206,8 @@ class ServiceAgent:
                 ok=bool(result.get("ok")) and bool(preflight.get("ok")),
             )
         if stage_id == "build_ble_advertiser":
+            # DeepRadio protocol + compose tools. Do not inline PDU/CRC/GFSK;
+            # GNU Radio has no BLE Complete Local Name generator.
             slots = self._workflow.workflow.intent.slots
             local_name = str(slots.get("local_name") or "")
             channel = int((slots.get("advertising_channels") or [37])[0])
@@ -1106,7 +1261,9 @@ class ServiceAgent:
                     "channel": channel,
                     "sample_rate": slots.get("sample_rate") or 2e6,
                     "gain": slots.get("tx_gain", 0.0),
-                    "device_args": "type=b200",
+                    "device_args": device_args_for(
+                        hardware, str(slots.get("device_args") or "")
+                    ),
                     "duration_seconds": slots.get("duration_seconds") or 30.0,
                 }
                 built = registry.call(
@@ -1174,8 +1331,6 @@ class ServiceAgent:
                     source="deterministic-stage", ok=False,
                 )
             args = {"device_type": hardware}
-            if hardware == "b210":
-                args["device_args"] = "type=b200"
             discovered = registry.call("discover_devices", args, ctx)
             self._record_tool_result(ctx, "discover_devices", discovered, args)
             if discovered.get("device_identity"):
@@ -1286,30 +1441,42 @@ class ServiceAgent:
             slots = self._workflow.workflow.intent.slots
             start_args = {
                 "grc_path": self._state.project.grc_path,
-                "duration_seconds": slots.get("duration_seconds") or 30.0,
+                "duration_seconds": slots.get("max_duration_seconds")
+                or slots.get("duration_seconds")
+                or 30.0,
             }
             result = registry.call("start_flowgraph", start_args, ctx)
             self._record_tool_result(ctx, "start_flowgraph", result, start_args)
+            max_duration = start_args["duration_seconds"]
             return self._fold(
                 ctx,
                 result.get("error")
                 or (
-                    f"BLE 受控发射已就绪，run_id={result.get('run_id')}；"
-                    f"请在截止时间前检查广播名称 {slots.get('local_name') or '(未指定)'}。"
+                    f"受控发射已启动（最大时长 {max_duration:g} 秒；"
+                    "OTA 确认或取消后会提前停止）。"
+                    f" run_id={result.get('run_id')} pid={result.get('pid')}。"
+                    f"请在截止前检查广播名称 {slots.get('local_name') or '(未指定)'}。"
+                    "进程由 Workflow 管理，无需在 GRC 中点击运行。"
                 ),
                 source="deterministic-stage",
                 ok=bool(result.get("running") and result.get("ready")),
             )
         if stage_id == "run_bounded":
             slots = self._workflow.workflow.intent.slots
+            max_duration = slots.get("max_duration_seconds") or slots.get("duration_seconds") or 30.0
             result = registry.call("start_flowgraph", {
                 "grc_path": self._state.project.grc_path,
-                "duration_seconds": slots.get("duration_seconds") or 30.0,
+                "duration_seconds": max_duration,
             }, ctx)
             self._record_tool_result(ctx, "start_flowgraph", result)
             return self._fold(
                 ctx,
-                result.get("error") or "硬件 Flowgraph 已按有界时长启动，请检查实时界面。",
+                result.get("error")
+                or (
+                    f"受控运行已启动（最大时长 {max_duration:g} 秒）。"
+                    f" run_id={result.get('run_id')} pid={result.get('pid')}。"
+                    "无需在 GRC 中点击运行。"
+                ),
                 source="deterministic-stage",
                 ok=bool(result.get("running") and result.get("ready")),
             )
@@ -1404,7 +1571,7 @@ class ServiceAgent:
             {
                 "center_freq": slots.get("carrier_frequency"),
                 "sample_rate": slots.get("sample_rate"),
-                "device_args": "type=b200",
+                "device_args": device_args_for("b210"),
             },
             ctx,
         )
@@ -1532,21 +1699,16 @@ class ServiceAgent:
         return self._fold(
             ctx, "工程检查与测量完成。", source="deterministic-stage", ok=True
         )
-
-    @staticmethod
     def _record_tool_result(
+        self,
         ctx: ToolContext,
         kind: str,
         result: Dict[str, Any],
         args: Optional[Dict[str, Any]] = None,
     ) -> None:
-        ctx.extra.setdefault("events", []).append(
-            {
-                "kind": kind,
-                "args": dict(args or {}),
-                "payload": dict(result or {}),
-            }
-        )
+        from .tools_lc import record_tool_event
+
+        record_tool_event(ctx, kind, dict(result or {}), args)
 
     def _finish_workflow_reply(
         self,
@@ -1682,10 +1844,20 @@ class ServiceAgent:
             if unresolved is not None:
                 reply.pending = dict(unresolved)
             elif not reply.pending:
+                slots = (
+                    self._workflow.workflow.intent.slots
+                    if self._workflow.workflow else {}
+                )
                 reply.pending = {
-                    "action": "workflow_checkpoint",
+                    "action": current.id,
                     "reason": current.checkpoint.reason,
                     "checkpoint_id": current.checkpoint.id,
+                    "stage_id": current.id,
+                    "max_duration_seconds": (
+                        slots.get("max_duration_seconds")
+                        or slots.get("duration_seconds")
+                        or 30.0
+                    ),
                     "approved": False,
                 }
         reply.workflow_digest = self._digest_with_timeline()
@@ -1915,7 +2087,6 @@ class ServiceAgent:
             observed,
             artifact=str(details.get("artifact") or ""),
         )
-
     def _digest_with_timeline(self) -> Dict[str, Any]:
         digest = self._workflow.digest()
         digest["timeline"] = _store.recent_events(self.session_id, limit=40)
@@ -1924,8 +2095,40 @@ class ServiceAgent:
             deadline = float(runtime.get("deadline") or 0)
             runtime["remaining_seconds"] = max(0.0, deadline - time.time()) \
                 if runtime.get("running") and deadline else 0.0
+            log_path = _store.resolve_session_path(
+                self.session_id, str(runtime.get("log_path") or "")
+            )
+            if not log_path:
+                candidate = os.path.join(
+                    _store.session_root(self.session_id),
+                    "final", "hardware_runtime", "runtime.log",
+                )
+                log_path = candidate if os.path.isfile(candidate) else ""
+            runtime["log_tail"] = _read_log_tail(log_path)
+            if log_path:
+                runtime["log_path"] = log_path
+            current = digest.get("current_stage") or ""
+            runtime["can_retry"] = (
+                current in {
+                    "over_air_verification", "runtime_observation",
+                }
+                and not runtime.get("running")
+            )
+            runtime["do_not_run_grc"] = True
             digest["runtime"] = runtime
         return digest
+
+    def peek_runtime_digest(self) -> Dict[str, Any]:
+        """Refresh hardware runtime for GUI polling without advancing Workflow."""
+        if self._tool_ctx is None:
+            return self._digest_with_timeline()
+        try:
+            from ..tools.hardware_tools import query_runtime_status
+
+            query_runtime_status(self._tool_ctx)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("peek runtime 失败: %s", exc)
+        return self._digest_with_timeline()
 
     def _workflow_waiting_reply(self) -> AgentReply:
         stage = self._workflow.current_stage()
@@ -1975,7 +2178,11 @@ class ServiceAgent:
             }
             text = (
                 "请仅在 LightBlue 中实际看到目标 Complete Local Name 后点击“已看到目标名称”。"
+                "可附加上传截图；确认后受控进程会提前停止。"
                 if stage.id == "over_air_verification"
+                else "当前 Stage 等待你的确认；确认后继续，取消则保留现有工程。"
+                "批准后将由 Workflow 自动启动发射，无需在 GRC 中点击运行。"
+                if stage.id == "rf_plan_confirmation"
                 else "当前 Stage 等待你的确认；确认后继续，取消则保留现有工程。"
             )
         else:
@@ -2032,13 +2239,20 @@ class ServiceAgent:
                 name=kind, args=args, result=payload,
                 ok=bool(payload.get("ok", True) if isinstance(payload, dict)
                         else True)))
-            _store.append_session_event(
-                self.session_id,
-                "tool_called",
-                self._workflow_event_payload(
-                    {"tool": kind, "args": args, "result": payload}
-                ),
-            )
+            if not ev.get("logged"):
+                _store.append_session_event(
+                    self.session_id,
+                    "tool_called",
+                    self._workflow_event_payload(
+                        {
+                            "tool": kind,
+                            "origin": ev.get("origin") or "",
+                            "runtime": ev.get("runtime") or "",
+                            "args": args,
+                            "result": payload,
+                        }
+                    ),
+                )
 
         # 从会话 final/ 补扫 .grc(deepagents 路径产物可能只在磁盘)
         final = _store.scan_final_artifacts(self.session_id)
@@ -2060,11 +2274,17 @@ class ServiceAgent:
         }
         export_dir = str(ctx.extra.get("export_dir") or "")
         if export_dir:
+            exported = []
             for value in artifacts.values():
-                if isinstance(value, str) and os.path.isfile(value):
-                    _store.export_artifact(value, export_dir)
+                if not isinstance(value, str) or not os.path.isfile(value):
+                    continue
+                if os.path.basename(value) == "manifest.json":
+                    continue
+                copied = _store.export_artifact(value, export_dir)
+                if copied:
+                    exported.append(copied)
             _store.rewrite_exported_grc_paths(self.session_id, export_dir)
-            _store.write_export_manifest(self.session_id, export_dir)
+            _store.write_export_manifest(self.session_id, export_dir, exported)
         state = ctx.extra.get("state")
         if state is not None:
             reply.claims = ClaimStore(state).summary()
@@ -2168,6 +2388,32 @@ class ServiceAgent:
     ) -> str:
         """Keep host Tool observations authoritative over model narration."""
         events = list(ctx.extra.get("events") or [])
+        if source.startswith("deterministic"):
+            marks = []
+            for event in events:
+                name = str(event.get("kind") or "")
+                payload = event.get("payload") or {}
+                label = _DETERMINISTIC_PROGRESS.get(name)
+                if not label:
+                    continue
+                failed = isinstance(payload, dict) and payload.get("ok") is False
+                if failed:
+                    marks.append("✗ " + name)
+                    continue
+                if name == "probe_device":
+                    identity = str(
+                        payload.get("device_identity") or payload.get("uri") or ""
+                    )
+                    device = str(payload.get("device_type") or "SDR")
+                    label = (
+                        f"✓ {device} {identity} probed" if identity
+                        else "✓ SDR probed"
+                    )
+                marks.append(label)
+            parts = list(dict.fromkeys(marks))
+            if narrative:
+                parts.append(narrative)
+            return "\n".join(parts) if parts else (narrative or "")
         if not source.startswith("deepagents") or not events:
             return narrative or ServiceAgent._fallback_text(
                 {"recipe": None, "metrics": ctx.extra.get("metrics")}
@@ -2212,13 +2458,8 @@ class ServiceAgent:
         return "".join(parts)
 
 
-def _merge(dst: Dict[str, Any], src: Dict[str, Any]) -> None:
-    for k, v in (src or {}).items():
-        if v:
-            dst[k] = v
-
-
 def build_service_agent(session_id: Optional[str] = None,
                         profile: Any = None) -> ServiceAgent:
     """便捷构造入口(与参考实现 build_service_agent 命名对齐)。"""
     return ServiceAgent(session_id=session_id, profile=profile)
+

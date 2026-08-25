@@ -35,18 +35,47 @@ _ARTIFACTS_NOTE = (
 )
 
 
+def record_tool_event(
+    ctx: ToolContext,
+    kind: str,
+    payload: Dict[str, Any],
+    args: Dict[str, Any] | None = None,
+) -> None:
+    """Record a tool event and flush it to the session log immediately."""
+    from ..tools import registry
+    from . import session_store as store
+
+    event = {
+        "kind": kind,
+        "origin": registry.origin_of(kind),
+        "runtime": registry.runtime_of(kind),
+        "args": dict(args or {}),
+        "payload": payload,
+    }
+    ctx.extra.setdefault("events", []).append(event)
+    session_id = ctx.extra.get("session_id")
+    if not session_id:
+        return
+    try:
+        store.append_session_event(session_id, "tool_called", {
+            "tool": kind,
+            "origin": event["origin"],
+            "runtime": event["runtime"],
+            "args": event["args"],
+            "result": payload,
+        })
+        event["logged"] = True
+    except Exception:  # noqa: BLE001
+        logger.debug("tool_called 即时落盘失败", exc_info=True)
+
+
 def _rec_event(
     ctx: ToolContext,
     kind: str,
     payload: Dict[str, Any],
     args: Dict[str, Any] | None = None,
 ) -> None:
-    """把一次工具事件记进 ctx.extra['events'](供 adapter 折叠为事件流)。"""
-    ctx.extra.setdefault("events", []).append({
-        "kind": kind,
-        "args": dict(args or {}),
-        "payload": payload,
-    })
+    record_tool_event(ctx, kind, payload, args)
 
 
 def _merge_artifacts(ctx: ToolContext, artifacts: Dict[str, Any]) -> None:
@@ -315,11 +344,6 @@ def build_grc_tools(
         )
 
     @tool
-    def list_devices() -> str:
-        """Report whether real SDR discovery is enabled."""
-        return _call("list_devices", {})
-
-    @tool
     def hardware_preflight(device_type: str = "") -> str:
         """Run a read-only SDR capability and safety precheck; never starts transmission."""
         return _call("hardware_preflight", {"device_type": device_type})
@@ -352,7 +376,7 @@ def build_grc_tools(
     @tool
     def build_ble_uhd_tx_flowgraph(
         waveform_path: str, channel: int = 37, sample_rate: float = 2e6,
-        gain: float = 0.0, device_args: str = "type=b200",
+        gain: float = 0.0, device_args: str = "",
         duration_seconds: float = 30.0,
     ) -> str:
         """Build and validate, but never start, a BLE UHD TX flowgraph."""
@@ -399,7 +423,7 @@ def build_grc_tools(
         center_freq: float,
         sample_rate: float,
         gain: float = 20.0,
-        device_args: str = "type=b200",
+        device_args: str = "",
         antenna: str = "RX2",
     ) -> str:
         """Build a USRP RX + QT frequency sink flowgraph without starting RF."""
@@ -467,7 +491,6 @@ def build_grc_tools(
         apply_grc_diff,
         apply_flowgraph_patch,
         configure_sdr,
-        list_devices,
         hardware_preflight,
         build_ble_advertising_pdu,
         generate_ble_1m_waveform,

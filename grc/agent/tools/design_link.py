@@ -298,3 +298,39 @@ def _guess_modulation(recipe_name: str) -> str:
     if "ofdm" in n:
         return "ofdm"
     return ""
+
+
+def _profile_of(ctx):
+    try:
+        return ctx.extra.get("profile")
+    except AttributeError:
+        return None
+
+
+@registry.tool(
+    name="design_link",
+    description=(
+        "宏工具:按一句通信意图端到端搭出一张可跑流图(选配方→逐块建图→"
+        "critic 自检→可选仿真取指标→存 .grc)。适合 BUILD 阶段一步到位;"
+        "给 intent(自然语言)或 recipe(配方名 tone_noise/bpsk_awgn/qpsk_awgn/ofdm_awgn)之一。"),
+    parameters={
+        "type": "object",
+        "properties": {
+            "intent": {"type": "string",
+                       "description": "自然语言意图,用于离线选配方"},
+            "recipe": {"type": "string",
+                       "description": "显式配方名,优先于 intent"},
+            "simulate": {"type": "boolean",
+                         "description": "建好后是否顺带仿真取指标,默认 true"},
+            "render": {"type": "boolean",
+                       "description": "是否存 .grc,默认 true"},
+        },
+    },
+    group="macro",
+    origin="deepradio_macro",
+    runtime="deepradio",
+)
+def design_link_tool(ctx, intent: str = "", recipe: str = "",
+                     simulate: bool = True, render: bool = True) -> Dict[str, Any]:
+    return design_link(ctx, _profile_of(ctx), intent=intent, recipe=recipe,
+                       simulate=simulate, render=render)

@@ -21,6 +21,8 @@ from .registry import ToolContext, tool
         "required": ["flowgraph_id"],
     },
     group="build",
+    origin="deepradio_compose",
+    runtime="gnuradio_blocks",
 )
 def init_flow_graph(
     ctx: ToolContext, flowgraph_id: str, generate_options: str = "no_gui"
@@ -53,6 +55,8 @@ def init_flow_graph(
         "required": ["key", "id"],
     },
     group="build",
+    origin="deepradio_compose",
+    runtime="gnuradio_blocks",
 )
 def add_block(
     ctx: ToolContext, key: str, id: str, params: Optional[dict] = None
@@ -95,6 +99,8 @@ def add_block(
         "required": ["id", "name", "value"],
     },
     group="build",
+    origin="deepradio_compose",
+    runtime="gnuradio_blocks",
 )
 def set_param(ctx: ToolContext, id: str, name: str, value):
     block = ctx.blocks.get(id)
@@ -128,6 +134,8 @@ def set_param(ctx: ToolContext, id: str, name: str, value):
         "required": ["src_id", "dst_id"],
     },
     group="build",
+    origin="deepradio_compose",
+    runtime="gnuradio_blocks",
 )
 def connect(
     ctx: ToolContext,
@@ -177,6 +185,8 @@ def connect(
         "properties": {"path": {"type": "string"}},
     },
     group="build",
+    origin="deepradio_compose",
+    runtime="gnuradio_blocks",
 )
 def render_grc(ctx: ToolContext, path: str = ""):
     flow_graph = ctx.flow_graph
@@ -200,6 +210,8 @@ def render_grc(ctx: ToolContext, path: str = ""):
     description="Return a compact, read-only summary of the current flowgraph, project path, parameters, ports, connections, and version.",
     parameters={"type": "object", "properties": {}},
     group="build",
+    origin="deepradio_compose",
+    runtime="gnuradio_blocks",
 )
 def inspect_flowgraph(ctx: ToolContext):
     flow_graph = ctx.flow_graph

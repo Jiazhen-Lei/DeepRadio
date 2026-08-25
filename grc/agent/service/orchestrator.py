@@ -3,11 +3,11 @@
 这是本层的核心 —— 严格按 ``local/docs/agent_architecture_deepagents.md``,
 用 deepagents **现成库**装配真正的深度代理,不再自研编排器:
 
-* ``model``   —— :func:`service.model.build_chat_model` 封装的 ``ChatOpenAI``;
+* ``model``   —— ``build_chat_model`` 把 ``llm.get_config()`` 封成 ``ChatOpenAI``;
 * ``tools``   —— :func:`service.tools_lc.build_grc_tools` 桥接的确定性建图工具;
 * ``subagents`` —— :func:`service.subagents.build_grc_subagents` 的 ``SubAgent`` 列表;
 * ``skills``  —— ``skills`` 目录(deepagents 渐进式披露 SKILL);
-* ``backend`` —— :func:`service.backend.build_backend` 的 ``CompositeBackend``;
+* ``backend`` —— ``build_backend`` 的 ``CompositeBackend``;
 * ``checkpointer`` —— ``InMemorySaver``(会话内断点续跑)。
 
 **降级红线**(文档红线 4):未装 deepagents 或未配置 LLM 时,``build_agent``
@@ -18,13 +18,12 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Optional
 
+from .. import llm
 from ..tools.registry import ToolContext
-from . import backend as _backend
-from . import model as _model
 from . import subagents as _subagents
-from . import system_prompt as _sp
 
 logger = logging.getLogger(__name__)
 _CHECKPOINTERS = {}
@@ -61,7 +60,7 @@ _STAGE_TOOLS = {
         "validate_flowgraph", "run_simulation", "read_metric", "plot_spectrum",
         "plot_constellation", "plot_eye", "verify_claims", "explain_error",
     },
-    "hardware_precheck": {"hardware_preflight", "list_devices", "inspect_flowgraph"},
+    "hardware_precheck": {"hardware_preflight", "discover_devices", "inspect_flowgraph"},
     "configure_and_check": {"configure_sdr", "hardware_preflight", "inspect_flowgraph"},
     "protocol_spec_alignment": {"spec_clarify", "spec_commit"},
     "build_ble_advertiser": {
@@ -107,7 +106,7 @@ def build_agent(
     if not deepagents_available():
         logger.info("未安装 deepagents,主 Agent 降级到确定性骨架。")
         return None
-    if not _model.is_available():
+    if not is_available():
         logger.info("未配置 LLM(GRC_AGENT_*)或缺 langchain_openai,降级到确定性骨架。")
         return None
 
@@ -121,7 +120,7 @@ def build_agent(
     except ImportError:
         checkpointer = None
 
-    chat = _model.build_chat_model(temperature=temperature)
+    chat = build_chat_model(temperature=temperature)
     agent_names = list(getattr(stage, "recommended_agents", None) or [])
     tool_names = _subagents.tool_names_for_agents(agent_names)
     allowed_stage_tools = _STAGE_TOOLS.get(getattr(stage, "id", ""))
@@ -129,9 +128,9 @@ def build_agent(
         tool_names = [name for name in tool_names if name in allowed_stage_tools]
     tools = _import_tools(ctx, tool_names)
     subs = _subagents.build_grc_subagents(ctx, agent_names, tool_names)
-    be = _backend.build_backend()
+    be = build_backend()
     style_prompt = _resolve_style_prompt(ctx)
-    orch_prompt = _sp.build_orchestrator_prompt(
+    orch_prompt = _subagents.build_orchestrator_prompt(
         agent_names or _subagents.subagent_names(), style_prompt=style_prompt)
     if stage is not None:
         workflow_data = dict(ctx.extra.get("workflow") or {})
@@ -150,7 +149,7 @@ def build_agent(
         tools=tools,
         system_prompt=orch_prompt,
         subagents=subs,
-        skills=[_backend.SKILLS_MOUNT],
+        skills=[SKILLS_MOUNT],
         backend=be,
         checkpointer=checkpointer,
     )
@@ -182,3 +181,54 @@ def _resolve_style_prompt(ctx: ToolContext) -> str:
     except Exception as exc:  # noqa: BLE001
         logger.debug("读取 profile 风格失败,忽略: %s", exc)
     return ""
+
+SKILLS_MOUNT = "/workspace/skills/"
+
+
+def skills_root() -> str:
+    """返回 SKILL 包根目录 ``grc/agent/skills`` 的绝对路径。"""
+    agent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(agent_dir, "skills")
+
+
+def build_backend():
+    """组装 deepagents 的 CompositeBackend。"""
+    from deepagents.backends import CompositeBackend, StateBackend
+    from deepagents.backends.filesystem import FilesystemBackend
+
+    routes = {}
+    root = skills_root()
+    if os.path.isdir(root):
+        routes[SKILLS_MOUNT] = FilesystemBackend(
+            root_dir=root, virtual_mode=True)
+    else:
+        logger.warning("skills 目录不存在: %s(SKILL 只读挂载被跳过)", root)
+    return CompositeBackend(default=StateBackend(), routes=routes)
+
+
+def build_chat_model(temperature: float = 0.2):
+    """按 ``llm.get_config()`` 构造一个 LangChain ``ChatOpenAI``。"""
+    cfg = llm.get_config()
+    from langchain_openai import ChatOpenAI
+    model = ChatOpenAI(
+        model=cfg["model"],
+        base_url=f"{cfg['base_url']}/",
+        api_key=cfg["api_key"],
+        temperature=temperature,
+        timeout=cfg["timeout"],
+        max_retries=1,
+    )
+    logger.info("已构造 ChatOpenAI: model=%s base_url=%s",
+                cfg["model"], cfg["base_url"])
+    return model
+
+
+def is_available() -> bool:
+    """探测:是否既配置了 LLM 又装了 langchain_openai。"""
+    if not llm.is_configured():
+        return False
+    try:
+        import langchain_openai  # noqa: F401
+        return True
+    except ImportError:
+        return False

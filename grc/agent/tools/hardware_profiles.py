@@ -100,6 +100,14 @@ def normalize_hardware(value: str) -> str:
     return profile.key if profile else (value or "").strip().lower()
 
 
+def device_args_for(device_type: str, override: str = "") -> str:
+    """Return UHD/IIO device args from the profile unless the caller overrode them."""
+    if override:
+        return override
+    profile = resolve_hardware_profile(device_type)
+    return str(profile.default_device_args or "") if profile else ""
+
+
 def parse_device_identity(profile: HardwareProfile, output: str) -> str:
     """Extract a stable address when the backend exposes one."""
     text = output or ""

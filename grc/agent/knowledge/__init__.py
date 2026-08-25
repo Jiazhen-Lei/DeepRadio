@@ -12,7 +12,7 @@ from __future__ import annotations
 
 def __getattr__(name):
     if name in ("Recipe", "RECIPES", "match_recipe", "list_recipes",
-                "get_recipe"):
+                "get_recipe", "covering_recipe", "resolve_recipe"):
         from . import recipes
         return getattr(recipes, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

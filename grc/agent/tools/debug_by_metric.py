@@ -98,10 +98,36 @@ def _diagnose_evm(evm: float) -> tuple:
     return verdict, sugg
 
 
-def apply_suggestion(ctx, block_param: str, value: str) -> Dict[str, Any]:
-    """便捷:把 'chan.noise_voltage' 这类建议落成一次 set_param。"""
-    if "." not in block_param:
-        return {"ok": False, "error": "block_param 应形如 'chan.noise_voltage'"}
-    bid, pname = block_param.split(".", 1)
-    return registry.call("set_param",
-                        {"id": bid, "name": pname, "value": str(value)}, ctx)
+def _profile_of(ctx):
+    try:
+        return ctx.extra.get("profile")
+    except AttributeError:
+        return None
+
+
+@registry.tool(
+    name="debug_by_metric",
+    description=(
+        "宏工具:以指标为线索定位问题并给改参建议(读 EVM/频谱峰→判决→分档改参)。"
+        "适合 TUNE 阶段;需先有一次成功仿真(先调 design_link 或 run_simulation)。"),
+    parameters={
+        "type": "object",
+        "properties": {
+            "metric": {"type": "string",
+                       "description": "指标:evm 或 spectrum,默认 evm"},
+            "probe_id": {"type": "string",
+                         "description": "探针块 id(仿真落盘用的 sink id)"},
+            "modulation": {"type": "string",
+                           "description": "调制方式(算 EVM 用),默认 bpsk"},
+            "sps": {"type": "integer",
+                    "description": "每符号采样数,默认 4"},
+        },
+    },
+    group="macro",
+    origin="deepradio_macro",
+    runtime="deepradio",
+)
+def debug_by_metric_tool(ctx, metric: str = "evm", probe_id: str = "",
+                         modulation: str = "bpsk", sps: int = 4) -> Dict[str, Any]:
+    return debug_by_metric(ctx, _profile_of(ctx), metric=metric,
+                          probe_id=probe_id, modulation=modulation, sps=sps)

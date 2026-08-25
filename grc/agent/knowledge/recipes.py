@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
+import re
 
 # (src_id, dst_id, src_port, dst_port);后两个可省略(默认 0)
 Conn = Tuple[str, str]
@@ -334,12 +335,14 @@ def get_recipe(name: str) -> Optional[Recipe]:
     return RECIPES.get((name or "").lower().strip())
 
 
-#: 含这些词时优先选 rx_* 接收配方,避免「BPSK/AWGN/星座」把发射 recipe 分打得更高。
 _RX_HINTS = (
     "接收机", "receiver", "解调", "定时恢复", "时钟同步",
     "判决", "clock_sync", "constellation_receiver", "pfb_clock",
 )
 _TX_LINK_RECIPES = frozenset({"bpsk_awgn", "qpsk_awgn", "ofdm_awgn"})
+_BASEBAND_EXCLUSIVE = frozenset({
+    "diagnose", "modify_project", "protocol",
+})
 
 
 def wants_receiver(intent: str) -> bool:
@@ -347,24 +350,29 @@ def wants_receiver(intent: str) -> bool:
     return any(hint.lower() in low for hint in _RX_HINTS)
 
 
-def match_recipe(intent: str, default: str = "bpsk_awgn") -> Recipe:
-    """离线选型:按关键词命中数挑最合适的配方;全不中回落 default。
+def _intent_score(recipe: Recipe, intent: str) -> int:
+    score = recipe.score(intent)
+    stem = recipe.name.split("_")[0]
+    if stem and re.search(
+        rf"(?<![a-z0-9_]){re.escape(stem)}(?![a-z0-9_])",
+        (intent or "").lower(),
+    ):
+        score += 5
+    if wants_receiver(intent):
+        if recipe.name.startswith("rx_"):
+            score += 10
+        elif recipe.name in _TX_LINK_RECIPES:
+            score -= 5
+    elif recipe.name.startswith("rx_"):
+        score -= 20
+    return score
 
-    用户明确要接收机时,给 ``rx_*`` 加分并压低发射链路配方,避免 Task 3
-    那种「BPSK AWGN 接收机」被 ``bpsk_awgn`` 抢走。
-    没有接收机动词时压低 ``rx_*``,避免 Task 1 被误建成接收机。
-    """
-    wants_rx = wants_receiver(intent)
+
+def match_recipe(intent: str, default: str = "bpsk_awgn") -> Recipe:
+    """按关键词与调制名选型；接收机动词抬升 rx_*。全不中回落 default。"""
     best, best_score = None, 0
     for recipe in RECIPES.values():
-        score = recipe.score(intent)
-        if wants_rx:
-            if recipe.name.startswith("rx_"):
-                score += 10
-            elif recipe.name in _TX_LINK_RECIPES:
-                score -= 5
-        elif recipe.name.startswith("rx_"):
-            score -= 20
+        score = _intent_score(recipe, intent)
         if score > best_score:
             best, best_score = recipe, score
     return best if best is not None else RECIPES[default]
@@ -380,4 +388,25 @@ def resolve_recipe(intent: str = "", recipe: str = "") -> Recipe:
         return match_recipe(intent or "bpsk awgn")
     if wants_rx and selected.name in _TX_LINK_RECIPES:
         return get_recipe("rx_bpsk_awgn") or selected
+    return selected
+
+
+def covering_recipe(
+    intent: str = "",
+    capabilities: list | None = None,
+    recipe: str = "",
+) -> Optional[Recipe]:
+    """Return a baseband recipe only when it covers remaining capabilities."""
+    caps = set(capabilities or [])
+    if caps & _BASEBAND_EXCLUSIVE:
+        return None
+    selected = resolve_recipe(intent, recipe)
+    if selected is None:
+        return None
+    if _intent_score(selected, intent) <= 0:
+        return None
+    if "build_rx" in caps and not selected.name.startswith("rx_"):
+        return None
+    if "build_tx" in caps and selected.name.startswith("rx_"):
+        return None
     return selected

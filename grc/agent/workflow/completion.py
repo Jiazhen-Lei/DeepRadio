@@ -259,10 +259,7 @@ def evaluate(stage: Any, workflow: Any, state: Any, reply: Any) -> Dict[str, boo
                 for item in tool_results.get("arm_hardware_flowgraph", [])
             )
         ),
-        "hardware_check_completed": bool(
-            getattr(project, "config", {}).get("device", {}).get("mode")
-            == "flowgraph_config_only"
-        ),
+        "hardware_check_completed": _hardware_check_completed(project),
         "ble_packet_created": checked("build_ble_advertising_pdu"),
         "ble_waveform_generated": checked("generate_ble_1m_waveform"),
         "ble_packet_valid": any(
@@ -309,6 +306,16 @@ def evaluate(stage: Any, workflow: Any, state: Any, reply: Any) -> Dict[str, boo
         ),
     }
     return {name: bool(checks.get(name, False)) for name in stage.completion}
+
+
+def _hardware_check_completed(project: Any) -> bool:
+    device = dict(getattr(project, "config", {}).get("device") or {})
+    if not device:
+        return False
+    return (
+        device.get("configuration_mode") == "recorded"
+        or device.get("mode") in {"configuration_recorded", "flowgraph_config_only"}
+    )
 
 
 def complete(results: Dict[str, bool]) -> bool:

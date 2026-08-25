@@ -14,7 +14,7 @@
 * **限长自停**: 靠 ``blocks_head`` 限制样本数,流图自然结束;
   再叠加墙钟超时兜底,防止无 head 的图跑不完。
 * **复用已验证链路**: 接口取自
-  ``grc/agent/examples/bpsk_2g4_regression.py`` 的回归实践。
+  ``dev_docs/regression/bpsk_2g4_regression.py`` 的回归实践。
 
 典型用法::
 

@@ -9,6 +9,7 @@
     build_tools      add_block / connect / set_param / render_grc
     critic_tools     validate_flowgraph / explain_error
     sim_tools        run_simulation / read_metric / plot_constellation
+    design_link / debug_by_metric   宏工具（registry 注册）
 
 用法::
 

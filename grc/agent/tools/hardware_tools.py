@@ -1,4 +1,10 @@
-"""Driver-specific SDR discovery and explicitly gated RF runtime tools."""
+"""Driver-specific SDR discovery and explicitly gated RF runtime tools.
+
+``discover_devices`` / ``probe_device`` wrap vendor CLIs (uhd_find_devices,
+iio_info, …). ``arm_hardware_flowgraph`` / ``start_flowgraph`` are DeepRadio
+runtime gates around GNU Radio ``grcc`` + a bounded subprocess. Agents must
+call these registry tools; GNU Radio has no BLE ADV or device-discovery API.
+"""
 
 from __future__ import annotations
 
@@ -12,6 +18,7 @@ from typing import Any, Dict
 
 from ..service.hardware_runtime import RUNTIME
 from .hardware_profiles import (
+    device_args_for,
     normalize_hardware,
     output_indicates_device,
     output_indicates_successful_probe,
@@ -42,6 +49,15 @@ def _run(command: list[str], timeout: float = 15.0) -> Dict[str, Any]:
         "output": completed.stdout[-12000:],
         "command": command,
     }
+
+
+def _resolve_work_path(ctx: ToolContext, path: str) -> Path:
+    candidate = Path(path or "")
+    if candidate.is_absolute():
+        return candidate.resolve()
+    from ..service.session_store import session_root
+
+    return (Path(session_root(_session_id(ctx))) / path).resolve()
 
 
 def _session_id(ctx: ToolContext) -> str:
@@ -109,6 +125,8 @@ def _project_runtime_state(ctx: ToolContext, result: Dict[str, Any]) -> None:
     ):
         if key in result:
             runtime[key] = result.get(key)
+    if "duration_seconds" in result:
+        runtime["max_duration_seconds"] = result.get("duration_seconds")
     runtime["status"] = status
     runtime["running"] = bool(result.get("running"))
     project.config["runtime"] = runtime
@@ -150,8 +168,8 @@ def _rf_armed(ctx: ToolContext, grc_path: str) -> bool:
     config = dict(getattr(project, "config", {}) or {})
     return bool(
         config.get("rf_armed")
-        and Path(str(getattr(project, "grc_path", "") or "")).resolve()
-        == Path(grc_path).resolve()
+        and _resolve_work_path(ctx, str(getattr(project, "grc_path", "") or ""))
+        == _resolve_work_path(ctx, grc_path)
     )
 
 
@@ -167,12 +185,17 @@ def _device_command(device_type: str, *, probe: bool) -> list[str]:
 
 @tool(
     name="discover_devices",
-    description="Read-only SDR device discovery. Never opens an RF stream.",
+    description=(
+        "Vendor CLI wrapper: read-only SDR discovery via uhd_find_devices / "
+        "iio_info. Never opens an RF stream. Not a GNU Radio block."
+    ),
     parameters={"type": "object", "properties": {
         "device_args": {"type": "string"},
         "device_type": {"type": "string"},
     }},
     group="hardware",
+    origin="vendor_cli",
+    runtime="uhd_iio",
 )
 def discover_devices(
     ctx: ToolContext, device_args: str = "", device_type: str = "b210"
@@ -199,12 +222,17 @@ def discover_devices(
 
 @tool(
     name="probe_device",
-    description="Read-only probe for an explicitly selected SDR device.",
+    description=(
+        "Vendor CLI wrapper: read-only probe for an explicitly selected SDR "
+        "(uhd_usrp_probe / iio_info). Not a GNU Radio block."
+    ),
     parameters={"type": "object", "properties": {
         "device_args": {"type": "string"},
         "device_type": {"type": "string"},
     }},
     group="hardware",
+    origin="vendor_cli",
+    runtime="uhd_iio",
 )
 def probe_device(
     ctx: ToolContext, device_args: str = "", device_type: str = "b210"
@@ -253,6 +281,8 @@ def probe_device(
         "required": ["grc_path"],
     },
     group="hardware",
+    origin="deepradio_runtime",
+    runtime="grc_rewrite",
 )
 def arm_hardware_flowgraph(
     ctx: ToolContext, grc_path: str, device_identity: str = ""
@@ -270,7 +300,7 @@ def arm_hardware_flowgraph(
         return {"ok": False, "armed": False, "error": "硬件 discover/probe 尚未通过"}
     if not _rf_approved(ctx):
         return {"ok": False, "armed": False, "error": "缺少 rf_plan_confirmation"}
-    source = Path(grc_path).resolve()
+    source = _resolve_work_path(ctx, grc_path)
     out_dir = Path(ctx.out_dir or "").resolve()
     if not source.is_file() or out_dir not in source.parents:
         return {"ok": False, "armed": False, "error": "只允许武装当前 session 的流图"}
@@ -327,7 +357,10 @@ def arm_hardware_flowgraph(
 
 @tool(
     name="start_flowgraph",
-    description="Start an approved, generated hardware flowgraph for at most 60 seconds. Disabled by default.",
+    description=(
+        "DeepRadio runtime: start an approved hardware flowgraph via grcc for "
+        "at most duration_seconds (max 60). Stops early on OTA confirm or cancel."
+    ),
     parameters={
         "type": "object",
         "properties": {
@@ -337,19 +370,25 @@ def arm_hardware_flowgraph(
         "required": ["grc_path"],
     },
     group="hardware",
+    origin="deepradio_runtime",
+    runtime="grcc",
 )
 def start_flowgraph(
     ctx: ToolContext, grc_path: str, duration_seconds: float = 30.0
 ) -> Dict[str, Any]:
     workflow = ctx.extra.get("workflow") or {}
     stage_id = str(ctx.extra.get("stage_id") or "")
+    source_key = _resolve_work_path(ctx, grc_path)
     action_key = "{}:{}:{}:{}".format(
         workflow.get("workflow_id") or "",
         stage_id,
         workflow.get("revision") or 0,
-        Path(grc_path).resolve(),
+        source_key,
     )
     action_results = ctx.extra.setdefault("hardware_action_results", {})
+    if ctx.extra.get("force_hardware_start"):
+        RUNTIME.stop(_session_id(ctx))
+        action_results.pop(action_key, None)
     if action_key in action_results:
         replay = dict(action_results[action_key])
         replay["idempotent_replay"] = True
@@ -369,7 +408,7 @@ def start_flowgraph(
         return {"ok": False, "error": "硬件 discover/probe 尚未通过，拒绝启动 RF"}
     if _is_ble_deploy(ctx) and not _rf_armed(ctx, grc_path):
         return {"ok": False, "error": "流图尚未由受控流程武装，拒绝启动 RF"}
-    source = Path(grc_path).resolve()
+    source = _resolve_work_path(ctx, grc_path)
     out_dir = Path(ctx.out_dir or "").resolve()
     if not source.is_file() or out_dir not in source.parents:
         return {"ok": False, "error": "只允许执行当前 session 输出目录中的 .grc"}
@@ -417,6 +456,8 @@ def start_flowgraph(
     description="Read current bounded hardware runtime status.",
     parameters={"type": "object", "properties": {}},
     group="hardware",
+    origin="deepradio_runtime",
+    runtime="hardware_runtime",
 )
 def query_runtime_status(ctx: ToolContext) -> Dict[str, Any]:
     return _persist_runtime_result(ctx, RUNTIME.status(_session_id(ctx)))
@@ -427,6 +468,8 @@ def query_runtime_status(ctx: ToolContext) -> Dict[str, Any]:
     description="Stop the current hardware flowgraph. Always allowed.",
     parameters={"type": "object", "properties": {}},
     group="hardware",
+    origin="deepradio_runtime",
+    runtime="hardware_runtime",
 )
 def stop_flowgraph(ctx: ToolContext) -> Dict[str, Any]:
     return _persist_runtime_result(ctx, RUNTIME.stop(_session_id(ctx)))
@@ -437,6 +480,8 @@ def stop_flowgraph(ctx: ToolContext) -> Dict[str, Any]:
     description="Immediately kill the current hardware flowgraph. Always allowed.",
     parameters={"type": "object", "properties": {}},
     group="hardware",
+    origin="deepradio_runtime",
+    runtime="hardware_runtime",
 )
 def emergency_stop(ctx: ToolContext) -> Dict[str, Any]:
     return _persist_runtime_result(
@@ -476,8 +521,9 @@ def _persist_runtime_result(ctx: ToolContext, result: Dict[str, Any]) -> Dict[st
 @tool(
     name="build_usrp_rx_spectrum_flowgraph",
     description=(
-        "Build a USRP B210 receive flowgraph with QT GUI frequency sink. "
-        "Validates and saves .grc without starting RF."
+        "DeepRadio compose tool: assemble GNU Radio blocks "
+        "(uhd_usrp_source → QT frequency sink). Validates and saves .grc "
+        "without starting RF."
     ),
     parameters={
         "type": "object",
@@ -491,15 +537,18 @@ def _persist_runtime_result(ctx: ToolContext, result: Dict[str, Any]) -> Dict[st
         "required": ["center_freq", "sample_rate"],
     },
     group="hardware",
+    origin="deepradio_compose",
+    runtime="gnuradio_blocks",
 )
 def build_usrp_rx_spectrum_flowgraph(
     ctx: ToolContext,
     center_freq: float,
     sample_rate: float,
     gain: float = 20.0,
-    device_args: str = "type=b200",
+    device_args: str = "",
     antenna: str = "RX2",
 ) -> Dict[str, Any]:
+    device_args = device_args_for("b210", device_args)
     freq = float(center_freq)
     rate = float(sample_rate)
     rx_gain = float(gain)

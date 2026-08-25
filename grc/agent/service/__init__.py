@@ -10,18 +10,24 @@
 2. **不破坏 GUI 契约**:对 GUI 暴露的仍是 ``AgentReply`` 与磁盘上的 ``.grc``
    路径,新事件只在 ``adapter`` 内部消费。
 
+Live vs baseline (do not delete either):
+    Live: ``ServiceAgent`` + ``WorkflowEngine`` with both
+    ``deterministic_stage_handler`` and optional LLM/deepagents.
+    Baseline: ``build_flow_graph_from_text`` / ``design_link``.
+    Hardware identity lives in ``HardwareProfile.default_device_args``;
+    ``tools_lc`` is a LangChain bridge over ``registry.call``.
+
 子模块:
-    backend         deepagents 原生 CompositeBackend 装配(State + SKILL 只读挂载)
-    model           把 llm.get_config() 封装为 LangChain ChatOpenAI
-    tools_lc        把确定性建图工具桥接为 LangChain @tool
-    session_store   落盘镜像 + 会话事件流(mirror_files / append_event)
-    system_prompt   主 Agent 与各 subagent 的 system-prompt 构造
-    subagents       build_grc_subagents():deepagents SubAgent 列表
-    orchestrator    build_agent():create_deep_agent 组装主 Agent
-    adapter         运行结果 -> AgentReply / .grc 路径(GUI 契约守门人)
+    adapter           ServiceAgent（step / 画布 / 确定性 Stage / 可选 LLM）
+    orchestrator      build_agent()、ChatOpenAI、CompositeBackend
+    tools_lc          确定性工具桥为 LangChain @tool
+    session_store     落盘镜像 + 会话事件流
+    subagents         SubAgent 列表与 system-prompt
+    stage_executor    确定性执行器 / ResultEnvelope
+    hardware_runtime  受控 RF 子进程
 
 对外高层入口:
-    ServiceAgent    服务级 Agent(见 adapter)
+    ServiceAgent    服务级 Agent
     build_service_agent(...)   便捷构造入口
 """
 

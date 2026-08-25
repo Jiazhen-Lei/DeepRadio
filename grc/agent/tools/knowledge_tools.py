@@ -110,14 +110,20 @@ def describe_block(ctx: ToolContext, key: str):
     group="knowledge",
 )
 def list_examples(ctx: ToolContext, keyword: str = ""):
-    # examples 目录在 grc/agent/examples
-    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    ex_dir = os.path.join(here, "examples")
-    if not os.path.isdir(ex_dir):
-        return {"ok": True, "count": 0, "examples": []}
+    # Manual regressions live under dev_docs/regression, not a live agent layer.
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.abspath(os.path.join(here, os.pardir, os.pardir, os.pardir))
+    ex_dir = os.path.join(repo, "dev_docs", "regression")
     kw = (keyword or "").lower().strip()
     files = []
-    for fn in sorted(os.listdir(ex_dir)):
-        if fn.endswith((".grc", ".py")) and (not kw or kw in fn.lower()):
-            files.append(fn)
+    if os.path.isdir(ex_dir):
+        for fn in sorted(os.listdir(ex_dir)):
+            if fn.endswith((".grc", ".py")) and (not kw or kw in fn.lower()):
+                files.append(fn)
+    from ..knowledge import recipes as _recipes
+
+    for recipe in _recipes.list_recipes():
+        name = str(recipe.get("name") or "")
+        if name and (not kw or kw in name.lower()):
+            files.append(f"recipe:{name}")
     return {"ok": True, "count": len(files), "dir": ex_dir, "examples": files}

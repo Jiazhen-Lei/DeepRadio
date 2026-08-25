@@ -111,8 +111,12 @@ class HardwareRuntime:
                 "ready": True,
                 "elapsed_seconds": time.time() - record["started_at"],
                 "duration_seconds": record["duration"],
+                "max_duration_seconds": record["duration"],
                 "started_at": record["started_at"],
                 "deadline": record["started_at"] + record["duration"],
+                "program": record.get("program"),
+                "interpreter": record.get("interpreter"),
+                "output": "".join(record.get("output_chunks") or [])[-8000:],
             }
 
     def stop(self, session_id: str, emergency: bool = False) -> Dict[str, Any]:

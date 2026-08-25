@@ -1,6 +1,6 @@
 ---
 name: grc-ble-advertising
-description: Build BLE advertising data with a deterministic protocol tool.
+description: Build and offline-verify BLE advertising PDUs, 1M PHY waveforms, and TX flowgraphs.
 ---
 
 # BLE advertising
@@ -8,3 +8,10 @@ description: Build BLE advertising data with a deterministic protocol tool.
 Use `build_ble_advertising_pdu`; never invent PDU bits, CRC, whitening, or an
 over-the-air success claim. Complete Local Name is required and must fit the
 legacy advertising payload. Treat phone observation as independent evidence.
+
+# BLE PHY
+
+Use `generate_ble_1m_waveform` and `verify_ble_packet_bits`. Building a B210
+UHD or PlutoSDR TX flowgraph does not mean it was started. RF execution requires
+the dedicated checkpoint, explicit feature flag, bounded duration, and a
+confirmed stop.

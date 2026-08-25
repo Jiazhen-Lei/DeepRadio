@@ -1,10 +1,11 @@
-"""BPSK @ 2.4GHz 回归用例:验证 grc.agent.env 支撑的完整链路。
+"""BPSK @ 2.4GHz 手工回归:验证 grc.agent.env 支撑的完整链路。
+
+不是 live 架构层。产品路径请走 ServiceAgent + Workflow。
 
 运行::
 
-    cd ~/Desktop/gnuradio
-    PYTHONPATH=$PWD ~/miniforge3/envs/gnuradio/bin/python \
-        grc/agent/examples/bpsk_2g4_regression.py
+    conda activate gnuradio
+    PYTHONPATH=$PWD python dev_docs/regression/bpsk_2g4_regression.py
 
 验证链路: 建图 -> validate -> 存 .grc -> 生成 .py -> 执行 -> 星座校验。
 """
@@ -16,7 +17,7 @@ import sys
 import tempfile
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(_HERE))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(_HERE)))
 
 from grc.agent import env  # noqa: E402
 

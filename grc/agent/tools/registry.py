@@ -73,6 +73,8 @@ class ToolSpec:
     description: str
     parameters: Dict[str, Any]          # JSON-Schema (type=object)
     group: str = "misc"
+    origin: str = ""
+    runtime: str = ""
 
 
 #: 全局注册表: name -> ToolSpec
@@ -90,13 +92,16 @@ _TOOL_MODULES = (
     "state_tools",
     "ble_tools",
     "hardware_tools",
-    "skill_tools",     # 宏工具:把 skills 编排能力暴露给 function-calling
+    "design_link",
+    "debug_by_metric",
 )
 
 
 def tool(name: str, description: str,
          parameters: Optional[Dict[str, Any]] = None,
-         group: str = "misc"):
+         group: str = "misc",
+         origin: str = "",
+         runtime: str = ""):
     """把一个函数注册为工具。
 
     Args:
@@ -104,6 +109,10 @@ def tool(name: str, description: str,
         description: 给 LLM 看的一句话说明(何时该用)。
         parameters: JSON-Schema(type=object)。None 表示无参数。
         group: 分组标签(knowledge/build/critic/sim)。
+        origin: 实现归属。``deepradio_protocol`` 是 DeepRadio 协议算法；
+            ``deepradio_compose`` 用 GNU Radio 块组拓扑；``vendor_cli``
+            调用 uhd/iio 等主机命令；``deepradio_runtime`` 是受控子进程。
+        runtime: 实际执行面，如 ``gnuradio_blocks`` / ``grcc`` / ``iio_info``。
 
     被装饰函数签名应为 ``fn(ctx: ToolContext, **kwargs) -> dict``。
     """
@@ -114,7 +123,7 @@ def tool(name: str, description: str,
             logger.warning("工具 %s 已注册,后者覆盖前者", name)
         _REGISTRY[name] = ToolSpec(
             name=name, fn=fn, description=description,
-            parameters=schema, group=group)
+            parameters=schema, group=group, origin=origin, runtime=runtime)
         return fn
 
     return _decorator
@@ -143,6 +152,16 @@ def all_specs() -> List[ToolSpec]:
 
 def names() -> List[str]:
     return list(_REGISTRY.keys())
+
+
+def origin_of(name: str) -> str:
+    spec = _REGISTRY.get(name)
+    return spec.origin if spec else ""
+
+
+def runtime_of(name: str) -> str:
+    spec = _REGISTRY.get(name)
+    return spec.runtime if spec else ""
 
 
 # ---------------------------------------------------------------------------

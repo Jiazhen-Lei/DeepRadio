@@ -1,4 +1,11 @@
-"""Deterministic BLE advertising packet, waveform, and GRC builders."""
+"""Deterministic BLE advertising packet, waveform, and GRC builders.
+
+These are DeepRadio protocol tools. GNU Radio has no BLE Complete Local Name
+generator; this module implements PDU/CRC/whitening/GFSK IQ, then *composes*
+stock GNU Radio blocks (file_source, uhd_usrp_sink, iio_pluto_sink) into a
+flowgraph. Agents must call these registry tools instead of inlining the
+algorithms or asking an LLM to invent Access Address/CRC.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +18,7 @@ from typing import Any, Dict, Iterable
 
 import numpy as np
 
+from .hardware_profiles import device_args_for
 from .registry import ToolContext, call, tool
 
 
@@ -155,7 +163,10 @@ def _leave_hardware_sink_unarmed(ctx: ToolContext, block_id: str) -> None:
 
 @tool(
     name="build_ble_advertising_pdu",
-    description="Build a deterministic BLE ADV_NONCONN_IND packet containing Complete Local Name.",
+    description=(
+        "DeepRadio protocol tool: build a BLE ADV_NONCONN_IND PDU with Complete "
+        "Local Name. Not a GNU Radio block; call this tool instead of synthesizing bits."
+    ),
     parameters={
         "type": "object",
         "properties": {
@@ -165,6 +176,8 @@ def _leave_hardware_sink_unarmed(ctx: ToolContext, block_id: str) -> None:
         "required": ["local_name"],
     },
     group="ble",
+    origin="deepradio_protocol",
+    runtime="deepradio",
 )
 def build_ble_advertising_pdu(
     ctx: ToolContext, local_name: str, channel: int = 37
@@ -216,7 +229,10 @@ def _gaussian_taps(samples_per_symbol: int, bt: float = 0.5, span: int = 4) -> n
 
 @tool(
     name="generate_ble_1m_waveform",
-    description="Generate an offline complex64 BLE 1M GFSK advertising waveform; never opens hardware.",
+    description=(
+        "DeepRadio protocol tool: generate an offline complex64 BLE 1M GFSK "
+        "advertising waveform. Not a GNU Radio block; never opens hardware."
+    ),
     parameters={
         "type": "object",
         "properties": {
@@ -231,6 +247,8 @@ def _gaussian_taps(samples_per_symbol: int, bt: float = 0.5, span: int = 4) -> n
         "required": ["local_name"],
     },
     group="ble",
+    origin="deepradio_protocol",
+    runtime="deepradio",
 )
 def generate_ble_1m_waveform(
     ctx: ToolContext,
@@ -286,13 +304,18 @@ def generate_ble_1m_waveform(
 
 @tool(
     name="verify_ble_packet_bits",
-    description="Verify the current offline BLE advertising packet, CRC, whitening round-trip, and local name.",
+    description=(
+        "DeepRadio protocol tool: verify the offline BLE advertising packet, "
+        "CRC, whitening round-trip, and local name. Not a GNU Radio block."
+    ),
     parameters={
         "type": "object",
         "properties": {"local_name": {"type": "string"}, "channel": {"type": "integer"}},
         "required": ["local_name"],
     },
     group="ble",
+    origin="deepradio_protocol",
+    runtime="deepradio",
 )
 def verify_ble_packet_bits(
     ctx: ToolContext, local_name: str, channel: int = 37
@@ -436,7 +459,10 @@ def _verify_waveform_loopback(ctx: ToolContext, air_packet: bytes) -> Dict[str, 
 
 @tool(
     name="build_ble_uhd_tx_flowgraph",
-    description="Build and validate a BLE waveform-to-UHD Sink flowgraph without starting it.",
+    description=(
+        "DeepRadio compose tool: assemble GNU Radio blocks "
+        "(file_source → uhd_usrp_sink) into a BLE TX flowgraph. Does not start RF."
+    ),
     parameters={
         "type": "object",
         "properties": {
@@ -450,6 +476,8 @@ def _verify_waveform_loopback(ctx: ToolContext, air_packet: bytes) -> Dict[str, 
         "required": ["waveform_path"],
     },
     group="ble",
+    origin="deepradio_compose",
+    runtime="gnuradio_blocks",
 )
 def build_ble_uhd_tx_flowgraph(
     ctx: ToolContext,
@@ -457,9 +485,10 @@ def build_ble_uhd_tx_flowgraph(
     channel: int = 37,
     sample_rate: float = 2_000_000.0,
     gain: float = 0.0,
-    device_args: str = "type=b200",
+    device_args: str = "",
     duration_seconds: float = 30.0,
 ) -> Dict[str, Any]:
+    device_args = device_args_for("b210", device_args)
     path = Path(waveform_path).resolve()
     if not path.is_file():
         return {"ok": False, "error": "BLE waveform 文件不存在"}
@@ -538,8 +567,8 @@ def build_ble_uhd_tx_flowgraph(
 @tool(
     name="build_ble_pluto_tx_flowgraph",
     description=(
-        "Build and validate a BLE waveform-to-PlutoSDR Sink flowgraph without starting it. "
-        "Matches the local Pluto BLE beacon example: file source → iio_pluto_sink."
+        "DeepRadio compose tool: assemble GNU Radio blocks "
+        "(file_source → iio_pluto_sink) into a BLE TX flowgraph. Does not start RF."
     ),
     parameters={
         "type": "object",
@@ -554,6 +583,8 @@ def build_ble_uhd_tx_flowgraph(
         "required": ["waveform_path"],
     },
     group="ble",
+    origin="deepradio_compose",
+    runtime="gnuradio_blocks",
 )
 def build_ble_pluto_tx_flowgraph(
     ctx: ToolContext,
