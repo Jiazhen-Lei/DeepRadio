@@ -201,6 +201,9 @@ class SharedState:
             "local_name": local_name,
             "ble_channel": ble_channel,
             "carrier_frequency": carrier,
+            "sample_rate": config.get("sample_rate"),
+            "direction": str(config.get("direction") or ""),
+            "rf_armed": bool(config.get("rf_armed")),
             "max_duration_seconds": duration,
             "spec_kind": "ble" if protocol.lower() == "ble" else "link",
         }
@@ -244,6 +247,11 @@ def _hardware_label(hardware: str) -> str:
     return labels.get(key, hardware or "")
 
 
+def _format_rate(value: Any) -> str:
+    text = _format_hz(value)
+    return text.replace("Hz", "sps") if text else ""
+
+
 def _spec_summary_line(digest: Dict[str, Any]) -> str:
     if str(digest.get("protocol") or "").lower() == "ble":
         channel = digest.get("ble_channel")
@@ -258,10 +266,25 @@ def _spec_summary_line(digest: Dict[str, Any]) -> str:
         if local_name:
             parts.append(f"Local Name={local_name}")
         return " · ".join(part for part in parts if part)
+    hardware = str(digest.get("hardware") or "")
+    recipe = str(digest.get("recipe") or "")
+    if hardware and not recipe:
+        parts = [_hardware_label(hardware)]
+        direction = str(digest.get("direction") or "").upper()
+        if direction:
+            parts.append(direction)
+        hz = _format_hz(digest.get("carrier_frequency"))
+        if hz:
+            parts.append(hz)
+        rate = _format_rate(digest.get("sample_rate"))
+        if rate:
+            parts.append(rate)
+        parts.append("RF armed" if digest.get("rf_armed") else "sink 未 arm")
+        return " · ".join(part for part in parts if part)
     modulation = str(digest.get("modulation") or "").upper() or "?"
     channel = str(digest.get("channel") or "").upper() or "?"
-    recipe = str(digest.get("recipe") or "") or "?"
-    return f"{modulation} → {channel} → {recipe}"
+    recipe_name = recipe or "?"
+    return f"{modulation} → {channel} → {recipe_name}"
 
 
 def _from_dict(data: Dict[str, Any]) -> SharedState:

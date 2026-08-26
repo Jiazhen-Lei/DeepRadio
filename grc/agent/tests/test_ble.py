@@ -111,8 +111,9 @@ class BleDeployContractTest(unittest.TestCase):
             built = agent.step(
                 "用plutosdr发射一段2.402GHz的ble信号，local name为deepradio"
             )
-            self.assertEqual(
-                built.workflow_digest["current_stage"], "discover_and_probe_device"
+            self.assertIn(
+                built.workflow_digest["current_stage"],
+                ("discover_and_probe_device", "rf_plan_confirmation"),
             )
             self.assertTrue(Path(built.artifacts["grc_path"]).is_file())
             text = Path(built.artifacts["grc_path"]).read_text(encoding="utf-8")
@@ -122,6 +123,9 @@ class BleDeployContractTest(unittest.TestCase):
             self.assertGreaterEqual(agent._state.project.flowgraph_version, 1)
             self.assertEqual(agent._state.project.config["hardware"], "pluto")
             self.assertNotIn("modulation", agent._state.spec.open_questions)
+            self.assertNotEqual(
+                built.workflow_digest.get("execution_status"), "completed"
+            )
 
     def test_rf_start_is_disabled_by_default(self):
         with mock.patch.dict(os.environ, {}, clear=False):

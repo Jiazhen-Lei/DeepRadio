@@ -63,7 +63,7 @@ class ClaimStore:
         invalidated = []
         for claim in self.state.claims:
             if claim.project_version < new_version:
-                claim.status = "NotTested"
+                claim.status = "Stale"
                 invalidated.append(claim.id)
         return invalidated
 

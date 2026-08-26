@@ -64,14 +64,9 @@ def narrate_design(recipe, result: Dict[str, Any], profile) -> str:
         return s + " " + _NO_GUI_NOTE
 
     # student
-    s = (f"已按配方「{title}」搭好链路(难度 {recipe.difficulty},{nb} 块)"
-         f"并通过校验。")
+    s = f"已按「{title}」搭好链路并通过校验。"
     if evm is not None:
-        s += (f" 星座点相对理想位置的均方误差(EVM)为 {evm:.2f}%,"
-              f"它综合反映了噪声/失真对判决的影响。")
-    if recipe.knobs:
-        first = next(iter(recipe.knobs.items()))
-        s += f" 想调质量可从「{first[0]}」入手:{first[1]}。"
+        s += f" EVM 为 {evm:.2f}%。"
     return s + " " + _NO_GUI_NOTE
 
 

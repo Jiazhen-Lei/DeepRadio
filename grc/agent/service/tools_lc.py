@@ -256,10 +256,12 @@ def build_grc_tools(
         return json.dumps(result, ensure_ascii=False)
 
     @tool
-    def plot_constellation(probe_id: str = "sink", sps: int = 4) -> str:
+    def plot_constellation(probe_id: str = "sink", sps: int = 4, modulation: str = "") -> str:
         """Render a constellation artifact from the latest complex probe."""
         result = registry.call(
-            "plot_constellation", {"probe_id": probe_id, "sps": sps}, ctx
+            "plot_constellation",
+            {"probe_id": probe_id, "sps": sps, "modulation": modulation},
+            ctx,
         )
         if result.get("path"):
             _merge_artifacts(ctx, {"constellation_png": result["path"]})

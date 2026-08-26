@@ -13,6 +13,8 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 from typing import Any, Dict
 
@@ -173,6 +175,46 @@ def _rf_armed(ctx: ToolContext, grc_path: str) -> bool:
     )
 
 
+def _tx_requires_arming(ctx: ToolContext) -> bool:
+    intent = (ctx.extra.get("workflow") or {}).get("intent") or {}
+    slots = intent.get("slots") or {}
+    return bool(
+        _is_ble_deploy(ctx)
+        or str(slots.get("direction") or "").lower() == "tx"
+    )
+
+
+def _persist_hardware_report(
+    ctx: ToolContext, name: str, payload: Dict[str, Any]
+) -> str:
+    """Persist a host-observed hardware fact and register it as an artifact."""
+    directory = Path(ctx.out_dir or os.getcwd()) / "hardware_reports"
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / name
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+    except OSError:
+        return ""
+    ctx.extra.setdefault("artifacts", {})[path.stem] = str(path)
+    return str(path)
+
+
+def _compile_grc(path: str) -> Dict[str, Any]:
+    """Compile a saved GRC in a temporary directory without running it."""
+    if not shutil.which("grcc"):
+        return {"ok": False, "error": "命令不可用: grcc", "compiled": False}
+    try:
+        with tempfile.TemporaryDirectory(prefix="deepradio-grcc-") as build_dir:
+            result = _run(["grcc", "-o", build_dir, path], timeout=30.0)
+    except OSError as exc:
+        return {"ok": False, "error": f"无法创建临时编译目录: {exc}", "compiled": False}
+    result["compiled"] = bool(result.get("ok"))
+    return result
+
+
 def _device_command(device_type: str, *, probe: bool) -> list[str]:
     profile = resolve_hardware_profile(device_type)
     return profile.command(probe=probe) if profile else []
@@ -212,6 +254,10 @@ def discover_devices(
         result["device_label"] = profile.label
         result["driver_family"] = profile.driver_family
         result["device_identity"] = parse_device_identity(profile, output)
+    result["observed_at"] = time.time()
+    result["report_path"] = _persist_hardware_report(
+        ctx, "device_discovery.json", result
+    )
     return result
 
 
@@ -258,6 +304,10 @@ def probe_device(
         result["device_label"] = profile.label
         result["driver_family"] = profile.driver_family
         result["device_identity"] = device_args or parse_device_identity(profile, output)
+    result["observed_at"] = time.time()
+    result["report_path"] = _persist_hardware_report(
+        ctx, "device_probe.json", result
+    )
     return result
 
 
@@ -289,9 +339,14 @@ def arm_hardware_flowgraph(
             "requires_system_enable": True,
             "error": "RF 运行功能未启用，拒绝生成 armed 流图",
         }
-    if not _stage_passed(ctx, "offline_protocol_verify"):
+    if _is_ble_deploy(ctx) and not _stage_passed(ctx, "offline_protocol_verify"):
         return {"ok": False, "armed": False, "error": "离线协议校验尚未通过"}
-    if not _stage_passed(ctx, "discover_and_probe_device"):
+    discovery_stage = (
+        "discover_and_probe_device"
+        if _is_ble_deploy(ctx)
+        else "discover_and_probe_hardware"
+    )
+    if not _stage_passed(ctx, discovery_stage):
         return {"ok": False, "armed": False, "error": "硬件 discover/probe 尚未通过"}
     if not _rf_approved(ctx):
         return {"ok": False, "armed": False, "error": "缺少 rf_plan_confirmation"}
@@ -312,6 +367,11 @@ def arm_hardware_flowgraph(
     if not sinks:
         return {"ok": False, "armed": False, "error": "流图中没有受支持的硬件 TX Sink"}
     prior_states = [block.state for block in sinks]
+    preview_blocks = [
+        block for block in ctx.flow_graph.blocks
+        if str(getattr(block, "name", "")) in {"preview_throttle", "preview_sink"}
+    ]
+    preview_prior_states = [block.state for block in preview_blocks]
     for block in sinks:
         key = str(getattr(block, "key", ""))
         if device_identity and key in {"iio_pluto_sink", "iio_fmcomms2_sink_fc32"}:
@@ -321,11 +381,16 @@ def arm_hardware_flowgraph(
             address = device_identity if "=" in device_identity else f"serial={device_identity}"
             block.params["dev_addr"].set_value(repr(address))
         block.state = "enabled"
+    for block in preview_blocks:
+        block.state = "disabled"
     ctx.flow_graph.rewrite()
     ctx.flow_graph.validate()
     if not ctx.flow_graph.is_valid():
         for block, state in zip(sinks, prior_states):
             block.state = state
+        for block, state in zip(preview_blocks, preview_prior_states):
+            block.state = state
+        ctx.flow_graph.rewrite()
         return {"ok": False, "armed": False, "error": "启用 TX Sink 后流图校验失败"}
     armed_path = source.with_name(f"{source.stem}.armed.grc")
     try:
@@ -333,7 +398,27 @@ def arm_hardware_flowgraph(
     except Exception as exc:  # noqa: BLE001
         for block, state in zip(sinks, prior_states):
             block.state = state
+        for block, state in zip(preview_blocks, preview_prior_states):
+            block.state = state
+        ctx.flow_graph.rewrite()
         return {"ok": False, "armed": False, "error": f"武装流图保存失败: {exc}"}
+    compiled = _compile_grc(str(armed_path))
+    if not compiled.get("compiled"):
+        for block, state in zip(sinks, prior_states):
+            block.state = state
+        for block, state in zip(preview_blocks, preview_prior_states):
+            block.state = state
+        ctx.flow_graph.rewrite()
+        try:
+            armed_path.unlink()
+        except OSError:
+            pass
+        return {
+            "ok": False,
+            "armed": False,
+            "error": "武装流图未通过 grcc 编译",
+            "compile": compiled,
+        }
     state = ctx.extra.get("state")
     project = getattr(state, "project", None)
     if project is not None:
@@ -341,13 +426,18 @@ def arm_hardware_flowgraph(
         project.config["rf_armed"] = True
         project.config["rf_armed_path"] = str(armed_path)
     ctx.extra.setdefault("artifacts", {})["grc_path"] = str(armed_path)
-    return {
+    result = {
         "ok": True,
         "armed": True,
         "grc_path": str(armed_path),
         "device_identity": device_identity,
         "not_started": True,
+        "compile": compiled,
     }
+    result["report_path"] = _persist_hardware_report(
+        ctx, "flowgraph_arm.json", result
+    )
+    return result
 
 
 @tool(
@@ -401,7 +491,7 @@ def start_flowgraph(
         return {"ok": False, "error": "离线协议校验尚未通过，拒绝启动 RF"}
     if _is_ble_deploy(ctx) and not _stage_passed(ctx, "discover_and_probe_device"):
         return {"ok": False, "error": "硬件 discover/probe 尚未通过，拒绝启动 RF"}
-    if _is_ble_deploy(ctx) and not _rf_armed(ctx, grc_path):
+    if _tx_requires_arming(ctx) and not _rf_armed(ctx, grc_path):
         return {"ok": False, "error": "流图尚未由受控流程武装，拒绝启动 RF"}
     source = _resolve_work_path(ctx, grc_path)
     out_dir = Path(ctx.out_dir or "").resolve()
@@ -647,8 +737,27 @@ def build_sdr_tx_flowgraph(
                 "samp_rate": "samp_rate",
                 "waveform": "analog.GR_COS_WAVE",
                 "freq": "1000",
-                "amplitude": "0.3",
+                "amp": "0.3",
             },
+        },
+    )
+    invoke(
+        "add_block",
+        {
+            "key": "blocks_throttle",
+            "id": "preview_throttle",
+            "params": {
+                "type": "complex",
+                "samples_per_second": "samp_rate",
+            },
+        },
+    )
+    invoke(
+        "add_block",
+        {
+            "key": "blocks_null_sink",
+            "id": "preview_sink",
+            "params": {"type": "complex"},
         },
     )
     added = {"ok": False}
@@ -670,10 +779,49 @@ def build_sdr_tx_flowgraph(
     connect_args: Dict[str, Any] = {"src_id": "src", "dst_id": "sdr_sink"}
     if dst_port:
         connect_args["dst_port"] = dst_port
-    invoke("connect", connect_args)
-    _disable_block(ctx, "sdr_sink")
-    validation = invoke("validate_flowgraph", {})
-    rendered = invoke("render_grc", {}) if validation.get("valid") else {"ok": False}
+    connected = invoke("connect", connect_args)
+    if not connected.get("ok"):
+        return {
+            "ok": False,
+            "valid": False,
+            "error": connected.get("error") or "无法连接基带源与 SDR sink",
+            "steps": steps,
+            "hardware": hardware,
+            "sink_key": sink_key,
+            "not_started": True,
+            "armed": False,
+        }
+    preview_src = invoke(
+        "connect", {"src_id": "src", "dst_id": "preview_throttle"}
+    )
+    preview_sink = invoke(
+        "connect", {"src_id": "preview_throttle", "dst_id": "preview_sink"}
+    )
+    intended_validation = invoke("validate_flowgraph", {})
+    if intended_validation.get("valid"):
+        _disable_block(ctx, "sdr_sink")
+    # The artifact itself must be valid.  With the hardware endpoint disabled,
+    # the throttle/null branch is the runnable, RF-safe preview topology.
+    preview_validation = (
+        invoke("validate_flowgraph", {})
+        if intended_validation.get("valid")
+        and preview_src.get("ok")
+        and preview_sink.get("ok")
+        else {"ok": False, "valid": False, "errors": ["安全预览支路创建失败"]}
+    )
+    rendered = (
+        invoke("render_grc", {})
+        if preview_validation.get("valid")
+        else {"ok": False}
+    )
+    compiled = (
+        _compile_grc(str(rendered.get("path") or ""))
+        if rendered.get("ok") and rendered.get("path")
+        else {"ok": False, "compiled": False, "error": "流图尚未保存"}
+    )
+    final_valid = bool(
+        preview_validation.get("valid") and compiled.get("compiled")
+    )
     if rendered.get("path"):
         ctx.extra.setdefault("artifacts", {})["grc_path"] = rendered["path"]
         state = ctx.extra.get("state")
@@ -684,21 +832,49 @@ def build_sdr_tx_flowgraph(
                 "direction": "tx",
                 "carrier_frequency": freq,
                 "sample_rate": rate,
+                "rf_bandwidth": rate,
+                "tx_signal": {
+                    "kind": "diagnostic_tone",
+                    "frequency_hz": 1000.0,
+                    "amplitude": 0.3,
+                    "source": "safe_preview_default",
+                },
+                "tx_attenuation": 30.0 if hardware == "pluto" else None,
+                "tx_gain": 0.0 if hardware != "pluto" else None,
                 "rf_armed": False,
+                "rf_started": False,
+                "preview_mode": "throttled_null_sink",
             })
-    return {
-        "ok": bool(validation.get("valid") and rendered.get("ok")),
-        "valid": bool(validation.get("valid")),
+    result = {
+        "ok": bool(final_valid),
+        "valid": bool(final_valid),
         "grc_path": rendered.get("path"),
         "steps": steps,
-        "errors": validation.get("errors", []),
+        "errors": preview_validation.get("errors", [])
+        or ([] if compiled.get("compiled") else [compiled.get("error") or "grcc 编译失败"]),
+        "intended_topology_valid": bool(intended_validation.get("valid")),
+        "preview_topology_valid": bool(preview_validation.get("valid")),
+        "compiled": bool(compiled.get("compiled")),
+        "compile": compiled,
         "center_freq": freq,
         "sample_rate": rate,
+        "bandwidth": rate,
         "hardware": hardware,
         "sink_key": sink_key,
+        "baseband": {
+            "kind": "diagnostic_tone",
+            "frequency_hz": 1000.0,
+            "amplitude": 0.3,
+            "source": "safe_preview_default",
+        },
+        "preview_mode": "throttled_null_sink",
         "armed": False,
         "not_started": True,
     }
+    result["report_path"] = _persist_hardware_report(
+        ctx, "flowgraph_validation.json", result
+    )
+    return result
 
 
 @tool(

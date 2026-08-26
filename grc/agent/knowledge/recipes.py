@@ -77,7 +77,10 @@ _RECIPE_BPSK_AWGN = Recipe(
             "适合观察星座/EVM 随噪声退化。",
     blocks=[
         *_common_vars(),
-        ("variable_constellation", "bpsk_const", {"type": "bpsk"}),
+        ("variable_constellation", "bpsk_const", {
+            "type": "bpsk", "const_points": "[-1+0j, 1+0j]",
+            "rot_sym": "2", "sym_map": "[0, 1]",
+        }),
         ("analog_random_source_x", "src",
          {"type": "byte", "min": "0", "max": "2",
           "num_samps": "1000", "repeat": "True"}),
@@ -225,7 +228,10 @@ _RECIPE_RX_BPSK_AWGN = Recipe(
     summary="自包含 BPSK 激励与 AWGN 信道，经星座接收机完成载波跟踪和判决。",
     blocks=[
         *_common_vars(),
-        ("variable_constellation", "bpsk_const", {"type": "bpsk"}),
+        ("variable_constellation", "bpsk_const", {
+            "type": "bpsk", "const_points": "[-1+0j, 1+0j]",
+            "rot_sym": "2", "sym_map": "[0, 1]",
+        }),
         (
             "analog_random_source_x",
             "src",
@@ -330,7 +336,7 @@ _RECIPE_TONE_NOISE = Recipe(
         *_common_vars(),
         ("analog_sig_source_x", "sig",
          {"type": "complex", "samp_rate": "samp_rate", "waveform": "analog.GR_COS_WAVE",
-          "freq": "100000", "amplitude": "1.0"}),
+          "freq": "100000", "amp": "1.0"}),
         ("analog_noise_source_x", "noise",
          {"type": "complex", "noise_type": "analog.GR_GAUSSIAN",
           "amplitude": "0.1", "seed": "0"}),

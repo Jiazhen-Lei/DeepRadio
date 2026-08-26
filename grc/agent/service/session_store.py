@@ -19,6 +19,7 @@ import hashlib
 import logging
 import os
 import shutil
+import threading
 import time
 import uuid
 from typing import Any, Dict, List
@@ -28,6 +29,14 @@ logger = logging.getLogger(__name__)
 #: 会话虚拟路径前缀约定(与 backend 一致)。
 WORK_PREFIX = "/session/work/"
 FINAL_PREFIX = "/session/final/"
+
+_EVENT_LOCKS: Dict[str, threading.Lock] = {}
+_EVENT_LOCKS_GUARD = threading.Lock()
+
+
+def _event_lock(path: str) -> threading.Lock:
+    with _EVENT_LOCKS_GUARD:
+        return _EVENT_LOCKS.setdefault(path, threading.Lock())
 
 
 def sessions_root() -> str:
@@ -289,23 +298,24 @@ def append_session_event(session_id: str, event: str,
     """向会话事件流 ``events.jsonl`` 追加一条事件(JSONL)。"""
     payload_data = _jsonable(payload or {})
     path = os.path.join(session_root(session_id), "events.jsonl")
-    record = {
-        "event_id": f"evt-{uuid.uuid4().hex}",
-        "session_id": session_id,
-        "ts": time.time(),
-        "seq": _next_event_seq(path),
-        "event": event,
-        "payload": payload_data,
-    }
-    for key in _EVENT_CONTROL_KEYS:
-        value = payload_data.get(key)
-        if value is not None:
-            record[key] = value
-    try:
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-    except OSError as exc:
-        logger.warning("写会话事件失败: %s", exc)
+    with _event_lock(path):
+        record = {
+            "event_id": f"evt-{uuid.uuid4().hex}",
+            "session_id": session_id,
+            "ts": time.time(),
+            "seq": _next_event_seq(path),
+            "event": event,
+            "payload": payload_data,
+        }
+        for key in _EVENT_CONTROL_KEYS:
+            value = payload_data.get(key)
+            if value is not None:
+                record[key] = value
+        try:
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            logger.warning("写会话事件失败: %s", exc)
 
 
 def _next_event_seq(path: str) -> int:
@@ -490,30 +500,39 @@ def write_artifact_manifest(
     root = session_root(session_id)
     final_dir = os.path.join(root, "final")
     os.makedirs(final_dir, exist_ok=True)
+    listed = []
+    seen = set()
+    for value in (artifacts or {}).values():
+        if not isinstance(value, str) or not os.path.isfile(value):
+            continue
+        abs_path = os.path.abspath(value)
+        if abs_path in seen or _skip_manifest_name(os.path.basename(abs_path)):
+            continue
+        seen.add(abs_path)
+        listed.append(abs_path)
     roles = {
         os.path.abspath(value): key
         for key, value in (artifacts or {}).items()
         if isinstance(value, str) and os.path.isfile(value)
     }
     entries = []
-    for current_root, dirnames, names in os.walk(final_dir):
-        dirnames[:] = [name for name in dirnames if not _skip_manifest_name(name)]
-        for name in sorted(names):
-            path = os.path.join(current_root, name)
-            if _skip_manifest_name(name):
-                continue
-            try:
-                with open(path, "rb") as handle:
-                    digest = hashlib.sha256(handle.read()).hexdigest()
-                size = os.path.getsize(path)
-            except OSError:
-                continue
-            entries.append({
-                "role": roles.get(os.path.abspath(path), "artifact"),
-                "path": os.path.relpath(path, root),
-                "size": size,
-                "sha256": digest,
-            })
+    for path in listed:
+        try:
+            with open(path, "rb") as handle:
+                digest = hashlib.sha256(handle.read()).hexdigest()
+            size = os.path.getsize(path)
+        except OSError:
+            continue
+        try:
+            rel = os.path.relpath(path, root)
+        except ValueError:
+            rel = os.path.basename(path)
+        entries.append({
+            "role": roles.get(os.path.abspath(path), "artifact"),
+            "path": rel,
+            "size": size,
+            "sha256": digest,
+        })
     path = os.path.join(final_dir, "manifest.json")
     payload = {
         "schema_version": 1,

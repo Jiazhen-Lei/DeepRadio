@@ -10,7 +10,7 @@ from grc.agent.service.stage_executor import (
     make_task_card,
     synthesize_deterministic_invocations,
 )
-from grc.agent.state import Claim, SharedState
+from grc.agent.state import Claim, Evidence, SharedState
 from grc.agent.workflow import WorkflowEngine
 
 
@@ -527,6 +527,38 @@ class WorkflowCapabilityCompositionTest(unittest.TestCase):
         ])
         self.assertNotIn("hardware_runtime", workflow.intent.capabilities)
 
+    def test_stop_at_tx_confirmation_is_deferred_not_forbidden(self):
+        workflow = self.engine().consume_turn(
+            "为 PlutoSDR 配置 2.402 GHz、2 Msps 的发射流图，"
+            "保存配置并停在发射确认。",
+            SharedState(),
+        )
+        self.assertEqual(workflow.task_type, "HARDWARE_CONFIGURE")
+        self.assertEqual(workflow.intent.slots["deploy_permission"], "pending")
+        self.assertEqual(
+            workflow.intent.slots["terminal_checkpoint"],
+            "rf_plan_confirmation",
+        )
+        self.assertIn("hardware_runtime", workflow.intent.capabilities)
+        ids = [stage.id for stage in workflow.stages]
+        self.assertIn("discover_and_probe_hardware", ids)
+        self.assertIn("rf_plan_confirmation", ids)
+        self.assertLess(
+            ids.index("discover_and_probe_hardware"),
+            ids.index("rf_plan_confirmation"),
+        )
+
+    def test_do_not_transmit_remains_configuration_only(self):
+        workflow = self.engine().consume_turn(
+            "给 Pluto 配好发射流图，载频 915 MHz 采样率 2 Msps，先不要发射",
+            SharedState(),
+        )
+        self.assertEqual(workflow.intent.slots["deploy_permission"], "forbidden")
+        self.assertNotIn("hardware_runtime", workflow.intent.capabilities)
+        self.assertNotIn(
+            "rf_plan_confirmation", [stage.id for stage in workflow.stages]
+        )
+
     def test_explicit_generic_deploy_uses_bounded_runtime_not_protocol_template(self):
         workflow = self.engine().consume_turn(
             "用 HackRF 构建发射机，中心频率 915 MHz，采样率 2 Msps，"
@@ -980,7 +1012,9 @@ class Round2ContractTest(unittest.TestCase):
         path.write_text("<flow_graph/>", encoding="utf-8")
         state = SharedState(session_id="ber-gate")
         state.project.grc_path = str(path)
-        workflow = self.engine().consume_turn("构建 BPSK 接收机并测 BER", state)
+        workflow = self.engine().consume_turn(
+            "构建 BPSK 接收机并测 BER，Eb/N0 8 dB", state
+        )
         stage = workflow.stage("rx_build_and_verify")
         reply = AgentReply(
             stage="FINAL",
@@ -988,9 +1022,57 @@ class Round2ContractTest(unittest.TestCase):
         )
         result = evaluate(stage, workflow, state, reply)
         self.assertFalse(result["receive_quality_evaluated"])
-        reply.artifacts["metrics"] = {"ber": 0.02}
+        report = {
+            "valid": True,
+            "value": 0.02,
+            "bit_errors": 20,
+            "compared_bits": 1000,
+            "alignment_method": "bounded_delay_search",
+            "tx_probe": "tx_sink",
+            "rx_probe": "sink",
+        }
+        reply.artifacts["metrics"] = {"ber": 0.02, "ber_report": report}
+        reply.tool_invocations = [ToolInvocation(
+            name="run_simulation",
+            args={},
+            result={"ok": True, "probes": {
+                "tx_sink": "tx.bin", "sink": "rx.bin",
+            }},
+            ok=True,
+        )]
+        state.claims.append(Claim(
+            id="ber_measured",
+            statement="BER measured from bound TX/RX probes",
+            layer="sim",
+            status="Passed",
+            project_version=state.project.flowgraph_version,
+            evidence=[Evidence(
+                test="ber_report",
+                observation=report,
+                project_version=state.project.flowgraph_version,
+            )],
+        ))
         result = evaluate(stage, workflow, state, reply)
         self.assertTrue(result["receive_quality_evaluated"])
+
+    def test_receive_quality_rejects_unverifiable_low_ber(self):
+        from grc.agent.workflow.completion import evaluate
+
+        path = self.root / "rx-unverified.grc"
+        path.write_text("<flow_graph/>", encoding="utf-8")
+        state = SharedState(session_id="ber-unverified")
+        state.project.grc_path = str(path)
+        workflow = self.engine().consume_turn(
+            "构建 BPSK 接收机并测 BER，Eb/N0 8 dB", state
+        )
+        stage = workflow.stage("rx_build_and_verify")
+        reply = AgentReply(
+            stage="FINAL",
+            artifacts={"grc_path": str(path), "metrics": {"ber": 0.0}},
+        )
+        self.assertFalse(
+            evaluate(stage, workflow, state, reply)["receive_quality_evaluated"]
+        )
 
 
 class MutationAndExportContractTest(unittest.TestCase):

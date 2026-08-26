@@ -39,7 +39,7 @@ def derive_probes(ctx: ToolContext) -> dict:
     """从当前流图的 ``blocks_file_sink`` 推导 probe_id -> (路径, dtype)。
 
     真实落盘路径只写在 file sink 的 ``file`` 参数里。调用方若按 probe_id
-    拼文件名(如 ``<probe_id>_rx.bin``),流图仍写自己的路径,读回就是 0 样本。
+    拼文件名(如 ``<id>_iq.bin``),流图仍写自己的路径,读回就是 0 样本。
     """
     probes = {}
     for block_id, block in (getattr(ctx, "blocks", None) or {}).items():
@@ -161,6 +161,8 @@ def run_simulation(ctx: ToolContext, probes: dict = None, timeout: float = 30.0)
             "modulation": {"type": "string", "description": "调制方式(算 evm/ber 用),如 'bpsk'/'qpsk'"},
             "sps": {"type": "integer", "description": "每符号样本数,默认 4"},
             "tx_bits_probe": {"type": "string", "description": "算 ber 时,已知发送比特所在的 probe_id"},
+            "samp_rate": {"type": "number", "description": "频谱频率轴采样率 Hz"},
+            "fft_size": {"type": "integer", "description": "频谱 FFT 点数,默认最多 4096"},
         },
         "required": ["kind"],
     },
@@ -168,7 +170,8 @@ def run_simulation(ctx: ToolContext, probes: dict = None, timeout: float = 30.0)
 )
 def read_metric(ctx: ToolContext, kind: str, probe_id: str = "",
                 modulation: str = "bpsk", sps: int = 4,
-                tx_bits_probe: str = ""):
+                tx_bits_probe: str = "", samp_rate: float = 1e6,
+                fft_size: int = 4096):
     import numpy as np
     res = ctx.last_sim
     if res is None or not res.ok:
@@ -195,6 +198,8 @@ def read_metric(ctx: ToolContext, kind: str, probe_id: str = "",
         )
         evm = simulate.evm_from_symbols(syms, ideal)
         res.metrics["evm_pct"] = evm
+        res.aligned_symbols = syms
+        res.symbol_phase = phase
         return {"ok": True, "kind": "evm", "value": evm,
                 "unit": "%", "n_symbols": int(syms.size),
                 "sample_phase": phase}
@@ -213,9 +218,12 @@ def read_metric(ctx: ToolContext, kind: str, probe_id: str = "",
                     ),
                     "n_bits": int(getattr(bits, "size", 0)),
                 }
-            ber, delay = simulate.ber_from_bits(np.asarray(tx), np.asarray(bits))
-            res.metrics["ber"] = ber
-            return {"ok": True, "kind": "ber", "value": ber, "delay": delay}
+            report = simulate.ber_report(np.asarray(tx), np.asarray(bits))
+            if not report.get("valid"):
+                return {"ok": False, "kind": "ber", **report}
+            res.metrics["ber"] = report["value"]
+            return {"ok": True, "kind": "ber", "tx_probe": tx_bits_probe,
+                    "rx_probe": probe_id, **report}
         if iq is None:
             iq, err = _require_samples(ctx, probe_id)
             if err is not None:
@@ -226,17 +234,23 @@ def read_metric(ctx: ToolContext, kind: str, probe_id: str = "",
         if tx is None:
             return {"ok": False,
                     "error": "算 ber 需要已知发送比特(tx_bits_probe)"}
-        ber, delay = simulate.ber_from_bits(np.asarray(tx), rx_bits)
-        res.metrics["ber"] = ber
-        return {"ok": True, "kind": "ber", "value": ber, "delay": delay}
+        report = simulate.ber_report(np.asarray(tx), rx_bits)
+        if not report.get("valid"):
+            return {"ok": False, "kind": "ber", **report}
+        res.metrics["ber"] = report["value"]
+        return {"ok": True, "kind": "ber", "tx_probe": tx_bits_probe,
+                "rx_probe": probe_id, **report}
 
     if kind == "spectrum_peak":
-        n = min(len(iq), 4096)
-        spec = np.abs(np.fft.fft(iq[:n]))
-        peak = float(spec.max())
-        res.metrics["spectrum_peak"] = peak
-        return {"ok": True, "kind": "spectrum_peak", "value": peak,
-                "peak_bin": int(np.argmax(spec)), "peak": peak}
+        n = min(len(iq), max(32, int(fft_size)))
+        if n < 32 or float(samp_rate) <= 0:
+            return {"ok": False, "kind": "spectrum_peak",
+                    "error": "频谱测量需要有效样本和正采样率"}
+        report = simulate.spectrum_peak_report(iq, samp_rate, fft_size)
+        res.metrics["spectrum_peak"] = report["frequency_hz"]
+        res.metrics["spectrum_peak_report"] = report
+        return {"ok": True, "kind": "spectrum_peak",
+                "value": report["frequency_hz"], "unit": "Hz", **report}
 
     return {"ok": False, "error": f"未知指标: {kind}"}
 
@@ -249,19 +263,22 @@ def read_metric(ctx: ToolContext, kind: str, probe_id: str = "",
         "properties": {
             "probe_id": {"type": "string", "description": "用哪个 probe;默认第一个复数 probe"},
             "sps": {"type": "integer", "description": "每符号样本数,默认 1"},
+            "modulation": {"type": "string", "description": "调制名,与 EVM 同源抽取时使用"},
             "path": {"type": "string", "description": "可选,输出图片路径"},
         },
     },
     group="sim",
 )
 def plot_constellation(ctx: ToolContext, probe_id: str = "",
-                       sps: int = 1, path: str = ""):
+                       sps: int = 1, path: str = "", modulation: str = ""):
     _, err = _require_samples(ctx, probe_id)
     if err is not None:
         return err
     res = ctx.last_sim
     out = path or os.path.join(res.out_dir or ".", "constellation.png")
-    p = res.plot_constellation(out, probe_id=probe_id or None, sps=sps)
+    p = res.plot_constellation(
+        out, probe_id=probe_id or None, sps=sps, modulation=modulation,
+    )
     if p is None:
         return {"ok": False, "error": "无可用复数数据"}
     return {"ok": True, "path": p}

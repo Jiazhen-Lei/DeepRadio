@@ -85,10 +85,12 @@ class SimResult:
     stderr: str = ""
     error: Optional[str] = None
     summary: str = ""
+    aligned_symbols: Optional[object] = None
+    symbol_phase: int = 0
 
     # -- 可视化(惰性导入 matplotlib,无显示后端) ---------------------------
     def plot_constellation(self, path: str, probe_id: Optional[str] = None,
-                           sps: int = 1) -> Optional[str]:
+                           sps: int = 1, modulation: str = "") -> Optional[str]:
         """把某个 IQ probe 画成星座散点图,存到 path。返回图路径。"""
         arr = self._pick_complex(probe_id)
         if arr is None:
@@ -98,9 +100,21 @@ class SimResult:
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        syms = arr[sps * 4::sps] if sps > 1 else arr
+        if self.aligned_symbols is not None:
+            syms = self.aligned_symbols
+        elif int(sps or 1) > 1 and modulation:
+            ideal = ideal_points_for(modulation)
+            filtered = matched_filter_rrc(arr, sps=sps)
+            syms, phase = extract_symbols_best_phase(
+                filtered, sps=sps, ideal_points=ideal,
+                skip_symbols=15,
+            )
+            self.aligned_symbols = syms
+            self.symbol_phase = phase
+        else:
+            syms = arr[sps * 4::sps] if sps > 1 else arr
         fig, ax = plt.subplots(figsize=(4, 4))
-        ax.scatter(syms.real, syms.imag, s=6, alpha=0.4)
+        ax.scatter(np.real(syms), np.imag(syms), s=6, alpha=0.4)
         ax.axhline(0, color="gray", lw=0.5)
         ax.axvline(0, color="gray", lw=0.5)
         ax.set_aspect("equal")
@@ -114,24 +128,21 @@ class SimResult:
 
     def plot_spectrum(self, path: str, probe_id: Optional[str] = None,
                       samp_rate: float = 1.0) -> Optional[str]:
-        """把某个 IQ probe 画成频谱(dB),存到 path。返回图路径。"""
+        """把某个 IQ probe 画成频谱(dBFS),存到 path。返回图路径。"""
         arr = self._pick_complex(probe_id)
         if arr is None:
             return None
-        import numpy as np
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        n = min(len(arr), 4096)
-        spec = np.fft.fftshift(np.abs(np.fft.fft(arr[:n])))
-        spec_db = 20 * np.log10(spec + 1e-12)
-        freqs = np.fft.fftshift(np.fft.fftfreq(n, d=1.0 / samp_rate))
+        freqs, spec_db, _n = spectrum_trace(arr, samp_rate)
         fig, ax = plt.subplots(figsize=(5, 3))
         ax.plot(freqs, spec_db, lw=0.8)
+        ax.axvline(0, color="gray", lw=0.6, ls="--")
         ax.set_title("Spectrum")
         ax.set_xlabel("Frequency (Hz)")
-        ax.set_ylabel("Magnitude (dB)")
+        ax.set_ylabel("Magnitude (dBFS)")
         fig.tight_layout()
         fig.savefig(path, dpi=100)
         plt.close(fig)
@@ -253,6 +264,49 @@ def extract_symbols_best_phase(
     return best_symbols, best_phase
 
 
+def spectrum_trace(iq, samp_rate: float, fft_size: int = 4096):
+    """Hann-windowed, fftshifted spectrum in dBFS. Returns freqs, dbfs, n."""
+    import numpy as np
+
+    arr = np.asarray(iq)
+    n = min(len(arr), max(32, int(fft_size)))
+    window = np.hanning(n)
+    spectrum = np.fft.fftshift(np.fft.fft(arr[:n] * window, n=n))
+    magnitude = np.abs(spectrum) / max(float(window.sum()), 1e-12)
+    magnitude_dbfs = 20.0 * np.log10(np.maximum(magnitude, 1e-12))
+    freqs = np.fft.fftshift(np.fft.fftfreq(n, d=1.0 / float(samp_rate)))
+    return freqs, magnitude_dbfs, n
+
+
+def spectrum_peak_report(iq, samp_rate: float, fft_size: int = 4096) -> dict:
+    """Peak frequency excluding a DC spike, if one is present."""
+    import numpy as np
+
+    freqs, magnitude_dbfs, n = spectrum_trace(iq, samp_rate, fft_size)
+    dc_bin = int(n // 2)
+    peak_bin = int(np.argmax(magnitude_dbfs))
+    dc_excluded = False
+    if 2 < dc_bin < n - 2:
+        neighbors = np.concatenate((
+            magnitude_dbfs[dc_bin - 3:dc_bin],
+            magnitude_dbfs[dc_bin + 1:dc_bin + 4],
+        ))
+        if neighbors.size and magnitude_dbfs[dc_bin] > float(np.median(neighbors)) + 6.0:
+            masked = np.array(magnitude_dbfs, copy=True)
+            masked[dc_bin] = -np.inf
+            peak_bin = int(np.argmax(masked))
+            dc_excluded = True
+    return {
+        "valid": True, "metric": "spectrum_peak",
+        "frequency_hz": float(freqs[peak_bin]),
+        "magnitude_dbfs": float(magnitude_dbfs[peak_bin]),
+        "fft_bin": peak_bin, "peak_bin": peak_bin, "fft_size": n,
+        "sample_rate": float(samp_rate), "window": "hann",
+        "fft_shifted": True, "dc_excluded": dc_excluded,
+        "dc_dbfs": float(magnitude_dbfs[dc_bin]) if 0 <= dc_bin < n else None,
+    }
+
+
 def matched_filter_rrc(
     iq, sps: int, excess_bw: float = 0.35, span_symbols: int = 11
 ):
@@ -331,42 +385,79 @@ def bits_from_probe(data):
     return ints.astype(np.int8)
 
 
-def ber_from_bits(tx_bits, rx_bits) -> Tuple[float, int]:
-    """比对收发比特算 BER,自动搜索最佳对齐时延。
+def ber_report(tx_bits, rx_bits, *, max_delay: int = 512,
+               min_compare_bits: int = 256,
+               allow_inversion: bool = False) -> dict:
+    """Return an auditable BER measurement with a bounded alignment search.
 
-    Returns:
-        (ber, best_delay)。若无法对齐返回 (nan, 0)。
+    The old implementation searched almost the whole capture and always tried
+    an inverted stream.  Selecting the best of that many hypotheses can make a
+    short/random capture look unrealistically good.  Alignment is now bounded;
+    inversion is an explicit modulation ambiguity decision, never implicit.
     """
     import numpy as np
     tx = bits_from_probe(tx_bits)
     rx = bits_from_probe(rx_bits)
     if len(tx) == 0 or len(rx) == 0:
-        return float("nan"), 0
+        return {"valid": False, "value": float("nan"), "delay_bits": 0,
+                "error": "empty_probe", "compared_bits": 0,
+                "bit_errors": 0, "inversion_applied": False}
     n = min(len(tx), len(rx))
-    # PFB / 载波环会引入数百符号的捕获时延。RX 可能先吐垃圾，
-    # 也可能因为滤波器群时延而对应更晚的发送比特，两个方向都搜。
-    best_ber, best_delay = 1.0, 0
-    min_compare = max(32, n // 8)
-    search = max(1, n - min_compare)
-    ones = np.int8(1)
-    for d in range(search):
-        pairs = (
-            (tx[: n - d], rx[d:n]),
-            (tx[d:n], rx[: n - d]),
-        )
-        for a, b in pairs:
-            m = min(len(a), len(b))
-            if m < min_compare:
+    minimum = max(32, int(min_compare_bits))
+    if n < minimum:
+        return {"valid": False, "value": float("nan"), "delay_bits": 0,
+                "error": "insufficient_bits", "compared_bits": n,
+                "minimum_bits": minimum, "bit_errors": 0,
+                "inversion_applied": False}
+    search = min(max(0, int(max_delay)), n - minimum)
+    best = None
+    for delay in range(search + 1):
+        for direction, a, b in (
+            ("rx_lags_tx", tx[: n - delay], rx[delay:n]),
+            ("tx_lags_rx", tx[delay:n], rx[: n - delay]),
+        ):
+            compared = min(len(a), len(b))
+            if compared < minimum:
                 continue
-            chunk_a = a[:m]
-            chunk_b = b[:m]
-            ber = float(np.mean(chunk_a != chunk_b))
-            if ber < best_ber:
-                best_ber, best_delay = ber, d
-            inverted = float(np.mean(chunk_a != (ones - chunk_b)))
-            if inverted < best_ber:
-                best_ber, best_delay = inverted, d
-    return best_ber, best_delay
+            left, right = a[:compared], b[:compared]
+            candidates = [(False, right)]
+            if allow_inversion:
+                candidates.append((True, np.int8(1) - right))
+            for inverted, candidate in candidates:
+                errors = int(np.count_nonzero(left != candidate))
+                item = (errors / compared, -compared, delay, direction,
+                        inverted, errors, compared)
+                if best is None or item < best:
+                    best = item
+    if best is None:
+        return {"valid": False, "value": float("nan"), "delay_bits": 0,
+                "error": "alignment_failed", "compared_bits": 0,
+                "bit_errors": 0, "inversion_applied": False}
+    value, _, delay, direction, inverted, errors, compared = best
+    return {
+        "valid": True,
+        "metric": "ber",
+        "value": float(value),
+        "bit_errors": errors,
+        "compared_bits": compared,
+        "delay_bits": delay,
+        "alignment_direction": direction,
+        "alignment_method": "bounded_delay_search",
+        "max_delay_bits": search,
+        "inversion_applied": inverted,
+    }
+
+
+def ber_from_bits(tx_bits, rx_bits, *, max_delay: int = 512) -> Tuple[float, int]:
+    """Compatibility wrapper returning ``(ber, delay)``.
+
+    Returns:
+        (ber, best_delay)。若无法对齐返回 (nan, 0)。
+    """
+    report = ber_report(tx_bits, rx_bits, max_delay=max_delay)
+    return float(report.get("value", float("nan"))), int(
+        report.get("delay_bits", 0)
+    )
 
 
 def demod_bits(symbols, modulation: str = "bpsk"):

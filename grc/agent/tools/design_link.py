@@ -167,10 +167,18 @@ def design_link(ctx, profile=None, intent: str = "",
         return {"ok": False, "error": f"init 失败: {r.get('error')}",
                 "steps": steps}
 
-    # 2) probe 落盘路径：.grc 里写相对文件名，仿真读回仍用绝对路径
+    # 2) probe 落盘路径：.grc 里写相对文件名，仿真读回仍用绝对路径。
+    # TX-only recipes capture the transmitted waveform, so the file must not
+    # be labelled as an RX probe.
     out_dir = ctx.out_dir or os.getcwd()
     os.makedirs(out_dir, exist_ok=True)
-    probe_name = f"{fid}_rx.bin"
+    dtype = str(getattr(rc, "probe_dtype", "complex64") or "complex64")
+    if str(rc.name).endswith("_tx"):
+        probe_name = f"{fid}_tx.bin"
+    elif dtype in {"uint8", "int8"}:
+        probe_name = f"{fid}_bits.bin"
+    else:
+        probe_name = f"{fid}_iq.bin"
     tx_probe_name = f"{fid}_tx.bin"
     probe_path = os.path.join(out_dir, probe_name)
     tx_probe_path = os.path.join(out_dir, tx_probe_name)
@@ -224,27 +232,43 @@ def design_link(ctx, profile=None, intent: str = "",
         sim = _c("run_simulation", probes=probes)
         if sim.get("ok"):
             artifacts["out_dir"] = sim.get("out_dir")
+            if sim.get("probes"):
+                artifacts["probes"] = sim["probes"]
+            if sim.get("probe_sizes"):
+                artifacts["probe_sizes"] = sim["probe_sizes"]
+            mod = _recipes.guess_modulation(rc.name)
+            samp_rate = 1e6
+            for _key, bid, params in rc.blocks:
+                if bid == "samp_rate":
+                    try:
+                        samp_rate = float(str(params.get("value") or "1000000"))
+                    except ValueError:
+                        samp_rate = 1e6
+                    break
             if "evm" in rc.metrics:
-                mod = _recipes.guess_modulation(rc.name)
                 m = _c("read_metric", kind="evm", probe_id=probe_id,
                        modulation=mod, sps=rc.sps)
                 if m.get("ok"):
                     metrics["evm_pct"] = m["value"]
                     metrics["n_symbols"] = m.get("n_symbols")
             if "ber" in rc.metrics:
-                mod = _recipes.guess_modulation(rc.name)
                 ber_sps = 1 if rc.probe_dtype in {"uint8", "int8"} else rc.sps
                 m = _c("read_metric", kind="ber", probe_id=probe_id,
                        modulation=mod, sps=ber_sps,
                        tx_bits_probe=rc.tx_probe_block_id or "")
                 if m.get("ok"):
                     metrics["ber"] = m["value"]
+                    metrics["ber_report"] = {
+                        key: value for key, value in m.items()
+                        if key not in {"ok", "kind"}
+                    }
             if "constellation" in rc.metrics:
-                pc = _c("plot_constellation", probe_id=probe_id, sps=rc.sps)
+                pc = _c("plot_constellation", probe_id=probe_id, sps=rc.sps,
+                        modulation=mod)
                 if pc.get("ok"):
                     artifacts["constellation_png"] = pc["path"]
             if "spectrum" in rc.metrics:
-                ps = _c("plot_spectrum", probe_id=probe_id, samp_rate=1e6)
+                ps = _c("plot_spectrum", probe_id=probe_id, samp_rate=samp_rate)
                 if ps.get("ok"):
                     artifacts["spectrum_png"] = ps["path"]
             if "eye" in rc.metrics:

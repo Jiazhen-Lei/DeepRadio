@@ -8,7 +8,7 @@
 |-----|------|----------|----------|
 | `variable` | 定义变量(如 samp_rate/sps) | value | — |
 | `variable_constellation` | 定义星座(bpsk/qpsk) | type | — |
-| `analog_sig_source_x` | 正弦/方波等信号源 | waveform/freq/amplitude/samp_rate | complex/float |
+| `analog_sig_source_x` | 正弦/方波等信号源 | waveform/freq/amp/samp_rate | complex/float |
 | `analog_noise_source_x` | 高斯/均匀噪声源 | noise_type/amplitude/seed | complex/float |
 | `analog_random_source_x` | 随机字节源 | min/max/num_samps/repeat | byte |
 

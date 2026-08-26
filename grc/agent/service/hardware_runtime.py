@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import signal
 import subprocess
 import threading
@@ -103,6 +104,7 @@ class HardwareRuntime:
             process = record["process"]
             if process.poll() is not None:
                 return self._reap_locked(session_id)
+            output = "".join(record.get("output_chunks") or [])[-8000:]
             return {
                 "ok": True,
                 "running": True,
@@ -116,7 +118,8 @@ class HardwareRuntime:
                 "deadline": record["started_at"] + record["duration"],
                 "program": record.get("program"),
                 "interpreter": record.get("interpreter"),
-                "output": "".join(record.get("output_chunks") or [])[-8000:],
+                "output": output,
+                **self._stream_quality(output),
             }
 
     def stop(self, session_id: str, emergency: bool = False) -> Dict[str, Any]:
@@ -163,6 +166,18 @@ class HardwareRuntime:
         except (OSError, ValueError):
             return
 
+    @staticmethod
+    def _stream_quality(output: str) -> Dict[str, Any]:
+        """Extract GNU Radio scheduler U/O markers without parsing prose."""
+        compact_runs = re.findall(r"(?<![A-Za-z])[UO]+(?![A-Za-z])", output or "")
+        markers = "".join(compact_runs)
+        underruns = markers.count("U")
+        overruns = markers.count("O")
+        return {
+            "underrun_count": underruns,
+            "overrun_count": overruns,
+            "stream_quality_warning": bool(underruns or overruns),
+        }
     def _reap_locked(
         self,
         session_id: str,
@@ -216,6 +231,7 @@ class HardwareRuntime:
                 else "exited"
             ),
             "output": output,
+            **self._stream_quality(output),
             "program": record.get("program"),
             "interpreter": record.get("interpreter"),
             "started_at": record.get("started_at"),

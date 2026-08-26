@@ -189,13 +189,15 @@ def make_result_envelope(
     )
     completion_ok = complete(completion)
     protocol_ok = bool(invocations) and (protocol_strict or completion_ok)
-    reply_ok = getattr(reply, "stage", "") not in (
+    stage_name = getattr(reply, "stage", "")
+    # Host-proved completion is the Stage gate. CRITIC is advisory when the
+    # tools already satisfied completion.
+    reply_ok = stage_name not in (
         "ERROR",
-        "CRITIC",
         "DENY",
         "CONFIRM",
         "CANCELLED",
-    )
+    ) and (stage_name != "CRITIC" or completion_ok)
     succeeded = reply_ok and bool(invocations) and completion_ok
     errored = getattr(reply, "stage", "") == "ERROR"
     failure_codes = []

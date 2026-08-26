@@ -123,6 +123,14 @@ def _activity_from_reply(reply):
     stage = getattr(reply, "stage", "") or ""
     pending = getattr(reply, "pending", None) or {}
     if pending and not pending.get("approved"):
+        action = str(pending.get("action") or "")
+        if action == "rf_plan_confirmation":
+            return {
+                "loop": "确认",
+                "agent": "Hardware",
+                "action": "RF 计划确认",
+                "status": "等待明确授权",
+            }
         return {
             "loop": "修改",
             "agent": "Flowgraph",
@@ -518,6 +526,22 @@ class AgentPanel(Gtk.VBox):
             return
         agent = self._ensure_agent()
         digest = agent._workflow.digest()
+        wait_kind = str(digest.get("wait_kind") or "")
+        if wait_kind == "recovery":
+            action = (
+                "retry_stage" if decision == "approved" else "cancel_workflow"
+            )
+            self._append(
+                "我",
+                "重试本阶段" if action == "retry_stage" else "取消任务",
+            )
+            self._set_busy(True)
+            threading.Thread(
+                target=self._handle_agent_command,
+                args=({"action": action},),
+                daemon=True,
+            ).start()
+            return
         checkpoint_id = str(digest.get("checkpoint_id") or "")
         if not checkpoint_id:
             self._append("DeepRadio", "当前没有待确认的 Checkpoint。")

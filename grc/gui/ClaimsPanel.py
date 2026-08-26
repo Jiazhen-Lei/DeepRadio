@@ -283,12 +283,19 @@ class ClaimsPanel(Gtk.Frame):
         self._set_metrics(metrics, self._claims)
         pending_view = dict(pending or {})
         workflow_view = workflow or {}
+        wait = str(workflow_view.get("wait_kind") or "")
         if not pending_view and workflow_view.get("checkpoint_id"):
             pending_view = {
                 "action": workflow_view.get("current_stage") or "workflow_checkpoint",
                 "reason": workflow_view.get("waiting_reason") or "继续当前 Workflow",
                 "checkpoint_id": workflow_view.get("checkpoint_id"),
                 "max_duration_seconds": workflow_view.get("max_duration_seconds"),
+                "approved": False,
+            }
+        if not pending_view and wait == "recovery":
+            pending_view = {
+                "action": "stage_recovery",
+                "reason": workflow_view.get("waiting_reason") or "当前 Stage 未通过",
                 "approved": False,
             }
         pending_view["can_retry"] = bool(
@@ -461,7 +468,9 @@ class ClaimsPanel(Gtk.Frame):
                 all_passed = passed == len(completion) and all(
                     results.get(name) is True for name in completion
                 )
-                if all_passed:
+                if outcome == "failed":
+                    display = "failed"
+                elif all_passed:
                     display = "passed"
                 elif outcome == "passed":
                     display = "incomplete"
@@ -469,13 +478,18 @@ class ClaimsPanel(Gtk.Frame):
                     display = outcome or status
             else:
                 display = outcome or status
+            attempt = int(stage.get("attempt") or 0)
+            max_attempts = int(stage.get("max_attempts") or 1)
+            if display == "passed" and attempt <= 1:
+                attempt_text = "attempt {}".format(max(attempt, 1))
+            else:
+                attempt_text = "attempt {}/{}".format(attempt, max_attempts)
             lines.append(
-                "{} {}  {}  attempt {}/{}  completion {}/{}".format(
+                "{} {}  {}  {}  completion {}/{}".format(
                     marker,
                     stage.get("label") or stage.get("id") or "—",
                     display,
-                    stage.get("attempt") or 0,
-                    stage.get("max_attempts") or 1,
+                    attempt_text,
                     passed,
                     len(completion),
                 )
@@ -642,10 +656,35 @@ class ClaimsPanel(Gtk.Frame):
                 )
             elif action == "rf_plan_confirmation":
                 duration = pending.get("max_duration_seconds") or 30
+                device = dict(pending.get("device") or {})
+                identity = str(device.get("identity") or "未绑定")
+                device_type = str(device.get("type") or "SDR")
+                frequency = self._format_si(
+                    pending.get("center_frequency"), "Hz"
+                )
+                sample_rate = self._format_si(
+                    pending.get("sample_rate"), "sps"
+                )
+                bandwidth = self._format_si(pending.get("bandwidth"), "Hz")
+                level = (
+                    "衰减 {} dB".format(pending.get("tx_attenuation"))
+                    if pending.get("tx_attenuation") is not None
+                    else "增益 {} dB".format(pending.get("tx_gain"))
+                    if pending.get("tx_gain") is not None
+                    else "功率参数未设置"
+                )
                 text = (
-                    "RF 安全确认: 批准后将启动最长 {} 秒的受控发射；"
+                    "RF 安全确认: {} [{}] · {} · {} · BW {} · {}。"
+                    "批准后将启动最长 {} 秒的受控发射；"
                     "OTA 确认或取消后会提前停止。不要在 GRC 中点击运行。"
-                ).format(duration)
+                ).format(
+                    device_type, identity, frequency or "频率?",
+                    sample_rate or "采样率?", bandwidth or "?", level, duration,
+                )
+            elif action == "stage_recovery":
+                text = "Stage 未通过: {}".format(
+                    pending.get("reason") or "可重试本阶段或取消任务"
+                )
             elif action == "workflow_checkpoint":
                 text = "待确认: {}".format(
                     pending.get("reason") or "继续当前 Workflow"
@@ -659,6 +698,9 @@ class ClaimsPanel(Gtk.Frame):
             elif action == "rf_plan_confirmation":
                 self._confirm_btn.set_label("批准有限时长发射")
                 self._cancel_btn.set_label("取消")
+            elif action == "stage_recovery":
+                self._confirm_btn.set_label("重试本阶段")
+                self._cancel_btn.set_label("取消任务")
             else:
                 self._confirm_btn.set_label("确认")
                 self._cancel_btn.set_label("取消")
@@ -674,6 +716,17 @@ class ClaimsPanel(Gtk.Frame):
         retry = bool(pending.get("can_retry"))
         self._retry_btn.set_visible(retry)
         self._retry_btn.set_sensitive(retry)
+
+    @staticmethod
+    def _format_si(value, unit):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return ""
+        for scale, suffix in ((1e9, "G"), (1e6, "M"), (1e3, "k")):
+            if abs(number) >= scale:
+                return "{:g} {}{}".format(number / scale, suffix, unit)
+        return "{:g} {}".format(number, unit)
 
     @staticmethod
     def _summary_text(spec):

@@ -111,6 +111,10 @@ VARIANTS = [
     ("测量当前工程频谱", "OBSERVE"),
     ("查看当前工程眼图", "OBSERVE"),
     ("measure the current constellation", "OBSERVE"),
+    (
+        "查看当前接收信号的频谱和星座图，给出主峰，只观察工程。",
+        "OBSERVE",
+    ),
     ("配置 USRP B210，中心频率 2.4 GHz，采样率 1 MHz", "HARDWARE_CONFIGURE"),
     ("配置 SDR 硬件使用 B210", "HARDWARE_CONFIGURE"),
     ("设置 Pluto 中心频率 915 MHz 采样率 1 Msps", "HARDWARE_CONFIGURE"),
@@ -168,7 +172,9 @@ class SevenTaskTextVariantTest(unittest.TestCase):
 
 # --- test_seven_task_service_agent.py ---
 
+import hashlib
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -207,41 +213,126 @@ class SevenTaskServiceAgentTest(unittest.TestCase):
     def agent(self, session_id: str) -> ServiceAgent:
         return ServiceAgent(session_id=session_id, platform=self.platform)
 
+    def _events(self, session_id: str) -> str:
+        path = Path(store.session_root(session_id)) / "events.jsonl"
+        return path.read_text(encoding="utf-8") if path.is_file() else ""
+
+    def _claim(self, claims, claim_id: str) -> dict:
+        match = next((item for item in (claims or []) if item.get("id") == claim_id), None)
+        self.assertIsNotNone(match, f"missing claim {claim_id}")
+        return match
+
+    def _open_copied_project(self, session_id: str, source: ServiceAgent) -> ServiceAgent:
+        src = Path(source._state.project.grc_path)
+        self.assertTrue(src.is_file())
+        agent = self.agent(session_id)
+        dest_dir = Path(store.session_root(session_id)) / "final"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / src.name
+        shutil.copy(src, dest)
+        agent._state.project.grc_path = str(dest)
+        agent._state.project.flowgraph_version = int(
+            source._state.project.flowgraph_version
+        )
+        for key in ("recipe", "modulation", "channel"):
+            value = source._state.project.config.get(key)
+            if value not in (None, ""):
+                agent._state.project.config[key] = value
+        agent._tool_ctx = None
+        return agent
+
+    def _assert_no_rf_side_effects(self, session_id: str) -> None:
+        events = self._events(session_id)
+        self.assertNotIn("discover_devices", events)
+        self.assertNotIn("start_flowgraph", events)
+
+    def _assert_sim_tx_graph(self, reply) -> Path:
+        self.assertEqual(reply.workflow_digest["task_type"], "TX_BUILD")
+        self.assertNotIn(
+            "hardware_configure",
+            reply.workflow_digest.get("capabilities") or [],
+        )
+        grc_path = Path(reply.artifacts["grc_path"])
+        self.assertTrue(grc_path.is_file())
+        text = grc_path.read_text(encoding="utf-8")
+        self.assertRegex(text, r"type:\s*qpsk")
+        self.assertIn("blocks_file_sink", text)
+        self.assertNotRegex(text, r"_rx\.bin")
+        for token in ("uhd_usrp", "iio_pluto", "osmosdr", "limesdr"):
+            self.assertNotIn(token, text)
+        return grc_path
+
     def test_end_to_end_then_diagnose_observe_modify(self):
         agent = self.agent("seven-e2e")
         built = agent.step("构建 BPSK 过 AWGN 并测 EVM，要求 EVM 小于 10%")
         digest = built.workflow_digest
         self.assertEqual(digest["task_type"], "END_TO_END_SIM")
-        self.assertTrue(Path(built.artifacts["grc_path"]).is_file())
+        self.assertEqual(digest.get("execution_status"), "completed")
+        self.assertTrue(built.done)
+        built_grc = Path(built.artifacts["grc_path"])
+        self.assertTrue(built_grc.is_file())
         self.assertGreaterEqual(int(digest.get("base_project_version") or 0), 1)
-        if digest.get("execution_status") == "completed":
-            self.assertTrue(built.done)
+        self.assertEqual(agent._state.project.config.get("recipe"), "bpsk_awgn")
+        metrics = built.artifacts.get("metrics") or {}
+        self.assertLess(float(metrics["evm_pct"]), 10.0)
+        self.assertTrue(Path(built.artifacts["constellation_png"]).is_file())
+        self.assertTrue(Path(built.artifacts["spectrum_png"]).is_file())
+        evm_claim = self._claim(built.claims, "evm_lt_10")
+        self.assertEqual(evm_claim.get("status"), "Passed")
         built_version = int(agent._state.project.flowgraph_version)
+        built_hash = hashlib.sha256(built_grc.read_bytes()).hexdigest()
 
         diagnosed = agent.step(
             "诊断当前链路的 EVM，解释主要原因并给出最小修改建议，先保持工程不变。"
         )
         self.assertEqual(diagnosed.workflow_digest["task_type"], "DIAGNOSE")
+        self.assertEqual(
+            diagnosed.workflow_digest.get("execution_status"), "completed"
+        )
         self.assertNotEqual(
             diagnosed.workflow_digest["current_stage"], "repair_confirmation"
         )
-        self.assertEqual(agent._state.project.flowgraph_version, built_version)
-        self.assertNotIn("eye_png", diagnosed.artifacts or {})
-        evm = ((diagnosed.artifacts or {}).get("metrics") or {}).get("evm_pct")
-        if evm is not None and float(evm) < 10:
-            self.assertNotIn("偏高", diagnosed.text or "")
-            self.assertTrue(
-                "达标" in (diagnosed.text or "")
-                or "设计噪声" in (diagnosed.text or "")
-                or "不是故障" in (diagnosed.text or "")
+        self.assertIn(
+            "modify_project",
+            (agent._workflow.workflow.intent.context or {}).get(
+                "forbidden_capabilities"
             )
+            or [],
+        )
+        self.assertEqual(agent._state.project.flowgraph_version, built_version)
+        self.assertEqual(hashlib.sha256(built_grc.read_bytes()).hexdigest(), built_hash)
+        self.assertTrue(diagnosed.text)
+        self.assertNotIn("eye_png", diagnosed.artifacts or {})
+        self.assertNotIn("偏高", diagnosed.text or "")
+        self.assertTrue(
+            "达标" in (diagnosed.text or "")
+            or "设计噪声" in (diagnosed.text or "")
+            or "不是故障" in (diagnosed.text or "")
+        )
 
-        observed = agent.step("查看当前工程频谱和星座图")
+        observed = agent.step(
+            "查看当前接收信号的频谱和星座图，给出主峰，只观察工程。"
+        )
         self.assertEqual(observed.workflow_digest["task_type"], "OBSERVE")
+        self.assertEqual(
+            observed.workflow_digest.get("execution_status"), "completed"
+        )
         self.assertEqual(
             observed.workflow_digest["current_stage"], "inspect_and_measure"
         )
         self.assertEqual(agent._state.project.flowgraph_version, built_version)
+        self.assertEqual(hashlib.sha256(built_grc.read_bytes()).hexdigest(), built_hash)
+        self.assertEqual(agent._state.spec.open_questions, [])
+        self.assertIn("spectrum_png", observed.artifacts)
+        self.assertIn("constellation_png", observed.artifacts)
+        peak = (observed.artifacts.get("metrics") or {}).get("spectrum_peak_report") or {}
+        self.assertTrue(peak.get("valid"))
+        self.assertIsNotNone(peak.get("frequency_hz"))
+        self.assertIsNotNone(peak.get("magnitude_dbfs"))
+        self.assertGreaterEqual(float(peak.get("sample_rate") or 0), 1e3)
+        self.assertIn("主峰", observed.text or "")
+        self.assertIn("Hz", observed.text or "")
+        self._claim(observed.claims, "spectrum_peak_measured")
 
         modified = agent.step("把当前 BPSK 改成 QPSK")
         self.assertEqual(modified.workflow_digest["task_type"], "MODIFY_PROJECT")
@@ -255,6 +346,7 @@ class SevenTaskServiceAgentTest(unittest.TestCase):
             ))
         )
         self.assertEqual(agent._state.project.config.get("recipe"), "bpsk_awgn")
+        self.assertEqual(hashlib.sha256(built_grc.read_bytes()).hexdigest(), built_hash)
         self.assertEqual(modified.workflow_digest.get("wait_kind"), "approval")
         checkpoint_id = modified.workflow_digest.get("checkpoint_id") or ""
         self.assertTrue(checkpoint_id)
@@ -274,6 +366,12 @@ class SevenTaskServiceAgentTest(unittest.TestCase):
         self.assertRegex(grc_path.read_text(encoding="utf-8"), r"type:\s*qpsk")
         self.assertNotEqual(
             approved.workflow_digest.get("wait_kind"), "denied"
+        )
+        evm_after = self._claim(approved.claims, "evm_lt_10")
+        self.assertEqual(evm_after.get("status"), "Passed")
+        self.assertEqual(
+            int(evm_after.get("project_version") or 0),
+            int(agent._state.project.flowgraph_version),
         )
 
         events_path = Path(store.session_root("seven-e2e")) / "events.jsonl"
@@ -305,29 +403,65 @@ class SevenTaskServiceAgentTest(unittest.TestCase):
         self.assertEqual(agent._state.project.flowgraph_version, version)
         self.assertEqual(agent._state.project.config.get("recipe"), recipe)
 
+    def test_diagnose_opened_project_does_not_mutate(self):
+        source = self.agent("seven-diag-src")
+        built = source.step("构建 BPSK 过 AWGN 并测 EVM，要求 EVM 小于 10%")
+        src_hash = hashlib.sha256(
+            Path(built.artifacts["grc_path"]).read_bytes()
+        ).hexdigest()
+        src_version = int(source._state.project.flowgraph_version)
+        agent = self._open_copied_project("seven-diag-open", source)
+        diagnosed = agent.step(
+            "诊断当前链路的 EVM，解释主要原因并给出最小修改建议，先保持工程不变。"
+        )
+        self.assertEqual(diagnosed.workflow_digest["task_type"], "DIAGNOSE")
+        self.assertEqual(
+            diagnosed.workflow_digest.get("execution_status"), "completed"
+        )
+        self.assertEqual(agent._state.project.flowgraph_version, src_version)
+        self.assertEqual(
+            hashlib.sha256(Path(agent._state.project.grc_path).read_bytes()).hexdigest(),
+            src_hash,
+        )
+        self.assertNotIn("start_flowgraph", self._events("seven-diag-open"))
+
+    def test_modify_rejection_keeps_original_project(self):
+        agent = self.agent("seven-mod-reject")
+        built = agent.step("构建 BPSK 过 AWGN 并测 EVM，要求 EVM 小于 10%")
+        version = int(agent._state.project.flowgraph_version)
+        digest = hashlib.sha256(
+            Path(built.artifacts["grc_path"]).read_bytes()
+        ).hexdigest()
+        waiting = agent.step("把当前 BPSK 改成 QPSK")
+        checkpoint_id = waiting.workflow_digest.get("checkpoint_id") or ""
+        self.assertTrue(checkpoint_id)
+        rejected = agent.step_command({
+            "action": "checkpoint_decision",
+            "checkpoint_id": checkpoint_id,
+            "decision": "rejected",
+        })
+        self.assertEqual(agent._state.project.config.get("recipe"), "bpsk_awgn")
+        self.assertEqual(agent._state.project.config.get("modulation"), "bpsk")
+        self.assertEqual(agent._state.project.flowgraph_version, version)
+        self.assertEqual(
+            hashlib.sha256(Path(agent._state.project.grc_path).read_bytes()).hexdigest(),
+            digest,
+        )
+        self.assertIn(
+            rejected.workflow_digest.get("execution_status"),
+            ("completed", "cancelled"),
+        )
+
     def _assert_sim_only_tx_reply(self, session_id: str, text: str) -> None:
         with mock.patch("grc.agent.llm.is_configured", return_value=False):
             reply = self.agent(session_id).step(text)
-        self.assertNotIn(
-            "hardware_configure",
-            reply.workflow_digest.get("capabilities") or [],
-        )
-        self.assertNotIn(
-            reply.workflow_digest.get("current_stage"),
-            ("hardware_precheck", "hardware_confirmation", "configure_and_check"),
-        )
-        self.assertTrue(Path(reply.artifacts["grc_path"]).is_file())
-        events = (
-            Path(store.session_root(session_id)) / "events.jsonl"
-        ).read_text(encoding="utf-8")
-        self.assertNotIn("discover_devices", events)
-        self.assertNotIn("start_flowgraph", events)
+        self._assert_sim_tx_graph(reply)
+        self._assert_no_rf_side_effects(session_id)
 
     def test_tx_build_produces_flowgraph(self):
         agent = self.agent("seven-tx")
         reply = agent.step("构建一个 QPSK 发射机")
-        self.assertEqual(reply.workflow_digest["task_type"], "TX_BUILD")
-        self.assertTrue(Path(reply.artifacts["grc_path"]).is_file())
+        self._assert_sim_tx_graph(reply)
 
     def test_sim_only_tx_text_does_not_open_hardware(self):
         self._assert_sim_only_tx_reply(
@@ -343,17 +477,62 @@ class SevenTaskServiceAgentTest(unittest.TestCase):
 
     def test_rx_build_produces_flowgraph(self):
         agent = self.agent("seven-rx")
-        reply = agent.step("构建 BPSK 接收机并测 BER")
+        waiting = agent.step("构建 BPSK 接收机并测 BER")
+        self.assertEqual(waiting.workflow_digest.get("wait_kind"), "input")
+        self.assertIn("ebn0_db", waiting.workflow_digest.get("missing_slots") or [])
+        workflow_id = waiting.workflow_digest["workflow_id"]
+        reply = agent.step("Eb/N0 8 dB")
+        self.assertEqual(reply.workflow_digest["workflow_id"], workflow_id)
         self.assertEqual(reply.workflow_digest["task_type"], "RX_BUILD")
+        self.assertEqual(reply.workflow_digest.get("execution_status"), "completed")
+        self.assertEqual(agent._workflow.workflow.intent.slots.get("ebn0_db"), 8.0)
+        self.assertEqual(agent._state.project.config.get("ebn0_db"), 8.0)
+        self.assertEqual(agent._state.project.config.get("recipe"), "rx_bpsk_awgn")
         grc_path = Path(reply.artifacts["grc_path"])
         self.assertTrue(grc_path.is_file())
         self.assertNotRegex(
             grc_path.read_text(encoding="utf-8"),
             r"file:\s+/.+_rx\.bin",
         )
-        ber = ((reply.artifacts or {}).get("metrics") or {}).get("ber")
-        if ber is not None and ber == ber:
-            self.assertLess(float(ber), 0.1)
+        metrics = reply.artifacts.get("metrics") or {}
+        self.assertIn("ber", metrics)
+        self.assertLess(float(metrics["ber"]), 0.1)
+        report = metrics.get("ber_report") or {}
+        self.assertTrue(report.get("valid"))
+        self.assertGreaterEqual(int(report.get("compared_bits") or 0), 256)
+        self.assertTrue(report.get("tx_probe"))
+        self.assertTrue(report.get("rx_probe"))
+        ber_claim = self._claim(reply.claims, "ber_measured")
+        self.assertEqual(ber_claim.get("status"), "Passed")
+
+    def test_observe_opened_project_reports_calibrated_peak(self):
+        source = self.agent("seven-obs-src")
+        built = source.step("构建 BPSK 过 AWGN 并测 EVM，要求 EVM 小于 10%")
+        src_version = int(source._state.project.flowgraph_version)
+        src_hash = hashlib.sha256(
+            Path(built.artifacts["grc_path"]).read_bytes()
+        ).hexdigest()
+        agent = self._open_copied_project("seven-obs-open", source)
+        observed = agent.step(
+            "查看当前接收信号的频谱和星座图，给出主峰，只观察工程。"
+        )
+        self.assertEqual(observed.workflow_digest["task_type"], "OBSERVE")
+        self.assertEqual(
+            observed.workflow_digest.get("execution_status"), "completed"
+        )
+        self.assertEqual(agent._state.project.flowgraph_version, src_version)
+        self.assertEqual(
+            hashlib.sha256(Path(agent._state.project.grc_path).read_bytes()).hexdigest(),
+            src_hash,
+        )
+        self.assertEqual(agent._state.spec.open_questions, [])
+        peak = (observed.artifacts.get("metrics") or {}).get("spectrum_peak_report") or {}
+        self.assertTrue(peak.get("valid"))
+        self.assertGreaterEqual(float(peak.get("sample_rate") or 0), 1e3)
+        self.assertIn("主峰", observed.text or "")
+        self.assertIn("Hz", observed.text or "")
+        self.assertIn("dBFS", observed.text or "")
+        self._claim(observed.claims, "spectrum_peak_measured")
 
     def test_hardware_configure_stays_config_only(self):
         agent = self.agent("seven-hw")
@@ -364,13 +543,40 @@ class SevenTaskServiceAgentTest(unittest.TestCase):
             ("hardware_precheck", "hardware_confirmation", "configure_and_check"),
         )
         self.assertFalse(reply.done)
-        events_path = Path(store.session_root("seven-hw")) / "events.jsonl"
-        text = events_path.read_text(encoding="utf-8")
-        self.assertNotIn("start_flowgraph", text)
+        self.assertNotIn("start_flowgraph", self._events("seven-hw"))
 
     def test_pluto_tx_flowgraph_stays_hardware_configure(self):
+        if "iio_pluto_sink" not in self.platform.blocks:
+            self.skipTest("iio_pluto_sink is not available in this GNU Radio build")
         agent = self.agent("seven-hw-txfg")
-        with mock.patch("grc.agent.llm.is_configured", return_value=False):
+        from grc.agent.tools import registry
+
+        original = registry.call
+
+        def with_pluto(name, args=None, ctx=None):
+            if name == "discover_devices":
+                return {
+                    "ok": True,
+                    "device_found": True,
+                    "device_type": "pluto",
+                    "device_identity": "usb:test.pluto",
+                    "driver_family": "iio",
+                    "read_only": True,
+                }
+            if name == "probe_device":
+                return {
+                    "ok": True,
+                    "device_probed": True,
+                    "device_type": "pluto",
+                    "device_identity": "usb:test.pluto",
+                    "driver_family": "iio",
+                    "read_only": True,
+                }
+            return original(name, args or {}, ctx)
+
+        with mock.patch("grc.agent.llm.is_configured", return_value=False), mock.patch.object(
+            registry, "call", side_effect=with_pluto
+        ):
             reply = agent.step(
                 "为 PlutoSDR 配置 2.402 GHz、2 Msps 的发射流图，保存配置并停在发射确认。"
             )
@@ -381,6 +587,92 @@ class SevenTaskServiceAgentTest(unittest.TestCase):
             reply.text or "",
         )
         self.assertFalse(reply.done)
+        self.assertNotEqual(
+            reply.workflow_digest.get("execution_status"), "completed"
+        )
+        self.assertNotEqual(agent._state.project.config.get("recipe"), "bpsk_awgn")
+        grc_path = Path(
+            reply.artifacts.get("grc_path") or agent._state.project.grc_path or ""
+        )
+        self.assertTrue(grc_path.is_file())
+        text = grc_path.read_text(encoding="utf-8")
+        self.assertTrue("iio_pluto_sink" in text or "iio_fmcomms2_sink" in text)
+        self.assertIn("state: disabled", text)
+        self.assertIn("blocks_throttle", text)
+        self.assertIn("blocks_null_sink", text)
+        self.assertNotIn("channels_channel_model", text)
+        self.assertTrue("2402000000" in text or "2.402e9" in text or "2.402e+09" in text)
+        self.assertTrue("2000000" in text or "2e6" in text or "2e+06" in text)
+        self.assertNotIn("REPLY_STATUS_REJECTED", reply.text or "")
+        self.assertNotIn("Port is not connected", reply.text or "")
+        self.assertIn(
+            reply.workflow_digest.get("current_stage"),
+            ("rf_plan_confirmation",),
+        )
+        self.assertEqual(reply.workflow_digest.get("wait_kind"), "approval")
+        self.assertEqual((reply.pending.get("device") or {}).get("identity"), "usb:test.pluto")
+        self.assertEqual(reply.pending.get("center_frequency"), 2_402_000_000.0)
+        self.assertEqual(reply.pending.get("sample_rate"), 2_000_000.0)
+        built = next(
+            item.result for item in reply.tool_invocations
+            if item.name == "build_sdr_tx_flowgraph"
+        )
+        self.assertTrue(built.get("preview_topology_valid"), built)
+        self.assertTrue(built.get("compiled"), built)
+        self._claim(reply.claims, "final_flowgraph_valid")
+        self._claim(reply.claims, "hardware_device_probed")
+        self._claim(reply.claims, "rf_plan_awaiting_decision")
+        summary = (reply.spec_digest or {}).get("summary") or ""
+        self.assertNotIn("? → ? → ?", summary)
+        self.assertNotIn("start_flowgraph", self._events("seven-hw-txfg"))
+        if reply.workflow_digest.get("wait_kind") == "approval":
+            checkpoint_id = reply.workflow_digest.get("checkpoint_id") or ""
+            self.assertTrue(checkpoint_id)
+            with mock.patch.object(registry, "call", side_effect=with_pluto):
+                rejected = agent.step_command({
+                    "action": "checkpoint_decision",
+                    "checkpoint_id": checkpoint_id,
+                    "decision": "rejected",
+                })
+            self.assertNotIn("start_flowgraph", self._events("seven-hw-txfg"))
+            self.assertFalse(
+                bool((rejected.artifacts or {}).get("runtime") or {})
+            )
+
+    def test_failed_sdr_tx_builder_does_not_fallback_to_baseband(self):
+        from grc.agent.tools import registry
+
+        original = registry.call
+
+        def wrapped(name, args=None, ctx=None):
+            if name == "build_sdr_tx_flowgraph":
+                return {
+                    "ok": False,
+                    "valid": False,
+                    "error": "Port is not connected.",
+                    "errors": ["Port is not connected."],
+                }
+            return original(name, args or {}, ctx)
+
+        agent = self.agent("seven-hw-fallback")
+        with mock.patch("grc.agent.llm.is_configured", return_value=False), mock.patch.object(
+            registry, "call", side_effect=wrapped
+        ):
+            reply = agent.step(
+                "为 PlutoSDR 配置 2.402 GHz、2 Msps 的发射流图，保存配置并停在发射确认。"
+            )
+        self.assertEqual(reply.workflow_digest["task_type"], "HARDWARE_CONFIGURE")
+        self.assertFalse(reply.done)
+        self.assertNotEqual(
+            reply.workflow_digest.get("execution_status"), "completed"
+        )
+        self.assertNotEqual(agent._state.project.config.get("recipe"), "bpsk_awgn")
+        grc_path = Path(agent._state.project.grc_path or "")
+        if grc_path.is_file():
+            text = grc_path.read_text(encoding="utf-8")
+            self.assertNotIn("bpsk_awgn", text)
+            self.assertNotIn("channels_channel_model", text)
+        self.assertNotIn("start_flowgraph", self._events("seven-hw-fallback"))
 
     def test_input_wait_is_projected_to_persisted_shared_state(self):
         agent = self.agent("seven-input-wait")

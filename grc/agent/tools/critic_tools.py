@@ -9,6 +9,13 @@ from __future__ import annotations
 
 from .registry import ToolContext, tool
 
+# Disabled RF sinks look unconnected to GNU Radio. Topology checks may
+# temporarily re-enable them; the saved graph stays unarmed.
+_RF_IO = (
+    "usrp_sink", "usrp_source", "pluto_sink", "pluto_source",
+    "fmcomms", "osmosdr", "limesdr",
+)
+
 
 def _collect_errors(fg):
     """跑一遍校验,返回 (is_valid, [错误要点])。"""
@@ -27,17 +34,46 @@ def _collect_errors(fg):
     return valid, msgs
 
 
+def _enable_disabled_rf(ctx: ToolContext):
+    restored = []
+    fg = ctx.flow_graph
+    blocks = list(getattr(fg, "blocks", []) or []) if fg is not None else []
+    if not blocks:
+        blocks = list((ctx.blocks or {}).values())
+    for block in blocks:
+        key = str(getattr(block, "key", "") or "").lower()
+        if getattr(block, "state", None) != "disabled":
+            continue
+        if any(hint in key for hint in _RF_IO):
+            restored.append(block)
+            block.state = "enabled"
+    return restored
+
+
 @tool(
     name="validate_flowgraph",
     description="校验当前流图是否合法(类型一致/端口连通等),返回是否通过与错误列表。",
-    parameters={"type": "object", "properties": {}},
+    parameters={
+        "type": "object",
+        "properties": {
+            "arm_disabled_rf": {
+                "type": "boolean",
+                "description": "临时启用已 disable 的 RF 端点再校验拓扑，不改变存盘状态",
+            },
+        },
+    },
     group="critic",
 )
-def validate_flowgraph(ctx: ToolContext):
+def validate_flowgraph(ctx: ToolContext, arm_disabled_rf: bool = False):
     fg = ctx.flow_graph
     if fg is None:
         return {"ok": False, "error": "流图尚未创建"}
-    valid, msgs = _collect_errors(fg)
+    restored = _enable_disabled_rf(ctx) if arm_disabled_rf else []
+    try:
+        valid, msgs = _collect_errors(fg)
+    finally:
+        for block in restored:
+            block.state = "disabled"
     return {"ok": True, "valid": valid, "errors": msgs,
             "num_blocks": len(fg.blocks)}
 

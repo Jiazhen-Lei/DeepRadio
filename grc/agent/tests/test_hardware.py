@@ -230,6 +230,79 @@ class V3HardwareWorkflowRegressionTest(unittest.TestCase):
             self.assertIn("不在有效运行窗口", reply.text)
             self.assertEqual(stage.execution_status, "waiting")
 
+    def test_unarmed_tx_preview_is_valid_and_compiles(self) -> None:
+        if "iio_pluto_sink" not in self.ctx.platform.blocks:
+            self.skipTest("iio_pluto_sink is not available in this GNU Radio build")
+        built = registry.call(
+            "build_sdr_tx_flowgraph",
+            {
+                "device_type": "pluto",
+                "center_freq": 2.402e9,
+                "sample_rate": 2e6,
+            },
+            self.ctx,
+        )
+        self.assertTrue(built.get("ok"), built)
+        self.assertTrue(built.get("valid"), built)
+        self.assertTrue(built.get("compiled"), built)
+        self.assertTrue(Path(built["report_path"]).is_file())
+        naive = registry.call("validate_flowgraph", {}, self.ctx)
+        self.assertTrue(naive.get("valid"), naive)
+        armed = registry.call(
+            "validate_flowgraph", {"arm_disabled_rf": True}, self.ctx
+        )
+        self.assertTrue(armed.get("valid"), armed)
+        sink = self.ctx.blocks.get("sdr_sink")
+        self.assertEqual(getattr(sink, "state", None), "disabled")
+        self.assertEqual(
+            getattr(self.ctx.blocks.get("preview_throttle"), "state", None),
+            "enabled",
+        )
+        self.assertEqual(
+            getattr(self.ctx.blocks.get("preview_sink"), "state", None),
+            "enabled",
+        )
+
+    def test_generic_tx_arm_binds_identity_and_disables_preview(self) -> None:
+        if "iio_pluto_sink" not in self.ctx.platform.blocks:
+            self.skipTest("iio_pluto_sink is not available in this GNU Radio build")
+        built = registry.call(
+            "build_sdr_tx_flowgraph",
+            {"device_type": "pluto", "center_freq": 2.402e9, "sample_rate": 2e6},
+            self.ctx,
+        )
+        self.ctx.extra["workflow"] = {
+            "intent": {"slots": {"direction": "tx"}},
+            "stages": [
+                {
+                    "id": "discover_and_probe_hardware",
+                    "execution_status": "completed",
+                    "outcome": "passed",
+                },
+                {
+                    "id": "rf_plan_confirmation",
+                    "checkpoint": {"decision_status": "approved"},
+                },
+            ],
+        }
+        with mock.patch.dict(os.environ, {"GRC_AGENT_ENABLE_RF": "1"}):
+            armed = registry.call(
+                "arm_hardware_flowgraph",
+                {
+                    "grc_path": built["grc_path"],
+                    "device_identity": "usb:test.identity",
+                },
+                self.ctx,
+            )
+        self.assertTrue(armed.get("ok"), armed)
+        self.assertTrue(armed.get("compile", {}).get("compiled"), armed)
+        self.assertTrue(Path(armed["grc_path"]).is_file())
+        text = Path(armed["grc_path"]).read_text(encoding="utf-8")
+        self.assertIn("usb:test.identity", text)
+        self.assertEqual(self.ctx.blocks["sdr_sink"].state, "enabled")
+        self.assertEqual(self.ctx.blocks["preview_throttle"].state, "disabled")
+        self.assertEqual(self.ctx.blocks["preview_sink"].state, "disabled")
+
 
 # --- test_v6_followup_contracts.py ---
 
@@ -246,7 +319,7 @@ from grc.agent.tools import registry
 from grc.agent.tools.registry import ToolContext
 from grc.agent.workflow import WorkflowEngine
 from grc.agent.workflow.completion import evaluate
-from grc.agent.schema import AgentReply
+from grc.agent.schema import AgentReply, ToolInvocation
 
 
 class V6FollowupContractTest(unittest.TestCase):
@@ -357,6 +430,21 @@ class V6FollowupContractTest(unittest.TestCase):
         self.assertNotIn("GFSK → ? → ?", digest["summary"])
         self.assertIn("最大时长", digest["duration_note"])
 
+    def test_hardware_spec_digest_is_not_link_placeholders(self):
+        state = SharedState(session_id="hw-spec")
+        state.project.config.update({
+            "hardware": "pluto",
+            "direction": "tx",
+            "carrier_frequency": 2_402_000_000.0,
+            "sample_rate": 2_000_000.0,
+            "rf_armed": False,
+        })
+        digest = state.spec_digest()
+        self.assertIn("PlutoSDR", digest["summary"])
+        self.assertIn("2.402 GHz", digest["summary"])
+        self.assertIn("sink 未 arm", digest["summary"])
+        self.assertNotIn("? → ? → ?", digest["summary"])
+
     def test_configure_sdr_uses_configuration_mode(self):
         registry.load_all()
         state = SharedState(session_id="cfg")
@@ -386,7 +474,69 @@ class V6FollowupContractTest(unittest.TestCase):
         workflow.intent = mock.Mock(slots={}, capabilities=[])
         workflow.stages = []
         checks = evaluate(envelope_stage, workflow, state, AgentReply())
+        self.assertFalse(checks["hardware_check_completed"])
+        reply = AgentReply(tool_invocations=[ToolInvocation(
+            name="hardware_preflight",
+            result={"ok": True, "missing": []},
+            ok=True,
+        )])
+        workflow.intent.slots = {
+            "hardware": "pluto",
+            "carrier_frequency": 2.402e9,
+            "sample_rate": 2e6,
+        }
+        checks = evaluate(envelope_stage, workflow, state, reply)
         self.assertTrue(checks["hardware_check_completed"])
+
+    def test_session_event_sequences_are_unique_under_concurrency(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        session_id = "event-seq"
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(
+                lambda index: store.append_session_event(
+                    session_id, "parallel", {"index": index}
+                ),
+                range(64),
+            ))
+        records = [
+            json.loads(line)
+            for line in (
+                Path(store.session_root(session_id)) / "events.jsonl"
+            ).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        sequences = [int(item["seq"]) for item in records]
+        self.assertEqual(sequences, list(range(1, 65)))
+
+    def test_deepagent_thread_is_isolated_per_stage_taskcard(self):
+        class FakeAgent:
+            def __init__(self):
+                self.thread_ids = []
+
+            def invoke(self, _payload, config):
+                self.thread_ids.append(config["configurable"]["thread_id"])
+                return {"messages": [{"content": "ok"}]}
+
+        service = ServiceAgent(session_id="deep-stage-thread", platform=None)
+        ctx = ToolContext(platform=None, out_dir=str(self.root / "deep"))
+        ctx.extra.update({
+            "state": service._state,
+            "artifacts": {},
+            "events": [],
+            "metrics": {},
+            "workflow": {"workflow_id": "wf-one", "revision": 3},
+            "stage_id": "hardware_precheck",
+            "task_card": {"task_id": "task-a"},
+        })
+        fake = FakeAgent()
+        service._run_deep(fake, ctx, "first")
+        ctx.extra["stage_id"] = "configure_and_check"
+        ctx.extra["task_card"] = {"task_id": "task-b"}
+        service._run_deep(fake, ctx, "second")
+        self.assertEqual(len(set(fake.thread_ids)), 2)
+        self.assertIn("hardware_precheck", fake.thread_ids[0])
+        self.assertIn("configure_and_check", fake.thread_ids[1])
 
     def test_state_save_uses_relative_session_paths(self):
         session_id = "gui-rel"
@@ -642,6 +792,12 @@ from grc.agent.service.hardware_runtime import HardwareRuntime
 
 
 class HardwareRuntimeContractTest(unittest.TestCase):
+    def test_stream_quality_counts_scheduler_markers(self):
+        quality = HardwareRuntime._stream_quality("UUU\nnormal output\nOO")
+        self.assertEqual(quality["underrun_count"], 3)
+        self.assertEqual(quality["overrun_count"], 2)
+        self.assertTrue(quality["stream_quality_warning"])
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)

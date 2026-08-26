@@ -97,6 +97,21 @@ _DEVICE_HINTS = (
     "usrp", "b210", "b200", "hackrf", "pluto", "limesdr", "adalm", "ettus",
 )
 _HW_CAPABILITIES = ("hardware_configure", "hardware_runtime", "deploy")
+_TX_CONFIRM_ONLY = re.compile(
+    r"(?:停|等待|止步|pause|stop)\s*(?:在|at)?\s*(?:发射|rf|tx).{0,8}(?:确认|checkpoint)|"
+    r"(?:发射|rf|tx).{0,8}(?:确认|checkpoint).{0,8}(?:停|等待|pause|stop)",
+    re.I,
+)
+_TX_FORBIDDEN = re.compile(
+    r"(?:先|暂时)?\s*(?:不要|不|禁止|勿|别)\s*(?:启动|运行|发射|tx|transmit)|"
+    r"(?:do\s+not|don't|without)\s+(?:start|run|transmit)",
+    re.I,
+)
+_DEVICE_ACCESS_FORBIDDEN = re.compile(
+    r"(?:不要|不|禁止|勿|别)\s*(?:访问|探测|连接|打开)\s*(?:设备|硬件|sdr|radio)|"
+    r"without\s+(?:accessing|probing|connecting)\s+(?:the\s+)?(?:device|hardware|sdr)",
+    re.I,
+)
 _NEGATION = re.compile(
     r"(?:不(?:要|用|接|做|上|含)?|别|禁止|勿|without|no(?![a-z])|not\s+)",
     re.I,
@@ -144,6 +159,8 @@ _HW_OBJECT = re.compile(r"硬件|射频|sdr|usrp|电台|板子|空口", re.I)
 
 def _offline_forbidden(text: str) -> set[str]:
     forbidden: set[str] = set()
+    if _DEVICE_ACCESS_FORBIDDEN.search(text or ""):
+        forbidden.update({"hardware_runtime", "deploy"})
     if _SIM_ONLY.search(text or ""):
         forbidden.update(_HW_CAPABILITIES)
     for match in _HW_OBJECT.finditer(text or ""):
@@ -171,6 +188,11 @@ def _task_type_from_capabilities(
         "protocol" in caps
         and slots.get("operation") == "deploy"
         and "hardware_configure" not in blocked
+    ):
+        return "HARDWARE_CONFIGURE"
+    if (
+        "hardware_configure" in caps
+        and slots.get("terminal_checkpoint") == "rf_plan_confirmation"
     ):
         return "HARDWARE_CONFIGURE"
     hardware_primary = (
@@ -542,6 +564,29 @@ class WorkflowEngine:
         ):
             slots["sample_rate"] = 2_000_000.0
             slot_sources["sample_rate"] = "default"
+        if (
+            slots.get("hardware")
+            and slots.get("direction") == "tx"
+            and slots.get("sample_rate")
+        ):
+            slots.setdefault("bandwidth", slots["sample_rate"])
+            slot_sources.setdefault("bandwidth", "derived")
+            slots.setdefault("baseband_kind", "diagnostic_tone")
+            slots.setdefault("tone_frequency_hz", 1000.0)
+            slots.setdefault("tone_amplitude", 0.3)
+            for key in ("baseband_kind", "tone_frequency_hz", "tone_amplitude"):
+                slot_sources.setdefault(key, "safe_preview_default")
+            if slots.get("hardware") == "pluto":
+                slots.setdefault("tx_attenuation", 30.0)
+                slot_sources.setdefault("tx_attenuation", "safety_default")
+            else:
+                slots.setdefault("tx_gain", 0.0)
+                slot_sources.setdefault("tx_gain", "safety_default")
+        if "hardware_runtime" in capabilities:
+            slots.setdefault("duration_seconds", 30.0)
+            slots.setdefault("max_duration_seconds", slots["duration_seconds"])
+            slot_sources.setdefault("duration_seconds", "safety_default")
+            slot_sources.setdefault("max_duration_seconds", "safety_default")
         missing = self._missing_slots(task_type, slots, shared_state, capabilities)
         validation_errors = self._validate_slots(slots)
         intent = WorkflowIntent(
@@ -632,8 +677,9 @@ class WorkflowEngine:
         add("hardware_runtime", hardware and (
             realtime
             or slots.get("operation") == "deploy"
+            or slots.get("terminal_checkpoint") == "rf_plan_confirmation"
             or any(word in low for word in ("启动", "运行", "run", "start"))
-        ))
+        ) and slots.get("hardware_access") != "forbidden")
         forbidden = _offline_forbidden(text)
         return [name for name in capabilities if name not in forbidden]
 
@@ -663,8 +709,27 @@ class WorkflowEngine:
             "channel": channel,
             "requested_metrics": metrics,
         }
+        ebn0 = re.search(
+            r"(?:eb\s*/?\s*n0|ebn0)\s*[:=为]?\s*"
+            r"([-+]?\d+(?:\.\d+)?)\s*db",
+            low,
+        )
+        if ebn0:
+            slots["ebn0_db"] = float(ebn0.group(1))
         if any(word in low for word in ("直接部署", "部署", "deploy")):
             slots["operation"] = "deploy"
+            slots["deploy_permission"] = "requested"
+        if _TX_CONFIRM_ONLY.search(text or ""):
+            slots["operation"] = "prepare"
+            slots["deploy_permission"] = "pending"
+            slots["terminal_checkpoint"] = "rf_plan_confirmation"
+            slots["hardware_access"] = "read_only_probe"
+        elif _TX_FORBIDDEN.search(text or ""):
+            slots["operation"] = "configure"
+            slots["deploy_permission"] = "forbidden"
+            slots["hardware_access"] = "configuration_only"
+        if _DEVICE_ACCESS_FORBIDDEN.search(text or ""):
+            slots["hardware_access"] = "forbidden"
         duration = re.search(
             r"(?:运行|持续|时长|duration)\s*[:=为]?\s*"
             r"(\d+(?:\.\d+)?)\s*(?:秒|s|sec(?:onds?)?)",
@@ -812,6 +877,12 @@ class WorkflowEngine:
         signal_agnostic = "signal_agnostic_observe" in capabilities
         if task_type in {"END_TO_END_SIM", "TX_BUILD", "RX_BUILD"} and not signal_agnostic and not slots.get("modulation"):
             missing.append("modulation")
+        if (
+            task_type == "RX_BUILD"
+            and "ber" in (slots.get("requested_metrics") or [])
+            and slots.get("ebn0_db") is None
+        ):
+            missing.append("ebn0_db")
         if task_type in {"DIAGNOSE", "MODIFY_PROJECT", "OBSERVE"}:
             project = getattr(shared_state, "project", None)
             if not (getattr(project, "grc_path", "") or getattr(project, "config", {}).get("recipe")):
@@ -1015,6 +1086,15 @@ class WorkflowEngine:
                     self._add_completion(stage, "radio_parameters_match")
                     if "realtime_observe" in capabilities:
                         self._add_completion(stage, "realtime_sink_present")
+                if stage.id in {
+                    "discover_and_probe_device", "discover_and_probe_hardware",
+                }:
+                    self._add_completion(stage, "device_identity_matched")
+                if (
+                    stage.id == "configure_device"
+                    and str(intent.slots.get("direction") or "").lower() == "tx"
+                ):
+                    self._add_completion(stage, "flowgraph_armed")
         return stages
 
     @staticmethod
@@ -1461,7 +1541,12 @@ class WorkflowEngine:
                 return
             reason = self._checkpoint_reason(stage)
             stage.execution_status = "waiting"
-            stage.checkpoint = Checkpoint(id=f"cp-{uuid.uuid4().hex[:8]}", reason=reason)
+            stage.attempt = max(int(stage.attempt or 0), 1)
+            stage.checkpoint = Checkpoint(
+                id=f"cp-{uuid.uuid4().hex[:8]}",
+                reason=reason,
+                action=stage.id,
+            )
             self.workflow.execution_status = "waiting"
             self._event(
                 "checkpoint_opened",
@@ -1581,7 +1666,9 @@ _PROMPT = """你是 DeepRadio 的 Intent 校正器。只输出一个 JSON 对象
 - confidence: 0~1
 规则:
 - 否定、只仿真、不要硬件/射频 优先于关键词；不要因为出现「硬件」就打开 hardware_configure
-- 配置/接入 SDR 且停在确认、禁止 deploy 时，task_type 保持 HARDWARE_CONFIGURE；build_tx 只参与 Stage 组合
+- 「停在发射确认」表示 deploy_permission=pending、terminal_checkpoint=rf_plan_confirmation，
+  不是禁止硬件只读预检；task_type 保持 HARDWARE_CONFIGURE，build_tx 只参与 Stage 组合
+- 「不要发射」才表示 deploy_permission=forbidden；不得把二者合并
 - 不要因为「发射流图」就把配置任务改成 TX_BUILD
 - 不得把实时硬件观察改写成离线仿真
 - 不得因为 2.4GHz 就判定 BLE，除非用户说了 ble/蓝牙/发射广播
@@ -1642,12 +1729,24 @@ def _merge(rules: WorkflowIntent, parsed: dict[str, Any]) -> WorkflowIntent:
         + list((rules.context or {}).get("forbidden_capabilities") or [])
         if name in _CAPABILITIES
     }
+    checkpoint_prepare = (
+        rules.slots.get("terminal_checkpoint") == "rf_plan_confirmation"
+        and rules.slots.get("deploy_permission") == "pending"
+    )
+    if checkpoint_prepare:
+        # Reaching a TX checkpoint requires read-only preflight/probe.  It is
+        # deferred runtime authority, not an instruction to skip the gates.
+        forbidden.discard("hardware_runtime")
     raw_caps = parsed.get("capabilities")
     if isinstance(raw_caps, list) and raw_caps:
         capabilities = [name for name in raw_caps if name in _CAPABILITIES]
     else:
         capabilities = list(rules.capabilities)
     capabilities = [name for name in capabilities if name not in forbidden]
+    if checkpoint_prepare:
+        for name in ("hardware_configure", "hardware_runtime"):
+            if name in rules.capabilities and name not in capabilities:
+                capabilities.append(name)
     slots = dict(rules.slots)
     sources = dict(rules.slot_sources)
     for key, value in dict(parsed.get("slots") or {}).items():

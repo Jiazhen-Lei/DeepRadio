@@ -9,7 +9,11 @@ description: Configure SDR blocks while enforcing confirmation for real hardware
 `probe_device` are read-only checks (`uhd_find_devices` for B210, `iio_info`
 for PlutoSDR). `build_usrp_rx_spectrum_flowgraph`
 builds a B210 `uhd_usrp_source` + `qtgui_freq_sink_x` receiver without starting
-it. Building a UHD or Pluto flowgraph does not mean it was started. RF start is disabled
+it. Building a UHD or Pluto flowgraph does not mean it was started. Validate the
+graph **while the hardware sink is enabled**, then disable it. Host
+re-validation uses `arm_disabled_rf` so a later critic pass on that unarmed
+graph is not a Stage failure — GNU Radio reports `Port is not connected` for
+disabled sinks. RF start is disabled
 by default and requires the dedicated Workflow checkpoint,
 `GRC_AGENT_ENABLE_RF=1`, a session-owned `.grc`, bounded duration, and a
 verified stop. Realtime spectrum appears in the GNU Radio QT window, not as a

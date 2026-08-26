@@ -544,8 +544,9 @@ def build_ble_uhd_tx_flowgraph(
     invoke("connect", {"src_id": "ble_waveform", "dst_id": "bounded_tx"})
     # UHD Sink exposes the message command port before stream channel 0.
     invoke("connect", {"src_id": "bounded_tx", "dst_id": "b210_sink", "dst_port": 1})
-    _leave_hardware_sink_unarmed(ctx, "b210_sink")
     validation = invoke("validate_flowgraph", {})
+    if validation.get("valid"):
+        _leave_hardware_sink_unarmed(ctx, "b210_sink")
     rendered = invoke("render_grc", {}) if validation.get("valid") else {"ok": False}
     if rendered.get("path"):
         ctx.extra.setdefault("artifacts", {})["grc_path"] = rendered["path"]
@@ -660,8 +661,9 @@ def build_ble_pluto_tx_flowgraph(
         }
     invoke("connect", {"src_id": "ble_waveform", "dst_id": "bounded_tx"})
     invoke("connect", {"src_id": "bounded_tx", "dst_id": "pluto_sink"})
-    _leave_hardware_sink_unarmed(ctx, "pluto_sink")
     validation = invoke("validate_flowgraph", {})
+    if validation.get("valid"):
+        _leave_hardware_sink_unarmed(ctx, "pluto_sink")
     rendered = invoke("render_grc", {}) if validation.get("valid") else {"ok": False}
     if rendered.get("path"):
         ctx.extra.setdefault("artifacts", {})["grc_path"] = rendered["path"]

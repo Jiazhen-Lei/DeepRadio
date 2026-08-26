@@ -30,28 +30,54 @@ A/B 层证明控制面和算法契约。手机扫描结果由 D 层证明。
 ```bash
 conda activate gnuradio
 PYTHONPATH=$PWD python -m unittest discover -s grc/agent/tests -v
-PYTHONPATH=$PWD python -m unittest grc.gui.tests.test_chat_markup -v
+PYTHONPATH=$PWD python -m unittest discover -s grc/gui/tests -v
 ```
 
-2026-08-26 结果：
+2026-08-26 20:40（`gnuradio` conda，仓库根目录）结果：
 
 ```text
-Ran 121 tests in 13.044s
+PYTHONPATH=$PWD python -m unittest discover -s grc/agent/tests -v
+Ran 129 tests in 18.473s
 OK (skipped=1)
 
-Ran 6 tests in 0.029s
+PYTHONPATH=$PWD python -m unittest discover -s grc/gui/tests -v
+Ran 12 tests in 0.035s
 OK
 ```
 
-跳过项为 B210 实机 discover/probe（`GRC_AGENT_HIL=1` 且设备在线才跑）。若当前 shell 里仍留着 GUI 空口实验的 `GRC_AGENT_ENABLE_RF=1`，该项也会 skip，不会把 Gate 1 判红。自动回归默认不调用线上 Intent LLM；GUI 不受影响。运行中可能出现 GNU Radio double-mapped buffer 告警；验收以最后的 `Ran ...`、`OK` 和退出码为准。
+合计 **141** 项自动测试通过，其中 1 项按设计跳过。跳过项为 B210 实机 discover/probe（`GRC_AGENT_HIL=1` 且设备在线才跑）。若当前 shell 里仍留着 GUI 空口实验的 `GRC_AGENT_ENABLE_RF=1`，该项也会 skip，不会把 Gate 1 判红。自动回归默认不调用线上 Intent LLM；GUI 不受影响。运行中可能出现 GNU Radio 无 Throttle 告警；本次两条命令退出码均为 0。验收以最后的 `Ran ...`、`OK` 和退出码为准。
 
-测试模块：`test_seven_tasks.py`、`test_ble.py`、`test_hardware.py`、`test_workflow.py`、`grc.gui.tests.test_chat_markup`。
+七类 Task 主检包含在上述 Agent discover 中（23 项全部 ok）。单独运行：
+
+```bash
+PYTHONPATH=$PWD python -m unittest grc.agent.tests.test_seven_tasks -v
+```
+
+当前模块与用例数：
+
+| 模块 | 用例数 | 重点 |
+|---|---:|---|
+| `grc/agent/tests/test_seven_tasks.py` | 23 | 七类 Task 硬主检：分类、73 条文本变体、ServiceAgent 产物/Claim/禁止副作用 |
+| `grc/agent/tests/test_ble.py` | 17 | BLE PDU/PHY、Pluto/B210 Flowgraph 与 RF 安全门槛 |
+| `grc/agent/tests/test_hardware.py` | 38 | 设备探测、未 arm 流图重验、硬件规格摘要、运行事务与 B210 HIL gate |
+| `grc/agent/tests/test_workflow.py` | 51 | Workflow、能力组合、Intent、Completion、Mutation 与 Export |
+| `grc/gui/tests/test_chat_markup.py` | 6 | GTK 对话 Markdown/Pango 转换 |
+| `grc/gui/tests/test_workflow_presenter.py` | 6 | Task/Stage、runtime、Inspector（含 failed 不被 4/4 盖住）、RF/OTA/recovery 按钮 |
+| **合计** | **141** | Agent 129 项，GUI 12 项 |
 
 ### 2.1 覆盖范围
 
-- 七类 Task 代表文本与不少于 70 条变体分类；
+- 七类 Task 代表文本与 73 条变体分类；
 - 多轮补槽、低置信 Intent 补全、确认/拒绝/取消；
-- 同一 Agent：端到端仿真 → 只读诊断 → 确认后把 BPSK 改成 QPSK（流图、recipe、version）；
+- RX 构建缺少 `Eb/N0` 时进入 input wait，补充「8 dB」后保持同一 Workflow，recipe 为 `rx_bpsk_awgn`，并写入 `ebn0_db`；
+- 同一 Agent：端到端仿真 → 只读诊断 → 观察主峰 → 确认后把 BPSK 改成 QPSK（流图、recipe、version、Claim 重验）；
+- 独立打开已有工程后再 `DIAGNOSE` / `OBSERVE`：version 与 GRC 哈希不变；
+- `MODIFY_PROJECT` 拒绝确认后工程、recipe 与哈希不变；
+- TX 仿真图不得含 SDR sink，探针文件不得命名为 `*_rx.bin`；
+- Pluto 配置流图必须含禁用的 Pluto sink 与目标频率/采样率，不得回退 `bpsk_awgn`；Builder 失败同样禁止仿真降级；未 arm 图 naive critic 失败、`arm_disabled_rf` 拓扑重验通过；
+- 无 recipe 的硬件规格摘要不得写成 `? → ? → ?`；
+- Inspector `outcome=failed` 不被 completion 4/4 显示成 passed；`wait_kind=recovery` 有可操作按钮；
+- OBSERVE 完成时必须有带 Hz/dBFS 的主峰报告，并写入回复与 measurement Claim；`open_questions` 必须为空；
 - DENY / 失败改图不计入 `flowgraph_saved`、不误加 version；导出 Manifest 按路径去重；
 - Workflow revision、Stage attempt、Completion、失效；
 - TaskCard / ResultEnvelope 协议；
@@ -60,6 +86,8 @@ OK
 - HardwareProfile、`type=b200`、Pluto IIO URI probe；
 - RF Policy、环境开关、语义哈希、armed flowgraph；
 - 解释器选择、启动健康检查、run_id、停止和 crash；
+- runtime 日志中的 `U`/`O` 调度器标记统计，以及 underrun/overrun 警告；
+- BER 必须包含有效 report、比较比特数、对齐方法、TX/RX probe 和绑定 Claim；仅提交低 BER 数值无法通过 Completion；
 - OTA 确认与活动 runtime、目标名称、run_id 绑定；
 - 相对路径会话、导出 Manifest、GUI markup。
 
@@ -110,80 +138,40 @@ runtime.log       有进程输出
 
 
 
-## 4. 七类 Task 的 GUI 代表实验
+## 4. 七类 Task：自动主检与人工抽检
+
+迭代顺序：先跑本节命令。红了只修控制面，不要开 GUI。主检全绿后再做人工抽检。主检绿不等于产品过关；GTK 观感、回复是否好懂、真设备仍靠抽检和 §7。
 
 ```bash
 conda activate gnuradio
+PYTHONPATH=$PWD python -m unittest grc.agent.tests.test_seven_tasks -v
+```
+
+2026-08-26 晚间：`Ran 23 tests in 2.447s`，`OK`。覆盖七类 Task 分类、73 条文本变体、ServiceAgent 执行、结构化确认/拒绝、产物、Claim 和禁止副作用。代表路径必须真正完成；测量失败不得标成 `completed`。
+
+人工 GUI 抽检使用：
+
+```bash
 PYTHONPATH=$PWD python -m grc --gtk --fresh
 ```
 
-每个用例使用新 session（可点「重置」）。不要勾选「一句话直出(baseline)」。`DIAGNOSE` / `MODIFY_PROJECT` / `OBSERVE` 先打开已有工程。记录输入、回复、按钮、画布/状态栏截图和 session 路径。
+每个 GUI 用例使用新 session，不勾选「一句话直出(baseline)」。`DIAGNOSE`、`MODIFY_PROJECT`、`OBSERVE` 先打开已有工程。
 
-### 4.1 `END_TO_END_SIM`
+| Task | 代表输入 | 自动检测（2026-08-26 晚间已通过） | 人工检测 |
+|---|---|---|---|
+| `END_TO_END_SIM` | `构建 BPSK 过 AWGN 并测 EVM，要求 EVM 小于 10%` | 必须 completed；`.grc`；EVM&lt;10%；星座图与频谱图文件；`evm_lt_10` Claim Passed；recipe=`bpsk_awgn` | 画布、星座图和频谱图可读性；回复是否准确 |
+| `TX_BUILD` | `构建一个 QPSK 基带发射链路，只做仿真，不接真实硬件` | QPSK File Sink；无 SDR 块；探针不是 `*_rx.bin`；无 hardware capability、discover 和 start | 画布布局；界面中没有 RF 误导 |
+| `RX_BUILD` | `构建 BPSK 接收机并测 BER`，随后输入 `Eb/N0 8 dB` | 缺槽 input wait；同一 `workflow_id`；`ebn0_db=8`；recipe=`rx_bpsk_awgn`；有效 BER report、TX/RX probe 与 `ber_measured` Claim | 补槽提示是否易懂；接收链路布局 |
+| `DIAGNOSE` | `诊断当前链路的 EVM，给出最小建议，先保持工程不变` | 独立打开工程后 version/hash 不变；禁止 modify；达标不得写「偏高」 | 原因和建议是否合理、易懂 |
+| `MODIFY_PROJECT` | `把当前 BPSK 改成 QPSK` | 确认前 hash/recipe 不变；批准后 QPSK 且 Claim 绑定新 version；拒绝后工程不变 | 按钮语义、确认前后画布刷新 |
+| `OBSERVE` | `查看当前接收信号的频谱和星座图，给出主峰，只观察工程` | 独立打开工程后 version/hash 不变；`open_questions=[]`；主峰报告含 Hz/dBFS；回复含「主峰」；measurement Claim | 图像与主峰解释是否符合观察目标 |
+| `HARDWARE_CONFIGURE` | `为 PlutoSDR 配置 2.402 GHz、2 Msps 的发射流图，保存配置并停在发射确认` | Task 保持硬件配置；GRC 含禁用 Pluto sink 与目标频率/采样率；不是 `bpsk_awgn`；Builder 失败不得仿真降级；无 start | 真实设备连接、确认文案；拒绝后无 RF；实机 discover/probe 见 §7 |
 
-```text
-做一个 BPSK 过 AWGN 的基带链路，EVM 小于 10%，显示星座图和频谱。
-```
-
-规格完整时允许自动执行；若询问阈值，回答“10%”。期望：Task 为端到端仿真；产出 `.grc`、EVM、星座图、频谱图和当前版本 Claims。EVM 达标才完成。
-
-### 4.2 `TX_BUILD`
-
-```text
-构建一个 QPSK 基带发射链路，只做仿真，不接真实硬件。
-```
-
-出现 RF 确认即失败。期望：TX `.grc` 和结构校验；事件中无设备发现、配置或 start。
-
-### 4.3 `RX_BUILD`
-
-```text
-构建一个自包含的 BPSK AWGN 接收机，包含定时恢复和判决，并测 BER。
-```
-
-缺 Eb/N0 时答“8 dB”，保持同一 `workflow_id`。期望：接收流图；BER 同时引用发送参考和接收判决 probe。
-
-### 4.4 `DIAGNOSE`
-
-前置：打开已有工程。
-
-```text
-诊断当前链路的 EVM，解释主要原因并给出最小修改建议，先保持工程不变。
-```
-
-若询问修复，选择拒绝。期望：有诊断与 Evidence；`.grc` 哈希、Project version 和画布不变。
-
-### 4.5 `MODIFY_PROJECT`
-
-前置：打开 BPSK 工程。
-
-```text
-把当前 BPSK 工程改成 QPSK，其余条件保持一致。
-```
-
-先看方案，再点确认。期望：确认前工程不变；确认后 version 增加，流图变为 QPSK，受影响 Claim 重验。
-
-### 4.6 `OBSERVE`
-
-前置：打开可仿真的接收工程。
-
-```text
-查看当前接收信号的频谱和星座图，给出主峰，只观察工程。
-```
-
-期望：图和指标；工程哈希与版本不变。
-
-### 4.7 `HARDWARE_CONFIGURE`
-
-```text
-为 PlutoSDR 配置 2.402 GHz、2 Msps 的发射流图，保存配置并停在发射确认。
-```
-
-批准配置，拒绝发射。期望：发现与 probe 精确设备；生成禁用发射的基础 `.grc`；无 `start_flowgraph` 成功事件。
+自动测试负责可确定判定的状态、数据和副作用；人工测试负责 GTK 视觉、语言质量和真实外部设备。人工记录输入、回复、按钮选择、画布/状态栏截图和 session 路径。
 
 ## 5. Text 数据集实验
 
-七类 Task 每类至少 10 条文本，合计 70 条。覆盖：完整表达、参数顺序、中文同义、英文或中英混合、缺槽、多轮补充、否定约束、复合目标、模糊指代、与相邻 Task 易混的表达。
+七类 Task 每类至少 10 条文本，当前变体表合计 **73** 条（`test_seven_tasks.VARIANTS`）。覆盖：完整表达、参数顺序、中文同义、英文或中英混合、缺槽、多轮补充、否定约束、复合目标、模糊指代、与相邻 Task 易混的表达。分类由 `test_each_variant_classifies_to_expected_task` 自动断言。
 
 每条记录：
 
@@ -207,11 +195,25 @@ PYTHONPATH=$PWD python -m grc --gtk --fresh
 
 
 
-## 6. GUI 验收
+## 6. GUI 自动契约与人工验收
 
 
 
-### 6.1 状态栏与 Inspector
+### 6.1 自动契约
+
+```bash
+PYTHONPATH=$PWD python -m unittest discover -s grc/gui/tests -v
+```
+
+自动检查 Markdown/Pango 转换，以及以下 Workflow 展示契约：
+
+- Task、Stage、序号和等待状态；
+- Completion `n/m` 与 runtime 终态；
+- `run_id`、剩余时间、最大时长、return code 和末行日志；
+- 时间线 Actor；
+- RF 计划确认和 OTA 验收按钮文案、Evidence 按钮状态。
+
+### 6.2 人工视觉检查
 
 人工确认：
 
@@ -224,7 +226,7 @@ PYTHONPATH=$PWD python -m grc --gtk --fresh
 
 
 
-### 6.2 交互
+### 6.3 人工交互
 
 - 缺参数后补充；
 - 确认、拒绝、取消；
@@ -274,7 +276,7 @@ PYTHONPATH=$PWD python -m grc --gtk --fresh
 3. RF 计划确认处核对频率、采样率、增益、设备和最长时长。
 4. 点击「批准有限时长发射」。状态栏提示无需点击 GRC Run。
 5. 出现新的 `run_id`、running/ready 和剩余时长。
-6. LightBlue 扫描 `DRTEST24`。
+6. LightBlue 扫描 `Deepradio27`。
 7. 扫描到后点「已看到目标名称」，可「附加上传截图」；未扫描到点「未看到」。
 8. Workflow 进入停止阶段，runtime 终止且 return code 合法。
 
@@ -317,7 +319,7 @@ PYTHONPATH=$PWD python -m grc --gtk --fresh
 
 会话：`local/agent_sessions/0825/V2/plutoble/gui-190d6c70`  
 导出：`local/output/0825/V2/plutoble`  
-输入 local name：`Mobicom27`（与 §7.3 示例 `DRTEST24` 不同，按随机新名称复测）
+输入 local name：`Mobicom27`（与 §7.3 示例 `Deepradio27` 不同，按随机新名称复测）
 
 
 | 事件          | 结果                                                              |
@@ -400,7 +402,7 @@ uhd_usrp_probe --args="type=b200"
 
 ### Gate 1：自动回归
 
-- §2 全量命令退出码为 0；
+- §2 全量命令退出码为 0；当前记录为 Agent 129（skipped=1）+ GUI 12；
 - flaky 重跑率为 0；
 - skipped 项有明确平台原因。
 
@@ -408,9 +410,11 @@ uhd_usrp_probe --args="type=b200"
 
 ### Gate 2：七类 Task
 
-- 每类代表用例通过；
-- 70 条 Text 数据集达到约定阈值；
-- 否定约束与只读任务无越权动作。
+- §4 命令 `python -m unittest grc.agent.tests.test_seven_tasks -v` 退出码为 0（当前 23 项）；
+- 每类代表用例的自动硬条件通过，见 §4 表「自动检测」列；
+- 73 条 Text 变体分类全部命中期望 Task；
+- 否定约束与只读任务无越权动作；
+- 上述自动主检绿了之后，再做 GUI 抽检（画布、文案、确认按钮）。
 
 
 
@@ -444,8 +448,8 @@ uhd_usrp_probe --args="type=b200"
 
 ## 11. 下一步实验
 
-1. 用随机新 local name 重复 Pluto HIL，并完整归档截图。
-2. 执行 B210 只读预检、BLE TX HIL 和 RX 频谱 HIL。
-3. 实现并验证 BLE 37/38/39 三信道跳频调度。
-4. 按 §9 补齐真实进程故障注入。
-
+1. 在 §4 自动主检保持全绿的前提下，对七类 Task 做一轮 GUI 抽检，记录截图与 session。
+2. 用随机新 local name 重复 Pluto HIL，并把手机截图写入 `final/evidence/` 与 Manifest。
+3. 执行 B210 只读预检、BLE TX HIL 和 RX 频谱 HIL。
+4. 实现并验证 BLE 37/38/39 三信道跳频调度。
+5. 按 §9 补齐真实进程故障注入。
