@@ -29,6 +29,7 @@ _CANCEL_HINTS = (
 )
 _READ_ONLY_HINTS = (
     "先不要修改", "先不要改", "不要修改", "不要改图", "只诊断", "只分析", "先别改",
+    "保持工程不变", "先保持工程不变", "工程不变",
 )
 
 
@@ -51,15 +52,20 @@ def is_read_only_request(text: str) -> bool:
     return any(hint in raw for hint in _READ_ONLY_HINTS)
 
 
-def _guess_modulation(recipe_name: str) -> str:
-    n = (recipe_name or "").lower()
-    if "qpsk" in n:
-        return "qpsk"
-    if "bpsk" in n:
-        return "bpsk"
-    if "ofdm" in n:
-        return "ofdm"
-    return ""
+def _uttered_modulation(text: str) -> str:
+    lowered = (text or "").lower()
+    return next((name for name in ("ofdm", "qpsk", "bpsk") if name in lowered), "")
+
+
+def _known_spec_modulation(state) -> str:
+    return next(
+        (
+            str(item.value)
+            for item in reversed(state.spec.decisions)
+            if item.key == "modulation"
+        ),
+        "",
+    )
 
 
 _SWITCH_RE = re.compile(
@@ -97,9 +103,9 @@ def detect_recipe_switch(state, text: str) -> Optional[str]:
         return None
     current = str(state.project.config.get("recipe") or "")
     current_mod = str(
-        state.project.config.get("modulation") or _guess_modulation(current)
+        state.project.config.get("modulation") or recipes.guess_modulation(current)
     )
-    target_mod = _guess_modulation(target)
+    target_mod = recipes.guess_modulation(target)
     if target == current:
         return None
     if target_mod and current_mod and target_mod == current_mod:
@@ -114,9 +120,9 @@ def redundant_recipe_switch(state, text: str) -> Optional[str]:
         return None
     current = str(state.project.config.get("recipe") or "")
     current_mod = str(
-        state.project.config.get("modulation") or _guess_modulation(current)
+        state.project.config.get("modulation") or recipes.guess_modulation(current)
     )
-    target_mod = _guess_modulation(target)
+    target_mod = recipes.guess_modulation(target)
     if target == current or (
         target_mod and current_mod and target_mod == current_mod
     ):
@@ -167,6 +173,18 @@ def resolve_confirmation_decision(
     return {"ok": True, "resolved": True, "approved": bool(approved)}
 
 
+def looks_like_task_dump(text: str) -> bool:
+    """True when *text* is a TaskCard / USER DECISIONS dump, not a user goal."""
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    if stripped.startswith("TaskCard") or "当前 Stage TaskCard" in stripped:
+        return True
+    if "USER DECISIONS" in stripped.upper():
+        return True
+    return len(stripped) > 240
+
+
 def commit_intent(ctx: ToolContext, text: str) -> Dict[str, Any]:
     """Deterministically extract the minimum traceable radio specification."""
     state = _state(ctx)
@@ -180,18 +198,14 @@ def commit_intent(ctx: ToolContext, text: str) -> Dict[str, Any]:
             "skipped": "confirmation",
         }
     lowered = text.lower()
-    modulation = next(
-        (name for name in ("ofdm", "qpsk", "bpsk") if name in lowered), ""
+    modulation = _uttered_modulation(text)
+    known_modulation = _known_spec_modulation(state)
+    current_mod = str(
+        state.project.config.get("modulation")
+        or known_modulation
+        or recipes.guess_modulation(str(state.project.config.get("recipe") or ""))
+        or ""
     )
-    known_modulation = next(
-        (
-            str(item.value)
-            for item in reversed(state.spec.decisions)
-            if item.key == "modulation"
-        ),
-        "",
-    )
-    current_mod = str(state.project.config.get("modulation") or known_modulation or "")
     channel = "awgn" if "awgn" in lowered or "噪声" in text else ""
     decisions = []
     proposed = []
@@ -220,7 +234,7 @@ def commit_intent(ctx: ToolContext, text: str) -> Dict[str, Any]:
             existing.source = decision.source
         else:
             state.spec.decisions.append(decision)
-    if text and text not in state.spec.goals:
+    if text and text not in state.spec.goals and not looks_like_task_dump(text):
         state.spec.goals.append(text)
     if proposed:
         ctx.extra["proposed_decisions"] = [
@@ -322,16 +336,23 @@ def verify_state_claims(ctx: ToolContext, metrics: Dict[str, Any]) -> Dict[str, 
 
 @tool(
     name="spec_clarify",
-    description="Inspect missing radio specification fields.",
+    description="Inspect missing radio specification fields without writing them.",
     parameters={"type": "object", "properties": {"text": {"type": "string"}}},
     group="state",
 )
 def spec_clarify(ctx: ToolContext, text: str = ""):
-    result = commit_intent(ctx, text)
+    state = _state(ctx)
+    known = (
+        _uttered_modulation(text)
+        or _known_spec_modulation(state)
+        or str(state.project.config.get("modulation") or "")
+        or recipes.guess_modulation(str(state.project.config.get("recipe") or ""))
+    )
+    open_questions = [] if known else ["使用哪种调制方式？"]
     return {
         "ok": True,
-        "open_questions": result["open_questions"],
-        "complete": not result["open_questions"],
+        "open_questions": open_questions,
+        "complete": not open_questions,
     }
 
 

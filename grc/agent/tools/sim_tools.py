@@ -51,6 +51,8 @@ def derive_probes(ctx: ToolContext) -> dict:
         path = _strip_quotes(params["file"].get_value())
         if not path:
             continue
+        if not os.path.isabs(path):
+            path = os.path.join(ctx.out_dir or os.getcwd(), path)
         sink_type = ""
         if "type" in params:
             sink_type = str(params["type"].get_value()).strip()

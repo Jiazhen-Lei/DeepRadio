@@ -24,6 +24,6 @@ description: 按确定性配方选型并搭建 GRC 流图(init/add/set/connect/r
 `validate_flowgraph` 通过;file_sink 路径由运行时填充(配方占位符 `__PROBE__`)。
 
 ## 与确定性宏的关系
-无 LLM 场景下,建图由 `skills.design_link.design_link` 一步完成(同一套工具链)。
+无 LLM 场景下,建图由 `grc.agent.tools.design_link.design_link` 一步完成(同一套工具链)。
 有 LLM 时,你可逐步调用工具以做更细的意图适配,但**默认应优先复用配方骨架**,
 只在配方不覆盖时才偏离,并说明理由。

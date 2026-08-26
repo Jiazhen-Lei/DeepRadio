@@ -391,7 +391,12 @@ class MainWindow(Gtk.ApplicationWindow):
             self.page_to_be_closed = page
             page.saved = True
             self.close_page(ensure=False)
-        self.new_page()
+        remaining = self.current_page.file_path if self.current_page else ""
+        if remaining:
+            self.agent_panel.notify_canvas_opened(remaining)
+        else:
+            self.new_page()
+            self.agent_panel.notify_canvas_cleared()
 
     def close_pages(self):
         """

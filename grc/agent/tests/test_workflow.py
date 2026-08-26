@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -96,6 +97,12 @@ class DynamicWorkflowV2ContractTest(unittest.TestCase):
             artifacts={"grc_path": str(path), "metrics": {"evm_pct": 2.0}},
             tool_invocations=[
                 ToolInvocation(
+                    name="design_link",
+                    args={},
+                    result={"ok": True, "valid": True, "recipe": "bpsk_awgn"},
+                    ok=True,
+                ),
+                ToolInvocation(
                     name="validate_flowgraph",
                     args={},
                     result={"ok": True, "valid": True},
@@ -179,6 +186,12 @@ class DynamicWorkflowV2ContractTest(unittest.TestCase):
             stage="FINAL",
             artifacts={"grc_path": str(path), "metrics": {"evm_pct": 2.0}},
             tool_invocations=[
+                ToolInvocation(
+                    name="design_link",
+                    args={},
+                    result={"ok": True, "valid": True, "recipe": "bpsk_awgn"},
+                    ok=True,
+                ),
                 ToolInvocation(
                     name="validate_flowgraph",
                     args={},
@@ -601,6 +614,7 @@ import unittest
 from unittest import mock
 
 from grc.agent.state import SharedState
+from grc.agent.workflow import WorkflowEngine
 from grc.agent.workflow.engine import complete_intent
 from grc.agent.workflow.schema import WorkflowIntent
 
@@ -677,6 +691,25 @@ class IntentLlmTest(unittest.TestCase):
             completed.context.get("forbidden_capabilities") or [],
         )
 
+    def test_ble_deploy_stays_hardware_when_llm_says_tx_build(self):
+        engine = WorkflowEngine(tempfile.mktemp(suffix=".yaml"))
+        payload = {
+            "task_type": "TX_BUILD",
+            "confidence": 0.99,
+            "capabilities": ["build_tx", "protocol"],
+            "slots": {"operation": "deploy", "protocol": "ble"},
+        }
+        with mock.patch("grc.agent.llm.is_configured", return_value=True), mock.patch(
+            "grc.agent.llm.chat", return_value=__import__("json").dumps(payload)
+        ):
+            workflow = engine.consume_turn(
+                "用 PlutoSDR 发射 BLE，local name 为 demo，直接部署",
+                SharedState(),
+            )
+        self.assertEqual(workflow.task_type, "HARDWARE_CONFIGURE")
+        self.assertGreater(len(workflow.stages), 0)
+        self.assertEqual(workflow.stages[-1].id, "stop_and_finalize")
+
 
 _HW_STAGE_IDS = {
     "hardware_precheck",
@@ -741,7 +774,13 @@ class ConstraintCoverageTest(unittest.TestCase):
             "构建一个 QPSK 基带发射链路", ["build_tx"]
         )
         self.assertIsNotNone(covered)
-        self.assertEqual(covered.name, "qpsk_awgn")
+        self.assertEqual(covered.name, "qpsk_tx")
+        self.assertIsNone(
+            covering_recipe(
+                "为 Pluto 配置发射流图",
+                ["build_tx", "hardware_configure"],
+            )
+        )
 
     def test_accept_result_errored_waits_instead_of_retry(self):
         engine = self.engine()
@@ -804,6 +843,317 @@ class ConstraintCoverageTest(unittest.TestCase):
         self.assertTrue(Path(reply.artifacts["grc_path"]).is_file())
         self.assertNotEqual(reply.workflow_digest.get("execution_status"), "running")
         self.assertNotEqual(reply.stage, "ERROR")
+
+
+class Round2ContractTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def engine(self):
+        return WorkflowEngine(str(self.root / "workflow.yaml"))
+
+    def test_host_completion_overrides_invalid_llm_envelope(self):
+        path = self.root / "radio.grc"
+        path.write_text("<flow_graph/>", encoding="utf-8")
+        state = SharedState(session_id="protocol-host")
+        state.project.grc_path = str(path)
+        state.project.flowgraph_version = 1
+        engine = self.engine()
+        workflow = engine.consume_turn(
+            "诊断当前工程 EVM 偏高原因，先保持工程不变", state
+        )
+        stage = workflow.stage("inspect_and_diagnose")
+        self.assertIsNotNone(stage)
+        engine.workflow.current_stage = stage.id
+        engine._activate_current()
+        engine.start_stage()
+        parent = make_task_card(workflow, stage, state, workflow.intent.raw_text)
+        card = make_invocation_card(parent, "diagnosis_agent")
+        bound = bind_invocation_result(
+            vars(card),
+            {
+                "task_id": "mismatch",
+                "outcome": "passed",
+                "completion": {"diagnosis_created": True},
+            },
+            parent,
+        )
+        reply = AgentReply(
+            text="诊断完成",
+            stage="FINAL",
+            artifacts={"metrics": {"evm_pct": 12.0}},
+            tool_invocations=[
+                ToolInvocation(
+                    name="debug_by_metric",
+                    args={},
+                    result={"ok": True, "verdict": "噪声偏高"},
+                    ok=True,
+                )
+            ],
+        )
+        envelope = make_result_envelope(
+            workflow, stage, state, parent, reply, [bound]
+        )
+        self.assertTrue(envelope.ok)
+        self.assertTrue(envelope.completion.get("diagnosis_created"))
+        self.assertNotIn(
+            "INVALID_EXECUTION_INVOCATION",
+            envelope.acceptance.get("failure_codes") or [],
+        )
+
+    def test_readonly_diagnose_skips_repair_confirmation(self):
+        state = SharedState(session_id="diag-ro")
+        state.project.grc_path = "/tmp/current.grc"
+        state.project.config.update({"recipe": "bpsk_awgn", "modulation": "bpsk"})
+        with unittest.mock.patch(
+            "grc.agent.llm.is_configured", return_value=False
+        ):
+            workflow = self.engine().consume_turn(
+                "诊断当前链路的 EVM，解释主要原因并给出最小修改建议，先保持工程不变。",
+                state,
+            )
+        self.assertEqual(workflow.task_type, "DIAGNOSE")
+        self.assertIn("modify_project", workflow.intent.context.get("forbidden_capabilities") or [])
+        ids = {stage.id for stage in workflow.stages}
+        self.assertIn("inspect_and_diagnose", ids)
+        self.assertNotIn("repair_confirmation", ids)
+        inspect = workflow.stage("inspect_and_diagnose")
+        self.assertEqual(inspect.transitions.get("failed"), "completed")
+
+    def test_inspect_and_plan_failure_still_reaches_confirm(self):
+        state = SharedState(session_id="mod-plan")
+        state.project.grc_path = "/tmp/current.grc"
+        state.project.config.update({"recipe": "bpsk_awgn", "modulation": "bpsk"})
+        engine = self.engine()
+        workflow = engine.consume_turn("把当前 BPSK 改成 QPSK", state)
+        stage = workflow.stage("inspect_and_plan")
+        self.assertEqual(stage.transitions.get("failed"), "change_confirmation")
+        engine.start_stage()
+        engine.accept_result(
+            {
+                "workflow_id": workflow.workflow_id,
+                "stage_id": stage.id,
+                "workflow_revision": workflow.revision,
+                "base_project_version": workflow.base_project_version,
+                "ok": False,
+                "outcome": "failed",
+                "completion": {name: False for name in stage.completion},
+            }
+        )
+        self.assertEqual(engine.workflow.current_stage, "change_confirmation")
+        self.assertEqual(state.project.config.get("modulation"), "bpsk")
+        self.assertEqual(state.project.config.get("recipe"), "bpsk_awgn")
+
+    def test_observe_uses_canvas_bound_project(self):
+        path = self.root / "opened.grc"
+        path.write_text("id: analog_sig_source_x\n", encoding="utf-8")
+        state = SharedState(session_id="observe-canvas")
+        state.project.grc_path = str(path)
+        state.project.flowgraph_version = 1
+        workflow = self.engine().consume_turn("查看当前工程频谱和星座图", state)
+        self.assertEqual(workflow.task_type, "OBSERVE")
+        self.assertNotIn("current_project", workflow.intent.missing_slots)
+
+    def test_hardware_configure_not_stolen_by_tx_build(self):
+        cases = (
+            "为 PlutoSDR 配置 2.402 GHz、2 Msps 的发射流图，保存配置并停在发射确认。",
+            "给 Pluto 配好发射流图，载频 915 MHz 采样率 2 Msps，先不要发射",
+        )
+        for text in cases:
+            with self.subTest(text=text):
+                with unittest.mock.patch(
+                    "grc.agent.llm.is_configured", return_value=False
+                ):
+                    workflow = self.engine().consume_turn(text, SharedState())
+                self.assertEqual(workflow.task_type, "HARDWARE_CONFIGURE")
+                self.assertNotEqual(workflow.current_stage, "spec_alignment")
+                self.assertNotIn("modulation", workflow.intent.missing_slots)
+
+    def test_receive_quality_rejects_random_ber(self):
+        from grc.agent.workflow.completion import evaluate
+
+        path = self.root / "rx.grc"
+        path.write_text("<flow_graph/>", encoding="utf-8")
+        state = SharedState(session_id="ber-gate")
+        state.project.grc_path = str(path)
+        workflow = self.engine().consume_turn("构建 BPSK 接收机并测 BER", state)
+        stage = workflow.stage("rx_build_and_verify")
+        reply = AgentReply(
+            stage="FINAL",
+            artifacts={"grc_path": str(path), "metrics": {"ber": 0.475}},
+        )
+        result = evaluate(stage, workflow, state, reply)
+        self.assertFalse(result["receive_quality_evaluated"])
+        reply.artifacts["metrics"] = {"ber": 0.02}
+        result = evaluate(stage, workflow, state, reply)
+        self.assertTrue(result["receive_quality_evaluated"])
+
+
+class MutationAndExportContractTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def engine(self):
+        return WorkflowEngine(str(self.root / "workflow.yaml"))
+
+    def test_tool_payload_succeeded_treats_deny_as_failure(self):
+        from grc.agent.workflow.completion import tool_payload_succeeded
+
+        self.assertFalse(tool_payload_succeeded({"ok": False}))
+        self.assertFalse(tool_payload_succeeded({
+            "policy": "DENY", "error": "本轮禁止改图",
+        }))
+        self.assertFalse(tool_payload_succeeded({"error": "failed"}))
+        self.assertTrue(tool_payload_succeeded({"ok": True, "valid": True}))
+
+    def test_denied_design_link_does_not_satisfy_flowgraph_saved(self):
+        from grc.agent.workflow.completion import evaluate
+
+        path = self.root / "radio.grc"
+        path.write_text("<flow_graph/>", encoding="utf-8")
+        state = SharedState(session_id="deny-saved")
+        state.project.grc_path = str(path)
+        workflow = self.engine().consume_turn("构建 BPSK AWGN 并测 EVM", state)
+        stage = workflow.stage("build_and_verify")
+        reply = AgentReply(
+            text="本轮禁止改图",
+            stage="DENY",
+            artifacts={"grc_path": str(path)},
+            tool_invocations=[
+                ToolInvocation(
+                    name="design_link",
+                    args={},
+                    result={
+                        "ok": False,
+                        "policy": "DENY",
+                        "error": "本轮禁止改图",
+                    },
+                    ok=True,
+                )
+            ],
+        )
+        result = evaluate(stage, workflow, state, reply)
+        self.assertFalse(result["flowgraph_saved"])
+
+    def test_apply_without_mutating_success_is_not_saved(self):
+        from grc.agent.workflow.completion import evaluate
+
+        path = self.root / "radio.grc"
+        path.write_text("<flow_graph/>", encoding="utf-8")
+        state = SharedState(session_id="apply-stale")
+        state.project.grc_path = str(path)
+        state.project.config.update({"recipe": "bpsk_awgn", "modulation": "bpsk"})
+        workflow = self.engine().consume_turn("把当前 BPSK 改成 QPSK", state)
+        stage = workflow.stage("apply_and_verify")
+        reply = AgentReply(
+            text="完成",
+            stage="FINAL",
+            artifacts={"grc_path": str(path)},
+            tool_invocations=[
+                ToolInvocation(
+                    name="validate_flowgraph",
+                    args={},
+                    result={"ok": True, "valid": True},
+                    ok=True,
+                )
+            ],
+        )
+        result = evaluate(stage, workflow, state, reply)
+        self.assertFalse(result["flowgraph_saved"])
+
+    def test_digest_wait_kind_denied_for_mutation_refuse(self):
+        state = SharedState(session_id="deny-wait")
+        engine = self.engine()
+        workflow = engine.consume_turn("构建 BPSK AWGN 并测 EVM", state)
+        stage = engine.start_stage()
+        engine.accept_result(
+            {
+                "workflow_id": workflow.workflow_id,
+                "stage_id": stage.id,
+                "workflow_revision": workflow.revision,
+                "base_project_version": workflow.base_project_version,
+                "ok": False,
+                "outcome": "failed",
+                "note": "本轮禁止改图（用户要求只诊断/先不要修改）",
+                "completion": {name: False for name in stage.completion},
+                "acceptance": {"failure_codes": ["REPLY_STATUS_REJECTED"]},
+            }
+        )
+        digest = engine.digest()
+        self.assertEqual(digest["wait_kind"], "denied")
+        self.assertIn("禁止改图", digest["waiting_reason"])
+
+    def test_export_manifest_dedupes_paths(self):
+        from grc.agent.service import session_store as store
+
+        dest = self.root / "export"
+        dest.mkdir()
+        artifact = dest / "bpsk_awgn.grc"
+        artifact.write_text("id: radio\n", encoding="utf-8")
+        path = store.write_export_manifest(
+            "dup-export",
+            str(dest),
+            [str(artifact), str(artifact)],
+        )
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        paths = [item["path"] for item in payload["artifacts"]]
+        self.assertEqual(paths, ["bpsk_awgn.grc"])
+
+    def test_commit_intent_ignores_taskcard_dump(self):
+        from grc.agent.tools.registry import ToolContext
+        from grc.agent.tools.state_tools import commit_intent
+
+        state = SharedState(session_id="dump")
+        ctx = ToolContext(extra={"state": state})
+        dump = "TaskCard USER DECISIONS\n" + ("x" * 80)
+        commit_intent(ctx, dump)
+        self.assertEqual(state.spec.goals, [])
+        commit_intent(ctx, "把当前 BPSK 改成 QPSK")
+        self.assertEqual(state.spec.goals, ["把当前 BPSK 改成 QPSK"])
+
+
+class RecipeIndexAndSpecHygieneTest(unittest.TestCase):
+    def test_committed_recipe_index_matches_recipes(self):
+        from grc.agent.knowledge.recipes import (
+            RECIPE_INDEX_PATH,
+            render_recipe_index,
+        )
+
+        self.assertTrue(RECIPE_INDEX_PATH.is_file())
+        self.assertEqual(
+            RECIPE_INDEX_PATH.read_text(encoding="utf-8"),
+            render_recipe_index(),
+        )
+
+    def test_spec_clarify_does_not_write_goals(self):
+        from grc.agent.tools.registry import ToolContext
+        from grc.agent.tools.state_tools import spec_clarify
+
+        state = SharedState(session_id="clarify")
+        ctx = ToolContext(extra={"state": state})
+        result = spec_clarify(
+            ctx,
+            "诊断当前链路的 EVM，解释主要原因，先保持工程不变。",
+        )
+        self.assertEqual(state.spec.goals, [])
+        self.assertEqual(state.spec.decisions, [])
+        self.assertFalse(result["complete"])
+        self.assertIn("使用哪种调制方式？", result["open_questions"])
+
+        state.project.config["recipe"] = "bpsk_awgn"
+        state.project.config["modulation"] = "bpsk"
+        filled = spec_clarify(ctx, "诊断当前链路的 EVM，先保持工程不变。")
+        self.assertEqual(state.spec.goals, [])
+        self.assertTrue(filled["complete"])
+        self.assertEqual(filled["open_questions"], [])
 
 
 if __name__ == "__main__":

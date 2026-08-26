@@ -27,6 +27,11 @@ def _level(profile) -> str:
 # ---------------------------------------------------------------------------
 # design_link 的解说
 # ---------------------------------------------------------------------------
+_NO_GUI_NOTE = (
+    "星座/频谱图是会话产物；画布是无头仿真链（File Sink），不是 QT GUI。"
+)
+
+
 def narrate_design(recipe, result: Dict[str, Any], profile) -> str:
     lvl = _level(profile)
     ok = result.get("valid")
@@ -48,7 +53,7 @@ def narrate_design(recipe, result: Dict[str, Any], profile) -> str:
             s += (f"其中有个叫 EVM 的\"信号质量分\"是 {evm:.1f}%,"
                   f"数字越小说明信号越干净。")
         s += "接下来你可以让我把噪声调大一点,看看图会怎么变。"
-        return s
+        return s + " " + _NO_GUI_NOTE
 
     if lvl == "expert":
         s = f"已生成「{title}」({recipe.difficulty}),{nb} 块,校验通过。"
@@ -56,7 +61,7 @@ def narrate_design(recipe, result: Dict[str, Any], profile) -> str:
             s += f" EVM={evm:.2f}%。"
         knob_keys = ", ".join(list(recipe.knobs)[:3])
         s += f" 可调旋钮:{knob_keys}。"
-        return s
+        return s + " " + _NO_GUI_NOTE
 
     # student
     s = (f"已按配方「{title}」搭好链路(难度 {recipe.difficulty},{nb} 块)"
@@ -67,7 +72,7 @@ def narrate_design(recipe, result: Dict[str, Any], profile) -> str:
     if recipe.knobs:
         first = next(iter(recipe.knobs.items()))
         s += f" 想调质量可从「{first[0]}」入手:{first[1]}。"
-    return s
+    return s + " " + _NO_GUI_NOTE
 
 
 # ---------------------------------------------------------------------------

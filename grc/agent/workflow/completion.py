@@ -2,9 +2,72 @@
 
 from __future__ import annotations
 
+import math
 import os
 import re
 from typing import Any, Dict, Iterable
+
+
+MUTATING_TOOLS = frozenset(
+    {
+        "design_link",
+        "design_flowgraph",
+        "render_grc",
+        "apply_grc_diff",
+        "apply_flowgraph_patch",
+        "build_ble_uhd_tx_flowgraph",
+        "build_ble_pluto_tx_flowgraph",
+        "arm_hardware_flowgraph",
+        "build_usrp_rx_spectrum_flowgraph",
+        "build_sdr_tx_flowgraph",
+    }
+)
+_BUILD_SAVE_STAGES = frozenset(
+    {
+        "apply_and_verify",
+        "build_and_verify",
+        "tx_build_and_validate",
+        "rx_build_and_verify",
+    }
+)
+
+
+def tool_payload_succeeded(payload: Any) -> bool:
+    """Treat DENY / explicit errors as failure even when ``ok`` is omitted."""
+    if not isinstance(payload, dict):
+        return bool(payload)
+    if payload.get("ok") is False:
+        return False
+    if str(payload.get("policy") or "").upper() == "DENY":
+        return False
+    if payload.get("error") and payload.get("ok") is not True:
+        return False
+    return True
+
+
+def invocation_succeeded(item: Any) -> bool:
+    result = getattr(item, "result", None)
+    explicit = getattr(item, "ok", None)
+    if result is None and isinstance(item, dict):
+        result = item.get("result")
+        explicit = item.get("ok")
+    if isinstance(result, dict) and not tool_payload_succeeded(result):
+        return False
+    if explicit is False:
+        return False
+    if explicit is True:
+        return True
+    return tool_payload_succeeded(result) if isinstance(result, dict) else bool(result)
+
+
+def _mutated_flowgraph(invocations: Iterable[Any]) -> bool:
+    for item in invocations:
+        name = getattr(item, "name", None)
+        if name is None and isinstance(item, dict):
+            name = item.get("name")
+        if name in MUTATING_TOOLS and invocation_succeeded(item):
+            return True
+    return False
 
 
 KNOWN_COMPLETIONS = frozenset(
@@ -165,7 +228,9 @@ def evaluate(stage: Any, workflow: Any, state: Any, reply: Any) -> Dict[str, boo
         return all(value is not None and contains_numeric(value) for value in required)
 
     def checked(name: str) -> bool:
-        return any(bool(result.get("ok", True)) for result in tool_results.get(name, []))
+        return any(
+            tool_payload_succeeded(result) for result in tool_results.get(name, [])
+        )
 
     def stage_passed(stage_id: str) -> bool:
         return any(
@@ -177,17 +242,20 @@ def evaluate(stage: Any, workflow: Any, state: Any, reply: Any) -> Dict[str, boo
 
     def structural_validation() -> bool:
         results = tool_results.get("validate", []) + tool_results.get("validate_flowgraph", [])
-        if any(bool(item.get("ok", True)) and bool(item.get("valid")) for item in results):
+        if any(
+            tool_payload_succeeded(item) and bool(item.get("valid")) for item in results
+        ):
             return True
         if any(
-            bool(item.get("ok", True)) and bool(item.get("valid"))
+            tool_payload_succeeded(item) and bool(item.get("valid"))
             for item in tool_results.get("design_link", [])
         ):
             return True
         return any(
-            bool(item.get("ok", True)) and bool(item.get("valid"))
+            tool_payload_succeeded(item) and bool(item.get("valid"))
             for name in (
                 "build_usrp_rx_spectrum_flowgraph",
+                "build_sdr_tx_flowgraph",
                 "build_ble_uhd_tx_flowgraph",
                 "build_ble_pluto_tx_flowgraph",
             )
@@ -223,18 +291,23 @@ def evaluate(stage: Any, workflow: Any, state: Any, reply: Any) -> Dict[str, boo
             getattr(workflow.intent, "missing_slots", [])
             or getattr(workflow.intent, "validation_errors", [])
         ),
-        "flowgraph_saved": bool(grc_path and os.path.isfile(grc_path)),
+        "flowgraph_saved": (
+            bool(grc_path and os.path.isfile(grc_path))
+            and (
+                getattr(stage, "id", "") not in _BUILD_SAVE_STAGES
+                or _mutated_flowgraph(invocations)
+            )
+        ),
         "structural_validation_completed": structural_validation(),
         "affected_claims_evaluated": claims_current(),
-        "receive_quality_evaluated": metrics.get("ber") is not None
-        or metrics.get("evm_pct") is not None,
+        "receive_quality_evaluated": _receive_quality_evaluated(
+            metrics, artifacts, slots, tool_results
+        ),
         "diagnosis_created": bool(
             tool_names.intersection({"debug_by_metric", "diagnose_by_metric", "explain_error"})
         ),
         "repair_decision_recorded": True,
-        "repair_applied": bool(
-            tool_names.intersection({"apply_grc_diff", "apply_flowgraph_patch", "design_link"})
-        ),
+        "repair_applied": _mutated_flowgraph(invocations),
         "change_plan_created": bool(
             checked("inspect_flowgraph")
             and (
@@ -320,6 +393,65 @@ def _hardware_check_completed(project: Any) -> bool:
 
 def complete(results: Dict[str, bool]) -> bool:
     return all(results.values())
+
+
+_RANDOM_BER_CEILING = 0.45
+
+
+def _finite_number(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def _receive_quality_evaluated(
+    metrics: Dict[str, Any],
+    artifacts: Dict[str, Any],
+    slots: Dict[str, Any],
+    tool_results: Dict[str, list[Dict[str, Any]]],
+) -> bool:
+    """BER must be finite and clearly below random; otherwise EVM may prove RX."""
+    requested = list(slots.get("requested_metrics") or [])
+    ber = _finite_number(metrics.get("ber"))
+    evm = _finite_number(metrics.get("evm_pct"))
+    if "ber" in requested or ber is not None:
+        if ber is None or ber >= _RANDOM_BER_CEILING:
+            return False
+        return _ber_probes_present(artifacts, tool_results)
+    return evm is not None
+
+
+def _ber_probes_present(
+    artifacts: Dict[str, Any],
+    tool_results: Dict[str, list[Dict[str, Any]]],
+) -> bool:
+    """Fail only when simulation evidence is present but TX/RX probes are not."""
+    names: set[str] = set()
+    extra = artifacts.get("probes") or artifacts.get("probe_sizes")
+    if isinstance(extra, dict):
+        names.update(str(name) for name in extra)
+    for result in (
+        tool_results.get("run_simulation", [])
+        + tool_results.get("simulate", [])
+        + tool_results.get("design_link", [])
+    ):
+        for key in ("probes", "probe_sizes"):
+            value = result.get(key)
+            if isinstance(value, dict):
+                names.update(str(name) for name in value)
+    if not names:
+        return True
+    lowered = {name.lower() for name in names}
+    has_tx = any("tx" in name for name in lowered)
+    has_rx = any(
+        name in {"sink", "rx"} or "rx" in name
+        for name in lowered
+    )
+    return has_tx and has_rx
 
 
 def _tool_results(invocations: Iterable[Any]) -> Dict[str, list[Dict[str, Any]]]:

@@ -15,8 +15,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import re
+
+RECIPE_INDEX_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "skills"
+    / "grc-build"
+    / "references"
+    / "recipe_index.md"
+)
 
 # (src_id, dst_id, src_port, dst_port);后两个可省略(默认 0)
 Conn = Tuple[str, str]
@@ -91,7 +100,7 @@ _RECIPE_BPSK_AWGN = Recipe(
         "sps.value": "每符号样本数;影响过采样与眼图张开度。建议 2~8",
         "chan.freq_offset": "归一化频偏;非零会让星座旋转。诊断载波恢复用",
     },
-    metrics=["evm", "constellation", "eye", "spectrum"],
+    metrics=["evm", "constellation", "spectrum"],
     keywords=["bpsk", "awgn", "星座", "噪声", "调制", "误差", "evm", "基带"],
     probe_block_id="sink",
     sps=4,
@@ -130,10 +139,80 @@ _RECIPE_QPSK_AWGN = Recipe(
         "mod.excess_bw": "RRC 滚降系数。建议 0.2~0.5",
         "chan.freq_offset": "归一化频偏;QPSK 星座会整体旋转 45°的整数倍",
     },
-    metrics=["evm", "constellation", "eye", "spectrum"],
+    metrics=["evm", "constellation", "spectrum"],
     keywords=["qpsk", "四相", "awgn", "星座", "噪声", "evm"],
     probe_block_id="sink",
     sps=4,
+)
+
+# ---------------------------------------------------------------------------
+# TX-only: modulator to file sink, no AWGN / EVM loop
+# ---------------------------------------------------------------------------
+def _tx_only_recipe(
+    name: str,
+    title: str,
+    constellation: str,
+    src_max: str,
+    keywords: List[str],
+) -> Recipe:
+    const_id = f"{constellation}_const"
+    return Recipe(
+        name=name,
+        title=title,
+        difficulty="T2",
+        summary=f"随机比特 -> {constellation.upper()} 星座调制 -> 采集 IQ，不含信道。",
+        blocks=[
+            *_common_vars(),
+            ("variable_constellation", const_id, {"type": constellation}),
+            (
+                "analog_random_source_x",
+                "src",
+                {
+                    "type": "byte",
+                    "min": "0",
+                    "max": src_max,
+                    "num_samps": "1000",
+                    "repeat": "True",
+                },
+            ),
+            (
+                "digital_constellation_modulator",
+                "mod",
+                {
+                    "constellation": const_id,
+                    "differential": "False",
+                    "samples_per_symbol": "sps",
+                    "excess_bw": "0.35",
+                },
+            ),
+            ("blocks_head", "head", {"type": "complex", "num_items": "8192"}),
+            ("blocks_file_sink", "sink", {"type": "complex", "file": "__PROBE__"}),
+        ],
+        connections=[("src", "mod"), ("mod", "head"), ("head", "sink")],
+        knobs={
+            "mod.excess_bw": "RRC 滚降系数。建议 0.2~0.5",
+            "sps.value": "每符号样本数。建议 2~8",
+        },
+        metrics=[],
+        keywords=keywords,
+        probe_block_id="sink",
+        sps=4,
+    )
+
+
+_RECIPE_BPSK_TX = _tx_only_recipe(
+    "bpsk_tx",
+    "BPSK 发射（无信道）",
+    "bpsk",
+    "2",
+    ["bpsk", "发射机", "transmitter", "tx", "发射链"],
+)
+_RECIPE_QPSK_TX = _tx_only_recipe(
+    "qpsk_tx",
+    "QPSK 发射（无信道）",
+    "qpsk",
+    "4",
+    ["qpsk", "四相", "发射机", "transmitter", "tx", "发射链"],
 )
 
 # ---------------------------------------------------------------------------
@@ -153,12 +232,12 @@ _RECIPE_RX_BPSK_AWGN = Recipe(
             {
                 "type": "byte",
                 "min": "0",
-                "max": "2",
+                "max": "256",
                 "num_samps": "1000",
                 "repeat": "True",
             },
         ),
-        ("blocks_head", "tx_head", {"type": "byte", "num_items": "2048"}),
+        ("blocks_head", "tx_head", {"type": "byte", "num_items": "8192"}),
         ("blocks_file_sink", "tx_sink", {"type": "byte", "file": "__TX_PROBE__"}),
         (
             "digital_constellation_modulator",
@@ -189,8 +268,8 @@ _RECIPE_RX_BPSK_AWGN = Recipe(
                 "sps": "sps",
                 "loop_bw": "0.0628",
                 "taps": (
-                    "firdes.root_raised_cosine(32, 32, "
-                    "1.0/float(sps), 0.35, 11*sps*32)"
+                    "firdes.root_raised_cosine(32, 32 * sps, "
+                    "1.0, 0.35, 11 * sps * 32)"
                 ),
                 "filter_size": "32",
                 "init_phase": "16",
@@ -208,7 +287,7 @@ _RECIPE_RX_BPSK_AWGN = Recipe(
                 "fmax": "0.25",
             },
         ),
-        ("blocks_head", "head", {"type": "byte", "num_items": "2048"}),
+        ("blocks_head", "head", {"type": "byte", "num_items": "8192"}),
         ("blocks_file_sink", "sink", {"type": "byte", "file": "__PROBE__"}),
     ],
     connections=[
@@ -235,7 +314,7 @@ _RECIPE_RX_BPSK_AWGN = Recipe(
     probe_block_id="sink",
     tx_probe_block_id="tx_sink",
     probe_dtype="uint8",
-    sps=1,
+    sps=4,
 )
 
 # ---------------------------------------------------------------------------
@@ -316,12 +395,56 @@ _RECIPE_OFDM = Recipe(
 RECIPES: Dict[str, Recipe] = {
     r.name: r for r in (
         _RECIPE_TONE_NOISE,
+        _RECIPE_BPSK_TX,
+        _RECIPE_QPSK_TX,
         _RECIPE_BPSK_AWGN,
         _RECIPE_QPSK_AWGN,
         _RECIPE_RX_BPSK_AWGN,
         _RECIPE_OFDM,
     )
 }
+
+
+def guess_modulation(recipe_name: str) -> str:
+    """Map a recipe name to a modulation token used by EVM/BER and spec."""
+    n = (recipe_name or "").lower()
+    if "qpsk" in n:
+        return "qpsk"
+    if "bpsk" in n:
+        return "bpsk"
+    if "ofdm" in n:
+        return "ofdm"
+    return ""
+
+
+def render_recipe_index() -> str:
+    """Markdown index consumed by grc-build skill; keep in lockstep with RECIPES."""
+    lines = [
+        "# 配方索引(由 knowledge/recipes.py 生成,勿手改)",
+        "",
+        "选型:`match_recipe` 按关键词命中;全不中回落 `bpsk_awgn`。",
+        "仅 `build_tx` 且意图不含信道/EVM/BER/眼图时,`covering_recipe` 改用 `bpsk_tx` / `qpsk_tx`。",
+        "含 `hardware_configure` / `diagnose` / `modify_project` 时 covering 返回空,不套基带配方。",
+        "",
+    ]
+    for recipe in RECIPES.values():
+        metrics = ", ".join(recipe.metrics) if recipe.metrics else "(无默认指标)"
+        lines.extend(
+            [
+                f"## {recipe.name}  ({recipe.difficulty})",
+                f"- 标题: {recipe.title}",
+                f"- 摘要: {recipe.summary}",
+                f"- 关键词: {', '.join(recipe.keywords)}",
+                f"- 指标: {metrics}",
+                f"- 块数: {len(recipe.blocks)}",
+            ]
+        )
+        if recipe.knobs:
+            lines.append("- 可调旋钮:")
+            for key, desc in recipe.knobs.items():
+                lines.append(f"  - `{key}`: {desc}")
+        lines.append("")
+    return "\n".join(lines)
 
 
 def list_recipes() -> List[dict]:
@@ -340,8 +463,9 @@ _RX_HINTS = (
     "判决", "clock_sync", "constellation_receiver", "pfb_clock",
 )
 _TX_LINK_RECIPES = frozenset({"bpsk_awgn", "qpsk_awgn", "ofdm_awgn"})
+_TX_ONLY_RECIPES = frozenset({"bpsk_tx", "qpsk_tx"})
 _BASEBAND_EXCLUSIVE = frozenset({
-    "diagnose", "modify_project", "protocol",
+    "diagnose", "modify_project", "protocol", "hardware_configure",
 })
 
 
@@ -409,4 +533,27 @@ def covering_recipe(
         return None
     if "build_tx" in caps and selected.name.startswith("rx_"):
         return None
+    if (
+        "build_tx" in caps
+        and "build_rx" not in caps
+        and not _wants_channel_or_quality(intent, caps)
+    ):
+        if selected.name in _TX_LINK_RECIPES:
+            selected = get_recipe(selected.name.replace("_awgn", "_tx"))
+            if selected is None:
+                return None
+        elif selected.name not in _TX_ONLY_RECIPES:
+            return None
     return selected
+
+
+def _wants_channel_or_quality(intent: str, capabilities: set) -> bool:
+    if "observe" in capabilities:
+        return True
+    low = (intent or "").lower()
+    return any(
+        word in low
+        for word in (
+            "awgn", "噪声", "高斯", "evm", "ber", "眼图", "误码", "信道",
+        )
+    )

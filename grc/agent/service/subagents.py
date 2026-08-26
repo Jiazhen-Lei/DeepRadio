@@ -141,7 +141,7 @@ _SUBAGENT_DEFS = [
         "构建或增量修改 GNU Radio 流图。",
         build_flowgraph_prompt,
         ["grc-build", "grc-block-rag"],
-        ["design_flowgraph", "inspect_flowgraph", "apply_grc_diff", "apply_flowgraph_patch"],
+        ["design_flowgraph", "inspect_flowgraph", "apply_grc_diff", "apply_flowgraph_patch", "build_sdr_tx_flowgraph"],
     ),
     (
         "verification_agent",
@@ -191,6 +191,7 @@ _SUBAGENT_DEFS = [
             "query_runtime_status", "stop_flowgraph", "emergency_stop",
             "arm_hardware_flowgraph",
             "inspect_flowgraph", "build_usrp_rx_spectrum_flowgraph",
+            "build_sdr_tx_flowgraph",
         ],
     ),
 ]

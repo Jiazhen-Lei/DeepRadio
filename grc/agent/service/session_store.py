@@ -568,12 +568,16 @@ def write_export_manifest(
     else:
         candidates = list(exported_paths)
     entries = []
+    seen_rel = set()
     for path in candidates:
         name = os.path.basename(path)
         if _skip_manifest_name(name) or not os.path.isfile(path):
             continue
         abs_path = os.path.abspath(path)
         if os.path.commonpath([destination, abs_path]) != destination:
+            continue
+        rel = os.path.relpath(abs_path, destination)
+        if rel in seen_rel:
             continue
         try:
             with open(abs_path, "rb") as handle:
@@ -583,10 +587,11 @@ def write_export_manifest(
             continue
         entries.append({
             "role": "artifact",
-            "path": os.path.relpath(abs_path, destination),
+            "path": rel,
             "size": size,
             "sha256": digest,
         })
+        seen_rel.add(rel)
     path = os.path.join(destination, "manifest.json")
     payload = {
         "schema_version": 1,

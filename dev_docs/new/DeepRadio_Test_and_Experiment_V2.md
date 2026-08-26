@@ -1,6 +1,6 @@
 # DeepRadio 测试与实验
 
-> 日期：2026-08-25
+> 日期：2026-08-26
 > 读者：测试、实验、CHI、算法与工程人员
 > 范围：自动回归、七类 Task 交互实验、GUI 验收、Pluto/B210 硬件实验和证据标准
 
@@ -33,17 +33,17 @@ PYTHONPATH=$PWD python -m unittest discover -s grc/agent/tests -v
 PYTHONPATH=$PWD python -m unittest grc.gui.tests.test_chat_markup -v
 ```
 
-2026-08-25 结果：
+2026-08-26 结果：
 
 ```text
-Ran 95 tests in 11.610s
+Ran 121 tests in 13.044s
 OK (skipped=1)
 
-Ran 6 tests in 0.048s
+Ran 6 tests in 0.029s
 OK
 ```
 
-跳过项为 B210 实机 discover/probe，需 `GRC_AGENT_HIL=1` 且设备在线。运行中可能出现 GNU Radio double-mapped buffer 告警；验收以最后的 `Ran ...`、`OK` 和退出码为准。
+跳过项为 B210 实机 discover/probe（`GRC_AGENT_HIL=1` 且设备在线才跑）。若当前 shell 里仍留着 GUI 空口实验的 `GRC_AGENT_ENABLE_RF=1`，该项也会 skip，不会把 Gate 1 判红。自动回归默认不调用线上 Intent LLM；GUI 不受影响。运行中可能出现 GNU Radio double-mapped buffer 告警；验收以最后的 `Ran ...`、`OK` 和退出码为准。
 
 测试模块：`test_seven_tasks.py`、`test_ble.py`、`test_hardware.py`、`test_workflow.py`、`grc.gui.tests.test_chat_markup`。
 
@@ -51,6 +51,8 @@ OK
 
 - 七类 Task 代表文本与不少于 70 条变体分类；
 - 多轮补槽、低置信 Intent 补全、确认/拒绝/取消；
+- 同一 Agent：端到端仿真 → 只读诊断 → 确认后把 BPSK 改成 QPSK（流图、recipe、version）；
+- DENY / 失败改图不计入 `flowgraph_saved`、不误加 version；导出 Manifest 按路径去重；
 - Workflow revision、Stage attempt、Completion、失效；
 - TaskCard / ResultEnvelope 协议；
 - BLE PDU、CRC、白化、IQ 回环；
@@ -179,10 +181,6 @@ PYTHONPATH=$PWD python -m grc --gtk --fresh
 
 批准配置，拒绝发射。期望：发现与 probe 精确设备；生成禁用发射的基础 `.grc`；无 `start_flowgraph` 成功事件。
 
----
-
-
-
 ## 5. Text 数据集实验
 
 七类 Task 每类至少 10 条文本，合计 70 条。覆盖：完整表达、参数顺序、中文同义、英文或中英混合、缺槽、多轮补充、否定约束、复合目标、模糊指代、与相邻 Task 易混的表达。
@@ -267,7 +265,7 @@ PYTHONPATH=$PWD python -m grc --gtk --fresh
 ### 7.3 输入与操作
 
 ```text
-用 PlutoSDR 发射一段 2.402 GHz 的 BLE 广播，local name 为 DRTEST24，
+用 PlutoSDR 发射一段 2.402 GHz 的 BLE 广播，local name 为 Deepradio27，
 目标是用手机 LightBlue 扫描到，最长发射 30 秒。
 ```
 
@@ -314,6 +312,27 @@ PYTHONPATH=$PWD python -m grc --gtk --fresh
 
 
 前三个自动 Stage 约 0.39 秒；RF 启动约 1.12 秒。`duration_seconds=30` 为最长窗口，空口确认后工作流主动停止。本轮未把截图写入 `final/evidence/`。
+
+### 7.6 2026-08-25 V2 记录
+
+会话：`local/agent_sessions/0825/V2/plutoble/gui-190d6c70`  
+导出：`local/output/0825/V2/plutoble`  
+输入 local name：`Mobicom27`（与 §7.3 示例 `DRTEST24` 不同，按随机新名称复测）
+
+
+| 事件          | 结果                                                              |
+| ----------- | --------------------------------------------------------------- |
+| 用户提交        | 用 PlutoSDR 发射 2.402 GHz BLE，local name `Mobicom27`              |
+| 离线协议 / 发现探测 | 通过；URI `usb:2.4.5`                                              |
+| RF 批准后启动    | `run_id=run-ac9a5230c71c`，`pid=74718`                           |
+| 空口          | LightBlue 扫到 `Mobicom27`，MAC `DD:C2:2E:E0:5B:D4`，RSSI 约 -83 dBm |
+| 停止          | `return_code=0`，`crashed=false`，`reason=stopped`                |
+| 信道          | 仅 CH37 / 2.402 GHz                                              |
+| runtime 日志  | `UUUU` 欠载                                                       |
+| Evidence    | 手机截图在 output 目录；未写入 `final/evidence/`                           |
+
+
+问题与改法见工程文档 §8。
 
 ---
 

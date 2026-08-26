@@ -357,6 +357,7 @@ class ClaimsPanel(Gtk.Frame):
                     "approval": "等待批准",
                     "input": "等待补充",
                     "recovery": "等待恢复选择",
+                    "denied": "改图被拒绝",
                 }
                 text += "  ·  " + wait_labels.get(wait_kind, wait_kind)
             self._activity_label.set_text(text)
@@ -803,7 +804,9 @@ class ClaimsPanel(Gtk.Frame):
     def _sync_expanders(self, workflow, claims):
         wait = str((workflow or {}).get("wait_kind") or "")
         running = bool(((workflow or {}).get("runtime") or {}).get("running"))
-        need_exec = wait in ("input", "recovery") or (wait == "approval" and not running)
+        need_exec = wait in ("input", "recovery", "denied") or (
+            wait == "approval" and not running
+        )
         if need_exec and hasattr(self, "_workflow_expander"):
             self._workflow_expander.set_expanded(True)
         failed = any(

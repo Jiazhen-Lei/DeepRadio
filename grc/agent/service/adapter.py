@@ -19,8 +19,11 @@ from ..schema import AgentReply, ToolInvocation
 from ..memory.profile import UserProfile
 from ..state import Claim, ClaimStore, Decision, Evidence, SharedState
 from ..tools.registry import ToolContext
-from ..tools.hardware_tools import normalize_sdr_hardware
-from ..tools.hardware_profiles import device_args_for, resolve_hardware_profile
+from ..tools.hardware_profiles import (
+    device_args_for,
+    normalize_hardware,
+    resolve_hardware_profile,
+)
 from ..workflow import WorkflowEngine
 from . import orchestrator as _orch
 from . import session_store as _store
@@ -212,9 +215,43 @@ class ServiceAgent:
         ctx.extra["subagent_invocations"] = []
         ctx.extra["export_dir"] = export_dir
         ctx.extra["session_id"] = self.session_id
+        ctx.extra["mutation_forbidden"] = False
+        ctx.extra.pop("proposed_decisions", None)
         if ctx.flow_graph is None:
             self._load_session_flowgraph(ctx)
         return ctx
+
+    def _refresh_mutation_gate(
+        self, ctx: ToolContext, user_text: str, workflow: Any
+    ) -> None:
+        """Only-read is computed for this Turn / Stage, never inherited."""
+        from ..tools.state_tools import is_confirmation_utterance, is_read_only_request
+
+        forbidden = set()
+        task_type = ""
+        stage_id = ""
+        if workflow is not None:
+            forbidden = set(
+                (workflow.intent.context or {}).get("forbidden_capabilities") or []
+            )
+            task_type = str(workflow.task_type or "")
+            stage_id = str(workflow.current_stage or "")
+        readonly = "modify_project" in forbidden
+        if task_type == "MODIFY_PROJECT":
+            readonly = False
+        elif (
+            user_text
+            and is_read_only_request(user_text)
+            and not is_confirmation_utterance(user_text)
+        ):
+            readonly = True
+        if stage_id in {
+            "apply_and_verify",
+            "change_confirmation",
+            "repair_and_verify",
+        }:
+            readonly = False
+        ctx.extra["mutation_forbidden"] = bool(readonly)
 
     def _sync_workflow_intent_to_state(self) -> None:
         """Project canonical Workflow Intent into RadioSpec without reparsing."""
@@ -222,8 +259,24 @@ class ServiceAgent:
         if workflow is None:
             return
         intent = workflow.intent
-        if intent.raw_text and intent.raw_text not in self._state.spec.goals:
+        from ..tools.state_tools import looks_like_task_dump
+
+        if (
+            intent.raw_text
+            and intent.raw_text not in self._state.spec.goals
+            and not looks_like_task_dump(intent.raw_text)
+        ):
             self._state.spec.goals.append(intent.raw_text)
+        stage = self._workflow.current_stage()
+        planning = (
+            workflow.task_type == "MODIFY_PROJECT"
+            and stage is not None
+            and stage.id in {
+                "inspect_and_plan",
+                "change_confirmation",
+                "apply_and_verify",
+            }
+        )
         if (
             str(intent.slots.get("protocol") or "").lower() == "ble"
             and intent.slots.get("operation") == "deploy"
@@ -235,9 +288,12 @@ class ServiceAgent:
             )
             if condition not in self._state.spec.success_conditions:
                 self._state.spec.success_conditions.append(condition)
-        for key in (
-            "modulation", "channel", "hardware", "protocol", "local_name"
-        ):
+        spec_keys = (
+            ("hardware", "protocol", "local_name")
+            if planning
+            else ("modulation", "channel", "hardware", "protocol", "local_name")
+        )
+        for key in spec_keys:
             value = intent.slots.get(key)
             if value in (None, "", []):
                 continue
@@ -335,6 +391,44 @@ class ServiceAgent:
             "canvas_dirty": True,
             "workflow_digest": self._workflow.digest(),
         }
+
+    def bind_opened_project(self, file_path: str) -> Dict[str, Any]:
+        """Bind a canvas File→Open / reset path into SharedState."""
+        path = os.path.abspath(file_path or "")
+        if not path or not os.path.isfile(path) or not path.endswith(".grc"):
+            return {"ok": False, "skipped": True}
+        prior = str(self._state.project.grc_path or "")
+        semantic_hash = _flowgraph_semantic_hash(path)
+        self._state.project.grc_path = path
+        if semantic_hash:
+            self._state.project.config["flowgraph_semantic_hash"] = semantic_hash
+        self._state.project.config["slot_source"] = "canvas"
+        if not prior:
+            if int(self._state.project.flowgraph_version or 0) < 1:
+                self._state.project.flowgraph_version = 1
+        elif os.path.abspath(prior) != path:
+            self._state.project.flowgraph_version += 1
+        self._tool_ctx = None
+        try:
+            self._state.save(_store.state_path(self.session_id))
+        except OSError as exc:
+            logger.warning("绑定画布工程失败: %s", exc)
+            return {"ok": False, "error": str(exc)}
+        return {
+            "ok": True,
+            "grc_path": path,
+            "version": self._state.project.flowgraph_version,
+        }
+
+    def clear_opened_project(self) -> None:
+        self._state.project.grc_path = ""
+        self._state.project.config.pop("flowgraph_semantic_hash", None)
+        self._state.project.config.pop("slot_source", None)
+        self._tool_ctx = None
+        try:
+            self._state.save(_store.state_path(self.session_id))
+        except OSError as exc:
+            logger.warning("清除画布工程失败: %s", exc)
 
     def restore_last_snapshot(self) -> Dict[str, Any]:
         """把 SharedState 与 .grc 回滚到最近一次改图前快照。"""
@@ -447,6 +541,7 @@ class ServiceAgent:
         self._sync_workflow_intent_to_state()
         stage_text = user_text or workflow.intent.raw_text
         ctx = self._make_ctx()
+        self._refresh_mutation_gate(ctx, user_text, workflow)
         ctx.extra["user_text"] = stage_text
         ctx.extra["workflow_digest"] = self._workflow.digest()
         if workflow.execution_status == "completed" and workflow.outcome == "cancelled":
@@ -457,6 +552,18 @@ class ServiceAgent:
             except Exception as exc:  # noqa: BLE001
                 logger.debug("取消 Workflow 时清理旧 Policy pending 失败: %s", exc)
             return self._workflow_cancelled_reply()
+        if (
+            not consume_turn
+            and workflow.execution_status in ("completed", "errored")
+        ):
+            return AgentReply(
+                text="",
+                stage="DELIVER",
+                done=workflow.execution_status == "completed",
+                claims=ClaimStore(self._state).summary(),
+                spec_digest=self._state.spec_digest(),
+                workflow_digest=self._digest_with_timeline(),
+            )
         current = self._workflow.current_stage()
         if current and current.execution_status == "waiting":
             try:
@@ -526,7 +633,7 @@ class ServiceAgent:
                         logger.warning("SharedState 落盘失败: %s", exc)
                     return reply
             if user_text and is_read_only_request(user_text):
-                ctx.extra["mutation_forbidden"] = True
+                self._refresh_mutation_gate(ctx, user_text, workflow)
             if user_text and workflow.intent.turn_relation == "new_task" \
                     and not is_confirmation_utterance(user_text):
                 commit_intent(ctx, user_text)
@@ -599,7 +706,7 @@ class ServiceAgent:
     def _execute_stage(
         self, ctx: ToolContext, stage: Any, stage_text: str, recipe: str, simulate: bool
     ) -> AgentReply:
-        if stage.id in _HOST_CONTROLLED_STAGES:
+        if stage.id in _HOST_CONTROLLED_STAGES or self._prefer_host_stage(stage, recipe):
             return self._run_stage_deterministic(
                 ctx, stage_text, recipe, simulate, stage.id
             )
@@ -638,6 +745,25 @@ class ServiceAgent:
             return self._error_reply(
                 f"编排出错: {type(exc).__name__}: {exc}"
             )
+
+    def _prefer_host_stage(self, stage: Any, recipe: str) -> bool:
+        """Host handlers win for inspect/diagnose/measure and known recipe apply."""
+        if stage.id in {
+            "inspect_and_plan",
+            "inspect_and_diagnose",
+            "inspect_and_measure",
+        }:
+            return True
+        if stage.id != "apply_and_verify":
+            return False
+        from ..knowledge.recipes import get_recipe
+
+        slots = (
+            self._workflow.workflow.intent.slots
+            if self._workflow.workflow else {}
+        )
+        target = str(slots.get("target_recipe") or recipe or "")
+        return get_recipe(target) is not None
 
     def _continue_autonomous(
         self, first: AgentReply, *, recipe: str, simulate: bool
@@ -762,6 +888,14 @@ class ServiceAgent:
                     str(observation.get("artifact") or ""),
                     run_id=str(status.get("run_id") or ""),
                 )
+                if attached:
+                    try:
+                        _store.write_artifact_manifest(
+                            self.session_id,
+                            {"evidence": attached.get("artifact") or ""},
+                        )
+                    except OSError as exc:
+                        logger.debug("写入 Evidence Manifest 失败: %s", exc)
                 artifact = str(attached.get("artifact") or "")
                 evidence_kind = str(
                     observation.get("evidence_kind")
@@ -796,11 +930,17 @@ class ServiceAgent:
             logger.debug("同步 Policy confirmation 失败: %s", exc)
         self._workflow.resolve_checkpoint(decision)
         self._state.save(_store.state_path(self.session_id))
-        if (
-            self._workflow.workflow.execution_status == "completed"
-            and self._workflow.workflow.outcome == "cancelled"
-        ):
-            return self._workflow_cancelled_reply()
+        if self._workflow.workflow.execution_status in ("completed", "errored"):
+            if self._workflow.workflow.outcome == "cancelled":
+                return self._workflow_cancelled_reply()
+            return AgentReply(
+                text="当前 Workflow 已结束。",
+                stage="DELIVER",
+                done=True,
+                claims=ClaimStore(self._state).summary(),
+                spec_digest=self._state.spec_digest(),
+                workflow_digest=self._digest_with_timeline(),
+            )
         reply = self._step_once(
             "", recipe="", simulate=True, consume_turn=False
         )
@@ -1031,8 +1171,13 @@ class ServiceAgent:
         result = design_link(ctx, profile=self.profile, intent=user_text,
                              recipe=recipe, simulate=simulate, render=True)
 
-        # 环境级失败(缺 platform/gnuradio):如实报告,不伪装成建图结果
-        if not result.get("ok") and "recipe" not in result:
+        # 环境级失败(缺 platform/gnuradio):如实报告,不伪装成建图结果。
+        # DENY 没有 recipe 字段,但不能当成环境不可用。
+        if (
+            not result.get("ok")
+            and "recipe" not in result
+            and str(result.get("policy") or "").upper() != "DENY"
+        ):
             err = result.get("error", "建图环境不可用")
             _store.append_session_event(self.session_id, "env_error",
                                         {"error": err})
@@ -1044,11 +1189,16 @@ class ServiceAgent:
         if result.get("metrics"):
             ctx.extra.setdefault("metrics", {}).update(result["metrics"])
         ctx.extra["events"].append({"kind": "design_link", "payload": {
+            "ok": result.get("ok"),
             "recipe": result.get("recipe"), "valid": result.get("valid"),
             "steps": result.get("steps", []),
             "policy": result.get("policy"),
             "error": result.get("error")}})
-        narrative = result.get("narrative") or self._fallback_text(result)
+        narrative = (
+            result.get("narrative")
+            or result.get("error")
+            or self._fallback_text(result)
+        )
         return self._fold(ctx, narrative, source="deterministic",
                           ok=bool(result.get("ok")))
     def _run_stage_deterministic(
@@ -1097,12 +1247,7 @@ class ServiceAgent:
         ):
             if self._hardware_rx_spectrum_ready():
                 return self._run_hardware_rx_spectrum(ctx)
-            return self._fold(
-                ctx,
-                "当前无可证明满足全部硬件能力的确定性模板；已停止，避免用离线仿真配方替代用户目标。",
-                source="deterministic-stage",
-                ok=False,
-            )
+            return self._run_hardware_endpoint_flowgraph(ctx)
 
         if stage_id in {
             "build_and_verify", "tx_build_and_validate", "rx_build_and_verify"
@@ -1158,10 +1303,21 @@ class ServiceAgent:
         if stage_id == "inspect_and_plan":
             result = registry.call("inspect_flowgraph", {}, ctx)
             self._record_tool_result(ctx, "inspect_flowgraph", result)
-            note = (
-                "已检查当前工程并形成变更计划；确认后才会应用并重验。"
-                if result.get("ok") else result.get("error", "工程检查失败")
+            slots = (
+                self._workflow.workflow.intent.slots
+                if self._workflow.workflow else {}
             )
+            target = str(slots.get("target_recipe") or "")
+            current = str(self._state.project.config.get("recipe") or "")
+            if result.get("ok") and target:
+                note = (
+                    f"已检查当前工程（{current or '未命名'}）。"
+                    f"确认后将套用配方 {target}，其余信道与成形条件保持一致；现在不改图。"
+                )
+            elif result.get("ok"):
+                note = "已检查当前工程并形成变更计划；确认后才会应用并重验。"
+            else:
+                note = result.get("error", "工程检查失败")
             return self._fold(
                 ctx, note, source="deterministic-stage", ok=bool(result.get("ok"))
             )
@@ -1211,7 +1367,7 @@ class ServiceAgent:
             slots = self._workflow.workflow.intent.slots
             local_name = str(slots.get("local_name") or "")
             channel = int((slots.get("advertising_channels") or [37])[0])
-            hardware = normalize_sdr_hardware(str(slots.get("hardware") or "b210"))
+            hardware = normalize_hardware(str(slots.get("hardware") or "b210"))
             profile = resolve_hardware_profile(hardware)
             pdu_args = {
                 "local_name": local_name, "channel": channel,
@@ -1313,7 +1469,7 @@ class ServiceAgent:
             )
             validation = registry.call("validate_flowgraph", {}, ctx)
             self._record_tool_result(ctx, "validate_flowgraph", validation)
-            hardware = normalize_sdr_hardware(str(slots.get("hardware") or "b210"))
+            hardware = normalize_hardware(str(slots.get("hardware") or "b210"))
             profile = resolve_hardware_profile(hardware)
             sink = profile.label if profile else hardware or "SDR"
             return self._fold(
@@ -1323,7 +1479,7 @@ class ServiceAgent:
             )
         if stage_id == "discover_and_probe_device":
             slots = self._workflow.workflow.intent.slots
-            hardware = normalize_sdr_hardware(str(slots.get("hardware") or "b210"))
+            hardware = normalize_hardware(str(slots.get("hardware") or "b210"))
             profile = resolve_hardware_profile(hardware)
             if profile is None:
                 return self._fold(
@@ -1365,7 +1521,7 @@ class ServiceAgent:
             )
         if stage_id == "discover_and_probe_hardware":
             slots = self._workflow.workflow.intent.slots
-            hardware = normalize_sdr_hardware(str(slots.get("hardware") or ""))
+            hardware = normalize_hardware(str(slots.get("hardware") or ""))
             profile = resolve_hardware_profile(hardware)
             if profile is None:
                 return self._fold(
@@ -1412,7 +1568,7 @@ class ServiceAgent:
             }
             result = registry.call("configure_sdr", configure_args, ctx)
             self._record_tool_result(ctx, "configure_sdr", result, configure_args)
-            hardware = normalize_sdr_hardware(str(slots.get("hardware") or "b210"))
+            hardware = normalize_hardware(str(slots.get("hardware") or "b210"))
             profile = resolve_hardware_profile(hardware)
             label = profile.label if profile else hardware or "SDR"
             armed = {"ok": True, "armed": False}
@@ -1591,6 +1747,42 @@ class ServiceAgent:
             ok=bool(result.get("ok")) and bool(validation.get("valid")),
         )
 
+    def _run_hardware_endpoint_flowgraph(self, ctx: ToolContext) -> AgentReply:
+        from ..tools import registry
+
+        intent = self._workflow.workflow.intent if self._workflow.workflow else None
+        slots = dict(intent.slots or {}) if intent else {}
+        if str(slots.get("direction") or "") == "rx":
+            return self._fold(
+                ctx,
+                "当前没有可证明覆盖该接收硬件 endpoint 的确定性模板，已停止等待补充。",
+                source="deterministic-stage",
+                ok=False,
+            )
+        result = registry.call(
+            "build_sdr_tx_flowgraph",
+            {
+                "device_type": slots.get("hardware") or "sdr",
+                "center_freq": slots.get("carrier_frequency"),
+                "sample_rate": slots.get("sample_rate"),
+            },
+            ctx,
+        )
+        self._record_tool_result(ctx, "build_sdr_tx_flowgraph", result)
+        if result.get("grc_path"):
+            ctx.extra.setdefault("artifacts", {})["grc_path"] = result["grc_path"]
+        validation = {"ok": True, "valid": bool(result.get("valid"))}
+        if result.get("ok"):
+            validation = registry.call("validate_flowgraph", {}, ctx)
+            self._record_tool_result(ctx, "validate_flowgraph", validation)
+        note = result.get("error") or (
+            "已生成未 arm 的 SDR 发射流图（sink 保持禁用）。保存配置后停在发射确认，不会自动开机。"
+        )
+        return self._fold(
+            ctx, note, source="deterministic-stage",
+            ok=bool(result.get("ok")) and bool(validation.get("valid")),
+        )
+
     def _inspect_measure_stage(
         self, ctx: ToolContext, *, diagnose: bool = False
     ) -> AgentReply:
@@ -1631,14 +1823,22 @@ class ServiceAgent:
         modulation = str(
             self._state.project.config.get("modulation") or slots.get("modulation") or "bpsk"
         )
-        sps = 1 if str(self._state.project.config.get("recipe") or "").startswith("rx_") else 4
+        sps = 4
         metrics = ctx.extra.setdefault("metrics", {})
+        plot_for = {
+            "evm": ("constellation",),
+            "ber": (),
+            "spectrum": ("spectrum",),
+            "constellation": ("constellation",),
+            "eye": ("eye",),
+        }
+        plots: list[str] = []
         for kind in requested:
             if kind in ("evm", "ber", "spectrum"):
                 args = {
                     "kind": kind,
                     "modulation": modulation,
-                    "sps": sps,
+                    "sps": 1 if kind == "ber" else sps,
                 }
                 if kind == "ber":
                     args.update({"probe_id": "sink", "tx_bits_probe": "tx_sink"})
@@ -1650,21 +1850,28 @@ class ServiceAgent:
                     )] = measured["value"]
                     if measured.get("peak_bin") is not None:
                         metrics["spectrum_peak_bin"] = measured["peak_bin"]
+            for plot_kind in plot_for.get(kind, ()):
+                if plot_kind not in plots:
+                    plots.append(plot_kind)
+        for kind in plots:
             plot_name = {
                 "spectrum": "plot_spectrum",
                 "constellation": "plot_constellation",
                 "eye": "plot_eye",
             }.get(kind)
-            if plot_name:
-                plotted = registry.call(plot_name, {"sps": sps} if plot_name != "plot_spectrum" else {}, ctx)
-                self._record_tool_result(ctx, plot_name, plotted)
-                if plotted.get("path"):
-                    key = {
-                        "plot_spectrum": "spectrum_png",
-                        "plot_constellation": "constellation_png",
-                        "plot_eye": "eye_png",
-                    }[plot_name]
-                    ctx.extra.setdefault("artifacts", {})[key] = plotted["path"]
+            if not plot_name:
+                continue
+            plotted = registry.call(
+                plot_name, {"sps": sps} if plot_name != "plot_spectrum" else {}, ctx
+            )
+            self._record_tool_result(ctx, plot_name, plotted)
+            if plotted.get("path"):
+                key = {
+                    "plot_spectrum": "spectrum_png",
+                    "plot_constellation": "constellation_png",
+                    "plot_eye": "eye_png",
+                }[plot_name]
+                ctx.extra.setdefault("artifacts", {})[key] = plotted["path"]
         if diagnose:
             diagnosis = registry.call("debug_by_metric", {
                 "metric": "evm" if "evm" in requested else "spectrum",
@@ -1672,13 +1879,26 @@ class ServiceAgent:
                 "sps": sps,
             }, ctx)
             self._record_tool_result(ctx, "debug_by_metric", diagnosis)
-            issue = "偏高" in str(diagnosis.get("verdict") or "")
+            issue = (
+                "偏高" in str(diagnosis.get("verdict") or "")
+                and not diagnosis.get("meets_claim")
+            )
+            forbidden = set(
+                (workflow.intent.context if workflow else {}).get("forbidden_capabilities")
+                or []
+            )
+            readonly = bool(
+                ctx.extra.get("mutation_forbidden") or "modify_project" in forbidden
+            )
             reply = self._fold(
                 ctx,
                 diagnosis.get("narrative") or diagnosis.get("error") or "诊断完成。",
-                source="deterministic-stage", ok=not issue and bool(diagnosis.get("ok")),
+                source="deterministic-stage",
+                ok=bool(diagnosis.get("ok")) if readonly else (
+                    not issue and bool(diagnosis.get("ok"))
+                ),
             )
-            if issue:
+            if issue and not readonly:
                 block = ctx.blocks.get("chan")
                 parameter = (getattr(block, "params", None) or {}).get("noise_voltage")
                 try:
@@ -1699,6 +1919,7 @@ class ServiceAgent:
         return self._fold(
             ctx, "工程检查与测量完成。", source="deterministic-stage", ok=True
         )
+
     def _record_tool_result(
         self,
         ctx: ToolContext,
@@ -1820,7 +2041,10 @@ class ServiceAgent:
                 invocation.name in ("explain_error", "debug_by_metric", "diagnose_by_metric")
                 for invocation in reply.tool_invocations
             )
-            if ok is not None and not bool(ok):
+            if reply.stage == "DENY":
+                result["ok"] = False
+                result["outcome"] = outcome or "failed"
+            elif ok is not None and not bool(ok):
                 result["ok"] = False
                 result["outcome"] = outcome or "failed"
             self._workflow.accept_result(result)
@@ -1867,28 +2091,26 @@ class ServiceAgent:
 
     def _project_stage_effects(self, stage: Any, reply: AgentReply) -> None:
         """Commit host-observed artifacts for deterministic and LLM executors."""
+        from ..workflow.completion import MUTATING_TOOLS, invocation_succeeded
+
         grc_path = str((reply.artifacts or {}).get("grc_path") or "")
         if not grc_path:
             return
         successful_tools = {
-            item.name for item in (reply.tool_invocations or []) if item.ok
+            item.name
+            for item in (reply.tool_invocations or [])
+            if invocation_succeeded(item)
         }
-        mutating_tools = {
-            "design_link",
-            "design_flowgraph",
-            "render_grc",
-            "apply_grc_diff",
-            "apply_flowgraph_patch",
-            "build_ble_uhd_tx_flowgraph",
-            "build_ble_pluto_tx_flowgraph",
-            "arm_hardware_flowgraph",
-            "build_usrp_rx_spectrum_flowgraph",
-        }
-        if not successful_tools.intersection(mutating_tools):
+        if not successful_tools.intersection(MUTATING_TOOLS):
             return
         workflow = self._workflow.workflow
         self._state.project.grc_path = grc_path
         semantic_hash = _flowgraph_semantic_hash(grc_path)
+        old_hash = str(
+            self._state.project.config.get("flowgraph_semantic_hash") or ""
+        )
+        if old_hash and semantic_hash == old_hash:
+            return
         if semantic_hash:
             self._state.project.config["flowgraph_semantic_hash"] = semantic_hash
         if workflow and self._state.project.flowgraph_version <= int(
@@ -1904,6 +2126,24 @@ class ServiceAgent:
                 value = slots.get(key)
                 if value not in (None, "", []):
                     self._state.project.config[key] = value
+            target_recipe = str(slots.get("target_recipe") or "")
+            if target_recipe:
+                self._state.project.config["recipe"] = target_recipe
+            for key in ("modulation", "channel"):
+                value = slots.get(key)
+                if value in (None, "", []):
+                    continue
+                existing = next(
+                    (item for item in self._state.spec.decisions if item.key == key),
+                    None,
+                )
+                if existing is None:
+                    self._state.spec.decisions.append(
+                        Decision(key=key, value=value, source="apply")
+                    )
+                else:
+                    existing.value = value
+                    existing.source = "apply"
             hardware = str(slots.get("hardware") or "")
             if hardware:
                 self._state.project.config["desired_device"] = {
@@ -2036,6 +2276,23 @@ class ServiceAgent:
                     False,
                     artifact=str(terminal.get("log_path") or ""),
                 )
+        output = "".join(
+            str(item.get("output") or "")
+            for name in (
+                "start_flowgraph", "query_runtime_status",
+                "stop_flowgraph", "emergency_stop",
+            )
+            for item in results.get(name, [])
+        )
+        if "UUU" in output or output.count("U") >= 8:
+            self._record_claim(
+                "rf_runtime_underflow",
+                "Hardware runtime log contains GNU Radio underflow markers",
+                "hardware",
+                "runtime_underflow",
+                {"run_id": (terminal or started or {}).get("run_id"), "markers": "U"},
+                False,
+            )
 
     def _record_claim(
         self,
@@ -2225,6 +2482,8 @@ class ServiceAgent:
             self._state.project.grc_path = artifacts["grc_path"]
 
         # 把工具事件折叠为 tool_invocations,并落会话事件流
+        from ..workflow.completion import tool_payload_succeeded
+
         for ev in ctx.extra.get("events", []):
             kind = ev.get("kind", "")
             args = dict(ev.get("args") or {})
@@ -2237,8 +2496,7 @@ class ServiceAgent:
                 explicit_confirmation = True
             reply.tool_invocations.append(ToolInvocation(
                 name=kind, args=args, result=payload,
-                ok=bool(payload.get("ok", True) if isinstance(payload, dict)
-                        else True)))
+                ok=tool_payload_succeeded(payload)))
             if not ev.get("logged"):
                 _store.append_session_event(
                     self.session_id,
@@ -2275,11 +2533,16 @@ class ServiceAgent:
         export_dir = str(ctx.extra.get("export_dir") or "")
         if export_dir:
             exported = []
+            seen_src = set()
             for value in artifacts.values():
                 if not isinstance(value, str) or not os.path.isfile(value):
                     continue
                 if os.path.basename(value) == "manifest.json":
                     continue
+                abs_src = os.path.abspath(value)
+                if abs_src in seen_src:
+                    continue
+                seen_src.add(abs_src)
                 copied = _store.export_artifact(value, export_dir)
                 if copied:
                     exported.append(copied)

@@ -1,7 +1,7 @@
 """tools_lc:把 DeepRadio 的确定性建图工具桥接为 LangChain ``@tool``。
 
 ``create_deep_agent`` 的工具是 LangChain 工具。DeepRadio 已有一套确定性工具链
-(``grc.agent.tools.registry`` + ``skills.design_link`` 宏),它既是无 LLM 降级
+(``grc.agent.tools.registry`` + ``grc.agent.tools.design_link`` 宏),它既是无 LLM 降级
 底座,也应作为 subagent 在 function-calling 时的真实执行工具——**单一事实源**。
 
 桥接策略(与 deepagents 内部 runtime API 解耦,跨版本稳定):
@@ -113,12 +113,13 @@ def build_grc_tools(
         """按一句通信意图端到端搭出一张可跑流图并自检。
 
         选配方 -> 逐块建图 -> critic 校验 -> 可选仿真取指标 -> 存 .grc。
-        参数: intent(自然语言意图) 或 recipe(配方名 tone_noise/bpsk_awgn/
-        qpsk_awgn/ofdm_awgn)择一;simulate 是否顺带仿真取指标。
+        参数: intent(自然语言意图) 或 recipe(配方名,见 recipe_index /
+        knowledge.recipes)择一;simulate 是否顺带仿真取指标。
         """
         result = _design_link(ctx, profile=profile, intent=intent,
                               recipe=recipe, simulate=simulate, render=True)
         _rec_event(ctx, "design_link", {
+            "ok": result.get("ok"),
             "recipe": result.get("recipe"),
             "valid": result.get("valid"),
             "steps": result.get("steps", []),
@@ -228,7 +229,7 @@ def build_grc_tools(
 
     @tool
     def list_examples(keyword: str = "") -> str:
-        """List bundled flowgraph examples matching an optional keyword."""
+        """List deterministic recipes and optional regression samples."""
         return _call("list_examples", {"keyword": keyword})
 
     @tool
@@ -419,6 +420,23 @@ def build_grc_tools(
         return json.dumps(result, ensure_ascii=False)
 
     @tool
+    def build_sdr_tx_flowgraph(
+        device_type: str,
+        center_freq: float,
+        sample_rate: float,
+    ) -> str:
+        """Build an unarmed analog-source → SDR TX sink flowgraph without starting RF."""
+        result = registry.call("build_sdr_tx_flowgraph", {
+            "device_type": device_type,
+            "center_freq": center_freq,
+            "sample_rate": sample_rate,
+        }, ctx)
+        if result.get("grc_path"):
+            _merge_artifacts(ctx, {"grc_path": result["grc_path"]})
+        _rec_event(ctx, "build_sdr_tx_flowgraph", result)
+        return json.dumps(result, ensure_ascii=False)
+
+    @tool
     def build_usrp_rx_spectrum_flowgraph(
         center_freq: float,
         sample_rate: float,
@@ -498,6 +516,7 @@ def build_grc_tools(
         build_ble_uhd_tx_flowgraph,
         build_ble_pluto_tx_flowgraph,
         arm_hardware_flowgraph,
+        build_sdr_tx_flowgraph,
         build_usrp_rx_spectrum_flowgraph,
         discover_devices,
         probe_device,

@@ -52,7 +52,7 @@ def design_link(ctx, profile=None, intent: str = "",
     if state is not None:
         from ..state import ALLOW, create_snapshot, gate
 
-        new_modulation = _guess_modulation(rc.name)
+        new_modulation = _recipes.guess_modulation(rc.name)
         old_modulation = str(state.project.config.get("modulation") or "")
         if (
             "modulation" in state.coordination.locked_constraints
@@ -167,20 +167,22 @@ def design_link(ctx, profile=None, intent: str = "",
         return {"ok": False, "error": f"init 失败: {r.get('error')}",
                 "steps": steps}
 
-    # 2) probe 落盘路径(把配方里的占位符替换成真实路径)
+    # 2) probe 落盘路径：.grc 里写相对文件名，仿真读回仍用绝对路径
     out_dir = ctx.out_dir or os.getcwd()
     os.makedirs(out_dir, exist_ok=True)
-    probe_path = os.path.join(out_dir, f"{fid}_rx.bin")
-    tx_probe_path = os.path.join(out_dir, f"{fid}_tx.bin")
+    probe_name = f"{fid}_rx.bin"
+    tx_probe_name = f"{fid}_tx.bin"
+    probe_path = os.path.join(out_dir, probe_name)
+    tx_probe_path = os.path.join(out_dir, tx_probe_name)
 
     # 3) 逐块添加
     for key, bid, params in rc.blocks:
         p = dict(params)
         for k, v in list(p.items()):
             if v == "__PROBE__":
-                p[k] = repr(probe_path)
+                p[k] = repr(probe_name)
             elif v == "__TX_PROBE__":
-                p[k] = repr(tx_probe_path)
+                p[k] = repr(tx_probe_name)
         _c("add_block", key=key, id=bid, params=p)
 
     # 4) 逐条连接(支持 (src,dst) 或 (src,dst,sp,dp))
@@ -223,16 +225,17 @@ def design_link(ctx, profile=None, intent: str = "",
         if sim.get("ok"):
             artifacts["out_dir"] = sim.get("out_dir")
             if "evm" in rc.metrics:
-                mod = _guess_modulation(rc.name)
+                mod = _recipes.guess_modulation(rc.name)
                 m = _c("read_metric", kind="evm", probe_id=probe_id,
                        modulation=mod, sps=rc.sps)
                 if m.get("ok"):
                     metrics["evm_pct"] = m["value"]
                     metrics["n_symbols"] = m.get("n_symbols")
             if "ber" in rc.metrics:
-                mod = _guess_modulation(rc.name)
+                mod = _recipes.guess_modulation(rc.name)
+                ber_sps = 1 if rc.probe_dtype in {"uint8", "int8"} else rc.sps
                 m = _c("read_metric", kind="ber", probe_id=probe_id,
-                       modulation=mod, sps=rc.sps,
+                       modulation=mod, sps=ber_sps,
                        tx_bits_probe=rc.tx_probe_block_id or "")
                 if m.get("ok"):
                     metrics["ber"] = m["value"]
@@ -271,7 +274,7 @@ def design_link(ctx, profile=None, intent: str = "",
         if artifacts.get("grc_path"):
             state.project.grc_path = artifacts["grc_path"]
         state.project.config["recipe"] = rc.name
-        state.project.config["modulation"] = _guess_modulation(rc.name)
+        state.project.config["modulation"] = _recipes.guess_modulation(rc.name)
         state.project.config["canvas_dirty"] = False
         from .state_tools import apply_proposed_decisions
 
@@ -289,17 +292,6 @@ def design_link(ctx, profile=None, intent: str = "",
     return out
 
 
-def _guess_modulation(recipe_name: str) -> str:
-    n = recipe_name.lower()
-    if "qpsk" in n:
-        return "qpsk"
-    if "bpsk" in n:
-        return "bpsk"
-    if "ofdm" in n:
-        return "ofdm"
-    return ""
-
-
 def _profile_of(ctx):
     try:
         return ctx.extra.get("profile")
@@ -312,7 +304,7 @@ def _profile_of(ctx):
     description=(
         "宏工具:按一句通信意图端到端搭出一张可跑流图(选配方→逐块建图→"
         "critic 自检→可选仿真取指标→存 .grc)。适合 BUILD 阶段一步到位;"
-        "给 intent(自然语言)或 recipe(配方名 tone_noise/bpsk_awgn/qpsk_awgn/ofdm_awgn)之一。"),
+        "给 intent(自然语言)或 recipe(配方名,见 knowledge.recipes)之一。"),
     parameters={
         "type": "object",
         "properties": {

@@ -33,7 +33,7 @@
     "MODIFY_PROJECT": {
       "description": "修改已有 GNU Radio 工程",
       "stages": [
-        {"id": "inspect_and_plan", "interaction": "autonomous", "recommended_agents": ["spec_agent", "flowgraph_agent"], "completion": ["change_plan_created"], "on": {"passed": "change_confirmation", "errored": "stop"}},
+        {"id": "inspect_and_plan", "interaction": "autonomous", "recommended_agents": ["spec_agent", "flowgraph_agent"], "completion": ["change_plan_created"], "on": {"passed": "change_confirmation", "failed": "change_confirmation", "failed_without_improvement": "change_confirmation", "errored": "stop"}},
         {"id": "change_confirmation", "interaction": "conditional_checkpoint", "when": {"any": ["modulation_change", "recipe_change", "multi_block_change", "hardware_change"]}, "recommended_agents": ["flowgraph_agent"], "completion": ["change_decision_recorded"], "on": {"approved": "apply_and_verify", "rejected": "cancelled", "not_required": "apply_and_verify"}},
         {"id": "apply_and_verify", "interaction": "autonomous", "recommended_agents": ["flowgraph_agent", "verification_agent", "diagnosis_agent"], "completion": ["flowgraph_saved", "structural_validation_completed", "affected_claims_evaluated"], "max_attempts": 2, "on": {"passed": "completed", "failed_with_improvement": "apply_and_verify", "failed_without_improvement": "waiting_user", "errored": "stop"}}
       ]

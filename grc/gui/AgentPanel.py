@@ -291,6 +291,7 @@ class AgentPanel(Gtk.VBox):
 
         # 多轮协商 Agent 实例 (惰性创建, 避免无 gnuradio 时导入报错)。
         self._agent = None
+        self._canvas_path = ""
         # baseline 一句话直出的历史 [(role, content), ...]。
         self._baseline_history = []
 
@@ -433,6 +434,11 @@ class AgentPanel(Gtk.VBox):
             self._agent.ctx.tool_ctx.out_dir = self._out_dir
             # 把当前下拉档位应用到画像。
             self._apply_level_to_agent()
+            if self._canvas_path:
+                try:
+                    self._agent.bind_opened_project(self._canvas_path)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("绑定画布工程失败: %s", exc)
         return self._agent
 
     def _on_apply_workflow(self, _panel, modulation, channel, recipe):
@@ -576,6 +582,28 @@ class AgentPanel(Gtk.VBox):
             "画布已保存，工程版本 {}，Claim 待重验。".format(
                 result.get("version", "?")))
 
+    def notify_canvas_opened(self, file_path):
+        """File→Open / 打开最近文件后，把当前画布绑定为 current_project。"""
+        path = os.path.abspath(file_path or "")
+        if not path or not os.path.isfile(path) or not path.endswith(".grc"):
+            return
+        self._canvas_path = path
+        if self._agent is None:
+            return
+        try:
+            self._agent.bind_opened_project(path)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("绑定打开的流图失败: %s", exc)
+
+    def notify_canvas_cleared(self):
+        self._canvas_path = ""
+        if self._agent is None:
+            return
+        try:
+            self._agent.clear_opened_project()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("清除画布工程失败: %s", exc)
+
     def _apply_level_to_agent(self):
         """把档位下拉的选择应用到 Agent 的 profile / adaptive 开关。"""
         if self._agent is None:
@@ -669,6 +697,7 @@ class AgentPanel(Gtk.VBox):
             except OSError as exc:
                 log.warning("归档 Workflow 失败: %s", exc)
         self._agent = None
+        self._canvas_path = ""
         self._baseline_history = []
         for child in self._log_box.get_children():
             self._log_box.remove(child)
@@ -708,6 +737,8 @@ class AgentPanel(Gtk.VBox):
         """子线程: 走 agent.step 多轮协商。UI 更新回主线程。"""
         try:
             agent = self._ensure_agent()
+            if self._canvas_path:
+                agent.bind_opened_project(self._canvas_path)
             reply = agent.step(text)
             GLib.idle_add(self._on_agent_reply, reply)
         except Exception as e:  # noqa: BLE001

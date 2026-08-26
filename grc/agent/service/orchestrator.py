@@ -33,7 +33,7 @@ _STAGE_TOOLS = {
     "inspect_and_plan": {"inspect_flowgraph", "spec_clarify", "spec_commit"},
     "inspect_and_diagnose": {
         "inspect_flowgraph", "validate_flowgraph", "run_simulation", "read_metric",
-        "plot_spectrum", "plot_constellation", "plot_eye", "diagnose_by_metric",
+        "plot_spectrum", "plot_constellation", "diagnose_by_metric",
         "explain_error",
     },
     "inspect_and_measure": {
@@ -50,10 +50,12 @@ _STAGE_TOOLS = {
     },
     "tx_build_and_validate": {
         "select_recipe", "design_flowgraph", "validate_flowgraph",
+        "build_sdr_tx_flowgraph",
     },
     "build_and_verify": {
         "select_recipe", "design_flowgraph", "validate_flowgraph",
         "run_simulation", "read_metric", "plot_spectrum",
+        "build_sdr_tx_flowgraph",
     },
     "apply_and_verify": {
         "design_flowgraph", "apply_grc_diff", "apply_flowgraph_patch",

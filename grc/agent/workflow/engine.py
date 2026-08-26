@@ -14,6 +14,7 @@ from typing import Any, Callable, Dict, Optional
 from .completion import KNOWN_COMPLETIONS
 from .schema import Checkpoint, Stage, Workflow, WorkflowIntent
 from ..tools.hardware_profiles import resolve_hardware_profile
+from ..tools.state_tools import is_read_only_request
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,17 @@ _KNOWN_AGENTS = frozenset(
     }
 )
 _TERMINAL_TARGETS = frozenset({"completed", "cancelled", "stop", "waiting_user"})
+_TASK_TYPES = frozenset(
+    {
+        "END_TO_END_SIM",
+        "TX_BUILD",
+        "RX_BUILD",
+        "DIAGNOSE",
+        "MODIFY_PROJECT",
+        "OBSERVE",
+        "HARDWARE_CONFIGURE",
+    }
+)
 _TASK_LABELS = {
     "END_TO_END_SIM": "端到端仿真",
     "TX_BUILD": "构建发射链路",
@@ -141,18 +153,44 @@ def _offline_forbidden(text: str) -> set[str]:
     return forbidden
 
 
-def _task_type_from_capabilities(capabilities: list[str], current: str) -> str:
+def _task_type_from_capabilities(
+    capabilities: list[str],
+    current: str,
+    *,
+    slots: Dict[str, Any] | None = None,
+    forbidden: list[str] | None = None,
+) -> str:
+    blocked = set(forbidden or [])
     caps = set(capabilities or [])
+    slots = dict(slots or {})
     if "diagnose" in caps:
         return "DIAGNOSE"
     if "modify_project" in caps:
         return "MODIFY_PROJECT"
+    if (
+        "protocol" in caps
+        and slots.get("operation") == "deploy"
+        and "hardware_configure" not in blocked
+    ):
+        return "HARDWARE_CONFIGURE"
+    hardware_primary = (
+        "hardware_configure" in caps
+        and "deploy" not in caps
+        and "hardware_runtime" not in caps
+        and not slots.get("requires_build")
+    )
+    if hardware_primary:
+        return "HARDWARE_CONFIGURE"
     if "build_rx" in caps:
         return "RX_BUILD"
     if "build_tx" in caps:
         return "TX_BUILD"
     if "hardware_configure" in caps:
         return "HARDWARE_CONFIGURE"
+    if "build_signal" in caps:
+        return "END_TO_END_SIM"
+    if "observe" in caps:
+        return "OBSERVE"
     if current == "HARDWARE_CONFIGURE":
         return "END_TO_END_SIM"
     if current in _TASK_TYPES:
@@ -442,20 +480,9 @@ class WorkflowEngine:
         )
         slots = self._parse_slots(text)
         capabilities = self._detect_capabilities(text, slots, has_project)
-        if "diagnose" in capabilities:
-            task_type = "DIAGNOSE"
-        elif "modify_project" in capabilities:
-            task_type = "MODIFY_PROJECT"
-        elif "build_rx" in capabilities:
-            task_type = "RX_BUILD"
-        elif "build_tx" in capabilities:
-            task_type = "TX_BUILD"
-        elif "observe" in capabilities and has_project:
-            task_type = "OBSERVE"
-        elif "hardware_configure" in capabilities:
-            task_type = "HARDWARE_CONFIGURE"
-        else:
-            task_type = "END_TO_END_SIM"
+        task_type = _task_type_from_capabilities(
+            capabilities, "END_TO_END_SIM", slots=slots
+        )
         project_config = getattr(getattr(shared_state, "project", None), "config", {})
         slot_sources = {key: "user" for key, value in slots.items() if value not in (None, "", [])}
         if slots.get("protocol") == "ble":
@@ -543,12 +570,19 @@ class WorkflowEngine:
             configured = False
         if configured:
             intent = complete_intent(intent, text, shared_state)
+        if "diagnose" in intent.capabilities and is_read_only_request(text):
+            forbidden = set(intent.context.get("forbidden_capabilities") or [])
+            forbidden.add("modify_project")
+            intent.context["forbidden_capabilities"] = sorted(forbidden)
         intent.capabilities = [
             name for name in intent.capabilities
             if name not in set(intent.context.get("forbidden_capabilities") or ())
         ]
         intent.task_type = _task_type_from_capabilities(
-            intent.capabilities, intent.task_type
+            intent.capabilities,
+            intent.task_type,
+            slots=intent.slots,
+            forbidden=list(intent.context.get("forbidden_capabilities") or []),
         )
         intent.missing_slots = self._missing_slots(
             intent.task_type, intent.slots, shared_state, intent.capabilities
@@ -580,6 +614,12 @@ class WorkflowEngine:
         add("modify_project", modify and (has_project or bool(slots.get("target_project"))))
         add("build_rx", build and rx)
         add("build_tx", build and tx)
+        add(
+            "build_tx",
+            hardware
+            and tx
+            and any(word in low for word in ("流图", "flowgraph", "flow graph")),
+        )
         add("build_signal", build and not rx and not tx)
         add("hardware_configure", hardware)
         add("observe", observe)
@@ -662,7 +702,10 @@ class WorkflowEngine:
             slots["local_name"] = name.group(1)
         if any(word in low for word in ("接收机", "receiver", "解调", " rx")):
             slots["direction"] = "rx"
-        elif any(word in low for word in ("发射机", "transmitter", "发射链", " tx")):
+        elif any(
+            word in low
+            for word in ("发射机", "transmitter", "发射链", "发射流图", " tx")
+        ):
             slots["direction"] = "tx"
         elif modulation:
             slots["direction"] = "transceiver"
@@ -684,6 +727,13 @@ class WorkflowEngine:
             match = re.search(pattern, low, flags=re.IGNORECASE)
             if match:
                 slots[key] = float(match.group(1)) * units[match.group(2).lower()]
+        if not slots.get("sample_rate"):
+            msps = re.search(
+                r"(\d+(?:\.\d+)?)\s*m(?:sps|(?:ega)?(?:samples?)\s*/\s*s)",
+                low,
+            )
+            if msps:
+                slots["sample_rate"] = float(msps.group(1)) * 1e6
         if not slots.get("carrier_frequency") and any(
             marker in low for marker in ("硬件", "usrp", "sdr", "信号", "carrier")
         ):
@@ -849,7 +899,12 @@ class WorkflowEngine:
             and "protocol" in intent.capabilities
         )
         if deploying_protocol:
-            selected = candidate.get("deploy_stages") or []
+            selected = list(candidate.get("deploy_stages") or [])
+            if not selected:
+                hardware = self.catalog["task_candidates"].get("HARDWARE_CONFIGURE") or {}
+                selected = list(hardware.get("deploy_stages") or [])
+            if not selected:
+                selected = list(candidate.get("stages") or [])
         elif (
             intent.task_type == "HARDWARE_CONFIGURE"
             and "hardware_runtime" in intent.capabilities
@@ -932,6 +987,18 @@ class WorkflowEngine:
         stages = [stage for group in groups for stage in group]
         if len({stage.id for stage in stages}) != len(stages):
             raise ValueError("能力组合产生重复 Stage id")
+
+        forbidden = set(intent.context.get("forbidden_capabilities") or [])
+        if "modify_project" in forbidden:
+            for stage in stages:
+                if stage.id == "inspect_and_diagnose":
+                    stage.transitions["failed"] = "completed"
+                    stage.transitions["failed_without_improvement"] = "completed"
+            stages = [
+                stage
+                for stage in stages
+                if stage.id not in {"repair_confirmation", "repair_and_verify"}
+            ]
 
         # Hardware observation needs structural evidence from the build/change
         # stage.  This is capability-driven and applies to any compatible Task.
@@ -1284,6 +1351,9 @@ class WorkflowEngine:
             or self.workflow.intent.validation_errors
             else "approval"
             if stage and stage.checkpoint
+            else "denied"
+            if self.workflow.execution_status == "waiting"
+            and _is_mutation_denied(stage)
             else "recovery"
             if self.workflow.execution_status == "waiting"
             else ""
@@ -1297,6 +1367,11 @@ class WorkflowEngine:
                     list(self.workflow.intent.missing_slots)
                     + list(self.workflow.intent.validation_errors)
                 )
+            )
+        elif wait_kind == "denied":
+            waiting_reason = str(
+                ((stage.result if stage else {}) or {}).get("note")
+                or "改图被拒绝，工程保持不变。"
             )
         elif wait_kind == "recovery":
             waiting_reason = str(
@@ -1455,6 +1530,18 @@ class WorkflowEngine:
             self._event_sink(event, data)
 
 
+def _is_mutation_denied(stage: Any) -> bool:
+    """True when waiting because a mutating tool was refused this turn."""
+    result = (stage.result if stage else {}) or {}
+    note = str(result.get("note") or "")
+    if any(marker in note for marker in ("禁止改图", "本轮禁止")):
+        return True
+    if "DENY" in note:
+        return True
+    codes = (result.get("acceptance") or {}).get("failure_codes") or []
+    return "REPLY_STATUS_REJECTED" in codes and "禁止改图" in note
+
+
 def _result_fingerprint(result: Dict[str, Any], ok: bool, outcome: str) -> str:
     payload = {
         "ok": ok,
@@ -1469,17 +1556,6 @@ def _result_fingerprint(result: Dict[str, Any], ok: bool, outcome: str) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
 
 
-_TASK_TYPES = frozenset(
-    {
-        "END_TO_END_SIM",
-        "TX_BUILD",
-        "RX_BUILD",
-        "DIAGNOSE",
-        "MODIFY_PROJECT",
-        "OBSERVE",
-        "HARDWARE_CONFIGURE",
-    }
-)
 _CAPABILITIES = frozenset(
     {
         "diagnose",
@@ -1505,6 +1581,8 @@ _PROMPT = """你是 DeepRadio 的 Intent 校正器。只输出一个 JSON 对象
 - confidence: 0~1
 规则:
 - 否定、只仿真、不要硬件/射频 优先于关键词；不要因为出现「硬件」就打开 hardware_configure
+- 配置/接入 SDR 且停在确认、禁止 deploy 时，task_type 保持 HARDWARE_CONFIGURE；build_tx 只参与 Stage 组合
+- 不要因为「发射流图」就把配置任务改成 TX_BUILD
 - 不得把实时硬件观察改写成离线仿真
 - 不得因为 2.4GHz 就判定 BLE，除非用户说了 ble/蓝牙/发射广播
 - 用户已给出的槽位不得覆盖

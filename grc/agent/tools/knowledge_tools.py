@@ -100,7 +100,7 @@ def describe_block(ctx: ToolContext, key: str):
 
 @tool(
     name="list_examples",
-    description="列举可参考的 .grc 样例/配方,用于借鉴一条完整链路的搭法。",
+    description="列举确定性配方与可选回归样例,用于借鉴一条完整链路的搭法。",
     parameters={
         "type": "object",
         "properties": {
@@ -110,7 +110,8 @@ def describe_block(ctx: ToolContext, key: str):
     group="knowledge",
 )
 def list_examples(ctx: ToolContext, keyword: str = ""):
-    # Manual regressions live under dev_docs/regression, not a live agent layer.
+    # Recipes are the live examples. Optional manual regressions live under
+    # dev_docs/regression (moved out of grc/agent/examples).
     here = os.path.dirname(os.path.abspath(__file__))
     repo = os.path.abspath(os.path.join(here, os.pardir, os.pardir, os.pardir))
     ex_dir = os.path.join(repo, "dev_docs", "regression")

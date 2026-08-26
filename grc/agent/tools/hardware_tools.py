@@ -173,11 +173,6 @@ def _rf_armed(ctx: ToolContext, grc_path: str) -> bool:
     )
 
 
-def normalize_sdr_hardware(device_type: str) -> str:
-    """Compatibility alias for the declarative HardwareProfile registry."""
-    return normalize_hardware(device_type)
-
-
 def _device_command(device_type: str, *, probe: bool) -> list[str]:
     profile = resolve_hardware_profile(device_type)
     return profile.command(probe=probe) if profile else []
@@ -491,6 +486,11 @@ def emergency_stop(ctx: ToolContext) -> Dict[str, Any]:
 
 def _persist_runtime_result(ctx: ToolContext, result: Dict[str, Any]) -> Dict[str, Any]:
     output = str(result.get("output") or "")
+    if not (
+        result.get("run_id") or result.get("running") or output
+    ):
+        _project_runtime_state(ctx, result)
+        return dict(result)
     enriched = dict(result)
     if output:
         directory = Path(ctx.out_dir or os.getcwd()) / "hardware_runtime"
@@ -516,6 +516,189 @@ def _persist_runtime_result(ctx: ToolContext, result: Dict[str, Any]) -> Dict[st
         pass
     _project_runtime_state(ctx, enriched)
     return enriched
+
+
+def _disable_block(ctx: ToolContext, block_id: str) -> None:
+    block = ctx.blocks.get(block_id)
+    if block is not None:
+        block.state = "disabled"
+
+
+def _sdr_tx_sink_candidates(
+    hardware: str, center_freq: float, sample_rate: float
+) -> list[tuple[str, str, Dict[str, str], int]]:
+    """Return (key, id, params, dst_port) candidates for an unarmed TX sink."""
+    profile = resolve_hardware_profile(hardware)
+    key = profile.key if profile else (hardware or "").strip().lower()
+    freq = str(float(center_freq))
+    rate = str(float(sample_rate))
+    if key in {"b210", "usrp"} or (profile and profile.driver_family == "uhd"):
+        return [(
+            "uhd_usrp_sink",
+            "sdr_sink",
+            {
+                "type": "fc32",
+                "dev_addr": repr(device_args_for(key or "usrp")),
+                "samp_rate": rate,
+                "center_freq0": freq,
+                "gain0": "0",
+                "ant0": repr("TX/RX"),
+            },
+            1,
+        )]
+    if key == "pluto" or (profile and profile.driver_family == "iio"):
+        pluto = {
+            "type": "fc32",
+            "uri": repr(""),
+            "frequency": str(int(float(center_freq))),
+            "samplerate": str(int(float(sample_rate))),
+            "bandwidth": str(int(float(sample_rate))),
+            "buffer_size": "32768",
+            "cyclic": "False",
+            "attenuation1": "30.0",
+            "filter_source": "'Auto'",
+        }
+        return [
+            ("iio_pluto_sink", "sdr_sink", dict(pluto), 0),
+            ("iio_fmcomms2_sink_fc32", "sdr_sink", dict(pluto), 0),
+        ]
+    if key == "hackrf":
+        return [(
+            "osmosdr_sink",
+            "sdr_sink",
+            {
+                "args": repr("hackrf=0"),
+                "samp_rate": rate,
+                "freq": freq,
+                "gain": "0",
+            },
+            0,
+        )]
+    if key == "limesdr":
+        return [(
+            "limesdr_sink",
+            "sdr_sink",
+            {"freq": freq, "samp_rate": rate, "gain": "0"},
+            0,
+        )]
+    return []
+
+
+@tool(
+    name="build_sdr_tx_flowgraph",
+    description=(
+        "DeepRadio compose tool: analog source → SDR TX sink, left unarmed. "
+        "Saves .grc without starting RF. Device family selects the sink block."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "device_type": {"type": "string"},
+            "center_freq": {"type": "number"},
+            "sample_rate": {"type": "number"},
+        },
+        "required": ["device_type", "center_freq", "sample_rate"],
+    },
+    group="hardware",
+    origin="deepradio_compose",
+    runtime="gnuradio_blocks",
+)
+def build_sdr_tx_flowgraph(
+    ctx: ToolContext,
+    device_type: str,
+    center_freq: float,
+    sample_rate: float,
+) -> Dict[str, Any]:
+    freq = float(center_freq)
+    rate = float(sample_rate)
+    if freq <= 0 or rate <= 0:
+        return {"ok": False, "error": "中心频率和采样率必须为正数"}
+    candidates = _sdr_tx_sink_candidates(device_type, freq, rate)
+    if not candidates:
+        return {
+            "ok": False,
+            "error": f"没有覆盖 {device_type or 'SDR'} 发射 endpoint 的确定性骨架",
+        }
+    steps: list[Dict[str, Any]] = []
+
+    def invoke(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        result = call(name, args, ctx)
+        steps.append({
+            "tool": name, "ok": bool(result.get("ok")), "error": result.get("error"),
+        })
+        return result
+
+    hardware = normalize_hardware(device_type)
+    invoke(
+        "init_flow_graph",
+        {"flowgraph_id": f"{hardware or 'sdr'}_tx", "generate_options": "no_gui"},
+    )
+    invoke(
+        "add_block",
+        {"key": "variable", "id": "samp_rate", "params": {"value": str(rate)}},
+    )
+    invoke(
+        "add_block",
+        {
+            "key": "analog_sig_source_x",
+            "id": "src",
+            "params": {
+                "type": "complex",
+                "samp_rate": "samp_rate",
+                "waveform": "analog.GR_COS_WAVE",
+                "freq": "1000",
+                "amplitude": "0.3",
+            },
+        },
+    )
+    added = {"ok": False}
+    sink_key = ""
+    dst_port = 0
+    for sink_key, sink_id, params, dst_port in candidates:
+        added = invoke("add_block", {"key": sink_key, "id": sink_id, "params": params})
+        if added.get("ok"):
+            break
+    if not added.get("ok"):
+        return {
+            "ok": False,
+            "valid": False,
+            "error": added.get("error") or f"当前环境没有 {device_type} 发射 sink",
+            "steps": steps,
+            "not_started": True,
+            "armed": False,
+        }
+    connect_args: Dict[str, Any] = {"src_id": "src", "dst_id": "sdr_sink"}
+    if dst_port:
+        connect_args["dst_port"] = dst_port
+    invoke("connect", connect_args)
+    _disable_block(ctx, "sdr_sink")
+    validation = invoke("validate_flowgraph", {})
+    rendered = invoke("render_grc", {}) if validation.get("valid") else {"ok": False}
+    if rendered.get("path"):
+        ctx.extra.setdefault("artifacts", {})["grc_path"] = rendered["path"]
+        state = ctx.extra.get("state")
+        if state is not None:
+            state.project.grc_path = rendered["path"]
+            state.project.config.update({
+                "hardware": hardware,
+                "direction": "tx",
+                "carrier_frequency": freq,
+                "sample_rate": rate,
+                "rf_armed": False,
+            })
+    return {
+        "ok": bool(validation.get("valid") and rendered.get("ok")),
+        "valid": bool(validation.get("valid")),
+        "grc_path": rendered.get("path"),
+        "steps": steps,
+        "errors": validation.get("errors", []),
+        "center_freq": freq,
+        "sample_rate": rate,
+        "hardware": hardware,
+        "sink_key": sink_key,
+        "armed": False,
+        "not_started": True,
+    }
 
 
 @tool(

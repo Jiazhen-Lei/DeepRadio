@@ -319,6 +319,18 @@ def evm_from_symbols(symbols, ideal_points) -> float:
     return float(evm * 100.0)
 
 
+def bits_from_probe(data):
+    """把探针字节变成 0/1 比特。打包字节(0–255)按 MSB 解开。"""
+    import numpy as np
+    arr = np.asarray(data).ravel()
+    if arr.size == 0:
+        return np.array([], dtype=np.int8)
+    ints = np.asarray(np.clip(arr, 0, 255), dtype=np.uint8).ravel()
+    if int(ints.max()) > 1:
+        return np.unpackbits(np.ascontiguousarray(ints), bitorder="big").astype(np.int8)
+    return ints.astype(np.int8)
+
+
 def ber_from_bits(tx_bits, rx_bits) -> Tuple[float, int]:
     """比对收发比特算 BER,自动搜索最佳对齐时延。
 
@@ -326,23 +338,34 @@ def ber_from_bits(tx_bits, rx_bits) -> Tuple[float, int]:
         (ber, best_delay)。若无法对齐返回 (nan, 0)。
     """
     import numpy as np
-    tx = np.asarray(tx_bits, dtype=np.int8).ravel()
-    rx = np.asarray(rx_bits, dtype=np.int8).ravel()
+    tx = bits_from_probe(tx_bits)
+    rx = bits_from_probe(rx_bits)
     if len(tx) == 0 or len(rx) == 0:
         return float("nan"), 0
     n = min(len(tx), len(rx))
-    # 在小范围内搜索最佳循环时延(成形滤波/同步会引入固定偏移)
+    # PFB / 载波环会引入数百符号的捕获时延。RX 可能先吐垃圾，
+    # 也可能因为滤波器群时延而对应更晚的发送比特，两个方向都搜。
     best_ber, best_delay = 1.0, 0
-    search = min(64, n // 2)
+    min_compare = max(32, n // 8)
+    search = max(1, n - min_compare)
+    ones = np.int8(1)
     for d in range(search):
-        a = tx[:n - d]
-        b = rx[d:n]
-        m = min(len(a), len(b))
-        if m == 0:
-            continue
-        ber = float(np.mean(a[:m] != b[:m]))
-        if ber < best_ber:
-            best_ber, best_delay = ber, d
+        pairs = (
+            (tx[: n - d], rx[d:n]),
+            (tx[d:n], rx[: n - d]),
+        )
+        for a, b in pairs:
+            m = min(len(a), len(b))
+            if m < min_compare:
+                continue
+            chunk_a = a[:m]
+            chunk_b = b[:m]
+            ber = float(np.mean(chunk_a != chunk_b))
+            if ber < best_ber:
+                best_ber, best_delay = ber, d
+            inverted = float(np.mean(chunk_a != (ones - chunk_b)))
+            if inverted < best_ber:
+                best_ber, best_delay = inverted, d
     return best_ber, best_delay
 
 
@@ -395,43 +418,52 @@ def _load_top_block_class(script_path: str):
 
 
 def execute_script(script_path: str,
-                   timeout: float = DEFAULT_TIMEOUT) -> Tuple[bool, str]:
+                   timeout: float = DEFAULT_TIMEOUT,
+                   cwd: str = "") -> Tuple[bool, str]:
     """在本进程动态载入并执行 top_block,带墙钟超时兜底。
 
-    用线程跑 start()+wait(),超时则尝试 stop()+wait()。
-    返回 (是否正常结束, 错误信息)。
+    File Sink 在 .grc 里使用 session 相对路径时，必须在输出目录下执行，
+    否则样本会写到进程 cwd，读回就是空探针。
     """
+    previous = os.getcwd()
     try:
-        top_cls = _load_top_block_class(script_path)
-    except Exception as exc:  # noqa: BLE001
-        return False, f"载入脚本失败: {exc}"
-
-    tb = top_cls()
-    err_holder: List[str] = []
-
-    def _run():
+        if cwd:
+            os.chdir(cwd)
         try:
-            tb.start()
-            tb.wait()
+            top_cls = _load_top_block_class(script_path)
         except Exception as exc:  # noqa: BLE001
-            err_holder.append(str(exc))
+            return False, f"载入脚本失败: {exc}"
 
-    th = threading.Thread(target=_run, daemon=True)
-    th.start()
-    th.join(timeout)
-    if th.is_alive():
-        # 超时:请求停止(head 通常已让它自停,这里是兜底)
-        try:
-            tb.stop()
-            tb.wait()
-        except Exception:  # noqa: BLE001
-            pass
-        th.join(5.0)
+        tb = top_cls()
+        err_holder: List[str] = []
+
+        def _run():
+            try:
+                tb.start()
+                tb.wait()
+            except Exception as exc:  # noqa: BLE001
+                err_holder.append(str(exc))
+
+        th = threading.Thread(target=_run, daemon=True)
+        th.start()
+        th.join(timeout)
         if th.is_alive():
-            return False, f"仿真超时(>{timeout}s)且无法停止"
-    if err_holder:
-        return False, "执行异常: " + "; ".join(err_holder)
-    return True, ""
+            try:
+                tb.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            th.join(5.0)
+            if th.is_alive():
+                return False, f"仿真超时(>{timeout}s)且无法停止"
+        if err_holder:
+            return False, "执行异常: " + "; ".join(err_holder)
+        return True, ""
+    finally:
+        if cwd:
+            try:
+                os.chdir(previous)
+            except OSError:
+                pass
 
 
 def read_probe(path: str, dtype: str = "complex64"):
@@ -509,7 +541,7 @@ def run(flow_graph, platform, *,
         return result
 
     # 4. 执行
-    ok, err = execute_script(result.script_path, timeout=timeout)
+    ok, err = execute_script(result.script_path, timeout=timeout, cwd=out_dir)
     if not ok:
         result.error = err
         result.stderr = err
@@ -520,10 +552,13 @@ def run(flow_graph, platform, *,
     if probes:
         import numpy as np
         for pid, (fpath, dtype) in probes.items():
-            arr = read_probe(fpath, dtype)
+            read_path = (
+                fpath if os.path.isabs(fpath) else os.path.join(out_dir, fpath)
+            )
+            arr = read_probe(read_path, dtype)
             result.data[pid] = arr
             if arr.size == 0:
-                logger.warning("probe %s 输出为空: %s", pid, fpath)
+                logger.warning("probe %s 输出为空: %s", pid, read_path)
 
     result.ok = True
     result.summary = _build_summary(result)

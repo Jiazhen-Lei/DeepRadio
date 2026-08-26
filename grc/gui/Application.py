@@ -686,6 +686,8 @@ class Application(Gtk.Application):
                     self.config.add_recent_file(file_path)
                     main.tool_bar.refresh_submenus()
                     main.menu.refresh_submenus()
+                    if i == 0 and hasattr(main, "agent_panel"):
+                        main.agent_panel.notify_canvas_opened(file_path)
         elif action == Actions.FLOW_GRAPH_OPEN_QSS_THEME:
             file_paths = FileDialogs.OpenQSS(main, self.platform.config.install_prefix +
                                              '/share/gnuradio/themes/').run()
@@ -699,6 +701,8 @@ class Application(Gtk.Application):
             self.config.add_recent_file(file_path)
             main.tool_bar.refresh_submenus()
             main.menu.refresh_submenus()
+            if hasattr(main, "agent_panel"):
+                main.agent_panel.notify_canvas_opened(file_path)
         elif action == Actions.FLOW_GRAPH_SAVE:
             # read-only or undefined file path, do save-as
             if page.get_read_only() or not page.file_path:

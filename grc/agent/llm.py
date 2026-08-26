@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import re
+import sys
 import urllib.error
 import urllib.request
 
@@ -148,8 +149,34 @@ def get_config() -> dict:
     }
 
 
+def _unittest_runner_active() -> bool:
+    """True for ``python -m unittest`` / pytest, not the GRC GUI."""
+    if os.environ.get("GRC_AGENT_FORCE_INTENT_LLM", "").strip().lower() in {
+        "1", "true", "yes",
+    }:
+        return False
+    if os.environ.get("GRC_AGENT_NO_INTENT_LLM", "").strip().lower() in {
+        "1", "true", "yes",
+    }:
+        return True
+    argv0 = os.path.basename(sys.argv[0] if sys.argv else "")
+    joined = " ".join(sys.argv)
+    return (
+        "unittest" in argv0
+        or "pytest" in argv0
+        or "unittest" in joined
+        or "pytest" in joined
+    )
+
+
 def is_configured() -> bool:
-    """是否已配置好 LLM(不抛异常的探测)。"""
+    """是否已配置好 LLM(不抛异常的探测)。
+
+    自动回归（``python -m unittest``）默认不打线上 Intent LLM，避免本机
+    ``.env`` 里的 key 把 Gate 1 变成不稳定的网络调用。GUI 不受影响。
+    """
+    if _unittest_runner_active():
+        return False
     try:
         get_config()
         return True

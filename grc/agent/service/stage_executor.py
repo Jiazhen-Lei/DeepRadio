@@ -135,33 +135,39 @@ def bind_invocation_result(
     parsed: dict[str, Any] | None,
     parent: TaskCard | None = None,
 ) -> dict[str, Any]:
-    """Mark one Subagent ResultEnvelope as protocol-valid or not."""
+    """Mark one Subagent ResultEnvelope as protocol-valid or not.
+
+    Models only have to return ``outcome`` and a boolean ``completion`` map.
+    Identity mismatches and missing optional lists are warnings, not a veto
+    of host-proved work.
+    """
+    completion = parsed.get("completion") if isinstance(parsed, dict) else None
     shape_valid = bool(
         parsed
         and parsed.get("outcome") in {"passed", "failed", "inconclusive"}
-        and isinstance(parsed.get("artifacts", {}), dict)
-        and isinstance(parsed.get("produced_claims", []), list)
-        and isinstance(parsed.get("proposed_changes", []), list)
-        and isinstance(parsed.get("completion", {}), dict)
-        and all(
-            isinstance(value, bool)
-            for value in (parsed.get("completion") or {}).values()
-        )
+        and isinstance(completion, dict)
+        and all(isinstance(value, bool) for value in completion.values())
     )
-    protocol_valid = bool(
-        parsed
-        and shape_valid
-        and isinstance(parsed.get("ok"), bool)
-        and parsed.get("task_id")
-        in {
-            invocation.get("task_id"),
-            getattr(parent, "task_id", None),
-        }
-        and parsed.get("workflow_id") == invocation.get("workflow_id")
-        and parsed.get("stage_id") == invocation.get("stage_id")
-        and parsed.get("workflow_revision") == invocation.get("workflow_revision")
-        and parsed.get("base_project_version") == invocation.get("base_project_version")
+    workflow_id = parsed.get("workflow_id") if parsed else None
+    stage_id = parsed.get("stage_id") if parsed else None
+    identity_ok = (
+        (not workflow_id or workflow_id == invocation.get("workflow_id"))
+        and (not stage_id or stage_id == invocation.get("stage_id"))
     )
+    protocol_valid = bool(parsed and shape_valid and identity_ok)
+    if isinstance(parsed, dict):
+        if "ok" not in parsed:
+            parsed["ok"] = parsed.get("outcome") == "passed"
+        if not isinstance(parsed.get("artifacts"), dict):
+            parsed["artifacts"] = {}
+        if not isinstance(parsed.get("produced_claims"), list):
+            parsed["produced_claims"] = []
+        if not isinstance(parsed.get("proposed_changes"), list):
+            parsed["proposed_changes"] = []
+        if not parsed.get("task_id"):
+            parsed["task_id"] = invocation.get("task_id") or getattr(
+                parent, "task_id", ""
+            )
     invocation["protocol_valid"] = protocol_valid
     invocation["result"] = parsed
     return invocation
@@ -176,13 +182,13 @@ def make_result_envelope(
     invocations: list[dict[str, Any]],
 ) -> ResultEnvelope:
     completion = evaluate(stage, workflow, state, reply)
-    # Validate only work that actually happened.  Recommendations influence
-    # routing, not acceptance; a future separation-of-duties requirement must
-    # use an explicit ``required_agents`` contract.
-    protocol_ok = (
-        bool(invocations)
-        and all(item.get("protocol_valid") is True for item in invocations)
+    # Host-proved completion is the Stage gate. Envelope shape / task_id
+    # mismatches are warnings when the tools already produced the work.
+    protocol_strict = bool(invocations) and all(
+        item.get("protocol_valid") is True for item in invocations
     )
+    completion_ok = complete(completion)
+    protocol_ok = bool(invocations) and (protocol_strict or completion_ok)
     reply_ok = getattr(reply, "stage", "") not in (
         "ERROR",
         "CRITIC",
@@ -190,15 +196,19 @@ def make_result_envelope(
         "CONFIRM",
         "CANCELLED",
     )
-    succeeded = reply_ok and protocol_ok and complete(completion)
+    succeeded = reply_ok and bool(invocations) and completion_ok
     errored = getattr(reply, "stage", "") == "ERROR"
     failure_codes = []
+    protocol_warnings = []
     if not reply_ok:
         failure_codes.append("REPLY_STATUS_REJECTED")
     if not invocations:
         failure_codes.append("MISSING_EXECUTION_INVOCATION")
-    elif not protocol_ok:
-        failure_codes.append("INVALID_EXECUTION_INVOCATION")
+    elif not protocol_strict:
+        if completion_ok:
+            protocol_warnings.append("INVALID_EXECUTION_INVOCATION")
+        else:
+            failure_codes.append("INVALID_EXECUTION_INVOCATION")
     failure_codes.extend(
         f"MISSING_COMPLETION:{name}"
         for name, passed in completion.items()
@@ -227,8 +237,9 @@ def make_result_envelope(
         acceptance={
             "reply_ok": reply_ok,
             "execution_protocol_ok": protocol_ok,
-            "completion_ok": complete(completion),
+            "completion_ok": completion_ok,
             "failure_codes": failure_codes,
+            "protocol_warnings": protocol_warnings,
         },
     )
     envelope.validate()
