@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
 from typing import Any
 
@@ -96,6 +98,10 @@ def make_task_card(workflow: Any, stage: Any, state: Any, user_text: str) -> Tas
             "context": dict(workflow.intent.context),
             "current_grc": str(getattr(state.project, "grc_path", "") or ""),
             "prior_results": prior,
+            "claim_snapshot": {
+                str(item.id): _claim_fingerprint(item)
+                for item in list(getattr(state, "claims", None) or [])
+            },
         },
         expected_results=list(stage.completion),
         workflow_id=workflow.workflow_id,
@@ -216,6 +222,12 @@ def make_result_envelope(
         for name, passed in completion.items()
         if not passed
     )
+    before = dict((task_card.inputs or {}).get("claim_snapshot") or {})
+    produced_claims = []
+    for claim in list(getattr(state, "claims", None) or []):
+        claim_id = str(getattr(claim, "id", "") or "")
+        if claim_id and before.get(claim_id) != _claim_fingerprint(claim):
+            produced_claims.append(claim_id)
     envelope = ResultEnvelope(
         task_id=task_card.task_id,
         workflow_id=workflow.workflow_id,
@@ -225,11 +237,7 @@ def make_result_envelope(
         ok=succeeded,
         outcome="inconclusive" if errored else ("passed" if succeeded else "failed"),
         artifacts=dict(getattr(reply, "artifacts", None) or {}),
-        produced_claims=[
-            claim.get("id")
-            for claim in (getattr(reply, "claims", None) or [])
-            if claim.get("id")
-        ],
+        produced_claims=produced_claims,
         proposed_changes=list(
             (getattr(reply, "pending", None) or {}).get("proposed_changes") or []
         ),
@@ -246,3 +254,19 @@ def make_result_envelope(
     )
     envelope.validate()
     return envelope
+
+
+def _claim_fingerprint(claim: Any) -> str:
+    payload = {
+        "id": getattr(claim, "id", ""),
+        "statement": getattr(claim, "statement", ""),
+        "layer": getattr(claim, "layer", ""),
+        "status": getattr(claim, "status", ""),
+        "project_version": getattr(claim, "project_version", 0),
+        "evidence": [
+            vars(item) if hasattr(item, "__dict__") else item
+            for item in list(getattr(claim, "evidence", None) or [])
+        ],
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:20]

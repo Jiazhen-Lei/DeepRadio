@@ -125,11 +125,13 @@ def _activity_from_reply(reply):
     if pending and not pending.get("approved"):
         action = str(pending.get("action") or "")
         if action == "rf_plan_confirmation":
+            effect = str(pending.get("requested_effect") or "")
+            rf_grant = effect in ("DEVICE_CONFIG", "RF_RUN")
             return {
                 "loop": "确认",
                 "agent": "Hardware",
-                "action": "RF 计划确认",
-                "status": "等待明确授权",
+                "action": "RF 计划确认" if rf_grant else "配置确认",
+                "status": "等待明确授权" if rf_grant else "确认配置，不启动射频",
             }
         return {
             "loop": "修改",
@@ -527,6 +529,17 @@ class AgentPanel(Gtk.VBox):
         agent = self._ensure_agent()
         digest = agent._workflow.digest()
         wait_kind = str(digest.get("wait_kind") or "")
+        if wait_kind == "capability":
+            blocker = dict(digest.get("blocker") or {})
+            self._append(
+                "DeepRadio",
+                "{}{}".format(
+                    blocker.get("message") or "当前系统能力未就绪。",
+                    "\n" + str(blocker.get("remediation") or "")
+                    if blocker.get("remediation") else "",
+                ),
+            )
+            return
         if wait_kind == "recovery":
             action = (
                 "retry_stage" if decision == "approved" else "cancel_workflow"
@@ -636,6 +649,9 @@ class AgentPanel(Gtk.VBox):
         if idx < 0:
             idx = 0
         adaptive, pinned = _LEVEL_CHOICES[idx][1]
+        if hasattr(self._agent, "record_profile_choice"):
+            self._agent.record_profile_choice(adaptive=adaptive, pinned=pinned)
+            return
         ctx = self._agent.ctx
         ctx.adaptive = adaptive
         if pinned is None:
@@ -789,9 +805,9 @@ class AgentPanel(Gtk.VBox):
             activity=_activity_from_reply(reply),
             workflow=getattr(reply, "workflow_digest", None) or {},
         )
-        # CONFIRM / DENY 不上画布；交付阶段原地刷新当前页。
+        # 交付与确认都刷画布；DENY/CANCELLED 不覆盖用户当前图。
         stage = getattr(reply, "stage", "") or ""
-        skip_canvas = stage in ("CONFIRM", "DENY", "CANCELLED")
+        skip_canvas = stage in ("DENY", "CANCELLED")
         grc_path = artifacts.get("grc_path") or artifacts.get("path")
         if (not skip_canvas) and grc_path and str(grc_path).endswith(".grc") \
                 and os.path.exists(grc_path):

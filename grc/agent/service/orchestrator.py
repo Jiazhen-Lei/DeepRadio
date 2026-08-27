@@ -33,7 +33,7 @@ _STAGE_TOOLS = {
     "inspect_and_plan": {"inspect_flowgraph", "spec_clarify", "spec_commit"},
     "inspect_and_diagnose": {
         "inspect_flowgraph", "validate_flowgraph", "run_simulation", "read_metric",
-        "plot_spectrum", "plot_constellation", "diagnose_by_metric",
+        "plot_spectrum", "plot_constellation", "debug_by_metric",
         "explain_error",
     },
     "inspect_and_measure": {

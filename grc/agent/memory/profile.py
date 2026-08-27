@@ -164,7 +164,7 @@ class UserProfile:
         if explicit:
             self.pin(explicit)
         sig = infer_level_signals(text)
-        if sig.net != 0 or sig.student_hits:
+        if self.pinned is None and (sig.net != 0 or sig.student_hits):
             # 把净分归一到 [-1,1]:每 2 个净命中拉满
             target = max(-1.0, min(1.0, sig.net / 2.0))
             if sig.net == 0 and sig.student_hits:
@@ -172,7 +172,8 @@ class UserProfile:
             self.score = (1 - self.alpha) * self.score + self.alpha * target
         self.history.append(
             {"text": (text or "")[:80], "signals": sig.as_dict(),
-             "score": round(self.score, 3), "level": self.level})
+             "score": round(self.score, 3), "level": self.level,
+             "pinned": self.pinned})
         return self
 
     # -- 持久化 ------------------------------------------------------------

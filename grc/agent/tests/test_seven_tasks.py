@@ -486,6 +486,15 @@ class SevenTaskServiceAgentTest(unittest.TestCase):
         self.assertEqual(reply.workflow_digest["task_type"], "RX_BUILD")
         self.assertEqual(reply.workflow_digest.get("execution_status"), "completed")
         self.assertEqual(agent._workflow.workflow.intent.slots.get("ebn0_db"), 8.0)
+
+    def test_rx_build_accepts_bare_db_followup(self):
+        agent = self.agent("seven-rx-bare")
+        waiting = agent.step("构建 BPSK 接收机并测 BER")
+        self.assertIn("ebn0_db", waiting.workflow_digest.get("missing_slots") or [])
+        reply = agent.step("8dB")
+        self.assertEqual(reply.workflow_digest.get("execution_status"), "completed")
+        self.assertEqual(agent._workflow.workflow.intent.slots.get("ebn0_db"), 8.0)
+        self.assertEqual(agent._state.project.config.get("recipe"), "rx_bpsk_awgn")
         self.assertEqual(agent._state.project.config.get("ebn0_db"), 8.0)
         self.assertEqual(agent._state.project.config.get("recipe"), "rx_bpsk_awgn")
         grc_path = Path(reply.artifacts["grc_path"])
@@ -598,7 +607,7 @@ class SevenTaskServiceAgentTest(unittest.TestCase):
         text = grc_path.read_text(encoding="utf-8")
         self.assertTrue("iio_pluto_sink" in text or "iio_fmcomms2_sink" in text)
         self.assertIn("state: disabled", text)
-        self.assertIn("blocks_throttle", text)
+        self.assertTrue("blocks_throttle2" in text or "blocks_throttle" in text)
         self.assertIn("blocks_null_sink", text)
         self.assertNotIn("channels_channel_model", text)
         self.assertTrue("2402000000" in text or "2.402e9" in text or "2.402e+09" in text)
@@ -610,6 +619,12 @@ class SevenTaskServiceAgentTest(unittest.TestCase):
             ("rf_plan_confirmation",),
         )
         self.assertEqual(reply.workflow_digest.get("wait_kind"), "approval")
+        self.assertTrue(reply.workflow_digest.get("needs_confirmation"))
+        self.assertTrue(reply.workflow_digest.get("can_confirm"))
+        self.assertFalse(reply.workflow_digest.get("blocker"))
+        self.assertEqual(reply.pending.get("requested_effect"), "DEVICE_READ")
+        self.assertIsNone(reply.pending.get("max_duration_seconds"))
+        self.assertEqual(reply.workflow_digest.get("stage_label"), "配置确认")
         self.assertEqual((reply.pending.get("device") or {}).get("identity"), "usb:test.pluto")
         self.assertEqual(reply.pending.get("center_frequency"), 2_402_000_000.0)
         self.assertEqual(reply.pending.get("sample_rate"), 2_000_000.0)
@@ -621,23 +636,48 @@ class SevenTaskServiceAgentTest(unittest.TestCase):
         self.assertTrue(built.get("compiled"), built)
         self._claim(reply.claims, "final_flowgraph_valid")
         self._claim(reply.claims, "hardware_device_probed")
-        self._claim(reply.claims, "rf_plan_awaiting_decision")
+        self.assertNotIn(
+            "rf_plan_awaiting_decision",
+            {
+                str(item.get("name") or item.get("id") or "")
+                if isinstance(item, dict)
+                else str(getattr(item, "name", "") or getattr(item, "id", ""))
+                for item in reply.claims
+            },
+        )
         summary = (reply.spec_digest or {}).get("summary") or ""
         self.assertNotIn("? → ? → ?", summary)
         self.assertNotIn("start_flowgraph", self._events("seven-hw-txfg"))
-        if reply.workflow_digest.get("wait_kind") == "approval":
-            checkpoint_id = reply.workflow_digest.get("checkpoint_id") or ""
-            self.assertTrue(checkpoint_id)
-            with mock.patch.object(registry, "call", side_effect=with_pluto):
-                rejected = agent.step_command({
-                    "action": "checkpoint_decision",
-                    "checkpoint_id": checkpoint_id,
-                    "decision": "rejected",
-                })
-            self.assertNotIn("start_flowgraph", self._events("seven-hw-txfg"))
-            self.assertFalse(
-                bool((rejected.artifacts or {}).get("runtime") or {})
-            )
+        checkpoint_id = (
+            agent._workflow.current_stage().checkpoint.id
+            if agent._workflow.current_stage()
+            and agent._workflow.current_stage().checkpoint
+            else ""
+        )
+        self.assertTrue(checkpoint_id)
+        with mock.patch.object(registry, "call", side_effect=with_pluto):
+            finished = agent.step_command({
+                "action": "checkpoint_decision",
+                "checkpoint_id": checkpoint_id,
+                "decision": "approved",
+            })
+        self.assertEqual(finished.stage, "DELIVER")
+        self.assertTrue(finished.done)
+        self.assertEqual(
+            finished.workflow_digest.get("execution_status"), "completed"
+        )
+        self.assertNotIn("RF_RUN", agent._state.runtime.granted_effects)
+        self.assertNotIn("start_flowgraph", self._events("seven-hw-txfg"))
+        self.assertFalse(bool((finished.artifacts or {}).get("runtime") or {}))
+        self.assertNotIn(
+            "configure_device",
+            [item.get("id") for item in finished.workflow_digest.get("stages") or []],
+        )
+        self.assertNotIn(
+            "max_duration_seconds",
+            agent._state.project.config.get("rf_plan") or {},
+        )
+        self.assertEqual(finished.workflow_digest.get("stage_label"), "配置确认")
 
     def test_failed_sdr_tx_builder_does_not_fallback_to_baseband(self):
         from grc.agent.tools import registry

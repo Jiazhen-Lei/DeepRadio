@@ -284,23 +284,43 @@ class ClaimsPanel(Gtk.Frame):
         pending_view = dict(pending or {})
         workflow_view = workflow or {}
         wait = str(workflow_view.get("wait_kind") or "")
-        if not pending_view and workflow_view.get("checkpoint_id"):
-            pending_view = {
-                "action": workflow_view.get("current_stage") or "workflow_checkpoint",
-                "reason": workflow_view.get("waiting_reason") or "继续当前 Workflow",
-                "checkpoint_id": workflow_view.get("checkpoint_id"),
-                "max_duration_seconds": workflow_view.get("max_duration_seconds"),
-                "approved": False,
-            }
-        if not pending_view and wait == "recovery":
-            pending_view = {
+        if wait == "approval":
+            pending_view.setdefault(
+                "requested_effect", workflow_view.get("requested_effect") or ""
+            )
+            if not pending_view.get("checkpoint_id") and workflow_view.get("checkpoint_id"):
+                pending_view = {
+                    "action": workflow_view.get("current_stage") or "workflow_checkpoint",
+                    "reason": workflow_view.get("waiting_reason") or "继续当前 Workflow",
+                    "checkpoint_id": workflow_view.get("checkpoint_id"),
+                    "requested_effect": workflow_view.get("requested_effect") or "",
+                    "approved": False,
+                }
+        elif wait == "recovery":
+            pending_view = pending_view or {
                 "action": "stage_recovery",
                 "reason": workflow_view.get("waiting_reason") or "当前 Stage 未通过",
                 "approved": False,
             }
-        pending_view["can_retry"] = bool(
-            ((workflow_view.get("runtime") or {}).get("can_retry"))
-        )
+        elif wait == "capability":
+            blocker = dict(workflow_view.get("blocker") or {})
+            pending_view = pending_view or {
+                "action": "capability_blocker",
+                "reason": blocker.get("message")
+                or workflow_view.get("waiting_reason")
+                or "当前系统能力未就绪",
+                "blocker": blocker,
+                "can_confirm": False,
+                "can_retry": bool(blocker.get("retryable", False)),
+                "approved": False,
+            }
+        else:
+            pending_view = {}
+        if pending_view:
+            pending_view["can_retry"] = bool(
+                pending_view.get("can_retry")
+                or ((workflow_view.get("runtime") or {}).get("can_retry"))
+            )
         self._set_pending(pending_view)
         self._sync_expanders(workflow_view, self._claims)
         empty = (
@@ -365,6 +385,7 @@ class ClaimsPanel(Gtk.Frame):
                     "input": "等待补充",
                     "recovery": "等待恢复选择",
                     "denied": "改图被拒绝",
+                    "capability": "系统能力未就绪",
                 }
                 text += "  ·  " + wait_labels.get(wait_kind, wait_kind)
             self._activity_label.set_text(text)
@@ -623,16 +644,25 @@ class ClaimsPanel(Gtk.Frame):
         self._set_activity({}, self._last_workflow)
         self._set_workflow_details(self._last_workflow)
         self._set_timeline(self._last_workflow.get("timeline") or [])
-        pending = {
-            "action": self._last_workflow.get("current_stage") or "",
-            "checkpoint_id": self._last_workflow.get("checkpoint_id") or "",
-            "can_retry": bool(
-                (self._last_workflow.get("runtime") or {}).get("can_retry")
-            ),
-            "approved": False,
-        }
-        if pending["checkpoint_id"]:
+        wait = str(self._last_workflow.get("wait_kind") or "")
+        if wait == "approval" and self._last_workflow.get("checkpoint_id"):
+            pending = dict(self._last_pending or {})
+            pending.update({
+                "action": self._last_workflow.get("current_stage") or pending.get("action") or "",
+                "checkpoint_id": self._last_workflow.get("checkpoint_id"),
+                "requested_effect": (
+                    self._last_workflow.get("requested_effect")
+                    or pending.get("requested_effect")
+                    or ""
+                ),
+                "can_retry": bool(
+                    (self._last_workflow.get("runtime") or {}).get("can_retry")
+                ),
+                "approved": False,
+            })
             self._set_pending(pending)
+        elif wait not in ("recovery", "capability"):
+            self._set_pending({})
 
     def _set_pending(self, pending):
         pending = pending or {}
@@ -650,12 +680,14 @@ class ClaimsPanel(Gtk.Frame):
                     extra = "  ·  已选 {}".format(
                         os.path.basename(self.evidence_path)
                     )
+                else:
+                    extra = " 人工确认、附件缺失。"
                 text = (
                     "空口验收: 请确认 LightBlue 实际显示目标广播名称。"
                     "可附加上传截图。{}".format(extra)
                 )
             elif action == "rf_plan_confirmation":
-                duration = pending.get("max_duration_seconds") or 30
+                duration = pending.get("max_duration_seconds")
                 device = dict(pending.get("device") or {})
                 identity = str(device.get("identity") or "未绑定")
                 device_type = str(device.get("type") or "SDR")
@@ -673,18 +705,36 @@ class ClaimsPanel(Gtk.Frame):
                     if pending.get("tx_gain") is not None
                     else "功率参数未设置"
                 )
-                text = (
-                    "RF 安全确认: {} [{}] · {} · {} · BW {} · {}。"
-                    "批准后将启动最长 {} 秒的受控发射；"
-                    "OTA 确认或取消后会提前停止。不要在 GRC 中点击运行。"
-                ).format(
-                    device_type, identity, frequency or "频率?",
-                    sample_rate or "采样率?", bandwidth or "?", level, duration,
-                )
+                effect = str(pending.get("requested_effect") or "")
+                if effect in ("DEVICE_CONFIG", "RF_RUN"):
+                    text = (
+                        "RF 安全确认: {} [{}] · {} · {} · BW {} · {}。"
+                        "批准后将启动最长 {} 秒的受控发射；"
+                        "OTA 确认或取消后会提前停止。不要在 GRC 中点击运行。"
+                    ).format(
+                        device_type, identity, frequency or "频率?",
+                        sample_rate or "采样率?", bandwidth or "?", level,
+                        duration or 30,
+                    )
+                else:
+                    text = (
+                        "配置确认: {} [{}] · {} · {} · BW {} · {}。"
+                        "确认后不启动射频。若要发射，请明确授权运行。"
+                    ).format(
+                        device_type, identity, frequency or "频率?",
+                        sample_rate or "采样率?", bandwidth or "?", level,
+                    )
             elif action == "stage_recovery":
                 text = "Stage 未通过: {}".format(
                     pending.get("reason") or "可重试本阶段或取消任务"
                 )
+            elif action == "capability_blocker":
+                blocker = dict(pending.get("blocker") or {})
+                text = "系统能力未就绪: {}".format(
+                    pending.get("reason") or "当前操作不可执行"
+                )
+                if blocker.get("remediation"):
+                    text += "  " + str(blocker["remediation"])
             elif action == "workflow_checkpoint":
                 text = "待确认: {}".format(
                     pending.get("reason") or "继续当前 Workflow"
@@ -696,19 +746,30 @@ class ClaimsPanel(Gtk.Frame):
                 self._confirm_btn.set_label("已看到目标名称")
                 self._cancel_btn.set_label("未看到")
             elif action == "rf_plan_confirmation":
-                self._confirm_btn.set_label("批准有限时长发射")
+                effect = str(pending.get("requested_effect") or "")
+                if effect in ("DEVICE_CONFIG", "RF_RUN"):
+                    self._confirm_btn.set_label("批准有限时长发射")
+                else:
+                    self._confirm_btn.set_label("确认配置")
                 self._cancel_btn.set_label("取消")
             elif action == "stage_recovery":
                 self._confirm_btn.set_label("重试本阶段")
+                self._cancel_btn.set_label("取消任务")
+            elif action == "capability_blocker":
+                self._confirm_btn.set_label("当前进程不可确认")
                 self._cancel_btn.set_label("取消任务")
             else:
                 self._confirm_btn.set_label("确认")
                 self._cancel_btn.set_label("取消")
         else:
             self._pending_label.set_text("")
+            self._confirm_btn.set_label("")
+            self._cancel_btn.set_label("")
         self._last_pending = pending
         self._pending_row.set_visible(visible)
-        self._confirm_btn.set_sensitive(visible)
+        can_confirm = bool(pending.get("can_confirm", True))
+        self._confirm_btn.set_visible(visible and can_confirm)
+        self._confirm_btn.set_sensitive(visible and can_confirm)
         self._cancel_btn.set_sensitive(visible)
         ota = visible and action == "over_air_verification"
         self._evidence_btn.set_visible(ota)

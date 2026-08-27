@@ -345,6 +345,7 @@ def _profile_of(ctx):
     group="macro",
     origin="deepradio_macro",
     runtime="deepradio",
+    effect_level="ARTIFACT_WRITE",
 )
 def design_link_tool(ctx, intent: str = "", recipe: str = "",
                      simulate: bool = True, render: bool = True) -> Dict[str, Any]:

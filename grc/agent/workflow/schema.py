@@ -14,6 +14,9 @@ DECISIONS = frozenset({"pending", "approved", "rejected"})
 TURN_RELATIONS = frozenset(
     {"new_task", "answer", "adjustment", "feedback", "approval", "rejection", "cancel"}
 )
+EFFECT_LEVELS = frozenset(
+    {"READ", "ARTIFACT_WRITE", "DEVICE_READ", "DEVICE_CONFIG", "RF_RUN"}
+)
 
 
 @dataclass
@@ -28,6 +31,15 @@ class WorkflowIntent:
     slot_sources: Dict[str, str] = field(default_factory=dict)
     context: Dict[str, Any] = field(default_factory=dict)
     validation_errors: List[str] = field(default_factory=list)
+    goals: List[str] = field(default_factory=list)
+    requested_operations: List[str] = field(default_factory=list)
+    desired_artifacts: List[str] = field(default_factory=list)
+    evidence_requirements: List[str] = field(default_factory=list)
+    constraints: Dict[str, Any] = field(default_factory=dict)
+    forbidden_effects: List[str] = field(default_factory=list)
+    decision_boundaries: List[str] = field(default_factory=list)
+    stop_conditions: List[str] = field(default_factory=list)
+    entities: Dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
         if self.turn_relation not in TURN_RELATIONS:
@@ -48,6 +60,15 @@ class WorkflowIntent:
             slot_sources=dict(data.get("slot_sources") or {}),
             context=dict(data.get("context") or {}),
             validation_errors=list(data.get("validation_errors") or []),
+            goals=list(data.get("goals") or []),
+            requested_operations=list(data.get("requested_operations") or []),
+            desired_artifacts=list(data.get("desired_artifacts") or []),
+            evidence_requirements=list(data.get("evidence_requirements") or []),
+            constraints=dict(data.get("constraints") or {}),
+            forbidden_effects=list(data.get("forbidden_effects") or []),
+            decision_boundaries=list(data.get("decision_boundaries") or []),
+            stop_conditions=list(data.get("stop_conditions") or []),
+            entities=dict(data.get("entities") or {}),
         )
         item.validate()
         return item
@@ -61,6 +82,8 @@ class Checkpoint:
     action: str = ""
     payload_ref: str = ""
     resume_stage: bool = False
+    requested_effect: str = "READ"
+    blocker: Dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
         if self.decision_status not in DECISIONS:
@@ -75,6 +98,8 @@ class Checkpoint:
             action=str(data.get("action") or ""),
             payload_ref=str(data.get("payload_ref") or ""),
             resume_stage=bool(data.get("resume_stage", False)),
+            requested_effect=str(data.get("requested_effect") or "READ"),
+            blocker=dict(data.get("blocker") or {}),
         )
         item.validate()
         return item
@@ -97,6 +122,14 @@ class Stage:
     when: Dict[str, Any] = field(default_factory=dict)
     depends_on: List[str] = field(default_factory=list)
     resume_pending: bool = False
+    resume_from: str = ""
+    effect_level: str = "READ"
+    idempotent: bool = True
+    safety_finalizer: bool = False
+    objective: str = ""
+    requires: List[str] = field(default_factory=list)
+    produces: List[str] = field(default_factory=list)
+    success_predicates: List[str] = field(default_factory=list)
 
     def validate(self) -> None:
         if not self.id:
@@ -107,6 +140,8 @@ class Stage:
             raise ValueError(f"非法 Stage outcome: {self.outcome}")
         if self.attempt < 0 or self.max_attempts < 1:
             raise ValueError("Stage attempt/max_attempts 非法")
+        if self.effect_level not in EFFECT_LEVELS:
+            raise ValueError(f"非法 Stage effect_level: {self.effect_level}")
         if self.checkpoint:
             self.checkpoint.validate()
 
@@ -132,6 +167,14 @@ class Stage:
             when=dict(when),
             depends_on=list(data.get("depends_on") or []),
             resume_pending=bool(data.get("resume_pending", False)),
+            resume_from=str(data.get("resume_from") or ""),
+            effect_level=str(data.get("effect_level") or data.get("effect") or "READ"),
+            idempotent=bool(data.get("idempotent", True)),
+            safety_finalizer=bool(data.get("safety_finalizer", False)),
+            objective=str(data.get("objective") or ""),
+            requires=list(data.get("requires") or []),
+            produces=list(data.get("produces") or []),
+            success_predicates=list(data.get("success_predicates") or []),
         )
         item.validate()
         return item
@@ -150,6 +193,9 @@ class Workflow:
     current_stage: str = ""
     schema_version: int = 1
     catalog_version: int = 1
+    decisions: List[Dict[str, Any]] = field(default_factory=list)
+    deferred_plan: List[Dict[str, Any]] = field(default_factory=list)
+    compiled_plan: List[Dict[str, Any]] = field(default_factory=list)
 
     def validate(self) -> None:
         if not self.workflow_id or not self.task_type:
@@ -190,6 +236,9 @@ class Workflow:
             current_stage=str(data.get("current_stage") or ""),
             schema_version=int(data.get("schema_version", 1)),
             catalog_version=int(data.get("catalog_version", 1)),
+            decisions=list(data.get("decisions") or []),
+            deferred_plan=list(data.get("deferred_plan") or []),
+            compiled_plan=list(data.get("compiled_plan") or []),
         )
         item.validate()
         return item

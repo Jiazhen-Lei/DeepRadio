@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -51,6 +52,40 @@ def _run(command: list[str], timeout: float = 15.0) -> Dict[str, Any]:
         "output": completed.stdout[-12000:],
         "command": command,
     }
+
+
+def _probe_health(output: str, *, identity_ok: bool) -> Dict[str, Any]:
+    """Classify vendor output without treating every optional attr as fatal."""
+    text = str(output or "")
+    low = text.lower()
+    warning_markers = (
+        "socket operation on non-socket",
+        "out of sync",
+        "attribute read error",
+        "not supported",
+    )
+    fatal_markers = (
+        "no devices found",
+        "unable to create context",
+        "permission denied",
+        "device or resource busy",
+        "connection refused",
+    )
+    warnings = [marker for marker in warning_markers if marker in low]
+    fatal_errors = [marker for marker in fatal_markers if marker in low]
+    return {
+        "identity_ok": bool(identity_ok),
+        "core_ready": bool(identity_ok and not fatal_errors),
+        "warnings": warnings,
+        "fatal_errors": fatal_errors,
+    }
+
+
+def _compact_vendor_output(output: str, limit: int = 2000) -> str:
+    text = str(output or "")[-max(200, int(limit)):]
+    return re.sub(
+        r"(?im)(serial\s*[:=]\s*)([^,\s]+)", r"\1<redacted>", text
+    )
 
 
 def _resolve_work_path(ctx: ToolContext, path: str) -> Path:
@@ -138,21 +173,47 @@ def _project_runtime_state(ctx: ToolContext, result: Dict[str, Any]) -> None:
 
 
 def _rf_approved(ctx: ToolContext) -> bool:
+    """Check a typed effect grant; checkpoint names are not policy facts."""
+    ranks = {
+        "READ": 0,
+        "ARTIFACT_WRITE": 1,
+        "DEVICE_READ": 2,
+        "DEVICE_CONFIG": 3,
+        "RF_RUN": 4,
+    }
+    state = ctx.extra.get("state")
+    runtime = getattr(state, "runtime", None)
+    grants = list(getattr(runtime, "granted_effects", None) or [])
+    if any(ranks.get(str(effect).upper(), 0) >= ranks["RF_RUN"] for effect in grants):
+        return True
     workflow = ctx.extra.get("workflow") or {}
     return any(
-        stage.get("id") == "rf_plan_confirmation"
-        and (stage.get("checkpoint") or {}).get("decision_status") == "approved"
+        (stage.get("checkpoint") or {}).get("decision_status") == "approved"
+        and ranks.get(
+            str((stage.get("checkpoint") or {}).get("requested_effect") or "").upper(),
+            -1,
+        ) >= ranks["RF_RUN"]
         for stage in workflow.get("stages") or []
         if isinstance(stage, dict)
     )
 
 
-def _stage_passed(ctx: ToolContext, stage_id: str) -> bool:
+def _completion_satisfied(ctx: ToolContext, predicate: str) -> bool:
+    """Resolve a stable completion fact without depending on Stage names."""
+    state = ctx.extra.get("state")
+    for claim in list(getattr(state, "claims", None) or []):
+        if (
+            str(getattr(claim, "id", "") or "") == predicate
+            and str(getattr(claim, "status", "") or "").lower() in {"pass", "passed"}
+        ):
+            return True
     workflow = ctx.extra.get("workflow") or {}
     return any(
-        stage.get("id") == stage_id
-        and stage.get("execution_status") == "completed"
+        stage.get("execution_status") == "completed"
         and stage.get("outcome") == "passed"
+        and bool(
+            ((stage.get("result") or {}).get("completion") or {}).get(predicate)
+        )
         for stage in workflow.get("stages") or []
         if isinstance(stage, dict)
     )
@@ -233,6 +294,7 @@ def _device_command(device_type: str, *, probe: bool) -> list[str]:
     group="hardware",
     origin="vendor_cli",
     runtime="uhd_iio",
+    effect_level="DEVICE_READ",
 )
 def discover_devices(
     ctx: ToolContext, device_args: str = "", device_type: str = "b210"
@@ -255,9 +317,15 @@ def discover_devices(
         result["driver_family"] = profile.driver_family
         result["device_identity"] = parse_device_identity(profile, output)
     result["observed_at"] = time.time()
+    result["health"] = _probe_health(
+        output, identity_ok=bool(result.get("device_found"))
+    )
     result["report_path"] = _persist_hardware_report(
         ctx, "device_discovery.json", result
     )
+    result["output"] = _compact_vendor_output(output)
+    result["raw_output_artifact"] = result["report_path"]
+    result["output_truncated"] = len(output) > len(result["output"])
     return result
 
 
@@ -274,6 +342,7 @@ def discover_devices(
     group="hardware",
     origin="vendor_cli",
     runtime="uhd_iio",
+    effect_level="DEVICE_READ",
 )
 def probe_device(
     ctx: ToolContext, device_args: str = "", device_type: str = "b210"
@@ -305,9 +374,18 @@ def probe_device(
         result["driver_family"] = profile.driver_family
         result["device_identity"] = device_args or parse_device_identity(profile, output)
     result["observed_at"] = time.time()
+    result["health"] = _probe_health(
+        output, identity_ok=bool(result.get("device_probed"))
+    )
+    if result["health"]["fatal_errors"]:
+        result["device_probed"] = False
+        result["ok"] = False
     result["report_path"] = _persist_hardware_report(
         ctx, "device_probe.json", result
     )
+    result["output"] = _compact_vendor_output(output)
+    result["raw_output_artifact"] = result["report_path"]
+    result["output_truncated"] = len(output) > len(result["output"])
     return result
 
 
@@ -328,6 +406,8 @@ def probe_device(
     group="hardware",
     origin="deepradio_runtime",
     runtime="grc_rewrite",
+    effect_level="DEVICE_CONFIG",
+    requires=["rf_runtime", "device_probed", "user_effect_grant"],
 )
 def arm_hardware_flowgraph(
     ctx: ToolContext, grc_path: str, device_identity: str = ""
@@ -339,17 +419,12 @@ def arm_hardware_flowgraph(
             "requires_system_enable": True,
             "error": "RF 运行功能未启用，拒绝生成 armed 流图",
         }
-    if _is_ble_deploy(ctx) and not _stage_passed(ctx, "offline_protocol_verify"):
+    if _is_ble_deploy(ctx) and not _completion_satisfied(ctx, "ble_packet_valid"):
         return {"ok": False, "armed": False, "error": "离线协议校验尚未通过"}
-    discovery_stage = (
-        "discover_and_probe_device"
-        if _is_ble_deploy(ctx)
-        else "discover_and_probe_hardware"
-    )
-    if not _stage_passed(ctx, discovery_stage):
+    if not _completion_satisfied(ctx, "device_probed"):
         return {"ok": False, "armed": False, "error": "硬件 discover/probe 尚未通过"}
     if not _rf_approved(ctx):
-        return {"ok": False, "armed": False, "error": "缺少 rf_plan_confirmation"}
+        return {"ok": False, "armed": False, "error": "缺少 RF_RUN 用户授权"}
     source = _resolve_work_path(ctx, grc_path)
     out_dir = Path(ctx.out_dir or "").resolve()
     if not source.is_file() or out_dir not in source.parents:
@@ -372,14 +447,8 @@ def arm_hardware_flowgraph(
         if str(getattr(block, "name", "")) in {"preview_throttle", "preview_sink"}
     ]
     preview_prior_states = [block.state for block in preview_blocks]
+    bind_endpoint_identity(ctx.flow_graph, device_identity)
     for block in sinks:
-        key = str(getattr(block, "key", ""))
-        if device_identity and key in {"iio_pluto_sink", "iio_fmcomms2_sink_fc32"}:
-            if "uri" in block.params:
-                block.params["uri"].set_value(repr(device_identity))
-        elif device_identity and key == "uhd_usrp_sink" and "dev_addr" in block.params:
-            address = device_identity if "=" in device_identity else f"serial={device_identity}"
-            block.params["dev_addr"].set_value(repr(address))
         block.state = "enabled"
     for block in preview_blocks:
         block.state = "disabled"
@@ -457,6 +526,9 @@ def arm_hardware_flowgraph(
     group="hardware",
     origin="deepradio_runtime",
     runtime="grcc",
+    effect_level="RF_RUN",
+    idempotent=False,
+    requires=["rf_runtime", "flowgraph_armed", "user_effect_grant"],
 )
 def start_flowgraph(
     ctx: ToolContext, grc_path: str, duration_seconds: float = 30.0
@@ -486,10 +558,10 @@ def start_flowgraph(
             "error": "真实 RF 默认关闭；仅在完成安全检查后显式设置 GRC_AGENT_ENABLE_RF=1",
         }
     if not _rf_approved(ctx):
-        return {"ok": False, "requires_confirmation": True, "error": "缺少 rf_plan_confirmation"}
-    if _is_ble_deploy(ctx) and not _stage_passed(ctx, "offline_protocol_verify"):
+        return {"ok": False, "requires_confirmation": True, "error": "缺少 RF_RUN 用户授权"}
+    if _is_ble_deploy(ctx) and not _completion_satisfied(ctx, "ble_packet_valid"):
         return {"ok": False, "error": "离线协议校验尚未通过，拒绝启动 RF"}
-    if _is_ble_deploy(ctx) and not _stage_passed(ctx, "discover_and_probe_device"):
+    if not _completion_satisfied(ctx, "device_probed"):
         return {"ok": False, "error": "硬件 discover/probe 尚未通过，拒绝启动 RF"}
     if _tx_requires_arming(ctx) and not _rf_armed(ctx, grc_path):
         return {"ok": False, "error": "流图尚未由受控流程武装，拒绝启动 RF"}
@@ -543,6 +615,7 @@ def start_flowgraph(
     group="hardware",
     origin="deepradio_runtime",
     runtime="hardware_runtime",
+    effect_level="DEVICE_READ",
 )
 def query_runtime_status(ctx: ToolContext) -> Dict[str, Any]:
     return _persist_runtime_result(ctx, RUNTIME.status(_session_id(ctx)))
@@ -555,6 +628,7 @@ def query_runtime_status(ctx: ToolContext) -> Dict[str, Any]:
     group="hardware",
     origin="deepradio_runtime",
     runtime="hardware_runtime",
+    effect_level="RF_RUN",
 )
 def stop_flowgraph(ctx: ToolContext) -> Dict[str, Any]:
     return _persist_runtime_result(ctx, RUNTIME.stop(_session_id(ctx)))
@@ -567,6 +641,7 @@ def stop_flowgraph(ctx: ToolContext) -> Dict[str, Any]:
     group="hardware",
     origin="deepradio_runtime",
     runtime="hardware_runtime",
+    effect_level="RF_RUN",
 )
 def emergency_stop(ctx: ToolContext) -> Dict[str, Any]:
     return _persist_runtime_result(
@@ -606,6 +681,35 @@ def _persist_runtime_result(ctx: ToolContext, result: Dict[str, Any]) -> Dict[st
         pass
     _project_runtime_state(ctx, enriched)
     return enriched
+
+
+_SINK_KEYS = {
+    "uhd_usrp_sink", "iio_pluto_sink", "iio_fmcomms2_sink_fc32",
+    "osmosdr_sink", "limesdr_sink",
+}
+_ENDPOINT_KEYS = _SINK_KEYS | {
+    "uhd_usrp_source", "iio_pluto_source", "osmosdr_source",
+}
+
+
+def bind_endpoint_identity(flow_graph: Any, identity: str) -> int:
+    """Write a probed identity into hardware endpoints without enabling them."""
+    if flow_graph is None or not identity:
+        return 0
+    changed = 0
+    address = identity if "=" in identity else f"serial={identity}"
+    for block in list(getattr(flow_graph, "blocks", None) or []):
+        key = str(getattr(block, "key", "") or "")
+        if key not in _ENDPOINT_KEYS:
+            continue
+        params = getattr(block, "params", None) or {}
+        if "uri" in params:
+            params["uri"].set_value(repr(identity))
+            changed += 1
+        elif "dev_addr" in params:
+            params["dev_addr"].set_value(repr(address))
+            changed += 1
+    return changed
 
 
 def _disable_block(ctx: ToolContext, block_id: str) -> None:
@@ -692,6 +796,7 @@ def _sdr_tx_sink_candidates(
     group="hardware",
     origin="deepradio_compose",
     runtime="gnuradio_blocks",
+    effect_level="ARTIFACT_WRITE",
 )
 def build_sdr_tx_flowgraph(
     ctx: ToolContext,
@@ -738,17 +843,24 @@ def build_sdr_tx_flowgraph(
                 "waveform": "analog.GR_COS_WAVE",
                 "freq": "1000",
                 "amp": "0.3",
+                "comment": "未指定调制：预览用 1 kHz 测试音",
             },
         },
+    )
+    throttle_key = (
+        "blocks_throttle2"
+        if "blocks_throttle2" in getattr(ctx.platform, "blocks", {})
+        else "blocks_throttle"
     )
     invoke(
         "add_block",
         {
-            "key": "blocks_throttle",
+            "key": throttle_key,
             "id": "preview_throttle",
             "params": {
                 "type": "complex",
                 "samples_per_second": "samp_rate",
+                "comment": "仅限速，避免预览空转；不是错误",
             },
         },
     )
@@ -757,13 +869,18 @@ def build_sdr_tx_flowgraph(
         {
             "key": "blocks_null_sink",
             "id": "preview_sink",
-            "params": {"type": "complex"},
+            "params": {
+                "type": "complex",
+                "comment": "安全预览：采样丢弃，不接天线。灰色硬件端未 arm，不会发射。",
+            },
         },
     )
     added = {"ok": False}
     sink_key = ""
     dst_port = 0
     for sink_key, sink_id, params, dst_port in candidates:
+        params = dict(params)
+        params["comment"] = "未授权射频，保持禁用。灰色=未 arm 的硬件端，不会发射。"
         added = invoke("add_block", {"key": sink_key, "id": sink_id, "params": params})
         if added.get("ok"):
             break
@@ -898,6 +1015,7 @@ def build_sdr_tx_flowgraph(
     group="hardware",
     origin="deepradio_compose",
     runtime="gnuradio_blocks",
+    effect_level="ARTIFACT_WRITE",
 )
 def build_usrp_rx_spectrum_flowgraph(
     ctx: ToolContext,

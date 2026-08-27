@@ -38,14 +38,16 @@ def build_orchestrator_prompt(subagent_names: Iterable[str],
         "停止并直接答复：design_flowgraph 已 ok+valid 且指标满足；"
         "或连续两次工具无新信息。同一目标不要重复 design_flowgraph / run_simulation"
         "（simulate=True 已含仿真和绘图）。artifacts 在宿主机，不要用文件工具确认。\n"
-        "遵守 raw_text、capabilities、forbidden_capabilities、slot_sources、completion；"
+        "遵守 raw_text、IntentIR goals/constraints/stop_conditions、capabilities、"
+        "forbidden_capabilities、slot_sources、completion；"
         "forbidden_capabilities 禁止调度对应硬件/部署工具。"
-        "Task Type 只是主动作，不能丢掉同句里仍允许的硬件/观测/构建。"
+        "Task Type 仅是兼容/评测标签，不得用标签改写目标；"
+        "按产物、证据和下一决策边界组织最短可执行计划。"
         "context 是背景，不得把硬件或实时观测改写成离线仿真。"
         "配方必须覆盖全部 capabilities，否则按块构建或报缺口，禁止近义顶替。\n"
         "换调制用 design_flowgraph 等确认，禁止 apply_grc_diff 改星座；"
         "用户说「确认」后运行时会重建，不必再选型。"
-        "「只诊断 / 先不要改」禁止 design_flowgraph、apply_grc_diff、suggest_fix。\n"
+        "「只诊断 / 先不要改」禁止 design_flowgraph、apply_grc_diff。\n"
         + style_section
     )
 
@@ -164,7 +166,7 @@ _SUBAGENT_DEFS = [
         "根据指标诊断并提出最小修复。",
         build_diagnosis_prompt,
         ["grc-diagnosis", "grc-critic"],
-        ["diagnose_by_metric", "explain_error", "suggest_fix"],
+        ["debug_by_metric", "explain_error"],
     ),
     (
         "protocol_agent",

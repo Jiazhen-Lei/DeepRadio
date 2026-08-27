@@ -496,25 +496,24 @@ def attach_evidence(
 def write_artifact_manifest(
     session_id: str, artifacts: Dict[str, Any] | None = None
 ) -> str:
-    """Write relocatable artifact references and content hashes for a session."""
+    """Write the cumulative, relocatable ArtifactIndex for a session."""
     root = session_root(session_id)
     final_dir = os.path.join(root, "final")
     os.makedirs(final_dir, exist_ok=True)
-    listed = []
-    seen = set()
-    for value in (artifacts or {}).values():
-        if not isinstance(value, str) or not os.path.isfile(value):
-            continue
-        abs_path = os.path.abspath(value)
-        if abs_path in seen or _skip_manifest_name(os.path.basename(abs_path)):
-            continue
-        seen.add(abs_path)
-        listed.append(abs_path)
     roles = {
-        os.path.abspath(value): key
+        os.path.abspath(value): _artifact_role_from_key(key, value)
         for key, value in (artifacts or {}).items()
         if isinstance(value, str) and os.path.isfile(value)
     }
+    listed = []
+    for current_root, dirnames, names in os.walk(final_dir):
+        dirnames[:] = [
+            name for name in dirnames if not _skip_manifest_name(name)
+        ]
+        for name in sorted(names):
+            if _skip_manifest_name(name):
+                continue
+            listed.append(os.path.join(current_root, name))
     entries = []
     for path in listed:
         try:
@@ -527,8 +526,13 @@ def write_artifact_manifest(
             rel = os.path.relpath(path, root)
         except ValueError:
             rel = os.path.basename(path)
+        role = roles.get(os.path.abspath(path)) or _infer_artifact_role(rel)
+        artifact_id = "art-" + hashlib.sha256(
+            f"{rel}\0{digest}".encode("utf-8")
+        ).hexdigest()[:16]
         entries.append({
-            "role": roles.get(os.path.abspath(path), "artifact"),
+            "artifact_id": artifact_id,
+            "role": role,
             "path": rel,
             "size": size,
             "sha256": digest,
@@ -575,17 +579,21 @@ def write_export_manifest(
     destination_dir: str,
     exported_paths: List[str] | None = None,
 ) -> str:
-    """Create a manifest for this round's exported files only."""
+    """Create a cumulative manifest for every artifact in an export root."""
     os.makedirs(destination_dir, exist_ok=True)
     destination = os.path.abspath(destination_dir)
-    if exported_paths is None:
-        candidates = []
-        for current_root, dirnames, names in os.walk(destination):
-            dirnames[:] = [name for name in dirnames if not _skip_manifest_name(name)]
-            for name in sorted(names):
-                candidates.append(os.path.join(current_root, name))
-    else:
-        candidates = list(exported_paths)
+    explicit_roles = {
+        os.path.abspath(path): _infer_artifact_role(
+            os.path.relpath(os.path.abspath(path), destination)
+        )
+        for path in (exported_paths or [])
+        if isinstance(path, str) and os.path.isfile(path)
+    }
+    candidates = []
+    for current_root, dirnames, names in os.walk(destination):
+        dirnames[:] = [name for name in dirnames if not _skip_manifest_name(name)]
+        for name in sorted(names):
+            candidates.append(os.path.join(current_root, name))
     entries = []
     seen_rel = set()
     for path in candidates:
@@ -604,8 +612,13 @@ def write_export_manifest(
             size = os.path.getsize(abs_path)
         except OSError:
             continue
+        role = explicit_roles.get(abs_path) or _infer_artifact_role(rel)
+        artifact_id = "art-" + hashlib.sha256(
+            f"{rel}\0{digest}".encode("utf-8")
+        ).hexdigest()[:16]
         entries.append({
-            "role": "artifact",
+            "artifact_id": artifact_id,
+            "role": role,
             "path": rel,
             "size": size,
             "sha256": digest,
@@ -631,6 +644,43 @@ def _skip_manifest_name(name: str) -> bool:
         or name.endswith(".pyc")
         or name.endswith(".pyo")
     )
+
+
+def _infer_artifact_role(relative_path: str) -> str:
+    low = str(relative_path or "").replace("\\", "/").lower()
+    name = os.path.basename(low)
+    if "/evidence/" in f"/{low}" or name.endswith(".meta.json"):
+        return "human_evidence"
+    if "runtime" in low and name.endswith((".log", ".json")):
+        return "runtime_log"
+    if "device_discovery" in name or "device_probe" in name:
+        return "device_report"
+    if "validation" in name or "verify" in name:
+        return "validation_report"
+    if name.endswith(".grc"):
+        return "armed_flowgraph" if "armed" in name else "safe_preview"
+    if name.endswith((".png", ".jpg", ".jpeg", ".svg")):
+        return "visualization"
+    if name.endswith((".bin", ".c64", ".dat", ".npy")):
+        return "signal_data"
+    if name.endswith(".py"):
+        return "generated_program"
+    if name.endswith(".json"):
+        return "report"
+    return "artifact"
+
+
+def _artifact_role_from_key(key: str, path: str) -> str:
+    normalized = str(key or "").lower()
+    aliases = {
+        "evidence": "human_evidence",
+        "runtime_program": "generated_program",
+        "runtime_log": "runtime_log",
+        "device_discovery": "device_report",
+        "device_probe": "device_report",
+        "flowgraph_validation": "validation_report",
+    }
+    return aliases.get(normalized) or _infer_artifact_role(path)
 
 
 def _jsonable(value: Any) -> Any:

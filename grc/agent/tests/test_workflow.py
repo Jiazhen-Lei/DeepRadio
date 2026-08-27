@@ -1,7 +1,9 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 from grc.agent.schema import AgentReply, ToolInvocation
 from grc.agent.service.stage_executor import (
     bind_invocation_result,
@@ -224,6 +226,19 @@ class DynamicWorkflowV2ContractTest(unittest.TestCase):
         )
         self.assertTrue(envelope.ok)
 
+    def test_alignment_accepts_bare_ebn0_followup(self):
+        state = SharedState(session_id="rx-ebn0")
+        engine = self.engine()
+        workflow = engine.consume_turn("构建 BPSK 接收机并测 BER", state)
+        self.assertEqual(workflow.current_stage, "rx_spec_alignment")
+        self.assertIn("ebn0_db", workflow.intent.missing_slots)
+        workflow_id = workflow.workflow_id
+        resumed = engine.consume_turn("8dB", state)
+        self.assertEqual(resumed.workflow_id, workflow_id)
+        self.assertEqual(resumed.intent.slots.get("ebn0_db"), 8.0)
+        self.assertNotIn("ebn0_db", resumed.intent.missing_slots)
+        self.assertEqual(resumed.current_stage, "rx_build_and_verify")
+
     def test_feedback_keeps_workflow_identity(self):
         state = SharedState(session_id="feedback")
         engine = self.engine()
@@ -342,7 +357,9 @@ class DynamicWorkflowV2ContractTest(unittest.TestCase):
 
 import tempfile
 import unittest
+import os
 from pathlib import Path
+from unittest import mock
 
 from grc.agent.schema import AgentReply, ToolInvocation
 from grc.agent.state import SharedState
@@ -510,11 +527,16 @@ class WorkflowCapabilityCompositionTest(unittest.TestCase):
             "hardware_precheck",
             "discover_and_probe_hardware",
             "rf_plan_confirmation",
-            "configure_device",
-            "run_bounded",
-            "runtime_observation",
-            "stop_runtime",
         ])
+        self.assertEqual(
+            [item.get("id") for item in workflow.deferred_plan],
+            [
+                "configure_device",
+                "run_bounded",
+                "runtime_observation",
+                "stop_runtime",
+            ],
+        )
 
     def test_configuration_only_request_does_not_start_runtime_chain(self):
         workflow = self.engine().consume_turn(
@@ -523,8 +545,12 @@ class WorkflowCapabilityCompositionTest(unittest.TestCase):
         )
         ids = [stage.id for stage in workflow.stages]
         self.assertEqual(ids, [
-            "hardware_precheck", "hardware_confirmation", "configure_and_check"
+            "hardware_precheck", "hardware_confirmation"
         ])
+        self.assertEqual(
+            [item.get("id") for item in workflow.deferred_plan],
+            ["configure_and_check"],
+        )
         self.assertNotIn("hardware_runtime", workflow.intent.capabilities)
 
     def test_stop_at_tx_confirmation_is_deferred_not_forbidden(self):
@@ -535,14 +561,19 @@ class WorkflowCapabilityCompositionTest(unittest.TestCase):
         )
         self.assertEqual(workflow.task_type, "HARDWARE_CONFIGURE")
         self.assertEqual(workflow.intent.slots["deploy_permission"], "pending")
-        self.assertEqual(
-            workflow.intent.slots["terminal_checkpoint"],
-            "rf_plan_confirmation",
+        self.assertEqual(workflow.intent.slots.get("operation"), "prepare")
+        self.assertIn(
+            "stop_at_decision_boundary", workflow.intent.stop_conditions
         )
+        self.assertNotIn("terminal_checkpoint", workflow.intent.slots)
         self.assertIn("hardware_runtime", workflow.intent.capabilities)
         ids = [stage.id for stage in workflow.stages]
         self.assertIn("discover_and_probe_hardware", ids)
         self.assertIn("rf_plan_confirmation", ids)
+        self.assertNotIn("configure_device", ids)
+        self.assertNotIn("run_bounded", ids)
+        self.assertNotIn("duration_seconds", workflow.intent.slots)
+        self.assertNotIn("max_duration_seconds", workflow.intent.slots)
         self.assertLess(
             ids.index("discover_and_probe_hardware"),
             ids.index("rf_plan_confirmation"),
@@ -568,8 +599,203 @@ class WorkflowCapabilityCompositionTest(unittest.TestCase):
         self.assertEqual(workflow.task_type, "TX_BUILD")
         self.assertEqual(workflow.intent.slots["duration_seconds"], 10.0)
         self.assertIn("hardware_runtime", workflow.intent.capabilities)
-        self.assertIn("run_bounded", [stage.id for stage in workflow.stages])
+        self.assertIn(
+            "run_bounded",
+            [item.get("id") for item in workflow.deferred_plan],
+        )
+        self.assertNotIn("run_bounded", [stage.id for stage in workflow.stages])
         self.assertNotIn("build_ble_advertiser", [stage.id for stage in workflow.stages])
+
+    def test_approval_materializes_deferred_rf_tail(self):
+        with mock.patch.dict(os.environ, {"GRC_AGENT_ENABLE_RF": "1"}):
+            engine = self.engine()
+            workflow = engine.consume_turn(
+                "用 plutosdr 发射 ble 信号，local name 为 loveu",
+                SharedState(),
+            )
+            self.assertNotIn("configure_device", [stage.id for stage in workflow.stages])
+            workflow.current_stage = "rf_plan_confirmation"
+            engine._activate_current()
+            digest = engine.digest()
+            self.assertEqual(digest["wait_kind"], "approval")
+            self.assertEqual(
+                workflow.stage("rf_plan_confirmation").checkpoint.requested_effect,
+                "RF_RUN",
+            )
+            engine.resolve_checkpoint("approved")
+            self.assertIn("transmit_bounded", [stage.id for stage in workflow.stages])
+            self.assertEqual(workflow.current_stage, "configure_device")
+            self.assertIn(
+                "stop_and_finalize",
+                [item.get("id") for item in workflow.deferred_plan],
+            )
+
+    def test_stop_at_boundary_approval_does_not_materialize_rf(self):
+        engine = self.engine()
+        workflow = engine.consume_turn(
+            "为 PlutoSDR 配置 2.402 GHz、2 Msps 的发射流图，"
+            "保存配置并停在发射确认。",
+            SharedState(),
+        )
+        self.assertIn("stop_at_decision_boundary", workflow.intent.stop_conditions)
+        workflow.current_stage = "rf_plan_confirmation"
+        engine._activate_current()
+        digest = engine.digest()
+        self.assertEqual(digest["wait_kind"], "approval")
+        self.assertEqual(
+            workflow.stage("rf_plan_confirmation").checkpoint.requested_effect,
+            "DEVICE_READ",
+        )
+        self.assertEqual(digest.get("stage_label"), "配置确认")
+        self.assertEqual(
+            next(
+                item["label"] for item in digest["stages"]
+                if item["id"] == "rf_plan_confirmation"
+            ),
+            "配置确认",
+        )
+        self.assertFalse(digest.get("max_duration_seconds"))
+        self.assertEqual(workflow.stage("rf_plan_confirmation").checkpoint.reason, "配置确认")
+        self.assertFalse(digest.get("blocker"))
+        engine.resolve_checkpoint("approved")
+        self.assertEqual(workflow.execution_status, "completed")
+        self.assertEqual(workflow.outcome, "passed")
+        self.assertNotIn("configure_device", [stage.id for stage in workflow.stages])
+        self.assertEqual(workflow.deferred_plan, [])
+        digest = engine.digest()
+        self.assertEqual(digest.get("wait_kind"), "")
+        self.assertFalse(digest.get("can_confirm"))
+        self.assertFalse(digest.get("checkpoint_id"))
+        self.assertEqual(digest.get("requested_effect"), "")
+        self.assertEqual(digest.get("stage_label"), "配置确认")
+
+    def test_followup_transmit_reuses_saved_preview_as_deploy(self):
+        engine = self.engine()
+        state = SharedState(session_id="followup-tx")
+        preview = self.root / "pluto_tx.grc"
+        preview.write_text("id: options\n", encoding="utf-8")
+        workflow = engine.consume_turn(
+            "为 PlutoSDR 配置 2.402 GHz、2 Msps 的发射流图，"
+            "保存配置并停在发射确认。",
+            state,
+        )
+        workflow.current_stage = "rf_plan_confirmation"
+        engine._activate_current()
+        engine.resolve_checkpoint("approved")
+        self.assertEqual(workflow.execution_status, "completed")
+        state.project.grc_path = str(preview)
+        state.project.config.update({
+            "hardware": "pluto",
+            "direction": "tx",
+            "carrier_frequency": 2_402_000_000.0,
+            "sample_rate": 2_000_000.0,
+            "preview_mode": "throttled_null_sink",
+            "rf_armed": False,
+        })
+        with mock.patch.dict(os.environ, {"GRC_AGENT_ENABLE_RF": "1"}):
+            follow = engine.consume_turn("现在发射 10 秒", state)
+            self.assertEqual(follow.intent.slots.get("operation"), "deploy")
+            self.assertEqual(follow.intent.slots.get("hardware"), "pluto")
+            self.assertEqual(follow.intent.slots.get("carrier_frequency"), 2_402_000_000.0)
+            self.assertEqual(follow.intent.slots.get("sample_rate"), 2_000_000.0)
+            self.assertEqual(follow.intent.slots.get("duration_seconds"), 10.0)
+            self.assertEqual(follow.intent.slot_sources.get("hardware"), "current_project")
+            self.assertNotIn("stop_at_decision_boundary", follow.intent.stop_conditions)
+            self.assertIn("hardware_runtime", follow.intent.capabilities)
+            follow.current_stage = "rf_plan_confirmation"
+            engine._activate_current()
+            digest = engine.digest()
+            self.assertEqual(
+                follow.stage("rf_plan_confirmation").checkpoint.requested_effect,
+                "RF_RUN",
+            )
+            self.assertEqual(digest.get("stage_label"), "RF 计划确认")
+            self.assertEqual(digest.get("max_duration_seconds"), 10.0)
+
+    def test_failed_stage_keeps_resume_from(self):
+        engine = self.engine()
+        workflow = engine.consume_turn("构建 BPSK AWGN", SharedState())
+        stage = engine.start_stage()
+        engine.accept_result({
+            "workflow_id": workflow.workflow_id,
+            "stage_id": stage.id,
+            "workflow_revision": workflow.revision,
+            "base_project_version": workflow.base_project_version,
+            "ok": False,
+            "outcome": "failed",
+            "resume_from": "arm_flowgraph",
+            "completion": {name: True for name in stage.completion},
+        })
+        self.assertEqual(stage.resume_from, "arm_flowgraph")
+        self.assertEqual(workflow.execution_status, "waiting")
+
+    def test_configure_device_resume_skips_already_applied_configure(self):
+        from grc.agent.service.adapter import ServiceAgent
+        from grc.agent.tools import registry
+        from grc.agent import env
+
+        try:
+            platform = env.make_platform()
+        except Exception as exc:  # noqa: BLE001
+            self.skipTest(f"make_platform unavailable: {exc}")
+        sessions = self.root / "sessions"
+        sessions.mkdir(parents=True, exist_ok=True)
+        with mock.patch(
+            "grc.agent.service.session_store.sessions_root",
+            return_value=str(sessions),
+        ), mock.patch(
+            "grc.agent.service.orchestrator.build_agent", return_value=None
+        ):
+            agent = ServiceAgent(session_id="resume-arm", platform=platform)
+            engine = agent._workflow
+            workflow = engine.consume_turn(
+                "用 HackRF 构建发射机，中心频率 915 MHz，采样率 2 Msps，"
+                "直接部署并运行 10 秒",
+                agent._state,
+            )
+            engine.ensure_stage("configure_device")
+            workflow.current_stage = "configure_device"
+            workflow.intent.slots["direction"] = "tx"
+            stage = workflow.stage("configure_device")
+            stage.resume_from = "arm_flowgraph"
+            stage.execution_status = "pending"
+            workflow.execution_status = "pending"
+            calls = []
+
+            def fake_call(name, args=None, ctx=None):
+                calls.append(name)
+                if name == "configure_sdr":
+                    return {"ok": True}
+                if name == "arm_hardware_flowgraph":
+                    return {"ok": False, "error": "arm failed"}
+                return {"ok": True}
+
+            ctx = agent._make_ctx()
+            with mock.patch.object(registry, "call", side_effect=fake_call):
+                agent._run_stage_deterministic(
+                    ctx, "", "", True, "configure_device"
+                )
+            self.assertNotIn("configure_sdr", calls)
+            self.assertIn("arm_hardware_flowgraph", calls)
+            self.assertEqual(stage.resume_from, "arm_flowgraph")
+
+    def test_open_compound_observe_is_not_a_seven_task_template(self):
+        from grc.agent.tests.test_seven_tasks import VARIANTS
+
+        text = (
+            "在保持当前调制不变的前提下，只把频谱主峰写进报告，"
+            "同时标出采样率，不要重新搭链路"
+        )
+        self.assertNotIn(text, {item[0] for item in VARIANTS})
+        workflow = self.engine().consume_turn(text, project_state())
+        ids = [stage.id for stage in workflow.stages]
+        self.assertNotIn("configure_device", ids)
+        self.assertNotIn("run_bounded", ids)
+        self.assertNotIn("rf_plan_confirmation", ids)
+        self.assertTrue(ids)
+        self.assertNotIn(
+            "hardware_runtime", workflow.intent.capabilities
+        )
 
     def test_policy_checkpoint_resume_does_not_consume_an_attempt(self):
         engine = self.engine()
@@ -689,6 +915,60 @@ class IntentLlmTest(unittest.TestCase):
         self.assertIn("build_signal", completed.capabilities)
         self.assertGreaterEqual(completed.confidence, 0.9)
 
+    def test_llm_does_not_relabel_safety_duration_as_user_constraint(self):
+        rules = WorkflowIntent(
+            raw_text="给 Pluto 配发射流图并停在下一决策点",
+            task_type="HARDWARE_CONFIGURE",
+            confidence=0.95,
+            capabilities=["build_tx", "hardware_configure", "hardware_runtime"],
+            slots={
+                "operation": "prepare",
+                "duration_seconds": 30.0,
+                "hardware": "pluto",
+            },
+            slot_sources={
+                "operation": "rules",
+                "duration_seconds": "safety_default",
+                "hardware": "user",
+            },
+        )
+        payload = {
+            "task_type": "HARDWARE_CONFIGURE",
+            "confidence": 0.96,
+            "capabilities": ["build_tx", "hardware_configure", "hardware_runtime"],
+            "slots": {"duration_seconds": 30.0, "operation": "prepare"},
+        }
+        with mock.patch("grc.agent.llm.is_configured", return_value=True), mock.patch(
+            "grc.agent.llm.chat", return_value=__import__("json").dumps(payload)
+        ):
+            completed = complete_intent(rules, rules.raw_text, SharedState())
+        self.assertEqual(completed.slot_sources["duration_seconds"], "safety_default")
+        self.assertEqual(completed.slots["duration_seconds"], 30.0)
+
+    def test_llm_can_promote_prepare_to_deploy_from_user_goal(self):
+        rules = WorkflowIntent(
+            raw_text="用 Pluto 在 2.402 GHz 发射 10 秒",
+            task_type="HARDWARE_CONFIGURE",
+            confidence=0.95,
+            capabilities=["build_tx", "hardware_configure", "hardware_runtime"],
+            slots={"operation": "prepare", "hardware": "pluto"},
+            slot_sources={"operation": "rules", "hardware": "user"},
+            stop_conditions=["stop_at_decision_boundary"],
+        )
+        payload = {
+            "task_type": "HARDWARE_CONFIGURE",
+            "confidence": 0.97,
+            "capabilities": ["build_tx", "hardware_configure", "hardware_runtime"],
+            "slots": {"operation": "deploy", "duration_seconds": 10.0},
+            "stop_conditions": [],
+        }
+        with mock.patch("grc.agent.llm.is_configured", return_value=True), mock.patch(
+            "grc.agent.llm.chat", return_value=__import__("json").dumps(payload)
+        ):
+            completed = complete_intent(rules, rules.raw_text, SharedState())
+        self.assertEqual(completed.slots["operation"], "deploy")
+        self.assertNotIn("stop_at_decision_boundary", completed.stop_conditions)
+
     def test_invalid_task_type_is_ignored(self):
         rules = WorkflowIntent(raw_text="x", task_type="RX_BUILD", confidence=0.5)
         with mock.patch("grc.agent.llm.is_configured", return_value=True), mock.patch(
@@ -740,7 +1020,11 @@ class IntentLlmTest(unittest.TestCase):
             )
         self.assertEqual(workflow.task_type, "HARDWARE_CONFIGURE")
         self.assertGreater(len(workflow.stages), 0)
-        self.assertEqual(workflow.stages[-1].id, "stop_and_finalize")
+        self.assertEqual(workflow.stages[-1].id, "rf_plan_confirmation")
+        self.assertEqual(
+            [item.get("id") for item in workflow.deferred_plan][-1],
+            "stop_and_finalize",
+        )
 
 
 _HW_STAGE_IDS = {
@@ -1133,8 +1417,9 @@ class MutationAndExportContractTest(unittest.TestCase):
         state = SharedState(session_id="apply-stale")
         state.project.grc_path = str(path)
         state.project.config.update({"recipe": "bpsk_awgn", "modulation": "bpsk"})
-        workflow = self.engine().consume_turn("把当前 BPSK 改成 QPSK", state)
-        stage = workflow.stage("apply_and_verify")
+        engine = self.engine()
+        workflow = engine.consume_turn("把当前 BPSK 改成 QPSK", state)
+        stage = engine.ensure_stage("apply_and_verify")
         reply = AgentReply(
             text="完成",
             stage="FINAL",

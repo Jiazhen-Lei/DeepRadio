@@ -129,7 +129,7 @@ class V3HardwareWorkflowRegressionTest(unittest.TestCase):
                 "用 PlutoSDR 发射 BLE，local name 为 variable-name，直接部署",
                 agent._state,
             )
-            stage = workflow.stage("over_air_verification")
+            stage = agent._workflow.ensure_stage("over_air_verification")
             self.assertIsNotNone(stage)
             for prior in workflow.stages:
                 if prior.id == stage.id:
@@ -192,7 +192,7 @@ class V3HardwareWorkflowRegressionTest(unittest.TestCase):
                 "用 PlutoSDR 发射 BLE，local name 为 expired-name，直接部署",
                 agent._state,
             )
-            stage = workflow.stage("over_air_verification")
+            stage = agent._workflow.ensure_stage("over_air_verification")
             for prior in workflow.stages:
                 if prior.id == stage.id:
                     break
@@ -254,6 +254,12 @@ class V3HardwareWorkflowRegressionTest(unittest.TestCase):
         self.assertTrue(armed.get("valid"), armed)
         sink = self.ctx.blocks.get("sdr_sink")
         self.assertEqual(getattr(sink, "state", None), "disabled")
+        text = Path(built["grc_path"]).read_text(encoding="utf-8")
+        self.assertTrue("blocks_throttle2" in text or "blocks_throttle" in text)
+        self.assertIn("未授权射频", self.ctx.blocks["sdr_sink"].comment)
+        self.assertIn("1 kHz", self.ctx.blocks["src"].comment)
+        self.assertIn("仅限速", self.ctx.blocks["preview_throttle"].comment)
+        self.assertIn("预览", self.ctx.blocks["preview_sink"].comment)
         self.assertEqual(
             getattr(self.ctx.blocks.get("preview_throttle"), "state", None),
             "enabled",
@@ -262,6 +268,23 @@ class V3HardwareWorkflowRegressionTest(unittest.TestCase):
             getattr(self.ctx.blocks.get("preview_sink"), "state", None),
             "enabled",
         )
+
+    def test_preview_bind_writes_identity_without_arming(self) -> None:
+        if "iio_pluto_sink" not in self.ctx.platform.blocks:
+            self.skipTest("iio_pluto_sink is not available in this GNU Radio build")
+        from grc.agent.tools.hardware_tools import bind_endpoint_identity
+
+        built = registry.call(
+            "build_sdr_tx_flowgraph",
+            {"device_type": "pluto", "center_freq": 2.402e9, "sample_rate": 2e6},
+            self.ctx,
+        )
+        changed = bind_endpoint_identity(self.ctx.flow_graph, "usb:2.4.5")
+        self.assertGreater(changed, 0)
+        self.ctx.platform.save_flow_graph(built["grc_path"], self.ctx.flow_graph)
+        text = Path(built["grc_path"]).read_text(encoding="utf-8")
+        self.assertIn("usb:2.4.5", text)
+        self.assertEqual(self.ctx.blocks["sdr_sink"].state, "disabled")
 
     def test_generic_tx_arm_binds_identity_and_disables_preview(self) -> None:
         if "iio_pluto_sink" not in self.ctx.platform.blocks:
@@ -278,10 +301,14 @@ class V3HardwareWorkflowRegressionTest(unittest.TestCase):
                     "id": "discover_and_probe_hardware",
                     "execution_status": "completed",
                     "outcome": "passed",
+                    "result": {"completion": {"device_probed": True}},
                 },
                 {
                     "id": "rf_plan_confirmation",
-                    "checkpoint": {"decision_status": "approved"},
+                    "checkpoint": {
+                        "decision_status": "approved",
+                        "requested_effect": "RF_RUN",
+                    },
                 },
             ],
         }
@@ -359,6 +386,46 @@ class V6FollowupContractTest(unittest.TestCase):
         self.assertNotIn("0824_V5", " ".join(paths))
         self.assertNotIn("__pycache__", " ".join(paths))
 
+    def test_session_manifest_is_cumulative_and_roles_are_semantic(self):
+        from grc.agent.service import result_projector
+
+        session_id = "artifact-index"
+        state = SharedState(session_id=session_id)
+        state.runtime.current_node = "probe_device"
+        final = Path(store.session_root(session_id)) / "final"
+        reports = final / "reports"
+        reports.mkdir(parents=True)
+        device_report = reports / "device_probe.json"
+        device_report.write_text('{"identity_ok":true}', encoding="utf-8")
+        first_manifest = store.write_artifact_manifest(
+            session_id, {"device_report": str(device_report)}
+        )
+        result_projector.project_artifact_index(state, first_manifest)
+
+        state.runtime.current_node = "prepare_artifact"
+        preview = final / "radio.grc"
+        preview.write_text("options:\n  parameters: {}\n", encoding="utf-8")
+        manifest = store.write_artifact_manifest(
+            session_id, {"grc_path": str(preview)}
+        )
+        payload = json.loads(Path(manifest).read_text(encoding="utf-8"))
+        result_projector.project_artifact_index(state, manifest)
+        entries = {item["path"]: item for item in payload["artifacts"]}
+        self.assertIn("final/reports/device_probe.json", entries)
+        self.assertIn("final/radio.grc", entries)
+        self.assertEqual(
+            entries["final/reports/device_probe.json"]["role"],
+            "device_report",
+        )
+        self.assertEqual(entries["final/radio.grc"]["role"], "safe_preview")
+        self.assertTrue(all(item.get("artifact_id") for item in entries.values()))
+        projected = {item.path: item for item in state.artifacts}
+        self.assertEqual(
+            projected["final/reports/device_probe.json"].producer,
+            "probe_device",
+        )
+        self.assertEqual(projected["final/radio.grc"].producer, "prepare_artifact")
+
     def test_attach_evidence_binds_run_id_and_hash(self):
         session_id = "gui-evidence"
         source = self.root / "lightblue.png"
@@ -377,14 +444,42 @@ class V6FollowupContractTest(unittest.TestCase):
             SharedState(),
         )
         workflow.current_stage = "rf_plan_confirmation"
-        engine._activate_current()
-        engine.resolve_checkpoint("approved")
+        with mock.patch.dict(os.environ, {"GRC_AGENT_ENABLE_RF": "1"}):
+            engine._activate_current()
+            engine.resolve_checkpoint("approved")
         stage = workflow.stage("rf_plan_confirmation")
         self.assertEqual(stage.outcome, "passed")
         self.assertTrue(stage.result["completion"]["rf_plan_approved"])
         digest = engine.digest()
         rf = next(item for item in digest["stages"] if item["id"] == "rf_plan_confirmation")
         self.assertTrue(rf["completion_result"]["rf_plan_approved"])
+
+    def test_rf_capability_blocker_clears_only_after_runtime_restart(self):
+        workflow_path = self.root / "workflow.yaml"
+        with mock.patch.dict(os.environ, {"GRC_AGENT_ENABLE_RF": "0"}):
+            engine = WorkflowEngine(str(workflow_path))
+            workflow = engine.consume_turn(
+                "用 plutosdr 发射 ble 信号，local name 为 loveu",
+                SharedState(),
+            )
+            workflow.current_stage = "rf_plan_confirmation"
+            engine._activate_current()
+            engine.save()
+            digest = engine.digest()
+            self.assertEqual(digest["wait_kind"], "capability")
+            self.assertEqual(
+                digest["blocker"]["code"], "SYSTEM_CAPABILITY_MISSING"
+            )
+            self.assertEqual(digest["blocker"]["requested_effect"], "RF_RUN")
+            with self.assertRaises(ValueError):
+                engine.resolve_checkpoint("approved")
+
+        with mock.patch.dict(os.environ, {"GRC_AGENT_ENABLE_RF": "1"}):
+            restored = WorkflowEngine(str(workflow_path))
+            digest = restored.digest()
+            self.assertEqual(digest["wait_kind"], "approval")
+            self.assertFalse(digest["blocker"])
+            restored.resolve_checkpoint("approved")
 
     def test_ota_checkpoint_records_run_id_and_evidence(self):
         engine = WorkflowEngine(str(self.root / "workflow.yaml"))
@@ -398,6 +493,7 @@ class V6FollowupContractTest(unittest.TestCase):
             "artifact": "final/evidence/run-f646528e87c5/shot.png",
             "sha256": "abc",
         }
+        self.assertIsNotNone(engine.ensure_stage("over_air_verification"))
         workflow.current_stage = "over_air_verification"
         engine._activate_current()
         engine.resolve_checkpoint("approved")
@@ -662,6 +758,23 @@ class ToolOriginTests(unittest.TestCase):
         self.assertEqual(registry.origin_of("arm_hardware_flowgraph"), "deepradio_runtime")
         self.assertEqual(registry.origin_of("start_flowgraph"), "deepradio_runtime")
 
+    def test_action_registry_exposes_generic_effect_contracts(self):
+        expected = {
+            "inspect_flowgraph": "READ",
+            "build_sdr_tx_flowgraph": "ARTIFACT_WRITE",
+            "discover_devices": "DEVICE_READ",
+            "arm_hardware_flowgraph": "DEVICE_CONFIG",
+            "start_flowgraph": "RF_RUN",
+        }
+        for name, effect in expected.items():
+            metadata = registry.action_metadata(name)
+            self.assertEqual(metadata.get("effect_level"), effect, metadata)
+        self.assertFalse(registry.action_metadata("start_flowgraph")["idempotent"])
+        self.assertIn(
+            "user_effect_grant",
+            registry.action_metadata("start_flowgraph")["requires"],
+        )
+
     def test_timeline_actor_includes_origin(self):
         actor = _event_actor(
             {
@@ -720,7 +833,11 @@ class UsrpRxSpectrumContractTest(unittest.TestCase):
         self.assertEqual(workflow.intent.missing_slots, [])
         self.assertEqual(workflow.current_stage, "rx_build_and_verify")
         self.assertIn("realtime_sink_present", workflow.stage("rx_build_and_verify").completion)
-        self.assertEqual(workflow.stages[-1].id, "stop_runtime")
+        self.assertEqual(workflow.stages[-1].id, "rf_plan_confirmation")
+        self.assertIn(
+            "stop_runtime",
+            [item.get("id") for item in workflow.deferred_plan],
+        )
 
     def test_flowgraph_has_usrp_source_and_qt_spectrum(self):
         built = registry.call(

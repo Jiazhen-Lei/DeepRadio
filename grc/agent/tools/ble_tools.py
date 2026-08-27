@@ -178,6 +178,7 @@ def _leave_hardware_sink_unarmed(ctx: ToolContext, block_id: str) -> None:
     group="ble",
     origin="deepradio_protocol",
     runtime="deepradio",
+    effect_level="ARTIFACT_WRITE",
 )
 def build_ble_advertising_pdu(
     ctx: ToolContext, local_name: str, channel: int = 37
@@ -212,6 +213,11 @@ def build_ble_advertising_pdu(
         **metadata,
         "packet_path": str(packet_path),
         "metadata_path": str(metadata_path),
+        "capability": "ble_advertising_single_channel",
+        "unsupported_capabilities": [
+            "ble_advertising_three_channel",
+            "ble_independent_sniffer",
+        ],
     }
 
 
@@ -249,6 +255,7 @@ def _gaussian_taps(samples_per_symbol: int, bt: float = 0.5, span: int = 4) -> n
     group="ble",
     origin="deepradio_protocol",
     runtime="deepradio",
+    effect_level="ARTIFACT_WRITE",
 )
 def generate_ble_1m_waveform(
     ctx: ToolContext,
@@ -299,7 +306,12 @@ def generate_ble_1m_waveform(
         "digital_amplitude": float(digital_amplitude),
     }
     ctx.extra.setdefault("artifacts", {})["ble_waveform"] = str(path)
-    return {"ok": True, **ctx.extra["ble_waveform"], "channel": channel}
+    return {"ok": True, **ctx.extra["ble_waveform"], "channel": channel,
+            "capability": "ble_advertising_single_channel",
+            "unsupported_capabilities": [
+                "ble_advertising_three_channel",
+                "ble_independent_sniffer",
+            ]}
 
 
 @tool(
@@ -478,6 +490,7 @@ def _verify_waveform_loopback(ctx: ToolContext, air_packet: bytes) -> Dict[str, 
     group="ble",
     origin="deepradio_compose",
     runtime="gnuradio_blocks",
+    effect_level="ARTIFACT_WRITE",
 )
 def build_ble_uhd_tx_flowgraph(
     ctx: ToolContext,
@@ -586,6 +599,7 @@ def build_ble_uhd_tx_flowgraph(
     group="ble",
     origin="deepradio_compose",
     runtime="gnuradio_blocks",
+    effect_level="ARTIFACT_WRITE",
 )
 def build_ble_pluto_tx_flowgraph(
     ctx: ToolContext,

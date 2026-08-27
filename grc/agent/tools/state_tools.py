@@ -6,7 +6,6 @@ import copy
 import os
 import re
 import shutil
-import uuid
 from typing import Any, Dict, List, Optional
 
 from ..knowledge import recipes
@@ -365,6 +364,7 @@ def spec_clarify(ctx: ToolContext, text: str = ""):
         "required": ["text"],
     },
     group="state",
+    effect_level="ARTIFACT_WRITE",
 )
 def spec_commit(ctx: ToolContext, text: str):
     return commit_intent(ctx, text)
@@ -395,6 +395,7 @@ def select_recipe(ctx: ToolContext, intent: str = "", recipe: str = ""):
     description="Bind current simulation metrics to pending claims.",
     parameters={"type": "object", "properties": {}},
     group="state",
+    effect_level="ARTIFACT_WRITE",
 )
 def verify_claims(ctx: ToolContext):
     return verify_state_claims(ctx, ctx.extra.get("metrics", {}))
@@ -415,6 +416,7 @@ def verify_claims(ctx: ToolContext):
     group="hardware",
     origin="deepradio_state",
     runtime="shared_state",
+    effect_level="ARTIFACT_WRITE",
 )
 def configure_sdr(
     ctx: ToolContext,
@@ -478,6 +480,7 @@ def configure_sdr(
     group="hardware",
     origin="deepradio_state",
     runtime="shared_state",
+    effect_level="DEVICE_READ",
 )
 def hardware_preflight(ctx: ToolContext, device_type: str = ""):
     state = _state(ctx)
@@ -521,6 +524,13 @@ def hardware_preflight(ctx: ToolContext, device_type: str = ""):
         "outcome": "passed" if complete else "failed",
         "device_type": requested,
         "checks": checks,
+        "system_capabilities": {
+            "rf_runtime": {
+                "available": checks["real_hardware_actions_enabled"],
+                "requires_restart": not checks["real_hardware_actions_enabled"],
+                "environment_key": "GRC_AGENT_ENABLE_RF",
+            }
+        },
         "missing": [name for name, value in checks.items() if not value and name != "real_hardware_actions_enabled"],
         "note": (
             "配置与驱动只读预检完成；RF 运行功能已由系统管理员启用。"
@@ -547,6 +557,7 @@ def hardware_preflight(ctx: ToolContext, device_type: str = ""):
         "required": ["block_id", "parameter", "value"],
     },
     group="build",
+    effect_level="ARTIFACT_WRITE",
 )
 def apply_grc_diff(
     ctx: ToolContext,
@@ -618,25 +629,41 @@ def apply_grc_diff(
                 "type": "array",
                 "items": {"type": "object"},
                 "maxItems": 100,
-            }
+            },
+            "preconditions": {
+                "type": "array",
+                "items": {},
+            },
         },
         "required": ["operations"],
     },
     group="build",
+    effect_level="ARTIFACT_WRITE",
 )
-def apply_flowgraph_patch(ctx: ToolContext, operations: List[Dict[str, Any]]):
+def apply_flowgraph_patch(
+    ctx: ToolContext,
+    operations: List[Dict[str, Any]],
+    preconditions: Optional[List[Any]] = None,
+):
     from . import registry
 
     if ctx.extra.get("mutation_forbidden"):
         return {"ok": False, "error": "本轮禁止改图"}
     if ctx.flow_graph is None:
         return {"ok": False, "error": "当前 session 没有已加载的流图"}
+    expanded, expand_error = expand_patch_operations(operations)
+    if expand_error:
+        return {"ok": False, "error": expand_error}
+    operations = expanded
     if not isinstance(operations, list) or not operations or len(operations) > 100:
         return {"ok": False, "error": "operations 必须是 1~100 项的列表"}
     allowed = {"add", "remove", "set", "connect", "disconnect"}
     for index, operation in enumerate(operations):
         if not isinstance(operation, dict) or operation.get("op") not in allowed:
             return {"ok": False, "error": f"operations[{index}] 的 op 非法"}
+    pre_error = check_patch_preconditions(ctx, preconditions or [])
+    if pre_error:
+        return {"ok": False, "error": pre_error}
 
     state = _state(ctx)
     scope = (
@@ -755,6 +782,70 @@ def apply_flowgraph_patch(ctx: ToolContext, operations: List[Dict[str, Any]]):
     }
 
 
+def expand_patch_operations(
+    operations: List[Dict[str, Any]],
+) -> tuple[List[Dict[str, Any]], str]:
+    """Normalize GraphPatch IR aliases into executable graph ops."""
+    if not isinstance(operations, list) or not operations:
+        return [], "operations 必须是 1~100 项的列表"
+    expanded: List[Dict[str, Any]] = []
+    for index, raw in enumerate(operations):
+        if not isinstance(raw, dict):
+            return [], f"operations[{index}] 不是对象"
+        operation = dict(raw)
+        op = str(operation.get("op") or "")
+        if op == "set_param":
+            operation["op"] = "set"
+            operation.setdefault("id", operation.get("block") or operation.get("block_id"))
+            operation.setdefault("name", operation.get("key") or operation.get("parameter"))
+        elif op == "replace_block":
+            old_id = str(operation.get("old") or operation.get("id") or "")
+            new_id = str(operation.get("new") or operation.get("new_id") or old_id)
+            key = str(operation.get("key") or operation.get("new_key") or "")
+            if not old_id or not key:
+                return [], f"operations[{index}] replace_block 需要 old 与 key"
+            expanded.append({"op": "remove", "id": old_id})
+            expanded.append({
+                "op": "add",
+                "id": new_id,
+                "key": key,
+                "params": dict(operation.get("params") or {}),
+            })
+            continue
+        elif op == "connect":
+            operation.setdefault("src_id", operation.get("src") or operation.get("source"))
+            operation.setdefault("dst_id", operation.get("dst") or operation.get("destination"))
+        elif op == "set":
+            operation.setdefault("id", operation.get("block") or operation.get("block_id"))
+            operation.setdefault("name", operation.get("key") or operation.get("parameter"))
+        expanded.append(operation)
+        if len(expanded) > 100:
+            return [], "operations 必须是 1~100 项的列表"
+    return expanded, ""
+
+
+def check_patch_preconditions(ctx: ToolContext, preconditions: List[Any]) -> str:
+    for index, item in enumerate(preconditions or []):
+        if item in (None, "", True):
+            continue
+        if isinstance(item, str):
+            if item not in (ctx.blocks or {}):
+                return f"preconditions[{index}] 缺少块 {item}"
+            continue
+        if not isinstance(item, dict):
+            return f"preconditions[{index}] 非法"
+        block_id = str(item.get("block") or item.get("id") or "")
+        param = str(item.get("param") or item.get("name") or item.get("key") or "")
+        if block_id and block_id not in (ctx.blocks or {}):
+            return f"preconditions[{index}] 缺少块 {block_id}"
+        if block_id and param:
+            block = (ctx.blocks or {}).get(block_id)
+            params = getattr(block, "params", None) or {}
+            if param not in params:
+                return f"preconditions[{index}] 块 {block_id} 无参数 {param}"
+    return ""
+
+
 def _disconnect_exact(ctx: ToolContext, operation: Dict[str, Any]) -> Dict[str, Any]:
     src_id = str(operation.get("src_id") or "")
     dst_id = str(operation.get("dst_id") or "")
@@ -819,7 +910,3 @@ def _resimulate_and_verify(ctx: ToolContext, state) -> Dict[str, Any]:
     if notes:
         out["note"] = "; ".join(notes)
     return out
-
-
-def make_task_id(prefix: str) -> str:
-    return f"{prefix}-{uuid.uuid4().hex[:8]}"

@@ -12,6 +12,26 @@ import uuid
 from typing import Any, Callable, Dict, Optional
 
 from .completion import KNOWN_COMPLETIONS
+from .plan_compiler import (
+    compact_invocations,
+    compact_workflow_payload,
+    compile_stages,
+    compiled_plan_summary,
+    replan_tail,
+)
+from .planning import (
+    EffectLevel,
+    highest_effect,
+    is_rf_grant_effect,
+    normalize_effect,
+    project_intent_ir,
+    split_at_decision_boundary,
+    stage_display_label,
+    stage_plan_item,
+    stops_at_boundary,
+    system_capability_blocker,
+    visible_plan_horizon,
+)
 from .schema import Checkpoint, Stage, Workflow, WorkflowIntent
 from ..tools.hardware_profiles import resolve_hardware_profile
 from ..tools.state_tools import is_read_only_request
@@ -107,9 +127,26 @@ _TX_FORBIDDEN = re.compile(
     r"(?:do\s+not|don't|without)\s+(?:start|run|transmit)",
     re.I,
 )
+_TX_AUTHORIZE = re.compile(
+    r"(?:现在|开始|批准|授权|立刻|立即)\s*(?:发射|运行|开机)|"
+    r"(?:发射|运行|transmit)\s*(?:现在|now)|"
+    r"transmit\s+now|start\s+(?:tx|transmit|rf)|"
+    r"authorize\s+(?:tx|rf|transmit)|"
+    r"(?:运行|发射|持续)\s*[:=为]?\s*\d+(?:\.\d+)?\s*(?:秒|s\b)",
+    re.I,
+)
 _DEVICE_ACCESS_FORBIDDEN = re.compile(
     r"(?:不要|不|禁止|勿|别)\s*(?:访问|探测|连接|打开)\s*(?:设备|硬件|sdr|radio)|"
     r"without\s+(?:accessing|probing|connecting)\s+(?:the\s+)?(?:device|hardware|sdr)",
+    re.I,
+)
+_EBN0_LABELED = re.compile(
+    r"(?:eb\s*/?\s*n0|ebn0)\s*[:=为]?\s*"
+    r"([-+]?\d+(?:\.\d+)?)\s*(?:db|分贝)?",
+    re.I,
+)
+_EBN0_ANSWER = re.compile(
+    r"^\s*([-+]?\d+(?:\.\d+)?)\s*(?:db|分贝)?\s*$",
     re.I,
 )
 _NEGATION = re.compile(
@@ -154,6 +191,21 @@ def _hardware_affirmed(text: str) -> bool:
     return False
 
 
+def _parse_ebn0_db(text: str, *, allow_bare_answer: bool = False) -> float | None:
+    """Parse Eb/N0 from a labeled phrase, or a short follow-up like ``8dB``."""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    labeled = _EBN0_LABELED.search(raw)
+    if labeled:
+        return float(labeled.group(1))
+    if allow_bare_answer:
+        bare = _EBN0_ANSWER.fullmatch(raw)
+        if bare:
+            return float(bare.group(1))
+    return None
+
+
 _HW_OBJECT = re.compile(r"硬件|射频|sdr|usrp|电台|板子|空口", re.I)
 
 
@@ -192,7 +244,8 @@ def _task_type_from_capabilities(
         return "HARDWARE_CONFIGURE"
     if (
         "hardware_configure" in caps
-        and slots.get("terminal_checkpoint") == "rf_plan_confirmation"
+        and slots.get("operation") == "prepare"
+        and "hardware_configure" not in blocked
     ):
         return "HARDWARE_CONFIGURE"
     hardware_primary = (
@@ -237,6 +290,7 @@ class WorkflowEngine:
         self.workflow = self._load()
         if self.workflow:
             self._recover_interrupted()
+            self.refresh_system_capabilities()
 
     def _load_catalog(self) -> Dict[str, Any]:
         with open(self.catalog_path, "r", encoding="utf-8") as handle:
@@ -352,7 +406,10 @@ class WorkflowEngine:
                     return self.workflow
                 if relation == "adjustment":
                     self._merge_turn_slots(text, shared_state)
-                    current.checkpoint.reason = self._checkpoint_reason(current)
+                    current.checkpoint.reason = self._checkpoint_reason(
+                        current,
+                        requested_effect=current.checkpoint.requested_effect,
+                    )
                     self.workflow.revision += 1
                     self.save()
                 return self.workflow
@@ -477,6 +534,14 @@ class WorkflowEngine:
             for key, value in update.slots.items()
             if value not in (None, "", [])
         }
+        missing_before = list(self.workflow.intent.missing_slots or [])
+        if (
+            "ebn0_db" in missing_before
+            and updates.get("ebn0_db") is None
+        ):
+            parsed = _parse_ebn0_db(text, allow_bare_answer=True)
+            if parsed is not None:
+                updates["ebn0_db"] = parsed
         self.workflow.intent.slots.update(updates)
         self.workflow.intent.slot_sources.update(
             {key: "user" for key in updates}
@@ -494,6 +559,56 @@ class WorkflowEngine:
             self.workflow.intent.slots
         )
 
+    @staticmethod
+    def _tx_authorize_requested(text: str) -> bool:
+        raw = text or ""
+        if _TX_CONFIRM_ONLY.search(raw) or _TX_FORBIDDEN.search(raw):
+            return False
+        return bool(_TX_AUTHORIZE.search(raw))
+
+    @staticmethod
+    def _inherit_tx_preview_slots(
+        text: str,
+        slots: Dict[str, Any],
+        slot_sources: Dict[str, str],
+        shared_state: Any,
+    ) -> None:
+        """Reuse a saved unarmed TX preview when the user authorizes RF."""
+        if not WorkflowEngine._tx_authorize_requested(text):
+            return
+        if slots.get("operation") in ("prepare", "configure"):
+            return
+        if slots.get("deploy_permission") == "forbidden":
+            return
+        project = getattr(shared_state, "project", None)
+        config = dict(getattr(project, "config", None) or {})
+        path = str(getattr(project, "grc_path", "") or "")
+        if (
+            path
+            and str(config.get("direction") or "") == "tx"
+            and config.get("hardware")
+            and not bool(config.get("rf_armed"))
+        ):
+            inherited = {
+                "hardware": config.get("hardware"),
+                "direction": "tx",
+                "carrier_frequency": config.get("carrier_frequency"),
+                "sample_rate": config.get("sample_rate"),
+                "bandwidth": config.get("rf_bandwidth") or config.get("sample_rate"),
+                "tx_gain": config.get("tx_gain"),
+                "tx_attenuation": config.get("tx_attenuation"),
+            }
+            for key, value in inherited.items():
+                if value in (None, "", []) or slots.get(key) not in (None, "", []):
+                    continue
+                slots[key] = value
+                slot_sources[key] = "current_project"
+        if slots.get("hardware"):
+            slots["operation"] = "deploy"
+            slots.setdefault("deploy_permission", "requested")
+            slot_sources.setdefault("operation", "rules")
+            slot_sources.setdefault("deploy_permission", "rules")
+
     def classify(self, text: str, shared_state: Any) -> WorkflowIntent:
         low = (text or "").lower()
         has_project = bool(
@@ -501,12 +616,20 @@ class WorkflowEngine:
             or getattr(getattr(shared_state, "project", None), "config", {}).get("recipe")
         )
         slots = self._parse_slots(text)
+        slot_sources = {
+            key: "user" for key, value in slots.items() if value not in (None, "", [])
+        }
+        self._inherit_tx_preview_slots(text, slots, slot_sources, shared_state)
         capabilities = self._detect_capabilities(text, slots, has_project)
         task_type = _task_type_from_capabilities(
             capabilities, "END_TO_END_SIM", slots=slots
         )
         project_config = getattr(getattr(shared_state, "project", None), "config", {})
-        slot_sources = {key: "user" for key, value in slots.items() if value not in (None, "", [])}
+        for key in ("operation", "deploy_permission", "hardware_access"):
+            if key in slots and slot_sources.get(key) == "user":
+                slot_sources[key] = "rules"
+        if slots.get("deploy_permission") == "forbidden":
+            slot_sources["deploy_permission"] = "user"
         if slots.get("protocol") == "ble":
             # Protocol-derived defaults are not fresh user decisions.  Keep
             # provenance precise so replanning may change defaults without
@@ -546,6 +669,12 @@ class WorkflowEngine:
                 "recipe": str(project_config.get("recipe") or ""),
                 "modulation": str(project_config.get("modulation") or ""),
                 "channel": str(project_config.get("channel") or ""),
+                "hardware": str(project_config.get("hardware") or ""),
+                "direction": str(project_config.get("direction") or ""),
+                "carrier_frequency": project_config.get("carrier_frequency"),
+                "sample_rate": project_config.get("sample_rate"),
+                "preview_mode": str(project_config.get("preview_mode") or ""),
+                "rf_armed": bool(project_config.get("rf_armed")),
             }
         } if has_project else {}
         # Only inherit parameters that are requirements of a signal-generation
@@ -582,7 +711,7 @@ class WorkflowEngine:
             else:
                 slots.setdefault("tx_gain", 0.0)
                 slot_sources.setdefault("tx_gain", "safety_default")
-        if "hardware_runtime" in capabilities:
+        if slots.get("operation") == "deploy" or "deploy" in capabilities:
             slots.setdefault("duration_seconds", 30.0)
             slots.setdefault("max_duration_seconds", slots["duration_seconds"])
             slot_sources.setdefault("duration_seconds", "safety_default")
@@ -601,6 +730,7 @@ class WorkflowEngine:
             context=context,
             validation_errors=validation_errors,
         )
+        project_intent_ir(intent)
         return intent
 
     def _reconcile_intent(
@@ -633,6 +763,7 @@ class WorkflowEngine:
             intent.task_type, intent.slots, shared_state, intent.capabilities
         )
         intent.validation_errors = self._validate_slots(intent.slots)
+        project_intent_ir(intent)
         return intent
 
     @staticmethod
@@ -676,10 +807,12 @@ class WorkflowEngine:
         add("deploy", slots.get("operation") == "deploy")
         add("hardware_runtime", hardware and (
             realtime
-            or slots.get("operation") == "deploy"
-            or slots.get("terminal_checkpoint") == "rf_plan_confirmation"
-            or any(word in low for word in ("启动", "运行", "run", "start"))
-        ) and slots.get("hardware_access") != "forbidden")
+            or slots.get("operation") in {"deploy", "prepare"}
+            or any(word in low for word in (
+                "启动", "运行", "发射", "transmit", "run", "start",
+            ))
+        ) and slots.get("hardware_access") != "forbidden"
+          and slots.get("deploy_permission") != "forbidden")
         forbidden = _offline_forbidden(text)
         return [name for name in capabilities if name not in forbidden]
 
@@ -709,20 +842,24 @@ class WorkflowEngine:
             "channel": channel,
             "requested_metrics": metrics,
         }
-        ebn0 = re.search(
-            r"(?:eb\s*/?\s*n0|ebn0)\s*[:=为]?\s*"
-            r"([-+]?\d+(?:\.\d+)?)\s*db",
-            low,
-        )
-        if ebn0:
-            slots["ebn0_db"] = float(ebn0.group(1))
+        ebn0 = _parse_ebn0_db(text or "", allow_bare_answer=False)
+        if ebn0 is None and (
+            "ber" in metrics or "ber" in low or "误码率" in (text or "")
+        ):
+            unlabeled = re.search(
+                r"([-+]?\d+(?:\.\d+)?)\s*(?:db|分贝)",
+                low,
+            )
+            if unlabeled:
+                ebn0 = float(unlabeled.group(1))
+        if ebn0 is not None:
+            slots["ebn0_db"] = ebn0
         if any(word in low for word in ("直接部署", "部署", "deploy")):
             slots["operation"] = "deploy"
             slots["deploy_permission"] = "requested"
         if _TX_CONFIRM_ONLY.search(text or ""):
             slots["operation"] = "prepare"
             slots["deploy_permission"] = "pending"
-            slots["terminal_checkpoint"] = "rf_plan_confirmation"
             slots["hardware_access"] = "read_only_probe"
         elif _TX_FORBIDDEN.search(text or ""):
             slots["operation"] = "configure"
@@ -731,7 +868,7 @@ class WorkflowEngine:
         if _DEVICE_ACCESS_FORBIDDEN.search(text or ""):
             slots["hardware_access"] = "forbidden"
         duration = re.search(
-            r"(?:运行|持续|时长|duration)\s*[:=为]?\s*"
+            r"(?:运行|持续|时长|发射|duration)\s*[:=为]?\s*"
             r"(\d+(?:\.\d+)?)\s*(?:秒|s|sec(?:onds?)?)",
             low,
         )
@@ -749,7 +886,7 @@ class WorkflowEngine:
                         word in low for word in ("发射", "部署", "transmit", "deploy")
                     ) else "configure",
                     "modulation": "gfsk",
-                    "advertising_channels": [37, 38, 39],
+                    "advertising_channels": [37],
                     "carrier_frequency": 2_402_000_000.0,
                     "sample_rate": 2_000_000.0,
                     "duration_seconds": slots.get("duration_seconds", 30.0),
@@ -933,16 +1070,28 @@ class WorkflowEngine:
         stages = self._compose_stages(intent, candidate)
         if not stages:
             raise ValueError(f"Task {intent.task_type} 没有可执行 Stage")
+        from .llm_planner import propose_plan
+
+        proposal = propose_plan(intent, shared_state, catalog=self.catalog)
+        stages, _nodes, rejected = compile_stages(
+            intent, stages, catalog=self.catalog, proposal=proposal
+        )
+        horizon, deferred = split_at_decision_boundary(stages)
         version = int(getattr(getattr(shared_state, "project", None), "flowgraph_version", 0))
+        deferred_items = [stage_plan_item(item) for item in deferred]
         self.workflow = Workflow(
             workflow_id=f"wf-{uuid.uuid4().hex[:8]}",
             task_type=intent.task_type,
             intent=intent,
-            stages=stages,
+            stages=list(horizon),
+            deferred_plan=deferred_items,
+            compiled_plan=compiled_plan_summary(horizon, deferred_items),
             base_project_version=version,
-            current_stage=stages[0].id,
+            current_stage=horizon[0].id,
             catalog_version=int(self.catalog.get("schema_version", 1)),
         )
+        if rejected:
+            self._event("plan_actions_rejected", {"actions": rejected})
         self._activate_current()
         self._event("intent_classified", {
             "task_type": intent.task_type,
@@ -959,11 +1108,10 @@ class WorkflowEngine:
     def _compose_stages(
         self, intent: WorkflowIntent, candidate: Dict[str, Any]
     ) -> list[Stage]:
-        """Compose capability groups while preserving each group's failure graph.
+        """Compose capability groups. task_type is only a compatibility label.
 
-        Task candidates remain stable policy/display entry points.  Independent
-        capabilities may extend their success path; no capability may replace
-        the user's raw text or silently terminate a later group.
+        Fragments come from capability membership.  The Plan Compiler then
+        attaches PlanNodes and enforces generic effect/truncation policy.
         """
         deploying_protocol = (
             intent.slots.get("operation") == "deploy"
@@ -1172,11 +1320,17 @@ class WorkflowEngine:
             )
             if data.get(key)
         }
+        if data.get("invocations"):
+            stage.result["invocations"] = compact_invocations(
+                list(data.get("invocations") or [])
+            )
         fingerprint = _result_fingerprint(stage.result, ok, outcome)
         stage.result["fingerprint"] = fingerprint
         if missing_completion:
             stage.result["missing_completion"] = missing_completion
         if data.get("errored"):
+            if data.get("resume_from"):
+                stage.resume_from = str(data.get("resume_from") or "")
             self._event("stage_errored", {"stage_id": stage.id, "attempt": stage.attempt})
             self._remember_result(stage, "errored")
             stage.execution_status = "waiting"
@@ -1209,12 +1363,24 @@ class WorkflowEngine:
                 "acceptance": dict(data.get("acceptance") or {}),
                 "missing_completion": missing_completion,
             })
+        if not ok or stage.outcome == "failed":
+            if data.get("resume_from"):
+                stage.resume_from = str(data.get("resume_from") or "")
+        else:
+            stage.resume_from = ""
         target = stage.transitions.get(transition_key)
         if target is None and transition_key == "passed":
             target = stage.transitions.get("completed")
         if target is None and stage.outcome == "failed":
             target = stage.transitions.get("failed")
-        self._transition(target or ("completed" if ok else "waiting_user"))
+        resolved_target = target or ("completed" if ok else "waiting_user")
+        if (
+            resolved_target == "waiting_user"
+            and stage.outcome != "passed"
+            and not stage.checkpoint
+        ):
+            stage.execution_status = "waiting"
+        self._transition(resolved_target)
         self.save()
         return True
 
@@ -1231,7 +1397,11 @@ class WorkflowEngine:
             raise ValueError("没有 current_stage")
         checkpoint = Checkpoint(
             id=f"cp-{uuid.uuid4().hex[:8]}",
-            reason=reason or _STAGE_LABELS.get(stage.id, stage.id),
+            reason=reason or stage_display_label(
+                stage.id,
+                _STAGE_LABELS.get(stage.id, stage.id),
+                stage.checkpoint.requested_effect if stage.checkpoint else "",
+            ),
             action=action,
             payload_ref=payload_ref,
             resume_stage=True,
@@ -1250,8 +1420,20 @@ class WorkflowEngine:
         stage = self.current_stage()
         if not stage or not stage.checkpoint or stage.execution_status != "waiting":
             raise ValueError("当前没有待决 Checkpoint")
+        if stage.checkpoint.blocker:
+            raise ValueError(
+                stage.checkpoint.blocker.get("message")
+                or "当前系统能力不足，不能接受该确认"
+            )
         normalized = "approved" if decision == "approved" else "rejected"
         stage.checkpoint.decision_status = normalized
+        self.workflow.decisions.append({
+            "checkpoint_id": stage.checkpoint.id,
+            "stage_id": stage.id,
+            "decision": normalized,
+            "requested_effect": stage.checkpoint.requested_effect,
+            "decided_at": time.time(),
+        })
         if stage.checkpoint.resume_stage and normalized == "approved":
             checkpoint_id = stage.checkpoint.id
             stage.execution_status = "pending"
@@ -1282,6 +1464,13 @@ class WorkflowEngine:
         stage.execution_status = "completed"
         stage.outcome = "passed" if normalized == "approved" else "cancelled"
         self._event("checkpoint_resolved", {"stage_id": stage.id, "decision": normalized})
+        if normalized == "approved" and stops_at_boundary(self.workflow.intent, stage.id):
+            self.workflow.deferred_plan = []
+            self._transition("completed")
+            self.save()
+            return
+        if normalized == "approved":
+            self._replan_and_materialize()
         self._transition(stage.transitions.get(normalized, "completed"))
         self.save()
 
@@ -1315,6 +1504,7 @@ class WorkflowEngine:
                 "evidence_sha256": observation.get("sha256")
                 or observation.get("artifact_sha256")
                 or "",
+                "evidence_complete": bool(observation.get("artifact")),
             },
             "note": (checkpoint.reason if checkpoint else "") or stage.id,
         }
@@ -1413,7 +1603,9 @@ class WorkflowEngine:
         os.makedirs(parent, exist_ok=True)
         from ..state.shared_state import relativize_tree_paths
 
-        payload = relativize_tree_paths(parent, self.workflow.to_dict())
+        payload = compact_workflow_payload(
+            relativize_tree_paths(parent, self.workflow.to_dict())
+        )
         tmp = f"{self.path}.tmp"
         with open(tmp, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, indent=2)
@@ -1425,21 +1617,36 @@ class WorkflowEngine:
             return {}
         stage = self.current_stage()
         index = next((i for i, item in enumerate(self.workflow.stages, 1) if item.id == self.workflow.current_stage), 0)
+        waiting = self.workflow.execution_status == "waiting"
+        pending_cp = (
+            waiting
+            and stage is not None
+            and stage.checkpoint is not None
+            and stage.checkpoint.decision_status == "pending"
+        )
         wait_kind = (
             "input"
-            if self.workflow.intent.missing_slots
-            or self.workflow.intent.validation_errors
+            if waiting and (
+                self.workflow.intent.missing_slots
+                or self.workflow.intent.validation_errors
+            )
+            else "capability"
+            if pending_cp and stage.checkpoint.blocker
             else "approval"
-            if stage and stage.checkpoint
+            if pending_cp
             else "denied"
-            if self.workflow.execution_status == "waiting"
-            and _is_mutation_denied(stage)
+            if waiting and _is_mutation_denied(stage)
             else "recovery"
-            if self.workflow.execution_status == "waiting"
+            if waiting
             else ""
         )
         waiting_reason = ""
-        if wait_kind == "approval" and stage and stage.checkpoint:
+        if wait_kind == "capability" and stage and stage.checkpoint:
+            waiting_reason = str(
+                stage.checkpoint.blocker.get("message")
+                or "当前系统能力不足。"
+            )
+        elif wait_kind == "approval" and stage and stage.checkpoint:
             waiting_reason = stage.checkpoint.reason
         elif wait_kind == "input":
             waiting_reason = "待补充或修正：{}".format(
@@ -1458,6 +1665,12 @@ class WorkflowEngine:
                 ((stage.result if stage else {}) or {}).get("note")
                 or "当前 Stage 未满足完成条件，请重试、调整方案或取消。"
             )
+        visible_stages = visible_plan_horizon(
+            self.workflow.stages, self.workflow.current_stage
+        )
+        blocker = dict(stage.checkpoint.blocker) if (
+            stage and stage.checkpoint and stage.checkpoint.blocker
+        ) else {}
         return {
             "workflow_id": self.workflow.workflow_id,
             "task_type": self.workflow.task_type,
@@ -1465,13 +1678,27 @@ class WorkflowEngine:
             "execution_status": self.workflow.execution_status,
             "outcome": self.workflow.outcome,
             "current_stage": self.workflow.current_stage,
-            "stage_label": _STAGE_LABELS.get(
-                self.workflow.current_stage, self.workflow.current_stage
+            "stage_label": stage_display_label(
+                self.workflow.current_stage,
+                _STAGE_LABELS.get(
+                    self.workflow.current_stage, self.workflow.current_stage
+                ),
+                (
+                    stage.checkpoint.requested_effect
+                    if stage and stage.checkpoint else ""
+                ),
             ),
             "stage_index": index,
-            "stage_total": len(self.workflow.stages),
+            "stage_total": len(visible_stages),
+            "all_stage_total": len(self.workflow.stages) + len(
+                self.workflow.deferred_plan or []
+            ),
+            "deferred_stage_count": len(self.workflow.deferred_plan or []),
             "waiting_reason": waiting_reason,
             "wait_kind": wait_kind,
+            "can_confirm": wait_kind == "approval",
+            "needs_confirmation": wait_kind == "approval",
+            "blocker": blocker,
             "interaction_request": (
                 {
                     "kind": wait_kind,
@@ -1490,19 +1717,65 @@ class WorkflowEngine:
                 if wait_kind == "approval" and stage and stage.checkpoint
                 else ""
             ),
+            "requested_effect": (
+                stage.checkpoint.requested_effect
+                if wait_kind == "approval" and stage and stage.checkpoint
+                else ""
+            ),
+            "intent_ir": {
+                "goals": list(self.workflow.intent.goals),
+                "requested_operations": list(
+                    self.workflow.intent.requested_operations
+                ),
+                "desired_artifacts": list(
+                    self.workflow.intent.desired_artifacts
+                ),
+                "evidence_requirements": list(
+                    self.workflow.intent.evidence_requirements
+                ),
+                "constraints": dict(self.workflow.intent.constraints),
+                "forbidden_effects": list(
+                    self.workflow.intent.forbidden_effects
+                ),
+                "decision_boundaries": list(
+                    self.workflow.intent.decision_boundaries
+                ),
+                "stop_conditions": list(
+                    self.workflow.intent.stop_conditions
+                ),
+                "entities": dict(self.workflow.intent.entities),
+            },
+            "compiled_plan": list(self.workflow.compiled_plan or []),
             "revision": self.workflow.revision,
             "base_project_version": self.workflow.base_project_version,
             "capabilities": list(self.workflow.intent.capabilities),
             "missing_slots": list(self.workflow.intent.missing_slots),
             "validation_errors": list(self.workflow.intent.validation_errors),
             "max_duration_seconds": (
-                self.workflow.intent.slots.get("max_duration_seconds")
-                or self.workflow.intent.slots.get("duration_seconds")
+                (
+                    self.workflow.intent.slots.get("max_duration_seconds")
+                    or self.workflow.intent.slots.get("duration_seconds")
+                )
+                if (
+                    self.workflow.intent.slots.get("operation") == "deploy"
+                    or is_rf_grant_effect(
+                        stage.checkpoint.requested_effect
+                        if stage and stage.checkpoint else ""
+                    )
+                )
+                else None
             ),
             "stages": [
                 {
                     "id": item.id,
-                    "label": _STAGE_LABELS.get(item.id, item.id),
+                    "label": stage_display_label(
+                        item.id,
+                        _STAGE_LABELS.get(item.id, item.id),
+                        (
+                            item.checkpoint.requested_effect
+                            if item.checkpoint else ""
+                        ),
+                    ),
                     "execution_status": item.execution_status,
                     "outcome": item.outcome,
                     "attempt": item.attempt,
@@ -1510,7 +1783,7 @@ class WorkflowEngine:
                     "completion": list(item.completion),
                     "completion_result": dict(item.result.get("completion") or {}),
                 }
-                for item in self.workflow.stages
+                for item in visible_stages
             ],
         }
 
@@ -1539,19 +1812,86 @@ class WorkflowEngine:
                 self._event("stage_skipped", {"stage_id": stage.id, "reason": "not_required"})
                 self._transition(stage.transitions.get("not_required", "completed"))
                 return
-            reason = self._checkpoint_reason(stage)
+            requested_effect = self._checkpoint_requested_effect(stage)
+            reason = self._checkpoint_reason(stage, requested_effect=requested_effect)
+            capability_blocker = system_capability_blocker(requested_effect)
             stage.execution_status = "waiting"
             stage.attempt = max(int(stage.attempt or 0), 1)
             stage.checkpoint = Checkpoint(
                 id=f"cp-{uuid.uuid4().hex[:8]}",
                 reason=reason,
                 action=stage.id,
+                requested_effect=requested_effect,
+                blocker=(
+                    capability_blocker.to_dict() if capability_blocker else {}
+                ),
             )
             self.workflow.execution_status = "waiting"
             self._event(
                 "checkpoint_opened",
                 {"stage_id": stage.id, "reason": reason, "checkpoint_id": stage.checkpoint.id},
             )
+
+    def _checkpoint_requested_effect(self, stage: Stage) -> str:
+        """Return the highest effect before the next decision boundary.
+
+        A grant covers the bounded segment the user is actually approving, not
+        merely the first implementation operation in that segment.  This keeps
+        ``configure -> run`` from being mislabeled as a DEVICE_CONFIG-only
+        decision and works for catalog and future generated plans alike.
+        """
+        if not self.workflow:
+            return "READ"
+        if stops_at_boundary(self.workflow.intent, stage.id):
+            return max(
+                normalize_effect(stage.effect_level),
+                EffectLevel.DEVICE_READ,
+            ).name
+        deferred = list(self.workflow.deferred_plan or [])
+        if deferred:
+            return highest_effect(deferred).name
+        target = stage.transitions.get("approved") or stage.transitions.get("passed")
+        highest = EffectLevel.READ
+        visited: set[str] = set()
+        while target and str(target) not in _TERMINALS and str(target) not in visited:
+            stage_id = str(target)
+            visited.add(stage_id)
+            candidate = self.workflow.stage(stage_id)
+            if candidate is None or candidate.safety_finalizer:
+                break
+            if "checkpoint" in str(candidate.interaction or ""):
+                break
+            highest = max(highest, normalize_effect(candidate.effect_level))
+            # Follow only the ordinary success path. Branches and failures are
+            # replanning boundaries and must not broaden an authorization.
+            target = (
+                candidate.transitions.get("passed")
+                or candidate.transitions.get("completed")
+                or candidate.transitions.get("approved")
+            )
+        return highest.name
+
+    def refresh_system_capabilities(self) -> None:
+        """Re-evaluate launch-time blockers when a session is restored."""
+        if not self.workflow:
+            return
+        stage = self.current_stage()
+        if not stage or not stage.checkpoint:
+            return
+        requested = stage.checkpoint.requested_effect or self._checkpoint_requested_effect(stage)
+        blocker = system_capability_blocker(requested)
+        updated = blocker.to_dict() if blocker else {}
+        if updated == stage.checkpoint.blocker:
+            return
+        stage.checkpoint.requested_effect = requested
+        stage.checkpoint.blocker = updated
+        self._event("system_capability_refreshed", {
+            "stage_id": stage.id,
+            "requested_effect": requested,
+            "available": not bool(updated),
+            "blocker": updated,
+        })
+        self.save()
 
     def _checkpoint_required(self, stage: Stage) -> bool:
         if stage.id in _ALIGNMENT_STAGES:
@@ -1563,14 +1903,94 @@ class WorkflowEngine:
             return self.workflow.intent.slots.get("change_type") != "single_parameter"
         return True
 
-    def _checkpoint_reason(self, stage: Stage) -> str:
+    def _checkpoint_reason(self, stage: Stage, requested_effect: str = "") -> str:
         return ", ".join(
             self.workflow.intent.missing_slots
             + self.workflow.intent.validation_errors
         ) or str(
             self.workflow.intent.slots.get("change_type")
-            or _STAGE_LABELS.get(stage.id, stage.id)
+            or stage_display_label(
+                stage.id,
+                _STAGE_LABELS.get(stage.id, stage.id),
+                requested_effect or (
+                    stage.checkpoint.requested_effect if stage.checkpoint else ""
+                ),
+            )
         )
+
+    def ensure_stage(self, stage_id: str) -> Optional[Stage]:
+        """Instantiate deferred plan items until ``stage_id`` exists."""
+        if not self.workflow or not stage_id:
+            return None
+        found = self.workflow.stage(stage_id)
+        if found:
+            return found
+        self._materialize_until(stage_id)
+        return self.workflow.stage(stage_id)
+
+    def _materialize_until(self, stage_id: str) -> None:
+        while self.workflow and self.workflow.deferred_plan:
+            if self.workflow.stage(stage_id):
+                return
+            added = self._materialize_next_horizon()
+            if not added:
+                return
+
+    def _materialize_next_horizon(self) -> list[Stage]:
+        if not self.workflow:
+            return []
+        pending = list(self.workflow.deferred_plan or [])
+        if not pending:
+            return []
+        horizon, rest = split_at_decision_boundary(pending)
+        existing = {item.id for item in self.workflow.stages}
+        added: list[Stage] = []
+        for item in horizon:
+            payload = stage_plan_item(item)
+            stage_id = str(payload.get("id") or "")
+            if not stage_id or stage_id in existing:
+                continue
+            stage = Stage.from_dict(payload)
+            self.workflow.stages.append(stage)
+            existing.add(stage_id)
+            added.append(stage)
+        self.workflow.deferred_plan = [stage_plan_item(item) for item in rest]
+        self.workflow.compiled_plan = compiled_plan_summary(
+            self.workflow.stages, self.workflow.deferred_plan
+        )
+        if added:
+            self.workflow.revision += 1
+        return added
+
+    def _replan_and_materialize(self) -> None:
+        """Rebuild the unexecuted tail, then expose the next decision horizon."""
+        from .llm_planner import propose_plan
+
+        if not self.workflow:
+            return
+        proposal = propose_plan(
+            self.workflow.intent, None, catalog=self.catalog
+        )
+        before = list(self.workflow.deferred_plan or [])
+        self.workflow.deferred_plan = replan_tail(
+            before, proposal=proposal, catalog=self.catalog
+        )
+        if proposal:
+            self._event("plan_replanned", {
+                "before": [
+                    str(item.get("id") or "")
+                    for item in before if isinstance(item, dict)
+                ],
+                "after": [
+                    str(item.get("id") or "")
+                    for item in self.workflow.deferred_plan
+                    if isinstance(item, dict)
+                ],
+            })
+        self.workflow.compiled_plan = compiled_plan_summary(
+            self.workflow.stages, self.workflow.deferred_plan
+        )
+        self._materialize_next_horizon()
 
     def _transition(self, target: str) -> None:
         if target == "completed":
@@ -1590,6 +2010,8 @@ class WorkflowEngine:
         if target == "waiting_user":
             self.workflow.execution_status = "waiting"
             return
+        if not self.workflow.stage(target):
+            self._materialize_until(target)
         if not self.workflow.stage(target):
             raise ValueError(f"Stage 转移目标不存在: {target}")
         self.workflow.current_stage = target
@@ -1659,21 +2081,26 @@ _CAPABILITIES = frozenset(
 )
 _PROMPT = """你是 DeepRadio 的 Intent 校正器。只输出一个 JSON 对象。
 字段:
-- task_type: END_TO_END_SIM / TX_BUILD / RX_BUILD / DIAGNOSE / MODIFY_PROJECT / OBSERVE / HARDWARE_CONFIGURE
-- capabilities: 用户最终要做的事，只能用给定集合
+- goals / requested_operations / desired_artifacts / evidence_requirements
+- constraints / decision_boundaries / stop_conditions
+- task_type: 仅作兼容标签，不得用它改写 goals
+- capabilities: 只能用给定集合
 - forbidden_capabilities: 用户明确不要的能力
 - slots: 文本里明确出现的参数
 - confidence: 0~1
 规则:
-- 否定、只仿真、不要硬件/射频 优先于关键词；不要因为出现「硬件」就打开 hardware_configure
-- 「停在发射确认」表示 deploy_permission=pending、terminal_checkpoint=rf_plan_confirmation，
-  不是禁止硬件只读预检；task_type 保持 HARDWARE_CONFIGURE，build_tx 只参与 Stage 组合
-- 「不要发射」才表示 deploy_permission=forbidden；不得把二者合并
-- 不要因为「发射流图」就把配置任务改成 TX_BUILD
-- 不得把实时硬件观察改写成离线仿真
-- 不得因为 2.4GHz 就判定 BLE，除非用户说了 ble/蓝牙/发射广播
-- 用户已给出的槽位不得覆盖
-- 不要发明 local_name 或 operation=deploy
+- 规则 Intent 只是初值。按用户目标校正，不要套固定任务模板。
+- 否定、只仿真、不要硬件/射频 优先于关键词。
+- 目标是现在发射/运行/部署: operation=deploy，不要加 stop_at_decision_boundary。
+- 已有未 arm 的硬件预览图时，「现在发射/运行 N 秒」是新一轮 deploy，复用当前工程参数，不要重建，也不要当成配置确认。
+- 目标是保存配置或停在下一决策、尚未授权射频: operation=prepare，deploy_permission=pending，stop_at_decision_boundary；仍做只读预检。
+- 「不要发射」才是 deploy_permission=forbidden；与「先停在确认」不是同一件事。
+- 配置/保存发射流图不是 TX_BUILD，也不是已经授权 RF_RUN。
+- 不得把实时硬件观察改写成离线仿真。
+- 不得因为载频像 2.4 GHz 就判定 BLE，除非用户说了 ble/蓝牙/广播。
+- slot_sources=user 或 current_project 的字段不得覆盖。
+- 不得把 safety_default 时长改写成用户约束；用户没写时长就不要填 duration。prepare/配置确认不要写 30 秒。
+- 不要发明 local_name。
 """
 
 
@@ -1699,6 +2126,13 @@ def complete_intent(
                 (rules_intent.context or {}).get("forbidden_capabilities") or []
             ),
             "slot_sources": rules_intent.slot_sources,
+            "goals": rules_intent.goals,
+            "requested_operations": rules_intent.requested_operations,
+            "desired_artifacts": rules_intent.desired_artifacts,
+            "evidence_requirements": rules_intent.evidence_requirements,
+            "constraints": rules_intent.constraints,
+            "decision_boundaries": rules_intent.decision_boundaries,
+            "stop_conditions": rules_intent.stop_conditions,
         },
         "allowed_task_types": sorted(_TASK_TYPES),
         "allowed_capabilities": sorted(_CAPABILITIES),
@@ -1713,11 +2147,15 @@ def complete_intent(
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ]
         )
-        parsed = _parse_json_object(content)
+        from ..llm import parse_json_object
+
+        parsed = parse_json_object(content)
     except Exception as exc:  # noqa: BLE001
         logger.info("Intent LLM 补全失败，沿用规则分类: %s", exc)
         return rules_intent
-    return _merge(rules_intent, parsed)
+    merged = _merge(rules_intent, parsed)
+    project_intent_ir(merged)
+    return merged
 
 
 def _merge(rules: WorkflowIntent, parsed: dict[str, Any]) -> WorkflowIntent:
@@ -1730,7 +2168,7 @@ def _merge(rules: WorkflowIntent, parsed: dict[str, Any]) -> WorkflowIntent:
         if name in _CAPABILITIES
     }
     checkpoint_prepare = (
-        rules.slots.get("terminal_checkpoint") == "rf_plan_confirmation"
+        rules.slots.get("operation") == "prepare"
         and rules.slots.get("deploy_permission") == "pending"
     )
     if checkpoint_prepare:
@@ -1749,10 +2187,14 @@ def _merge(rules: WorkflowIntent, parsed: dict[str, Any]) -> WorkflowIntent:
                 capabilities.append(name)
     slots = dict(rules.slots)
     sources = dict(rules.slot_sources)
+    locked = {
+        "user", "safety_default", "protocol_default", "derived",
+        "safe_preview_default", "current_project",
+    }
     for key, value in dict(parsed.get("slots") or {}).items():
         if value in (None, "", []):
             continue
-        if sources.get(key) == "user":
+        if sources.get(key) in locked:
             continue
         slots[key] = value
         sources[key] = "llm"
@@ -1775,20 +2217,40 @@ def _merge(rules: WorkflowIntent, parsed: dict[str, Any]) -> WorkflowIntent:
         slot_sources=sources,
         context=context,
         validation_errors=list(rules.validation_errors),
+        goals=_string_list(parsed.get("goals"), rules.goals),
+        requested_operations=_string_list(
+            parsed.get("requested_operations"), rules.requested_operations
+        ),
+        desired_artifacts=_string_list(
+            parsed.get("desired_artifacts"), rules.desired_artifacts
+        ),
+        evidence_requirements=_string_list(
+            parsed.get("evidence_requirements"), rules.evidence_requirements
+        ),
+        constraints=(
+            dict(parsed.get("constraints") or rules.constraints)
+            if isinstance(parsed.get("constraints") or rules.constraints, dict)
+            else dict(rules.constraints)
+        ),
+        forbidden_effects=_string_list(
+            parsed.get("forbidden_effects"), rules.forbidden_effects
+        ),
+        decision_boundaries=_string_list(
+            parsed.get("decision_boundaries"), rules.decision_boundaries
+        ),
+        stop_conditions=_string_list(
+            parsed.get("stop_conditions"), rules.stop_conditions
+        ),
+        entities=(
+            dict(parsed.get("entities") or rules.entities)
+            if isinstance(parsed.get("entities") or rules.entities, dict)
+            else dict(rules.entities)
+        ),
     )
 
 
-def _parse_json_object(content: str) -> dict[str, Any]:
-    text = (content or "").strip()
-    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL)
-    if fenced:
-        text = fenced.group(1)
-    else:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start >= 0 and end > start:
-            text = text[start : end + 1]
-    data = json.loads(text)
-    if not isinstance(data, dict):
-        raise ValueError("Intent LLM 返回值不是对象")
-    return data
+def _string_list(value: Any, fallback: list[str]) -> list[str]:
+    if not isinstance(value, list):
+        return list(fallback or [])
+    cleaned = [str(item).strip() for item in value if str(item).strip()]
+    return cleaned or list(fallback or [])

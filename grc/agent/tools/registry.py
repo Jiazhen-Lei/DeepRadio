@@ -75,6 +75,9 @@ class ToolSpec:
     group: str = "misc"
     origin: str = ""
     runtime: str = ""
+    effect_level: str = "READ"
+    idempotent: bool = True
+    requires: List[str] = field(default_factory=list)
 
 
 #: 全局注册表: name -> ToolSpec
@@ -94,6 +97,7 @@ _TOOL_MODULES = (
     "hardware_tools",
     "design_link",
     "debug_by_metric",
+    "diagnosis_experiment",
 )
 
 
@@ -101,7 +105,10 @@ def tool(name: str, description: str,
          parameters: Optional[Dict[str, Any]] = None,
          group: str = "misc",
          origin: str = "",
-         runtime: str = ""):
+         runtime: str = "",
+         effect_level: str = "READ",
+         idempotent: bool = True,
+         requires: Optional[List[str]] = None):
     """把一个函数注册为工具。
 
     Args:
@@ -123,7 +130,10 @@ def tool(name: str, description: str,
             logger.warning("工具 %s 已注册,后者覆盖前者", name)
         _REGISTRY[name] = ToolSpec(
             name=name, fn=fn, description=description,
-            parameters=schema, group=group, origin=origin, runtime=runtime)
+            parameters=schema, group=group, origin=origin, runtime=runtime,
+            effect_level=str(effect_level or "READ").upper(),
+            idempotent=bool(idempotent),
+            requires=list(requires or []))
         return fn
 
     return _decorator
@@ -162,6 +172,22 @@ def origin_of(name: str) -> str:
 def runtime_of(name: str) -> str:
     spec = _REGISTRY.get(name)
     return spec.runtime if spec else ""
+
+
+def action_metadata(name: str) -> Dict[str, Any]:
+    """Return planner-facing metadata without exposing the callable."""
+    spec = _REGISTRY.get(name)
+    if spec is None:
+        return {}
+    return {
+        "name": spec.name,
+        "description": spec.description,
+        "group": spec.group,
+        "effect_level": spec.effect_level,
+        "idempotent": spec.idempotent,
+        "requires": list(spec.requires),
+        "parameters": dict(spec.parameters),
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -83,7 +83,7 @@ _ERROR_HINTS = (
     ("type", "端口数据类型不一致:检查相连块的 type 参数(complex/float/byte)是否一致。"),
     ("port", "端口连接问题:确认源块有输出口、目标块有输入口,且端口序号未越界。"),
     ("not connected", "存在未连接的端口:每个块的输入/输出应被正确连线。"),
-    ("throttle", "缺少限速:纯软件仿真链路通常需要 blocks_throttle 或 blocks_head 限速。"),
+    ("throttle", "缺少限速:纯软件仿真链路通常需要 blocks_throttle2、blocks_throttle 或 blocks_head 限速。"),
     ("param", "参数取值非法:检查该参数是否引用了未定义的变量或类型不匹配。"),
     ("id", "块 id 重复或非法:每个块 id 必须唯一且为合法标识符。"),
 )

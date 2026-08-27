@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 
 from ..runtime import simulate
+from ..state.shared_state import attach_measurement
 from .registry import ToolContext, tool
 
 #: file_sink 的 ``type`` 参数 -> read_probe 支持的 numpy dtype 名。
@@ -117,6 +118,7 @@ def _pick_integer_bits(res, probe_id: str = ""):
         },
     },
     group="sim",
+    effect_level="ARTIFACT_WRITE",
 )
 def run_simulation(ctx: ToolContext, probes: dict = None, timeout: float = 30.0):
     fg = ctx.flow_graph
@@ -167,6 +169,7 @@ def run_simulation(ctx: ToolContext, probes: dict = None, timeout: float = 30.0)
         "required": ["kind"],
     },
     group="sim",
+    effect_level="ARTIFACT_WRITE",
 )
 def read_metric(ctx: ToolContext, kind: str, probe_id: str = "",
                 modulation: str = "bpsk", sps: int = 4,
@@ -202,7 +205,12 @@ def read_metric(ctx: ToolContext, kind: str, probe_id: str = "",
         res.symbol_phase = phase
         return {"ok": True, "kind": "evm", "value": evm,
                 "unit": "%", "n_symbols": int(syms.size),
-                "sample_phase": phase}
+                "sample_phase": phase,
+                "measurement_id": attach_measurement(
+                    ctx, metric="evm", result={"value": evm, "unit": "%"},
+                    probe_ids=[probe_id] if probe_id else [],
+                    algorithm={"modulation": modulation, "sps": sps},
+                )}
 
     if kind == "ber":
         bits = _pick_integer_bits(res, probe_id)
@@ -223,7 +231,12 @@ def read_metric(ctx: ToolContext, kind: str, probe_id: str = "",
                 return {"ok": False, "kind": "ber", **report}
             res.metrics["ber"] = report["value"]
             return {"ok": True, "kind": "ber", "tx_probe": tx_bits_probe,
-                    "rx_probe": probe_id, **report}
+                    "rx_probe": probe_id, **report,
+                    "measurement_id": attach_measurement(
+                        ctx, metric="ber", result=dict(report),
+                        probe_ids=[probe_id, tx_bits_probe],
+                        algorithm={"modulation": modulation, "sps": sps},
+                    )}
         if iq is None:
             iq, err = _require_samples(ctx, probe_id)
             if err is not None:
@@ -239,7 +252,12 @@ def read_metric(ctx: ToolContext, kind: str, probe_id: str = "",
             return {"ok": False, "kind": "ber", **report}
         res.metrics["ber"] = report["value"]
         return {"ok": True, "kind": "ber", "tx_probe": tx_bits_probe,
-                "rx_probe": probe_id, **report}
+                "rx_probe": probe_id, **report,
+                "measurement_id": attach_measurement(
+                    ctx, metric="ber", result=dict(report),
+                    probe_ids=[probe_id, tx_bits_probe],
+                    algorithm={"modulation": modulation, "sps": sps},
+                )}
 
     if kind == "spectrum_peak":
         n = min(len(iq), max(32, int(fft_size)))
@@ -250,7 +268,12 @@ def read_metric(ctx: ToolContext, kind: str, probe_id: str = "",
         res.metrics["spectrum_peak"] = report["frequency_hz"]
         res.metrics["spectrum_peak_report"] = report
         return {"ok": True, "kind": "spectrum_peak",
-                "value": report["frequency_hz"], "unit": "Hz", **report}
+                "value": report["frequency_hz"], "unit": "Hz", **report,
+                "measurement_id": attach_measurement(
+                    ctx, metric="spectrum", result=dict(report),
+                    probe_ids=[probe_id] if probe_id else [],
+                    algorithm={"samp_rate": samp_rate, "fft_size": fft_size},
+                )}
 
     return {"ok": False, "error": f"未知指标: {kind}"}
 
@@ -268,6 +291,7 @@ def read_metric(ctx: ToolContext, kind: str, probe_id: str = "",
         },
     },
     group="sim",
+    effect_level="ARTIFACT_WRITE",
 )
 def plot_constellation(ctx: ToolContext, probe_id: str = "",
                        sps: int = 1, path: str = "", modulation: str = ""):
@@ -281,7 +305,12 @@ def plot_constellation(ctx: ToolContext, probe_id: str = "",
     )
     if p is None:
         return {"ok": False, "error": "无可用复数数据"}
-    return {"ok": True, "path": p}
+    return {"ok": True, "path": p,
+            "measurement_id": attach_measurement(
+                ctx, metric="constellation", artifact=p,
+                probe_ids=[probe_id] if probe_id else [],
+                algorithm={"sps": sps, "modulation": modulation},
+            )}
 
 
 @tool(
@@ -296,6 +325,7 @@ def plot_constellation(ctx: ToolContext, probe_id: str = "",
         },
     },
     group="sim",
+    effect_level="ARTIFACT_WRITE",
 )
 def plot_spectrum(ctx: ToolContext, probe_id: str = "",
                   samp_rate: float = 1.0, path: str = ""):
@@ -307,7 +337,12 @@ def plot_spectrum(ctx: ToolContext, probe_id: str = "",
     p = res.plot_spectrum(out, probe_id=probe_id or None, samp_rate=samp_rate)
     if p is None:
         return {"ok": False, "error": "无可用复数数据"}
-    return {"ok": True, "path": p}
+    return {"ok": True, "path": p,
+            "measurement_id": attach_measurement(
+                ctx, metric="spectrum", artifact=p,
+                probe_ids=[probe_id] if probe_id else [],
+                algorithm={"samp_rate": samp_rate},
+            )}
 
 
 @tool(
@@ -322,6 +357,7 @@ def plot_spectrum(ctx: ToolContext, probe_id: str = "",
         },
     },
     group="sim",
+    effect_level="ARTIFACT_WRITE",
 )
 def plot_eye(ctx: ToolContext, probe_id: str = "", sps: int = 4, path: str = ""):
     _, err = _require_samples(ctx, probe_id)
@@ -332,4 +368,9 @@ def plot_eye(ctx: ToolContext, probe_id: str = "", sps: int = 4, path: str = "")
     p = res.plot_eye(out, probe_id=probe_id or None, sps=sps)
     if p is None:
         return {"ok": False, "error": "数据不足以画眼图"}
-    return {"ok": True, "path": p}
+    return {"ok": True, "path": p,
+            "measurement_id": attach_measurement(
+                ctx, metric="eye", artifact=p,
+                probe_ids=[probe_id] if probe_id else [],
+                algorithm={"sps": sps},
+            )}

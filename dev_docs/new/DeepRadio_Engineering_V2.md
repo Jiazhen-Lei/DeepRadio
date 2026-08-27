@@ -1,516 +1,199 @@
 # DeepRadio 工程问题与修复方案 V2
 
-> 日期：2026-08-26  
-> 范围：`0826/V2` 七类 Task 与 PlutoBLE 人工实验暴露的工程问题、根因、P0～P2 修复方案和验收标准  
-> 测试步骤见 `DeepRadio_Test_and_Experiment_V2.md`。
+> 更新日期：2026-08-27<br>
+> 当前证据：`local/agent_sessions/0826/V5/`、`local/output/0826/V5/` 及当前代码<br>
+> 文档原则：只保留仍存在或尚未被最新实验闭环验证的问题；已解决项只留结论，不再当作活动修复清单。
 
 ---
 
-## 1. 本轮结论
+## 1. 当前工程结论
 
-证据范围：
+V5 Task7 的 PlutoSDR 连接、只读发现、精确 probe、安全预览流图生成、结构校验和 GNU Radio 编译均成功。当时失败不是“没有发现 PlutoSDR”，而是 RF 系统能力检查晚于用户确认：precheck 通过后仍开放确认，`arm_hardware_flowgraph` 才拒绝 `GRC_AGENT_ENABLE_RF`。
 
-```text
-local/agent_sessions/0826/V2/
-local/output/0826/V2/
+P0/P1/P2 与 2026-08-27 去冗余之后，handler 近拷贝和 LC 手写包装已去掉。剩下的编排成本主要是 catalog 七类片段库、`adapter`/`engine` 门面体量。功能上：
+
+- 确认前按 effect 做系统能力门禁；配置-only 在 RF 关闭时仍可生成安全预览；
+- 初始计划截断到下一决策边界；批准后重规划未执行尾部，不回写 Intent；
+- IntentIR、PlanNode、Plan Compiler、可选 LLM 短期计划已接线；无模型时沿用能力片段；
+- DiagnosisExperiment、GraphPatch 别名、MeasurementRun、Profile pin/snapshot、BLE 单信道能力声明已落地；
+- 七类 Task 仍是评测标签和 catalog 片段库，`task_catalog.yaml` 尚未删除。
+
+### 1.1 V5 已正确完成的部分
+
+- `pluto_tx.grc` 是可编译的安全预览流图；
+- PlutoSDR 被识别为 IIO 设备并完成 probe；
+- Pluto Sink 处于禁用状态，没有发生未授权 RF 发射；
+- 用户确认前没有执行 arm/start；
+- RF 系统开关缺失时，底层工具最终拒绝 arm；
+- Session 事件序号连续，没有发现重复事件。
+
+### 1.2 当前自动回归状态
+
+在 `gnuradio` Conda 环境运行：
+
+```bash
+conda run -n gnuradio python -m unittest discover -s grc.agent.tests -t .
+conda run -n gnuradio python -m unittest discover -s grc.gui.tests -t .
 ```
 
-不能只依据 `workflow.yaml` 的 `passed/completed` 判定成功。Task 3、6 是假通过，Task 7 明确失败；PlutoBLE 空口链路成功，但 Evidence 归档不完整。
+2026-08-27 P1/P2 后的结果：
 
-| 用例 | Workflow 状态 | 工程验收 | 结论 |
-|---|---|---|---|
-| Task 1 `END_TO_END_SIM` | completed | EVM、流图和图片存在，档位与指标一致性有缺陷 | 部分通过 |
-| Task 2 `TX_BUILD` | completed | 无硬件 QPSK TX，无 RF 行为 | 通过 |
-| Task 3 `RX_BUILD` | completed | BER=0 缺少可信测量契约和 Claim，未补 Eb/N0 | 失败/假通过 |
-| Task 4 `DIAGNOSE` | completed | 工程未变，原因判断缺少量化对照 | 部分通过 |
-| Task 5 `MODIFY_PROJECT` | completed | 确认和版本更新正确，图、指标和 Claim 生命周期不完整 | 部分通过 |
-| Task 6 `OBSERVE` | completed | 留有 open question，规格未知，主峰语义错误 | 失败/假通过 |
-| Task 7 `HARDWARE_CONFIGURE` | failed | Pluto Builder 失败后错误回退为 BPSK+AWGN 仿真图 | 失败 |
-| PlutoBLE | completed | 手机收到 `Deepradio27`，自动启停成功，截图未绑定 Evidence | 功能通过、证据部分通过 |
+```text
+grc/agent: Ran 156 tests, OK (1 skipped)
+grc/gui:   Ran 13 tests, OK
+```
 
-当前版本不满足七类 Task Gate，也不满足完整的空口 Evidence Gate。
+此前三个 `waiting` 失败来自受限沙箱不允许 GNU Radio 在 `/var/tmp` 创建 `vmcircbuf`。相同代码在 `gnuradio` Conda 的真实权限下通过；没有伪造 metrics。跳过项来自当前 GNU Radio 构建缺少可选硬件块。
 
 ---
 
-## 2. 当前问题
+## 2. 已闭环项（不再进入活动清单）
 
-### 2.1 Task 1：端到端仿真
+旧 V2/V5 问题中，下列项已有实现和回归，不再展开问题陈述：
 
-已实现：正确识别 `END_TO_END_SIM`；生成 BPSK+AWGN 流图、Python、IQ、星座图和频谱图；EVM=5.89%，`evm_lt_10` Claim 为 Passed。
+| 主题 | 结论 |
+|---|---|
+| TX 探针 `_rx.bin`、BER 契约、Eb/N0 补槽、频谱 Hz/dBFS | 已修 |
+| `open_questions` 非空仍 completed、version 后 Claim 不失效 | 已修 |
+| Pluto Builder 失败回退 AWGN、runtime 不统计 `U/O`、配置流图无安全预览 | 已修 |
+| RF 能力检查晚于确认、restart-required blocker | P0：确认前按 `requested_effect` 门禁 |
+| “停在发射确认”被展开成 RF 尾 | P0：`stop_at_decision_boundary` + deferred materialize |
+| `configure_device` 部分成功与无效重试 | P0：`resume_from=arm_flowgraph` |
+| Intent 与 Decision 混写 | P0：确认只追加 `decisions` / `granted_effects` |
+| Manifest 被 Stage 覆盖 | P0：累积 ArtifactIndex |
+| GNU Radio 环境失败当业务失败 | P0：真实 runtime，无假成功 |
+| 七类 Task 硬路由 / 短视距计划 | P1 兼容迁移：catalog 作片段库；Compiler 截断与校验；无 LLM 时行为与现测试兼容 |
+| 诊断无对照实验 | P2：`run_diagnosis_experiment` 单因素对照后恢复原图 |
+| 改图只靠 recipe | P2 部分：GraphPatch `set_param`/`replace_block`/`connect`；新建工程仍可用 recipe |
+| Profile 隐式漂移 | P2：pin 后不改 score；`profile_changed`；同轮 `profile_snapshot` |
+| 图像/标量/Claim 不同源 | P2：`MeasurementRun.measurement_id` |
+| BLE 扩大为三信道/sniffer | P2：声明 `ble_advertising_single_channel`；unsupported 列出三信道与独立 sniffer |
+| 确定性 Stage 全堆在 adapter | P2 部分：已抽出 `stage_handlers.py`；`tools_lc` 对其余 Registry 工具自动包装 |
 
-问题：
+仍未完全闭环、需要后续核验或清理的：
 
-1. 输入时 `profile_level=student`，最终 reply/completion 变成 `expert`，档位不应自行变化。
-2. 星座图、调制类型和 EVM 没有同源样本一致性校验；当前只检查标量是否达标。
-3. GUI 显示的是后台静态图片，流图仍为 File Sink，用户容易误以为流图含 QT GUI。
-4. Task 1、4、5 共用 session，适合连续编辑，但不能替代三个独立代表用例。
-
-### 2.2 Task 2：发射机构建
-
-主体通过：正确识别 `TX_BUILD`；禁止 deploy/hardware runtime；生成 `qpsk_tx.grc`；没有设备发现、RF 确认或发射事件。
-
-遗留问题：
-
-- `qpsk_tx_rx.bin` 的 `rx` 与实际 TX 输出语义不符；
-- 结构正确性主要依赖 Completion，缺少独立结构 Claim。
-
-### 2.3 Task 3：接收机构建与 BER
-
-Workflow 标为 passed，但不应验收：
-
-1. 缺 Eb/N0 时没有询问，也没有记录测试要求的 8 dB。
-2. GUI 显示 `BER 0`，但 state 中没有 BER Claim。
-3. Completion 仅要求 BER 有限且小于 0.45，并检查 TX/RX probe 名称；未验证错误数、比较位数、捕获期、对齐方法和置信度。
-4. BER 在接近整段数据的范围搜索最佳延时，并允许全局反相后取最小值，存在择优偏差，可能产生虚假的低 BER。
-5. recipe 中 `max_rate_deviation` 被报告未知后忽略，结构仍判通过。
-6. TX reference 使用 0～255 字节再展开 bits，未证明与调制器和接收判决的位序一致。
-7. 没有持久化 BER、bit errors、compared bits、delay 和 probe 身份等审计字段。
-
-相关代码：
-
-```text
-grc/agent/runtime/simulate.py
-grc/agent/tools/sim_tools.py
-grc/agent/workflow/completion.py
-grc/agent/knowledge/recipes.py
-```
-
-### 2.4 Task 4：只读诊断
-
-原工程、Project version 和 hash 没有改变，但：
-
-1. “主因是 AWGN”主要由 recipe 推断，没有通过关闭噪声、频偏、定时偏差等对照实验量化贡献。
-2. 没有 diagnosis Claim/Evidence，结论只能从回复读取。
-3. 没出现修复确认，未覆盖“用户拒绝修复后工程保持不变”的交互分支。
-
-### 2.5 Task 5：修改已有工程
-
-确认前未改图；确认后 BPSK 改为 QPSK，Project version 从 1 增至 2。
-
-问题：
-
-1. QPSK 星座图呈现多个散乱簇，与 EVM=5.52% 的直观表现不一致。
-2. 原 Claim 被直接更新到 version 2，缺少 `stale → re-evaluating → passed/failed` 生命周期。
-3. 实现是切换预置 `qpsk_awgn` recipe，不是任意工程的通用最小 diff。
-4. “其余条件保持一致”缺少结构 diff 和参数保持清单 Evidence。
-
-### 2.6 Task 6：只读观察
-
-这是明确的假通过：
-
-1. state 仍有 `open_questions=["使用哪种调制方式？"]`，但 Intent 为 `missing_slots=[]`，Workflow 又 completed。
-2. GUI 规格显示 `? → ? → ?`，canvas context 未投影到 Spec。
-3. 主峰约为 `3505.934 @ bin 0`，无频率/幅度单位；bin 未结合采样率、FFT 长度和 shift 转为 Hz。
-4. 线性幅值没有转换或声明为 dB/dBFS。
-5. 回复没有直接给出用户要求的主峰位置和幅度。
-6. 没有 measurement Claim。
-7. 观察的是 Task 1 的 BPSK 工程，不是测试文档要求的接收工程，实验前置也不合格。
-8. Observe 将副本写入本 session 的 `final/`，需要明确它不是工程修改。
-
-相关代码：
-
-```text
-grc/agent/service/adapter.py
-grc/agent/workflow/completion.py
-grc/agent/tools/sim_tools.py
-grc/gui/ClaimsPanel.py
-```
-
-### 2.7 Task 7：仅配置 PlutoSDR
-
-实际链路：
-
-```text
-Pluto Builder
-→ valid=false / Port is not connected
-→ DeepAgent 改调用 design_link
-→ 生成 bpsk_awgn.grc
-→ hardware_endpoint_present=false
-→ radio_parameters_match=false
-→ 后续 hardware Stage 全部 pending
-```
-
-问题：
-
-1. 用户未指定 modulation，规则层却给出 `missing_slots=[]`，由 DeepAgent 临时询问 BPSK，Intent、Spec 和对话状态不一致。
-2. Pluto Builder 生成未连接端口；内部 validate 不能替代真实 GRC compile。
-3. 硬件 Builder 失败后错误回退到 `bpsk_awgn`，产物歪曲了硬件目标。
-4. 错误仿真产物进入 final/Manifest。
-5. Task 7 截图与 Task 3 截图 SHA-256 相同，是错误复制，不能作为证据。
-
-相关代码：
-
-```text
-grc/agent/service/adapter.py
-grc/agent/tools/hardware_tools.py
-grc/agent/knowledge/recipes.py
-grc/agent/workflow/completion.py
-```
-
-### 2.8 PlutoBLE
-
-真实功能已通过：
-
-- 手机收到 `Deepradio27`；
-- PDU、离线验证与手机名称一致；
-- 发现并 probe `usb:2.4.5`；
-- 用户批准后才启动 RF；
-- `run_id=run-9bacf77c5a16`；
-- 启动返回 `ready=true`、`startup_health_passed=true`；
-- OTA 确认时进程仍在 deadline 内；
-- 主动停止，`return_code=0`、`crashed=false`；
-- 无需点击 GRC Run。
-
-Evidence Gate 未通过：
-
-1. 手机截图只在 output，没有进入 `final/evidence/`。
-2. OTA Claim 的 `artifact`、`sha256`、`evidence_id` 为空。
-3. Manifest 不含手机截图。
-4. `runtime.log` 为 `UUU`，存在 underrun；手机收到不等于运行质量完全健康。
-5. 当前只发射 CH37，不能宣称三信道调度完成。
-6. GUI 需要区分“本次启动曾 ready”和“当前已停止”。
+| 主题 | 状态 | 判断 |
+|---|---|---|
+| Evidence / Manifest 原子闭环 | 部分解决 | OTA 无附件显示「人工确认、附件缺失」；V5 导出漏列仍待人工核验 |
+| BLE 三信道跳频 | 未实现 | 不得扩大 Claim；实现前 Gate 5 不登记通过 |
+| 调制/拓扑大改仍可能走 recipe | 部分解决 | GraphPatch 可改任意已加载图；新建/整链替换仍可用 recipe |
+| 静态 catalog 与七类 compose | 兼容保留 | 删除前必须有 Session 迁移测试 |
+| `adapter.py` / `engine.py` 体量 | 部分完成 | Wave 1/2 去拷贝已落地；`_fold` 与 engine 内拆仍见 §6 |
 
 ---
 
-## 3. 根因
+## 3. 仍有效的正确性约束（已实现，回归必须守住）
 
-### 3.1 Completion 只检查存在性
+这些不再是待修缺陷，而是后续精简时的**禁区**：
 
-多个 Completion 将“有文件、有字段、有数值”误当成目标已经可信完成：
-
-- BER 低于宽松上限即完成；
-- Observe 有图和 peak 数值即完成；
-- open question 与 completed 不互斥；
-- Claim 不是所有成功条件的硬证据；
-- hardware task 在执行阶段可以产生错误种类的流图。
-
-### 3.2 硬件任务缺少不可降级的产物契约
-
-`HARDWARE_CONFIGURE` 只在事后检查 endpoint。硬件 Builder 失败后，LLM/DeepAgent 仍可选择普通基带 recipe，导致 Task 类型没变但产物语义被歪曲。
-
-### 3.3 Intent、Spec、Project、Profile 不是统一事务
-
-表现为：
-
-- `missing_slots=[]` 与 open question 并存；
-- canvas 已知 BPSK，但 Spec 未知；
-- profile 从 student 跳成 expert；
-- Claim、Workflow revision 与 Project version 的失效/重验链不完整。
-
-### 3.4 指标缺少测量契约
-
-BER、频谱峰和 EVM 只是标量，没有统一保存 probe、样本区间、单位、算法、有效性条件、Project version 及其与图像的绑定关系。
-
-### 3.5 Evidence 未闭环
-
-output 中存在截图不等于系统已有 Evidence。附件上传、复制、hash、Evidence、Claim 和 Manifest 没有形成原子流水线。
+1. `READ/ARTIFACT_WRITE/DEVICE_READ` 不因 RF 开关缺失失败；下一节点进入 `DEVICE_CONFIG/RF_RUN` 时，确认前检查；blocker 不可普通 retry。
+2. 初始计划只到下一用户决策边界；批准后只重规划未执行尾部；`raw_text` 不被覆盖。
+3. RF_RUN 必须有时长上限和 stop/emergency_stop；未授权不得 arm/start。
+4. DiagnosisExperiment 不得 bump `flowgraph_version`、不得把对照结果写回原工程。
+5. 图像、标量、Claim 必须引用同一 `measurement_id`。
+6. BLE 结果只声明单信道广播能力。
+7. 测试必须跑真实 GNU Radio；禁止环境失败后伪成功。
 
 ---
 
-## 4. 推荐修复方案
+## 4. P1/P2 实现边界（避免误读为“已完全去 Task”）
 
-### 4.1 P0：阻止假通过与错误产物
+已落地：
 
-#### P0-1 Completion 全局不变量
+- IntentIR 字段（含 `entities`）、PlanNode metadata、`llm_planner.propose_plan`（未配置则为 no-op）、`plan_compiler`（未知 action 丢弃、RF bounds、`replan_tail`、`compact_workflow_payload`）；
+- `task_type` 作为兼容标签选择 catalog 片段；Compiler 不发明 Registry 外能力；
+- Workflow 落盘压缩 invocations；Inspector 短视距仍由 deferred + 决策截断保证。
 
-在 Workflow commit 前强制：
+尚未落地：
 
-```text
-open_questions 非空                    => 禁止 completed
-missing_slots/validation_errors 非空   => 禁止 autonomous build completed
-requested BER                          => 必须有有效 BER report + BER Claim
-requested spectrum peak                => 必须有带单位 peak report + Claim
-hardware_configure TX                  => 必须有目标硬件 sink
-hardware_configure RX                  => 必须有目标硬件 source
-Claim.project_version 过期             => 不得支撑当前完成条件
-```
-
-Completion 应返回结构化 failure code，而不是只有布尔值：
-
-```json
-{
-  "passed": false,
-  "missing": ["ber_claim"],
-  "invalid": ["open_questions_not_empty"],
-  "evidence": []
-}
-```
-
-#### P0-2 硬件 ArtifactContract
-
-构建前形成契约，例如：
-
-```json
-{
-  "task_type": "HARDWARE_CONFIGURE",
-  "direction": "tx",
-  "hardware": "pluto",
-  "required_blocks": ["iio_pluto_sink"],
-  "required_parameters": {
-    "center_frequency": 2402000000,
-    "sample_rate": 2000000
-  },
-  "forbidden_success_artifacts": ["baseband_file_sink_only"]
-}
-```
-
-执行约束：
-
-- 硬件 Builder 失败后进入 retry/waiting_user；
-- 可重试同类硬件 Builder，不能以 `bpsk_awgn/qpsk_awgn` 成功降级；
-- LLM 只能选择满足 contract 的 Tool；
-- 不符合 contract 的文件放入 `work/rejected/`，不得进入 final/Manifest；
-- `ResultEnvelope.ok=true` 仍须经过 contract validator。
-
-#### P0-3 修复 Pluto 通用 Builder
-
-1. 输出 block 端口和 connection graph；
-2. Builder 返回前运行结构校验；
-3. 写出 `.grc` 后调用 GNU Radio compiler 做二次验证；
-4. 编译失败禁止 finalize；
-5. 对 Pluto/B210 做参数化测试，变化频率、采样率、调制和设备身份，不能写死本次值。
-
-#### P0-4 修正硬件补槽
-
-- 仅记录参数可生成明确标记的 `configuration_only` 禁用模板；
-- 用户要求发射流图时必须明确基带输入或调制方式；
-- 补槽写回 Intent、Spec、slot source 和 workflow revision；
-- 禁止 Stage 内私自补出未持久化语义。
-
-### 4.2 P1：可信指标与统一状态
-
-#### P1-1 BER 测量协议
-
-不得写死本次 BER 结果，应修正通用算法：
-
-1. 定义 TX/RX byte 和 bit order；
-2. 使用同步字、帧号或相关峰确定 delay；
-3. 固定并记录捕获期；
-4. 限制 delay 搜索窗口；
-5. 反相只能由相位歧义判决触发并记录；
-6. 设置最小比较位数；
-7. 保存 bit errors 和 compared bits；
-8. Eb/N0/SNR 缺失时补槽；
-9. 重复运行报告均值和波动。
-
-标准报告：
-
-```json
-{
-  "metric": "ber",
-  "value": 0.001,
-  "bit_errors": 100,
-  "compared_bits": 100000,
-  "alignment_method": "preamble_correlation",
-  "delay_bits": 137,
-  "discarded_bits": 512,
-  "inversion_applied": false,
-  "ebn0_db": 8.0,
-  "tx_probe": "tx_sink",
-  "rx_probe": "sink",
-  "project_version": 1,
-  "valid": true
-}
-```
-
-BER Claim 必须引用报告和两个 probe artifact。
-
-#### P1-2 频谱峰测量协议
-
-```json
-{
-  "metric": "spectrum_peak",
-  "frequency_hz": 0.0,
-  "magnitude_dbfs": -12.3,
-  "fft_bin": 2048,
-  "fft_size": 4096,
-  "sample_rate": 1000000,
-  "window": "hann",
-  "fft_shifted": true,
-  "dc_excluded": true,
-  "valid": true
-}
-```
-
-bin 必须转换为 Hz；幅值使用 dBFS 或声明单位；记录 DC 处理；GUI 直接回答主峰；Completion 依赖有效报告和 measurement Claim。
-
-#### P1-3 EVM 与图片同源
-
-- 指标和图片使用同一 probe、运行和样本区间；
-- 统一丢弃 transient；
-- 按调制阶数检查聚类数量和有效点比例；
-- 图像元数据记录 project version、probe、sample range；
-- 图与指标明显冲突时不得完成。
-
-#### P1-4 状态事务
-
-每轮原子更新：
-
-```text
-Intent slots/missing_slots
-→ Spec decisions/open_questions
-→ Project context
-→ Profile
-→ Workflow revision
-→ Claim invalidation
-```
-
-不变量：
-
-- missing slots 与 open questions 对应；
-- profile 只能由用户操作或明确自适应事件改变；
-- canvas 槽位以 `source=canvas` 投影到 Spec；
-- Project version 变化后受影响 Claim 先 stale，再重验；
-- reply/events/state/workflow 使用同一快照。
-
-### 4.3 P2：诊断、Evidence 与 GUI
-
-#### P2-1 量化诊断
-
-对可仿真工程运行临时对照：
-
-```text
-baseline
-→ 降低 AWGN
-→ 清零频偏
-→ 恢复理想定时
-→ 分别重测
-→ 按改善量排序原因
-```
-
-对照使用临时快照，不写回用户工程；用户确认后才提交修复。
-
-#### P2-2 Evidence ingest
-
-上传截图时原子完成：
-
-1. 验证类型和大小；
-2. 复制到 `final/evidence/`；
-3. 计算 SHA-256；
-4. 生成 `evidence_id`；
-5. 绑定 workflow_id、run_id、expected_name、observed_at；
-6. 更新 OTA Claim；
-7. 写入 Manifest；
-8. 记录事件。
-
-仅点击“已看到”而不上传附件时，显示“人工确认通过，附件 Evidence 缺失”，不得宣称 Gate 5 完整通过。
-
-#### P2-3 Runtime 质量
-
-- 解析 GNU Radio `U/O` 为结构化计数；
-- 使用可配置阈值，不因单个 `U` 机械失败；
-- runtime Claim 保存 startup ready、当前终态、时长和 underrun；
-- GUI 分开显示“曾 ready”“当前状态”“质量告警”；
-- CH37/38/39 调度完成前只声明单信道能力。
-
-#### P2-4 GUI 与实验证据
-
-- 静态图标记“离线测量”，QT block 标记“实时 GUI”；
-- open question 存在时显示 waiting；
-- 截图带 case id、session id 和时间；
-- 导出前检测重复图片 hash；
-- 连续场景 Task 1→4→5 与七类独立代表场景分别记录。
+- LLM 完全生成并由 Compiler 执行任意未在 catalog/Registry 中的 PlanNode；
+- 删除 `task_catalog.yaml` 与 `_compose_stages` 的七类分支；
+- `engine.py` 拆成 intent / policy / repository 独立模块。
 
 ---
 
-## 5. 实施顺序
+## 5. 编排层现状与精简方案
 
-### 第一批 P0
-
-1. 收紧 Completion；
-2. 引入 ArtifactContract；
-3. 禁止硬件任务降级为 File-Sink-only 流图；
-4. 修复 Pluto Builder 端口；
-5. 失败产物不进入 final/Manifest；
-6. 修复硬件补槽。
-
-主要文件：
+当前规模（2026-08-27 去冗余后）：
 
 ```text
-grc/agent/workflow/completion.py
-grc/agent/workflow/engine.py
-grc/agent/service/adapter.py
-grc/agent/tools/hardware_tools.py
-grc/agent/knowledge/recipes.py
-grc/agent/tools/registry.py
+grc/agent/service/adapter.py        2380
+grc/agent/workflow/engine.py        2090
+grc/agent/tests/test_workflow.py    1397
+grc/agent/tools/hardware_tools.py   1096
+grc/agent/tests/test_hardware.py    1023
+grc/agent/tools/state_tools.py       912
+grc/agent/service/stage_handlers.py  807
+grc/agent/workflow/plan_compiler.py  318
+grc/agent/service/result_projector.py 284
+grc/agent/service/tools_lc.py        232
 ```
 
-### 第二批 P1
+`grc/agent` 仍约 68 个文件。Wave 1 与 Wave 2 的拷贝/包装项已落地；`adapter.py` / `engine.py` 仍是门面，尚未拆 classify / persist。
 
-1. 重写 BER 报告；
-2. 修正频谱峰频率轴和单位；
-3. 统一 EVM/图片样本窗口；
-4. 引入状态原子事务；
-5. 补齐 Claim stale/revalidate。
+### 5.1 必须保留的权威来源
 
-主要文件：
+| 模块 | 职责 |
+|---|---|
+| `planning.py` | Effect、截断、capability blocker |
+| `plan_compiler.py` | schema、未知 action、RF bounds、replan、落盘压缩 |
+| `completion.py` | Stage 成功谓词 |
+| `claim_store.py` | Claim CRUD 与 version stale |
+| `hardware_tools` + `HardwareRuntime` | RF 副作用 |
+| `apply_flowgraph_patch` / `apply_grc_diff` | 多 op 原子补丁 vs 单参策略门 |
+| `diagnosis_experiment` + `debug_by_metric` | 对照实验 vs 阈值叙述 |
+| `task_catalog.yaml` | 片段库；Wave 3 前不删 |
 
-```text
-grc/agent/runtime/simulate.py
-grc/agent/tools/sim_tools.py
-grc/agent/tools/design_link.py
-grc/agent/state/claim_store.py
-grc/agent/state/shared_state.py
-grc/agent/service/adapter.py
-grc/gui/ClaimsPanel.py
-```
+`debug_by_metric` 与 DiagnosisExperiment 不是重复：一个给 verdict/叙事，一个做单因素对照。`apply_grc_diff` 与 GraphPatch 也不是重复：单参 DENY/确认策略与多 op 回滚语义不同。
 
-### 第三批 P2
+### 5.2 已完成的去冗余
 
-1. 量化诊断；
-2. Evidence ingest 与 Manifest；
-3. runtime underrun 统计；
-4. GUI 状态和证据检查；
-5. BLE 三信道调度另立能力项。
+| 项 | 结果 |
+|---|---|
+| probe / start / stop handler 近拷贝 | 已合并函数体；两个 discover Stage id 保留 |
+| `engine` / `plan_compiler` 两份 compact | 只留 `plan_compiler.compact_invocations` |
+| LLM JSON 解析 | `llm.parse_json_object` 共用 |
+| `tools_lc` 手写 `_call` 包装 | 仅保留 `design_flowgraph` / `read_metric`；其余从 Registry schema 生成 |
+| `diagnose_by_metric` / `suggest_fix` | 技能与 subagent 改为 `debug_by_metric`；LC 别名删除 |
+| `make_task_id` | 已删 |
+| `inspect_measure` / Claim 投影 | 分别在 `stage_handlers` 与 `result_projector` |
+| Stage if 链 | `_HANDLERS` 字典分派 |
+
+### 5.3 仍待做（不改架构）
+
+**Wave 2 剩余**
+
+1. 确定性 handler 显式传入 host 依赖，不再把 adapter 当 `self` 走私；
+2. `_fold` 抽到 reply renderer；
+3. `WorkflowEngine` 内部拆 classify / compose / persist，门面保留。
+
+**Wave 3 — 兼容退役（有迁移测试才做）**
+
+1. catalog 改为按 capability 索引的片段；`task_type` 只做评测标签；
+2. 会话迁移后再考虑合并 `discover_and_probe_*` 的 Stage id；
+3. `VARIANTS` 句式表收敛为每类能力 1–2 条金标。
+
+硬停止条件：Session reload / event replay 一致；RF 确认前门禁回归绿；BLE 单信道声明不变。
 
 ---
 
-## 6. 必增自动测试
+## 6. 剩余实施顺序
 
-### Completion 负向测试
-
-- open question 非空不得 completed；
-- 请求 BER 但无 BER Claim 不得通过；
-- BER 缺 compared bits 或 TX/RX probe 不得通过；
-- peak 缺单位或 FFT 参数不得通过；
-- Pluto/B210 流图缺目标硬件 endpoint 不得通过；
-- stale Claim 不得支撑当前版本。
-
-### BER 参数化测试
-
-覆盖随机 payload、delay、捕获期、bit order、相位反转、Eb/N0、长度和 BPSK/QPSK。根据注入错误数计算期望 BER，禁止写死一次实验结果。
-
-### 硬件 Builder 测试
-
-覆盖 Pluto/B210、TX/RX、多组频率与采样率、不同基带 source、validate+compile；断言 Builder 失败后无基带 recipe fallback，rejected artifact 不进 Manifest。
-
-### 状态一致性测试
-
-- profile 稳定；
-- 多轮补槽同步更新 Intent/Spec/revision；
-- canvas context 补充 Observe/Diagnose；
-- 修改后旧 Claim stale、新 Claim 绑定新版本；
-- session reload 后一致。
-
-### Evidence 测试
-
-- 截图进入 `final/evidence/`；
-- hash、Evidence、Claim、Manifest 一致；
-- run_id/名称不匹配时拒绝；
-- 仅人工确认时标记附件缺失；
-- 导出后相对路径有效。
+1. Wave 2 剩余：handler 去 `self` 走私、`_fold` 抽出、engine 内部分模块；
+2. 人工核验 V5 Manifest 是否仍漏列设备报告；
+3. Wave 3 片段化 catalog，删除七类 compose 分支（需 Session 迁移测试）；
+4. 三信道跳频与独立 sniffer 仍是**新能力**，不是精简项；未实现前不得扩大 Claim。
 
 ---
 
-## 7. 修复后验收标准
+## 7. 回归 Gate
 
-- Task 1：profile 不跳变，EVM 与图片同源；
-- Task 2：无硬件、无 RF，有结构 Claim；
-- Task 3：缺 Eb/N0 时补槽，BER 含错误数、比较位数、同步方法和 Claim；
-- Task 4：诊断有对照指标，拒绝修复后 hash/version 不变；
-- Task 5：确认前不改图，确认后 version 增加，旧 Claim stale、新 Claim 重验；
-- Task 6：无悬空 open question，明确回答主峰 Hz 与 dBFS，原工程不变；
-- Task 7：生成真实 Pluto Sink 流图并停在确认，File-Sink-only fallback 必须失败；
-- PlutoBLE：截图进入 Evidence，Claim 与 Manifest 路径/hash 一致，underrun 被记录，单信道能力不冒充三信道。
+1. `grc.agent.tests` 156 项（1 skip）与 `grc.gui.tests` 13 项通过；硬件 HIL 允许显式 skip；
+2. 连续三次运行无 `waiting/completed` 漂移；
+3. V5 同类请求在 RF 未启用时停在 capability blocker，不接受无效确认；
+4. RF 已启用时，用户确认后才生成有限时长执行计划；
+5. Inspector 初始只显示到下一决策点；
+6. Manifest 含设备报告、验证报告和流图；OTA 无附件不得宣称 Evidence Gate 完整通过；
+7. 至少一组不属于七类固定表述的开放式复合任务回归（已有 `test_plan_p12` / `test_open_compound_*`）。
 
-只有自动回归、七类独立代表用例、硬件安全链和 Evidence 链全部一致通过，才可登记当前版本发布 Gate 通过。
+只有自动回归、Dynamic State 一致性、安全 Policy、Artifact/Evidence 闭环和真实硬件人工验证共同通过，才可以登记当前工程版本 Gate 通过。

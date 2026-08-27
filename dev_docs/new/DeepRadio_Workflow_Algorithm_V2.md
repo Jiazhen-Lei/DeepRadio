@@ -1,55 +1,58 @@
 # DeepRadio Workflow 算法
 
-> 日期：2026-08-25
+> 日期：2026-08-27
 > 读者：算法、Agent、Workflow 与评测开发人员
-> 范围：文本到 Workflow、状态模型、执行选择、完成判定、反馈传播和硬件闭环
+> 范围：当前 `grc/agent` 控制面。七类 Task 是评测标签与 catalog 片段库，不是独立编排器。
 
 ---
 
 ## 1. 算法目标
 
-DeepRadio 将用户自然语言转换成可执行、可确认、可恢复、可审计的通信工程流程：
+DeepRadio 把用户自然语言变成可确认、可截断、可恢复、可审计的通信工程流程。权威流水线：
 
 ```text
 用户文本
-→ User Turn 关系判断
-→ Intent 结构化
-→ Task 选择与 Stage 实例化
-→ Stage 执行器和能力装配
-→ Completion 判定
-→ Workflow 转移
-→ SharedState、Claims、Evidence 与 GUI 同步
+→ turn_relation
+→ 规则 Intent + 可选 LLM 补全 → IntentIR
+→ Catalog 片段组成 Stage
+→ Plan Compiler（截断、校验、RF 时长）
+→ 执行器（主机确定性 / LLM Subagent）
+→ Completion
+→ Workflow 转移（批准后只展开下一视距）
+→ SharedState / Claim / ArtifactIndex / GUI
 ```
 
 下一步由三类输入共同决定：
 
 ```text
-Next = F(当前 Workflow/工程状态，用户本轮决定，反馈影响范围)
+Next = F(当前 Workflow 与工程，用户本轮决定，反馈影响范围)
 ```
 
 约束：
 
-- 用户原始目标和显式参数保持最高优先级；
-- Task 按终态产物、验收方式和安全边界选择；
-- Stage 对应可判定的中间产物或必须由用户表态的边界；
-- Subagent、Skill 和 Tool 由能力约束装配；
-- 每个通过状态都有 Completion 与 Evidence；
-- 工程修改、设备操作和 RF 发射受 Policy 与 Checkpoint 约束；
-- 失败只回退受影响范围，保留仍然有效的上游事实和证据。
+- `raw_text` 与 `slot_sources=user` 的字段不被覆盖；确认只追加 Decision，不回写 Intent。
+- Catalog 提供可执行 Stage 片段；`task_type` 只选片段并作为评测标签。
+- 初始计划只到下一用户决策边界；批准后只重规划未执行尾部。
+- Effect 为 `DEVICE_CONFIG` / `RF_RUN` 时，确认前检查进程能力；RF 必须有时长上限与 stop。
+- Completion 只认工具事实、工程版本和 `run_id`，不认叙述。
+- 失败只失效受影响范围。诊断对照实验不得 bump 工程版本、不得写回原图。
 
 ---
 
 ## 2. 核心对象
 
-### 2.1 Intent
+### 2.1 IntentIR
+
+`WorkflowIntent` 是规则槽位加上开放约束层：
 
 ```json
 {
-  "turn_relation": "new_task | answer | confirm | reject | feedback | cancel",
+  "turn_relation": "new_task",
   "task_type": "HARDWARE_CONFIGURE",
-  "operation": "deploy",
-  "capabilities": ["protocol", "hardware_runtime", "deploy"],
+  "confidence": 0.96,
+  "capabilities": ["protocol", "hardware_configure", "hardware_runtime", "deploy"],
   "slots": {
+    "operation": "deploy",
     "protocol": "ble",
     "hardware": "pluto",
     "center_freq": 2402000000,
@@ -57,101 +60,93 @@ Next = F(当前 Workflow/工程状态，用户本轮决定，反馈影响范围)
     "advertising_channels": [37],
     "duration_seconds": 30
   },
-  "slot_sources": {
-    "local_name": "user"
-  },
+  "slot_sources": {"local_name": "user"},
   "missing_slots": [],
-  "confidence": 0.96
+  "goals": ["在 Pluto 上广播 BLE 名称 loveu"],
+  "requested_operations": ["protocol", "deploy"],
+  "entities": {"hardware": "pluto", "protocol": "ble", "local_name": "loveu"},
+  "constraints": {"duration_seconds": 30},
+  "forbidden_effects": [],
+  "stop_conditions": [],
+  "decision_boundaries": ["rf_plan_confirmation"]
 }
 ```
 
-`slot_sources=user` 的字段受保护。低置信输入可由 Intent 补全器输出结构化补充；响应无效或模型不可用时使用规则结果。补全实现位于 `workflow/engine.py`。
+规则分类在 `workflow/engine.py`；有模型时 `complete_intent` 按用户目标校正 `operation`（prepare / deploy），不得覆盖 `slot_sources=user` 或 safety 默认时长。无模型时为 no-op。`operation=prepare` 会加上 `stop_at_decision_boundary`；`deploy` 会去掉它。Inspector `wait_kind=approval` 仅在 Workflow 仍 `waiting` 且 Checkpoint 为 pending。
 
 ### 2.2 Workflow
 
-- `workflow_id`、`task_type`、`revision`；
-- `base_project_version`；
-- Intent、capabilities、missing slots；
-- 当前 Stage 和完整 Stage 列表；
-- Workflow/Stage 的状态、attempt、outcome；
-- `completion_result`；
-- Checkpoint 与等待原因。
+- 标识：`workflow_id`、`task_type`、`revision`、`base_project_version`。
+- IntentIR。
+- **视距内** Stage 列表（不是一次展开的完整尾部）。
+- `deferred_plan`：决策点之后尚未物化的 Stage。
+- `compiled_plan`：视距 + 延迟项的 PlanNode 摘要。
+- `decisions` / `granted_effects`：用户批准记录；不写回 Intent。
+- 当前 Stage 的 `execution_status`、`attempt`、`resume_from`、`completion_result`、Checkpoint。
 
-### 2.3 SharedState
+### 2.3 PlanNode
 
-- RadioSpec 和用户锁定约束；
-- 当前 GRC 工程、版本、语义哈希和快照；
-- Tool 产生的工件；
-- Claim、Evidence 和验证版本；
-- 设备身份、RF armed 状态和 runtime 摘要。
+Compiler 挂在 Stage 上的通用计划元数据：`id`、`objective`、`requires`、`produces`、`effect_level`、`success_predicates`、`needs_user_decision`、`tools`、`stage_id`。未知 action 或未知工具名被丢弃，不得发明 Registry 外能力。
 
-路径以 session 根为基准相对化存储。
+### 2.4 SharedState
 
-### 2.4 TaskCard 与 ResultEnvelope
+- RadioSpec 与用户锁定约束。
+- 当前 GRC 工程、版本、语义哈希、快照。
+- 累积 ArtifactIndex（Stage 不得整表覆盖）。
+- Claim / Evidence（图像、标量、Claim 共用 `measurement_id`）。
+- 设备身份、RF armed、runtime 摘要（同一 `run_id`）。
 
-TaskCard：
+路径以 session 根为基准相对化。
 
-```text
-task_id、workflow_id、workflow_revision、stage_id、attempt
-目标、允许能力、推荐 Agent、允许 Tool、输入事实、Completion 条件
-```
+### 2.5 TaskCard 与 ResultEnvelope
 
-ResultEnvelope：
+TaskCard：`task_id`、`workflow_id`、`workflow_revision`、`stage_id`、`attempt`，以及目标、允许能力、推荐 Agent、允许 Tool、输入事实、Completion。
 
-```text
-task_id、workflow_id、workflow_revision、stage_id
-ok、outcome、protocol_valid、tool_calls、artifacts、claims、errors、completion
-```
+ResultEnvelope：对应身份字段 + `ok`、`outcome`、`protocol_valid`、`tool_calls`、`artifacts`、`claims`、`errors`、`completion`。
 
-ID、revision 或 Stage 不匹配时，结果被拒绝提交。
+ID、revision 或 Stage 不匹配时结果被拒绝。落盘时压缩 invocations，原始工具输出留在 Evidence。
 
 ---
 
-## 3. 七类 Task
+## 3. Catalog 片段与七类标签
 
-| Task | 终态产物 | 核心 Stage |
+七类名称仍用于选片段和评测对照，**不是**运行时硬路由表。Composer 按 `task_type`、`capabilities`、`slots.operation` 从 `task_catalog.yaml` 取片段，再交给 Compiler 截断。
+
+| 标签 | 终态产物 | 默认片段 |
 |---|---|---|
-| `END_TO_END_SIM` | 完整流图、测量与 Claims | 规格对齐 → 构建与验证 |
-| `TX_BUILD` | 发射链路与结构校验 | 规格对齐 → TX 构建与校验 |
-| `RX_BUILD` | 接收链路、BER/质量证据 | RX 规格对齐 → 构建与验证 |
-| `DIAGNOSE` | 诊断、证据、可选修复 | 检查诊断 → 修复确认 → 修复验证 |
-| `MODIFY_PROJECT` | 新工程版本和重验结果 | 检查计划 → 修改确认 → 应用验证 |
-| `OBSERVE` | 图、指标或结构观察 | 检查与测量 |
-| `HARDWARE_CONFIGURE` | 配置、运行或空口 Evidence | 按 operation 选择配置、运行或部署 Stage |
+| `END_TO_END_SIM` | 流图、测量、Claims | 规格对齐 → 构建与验证 |
+| `TX_BUILD` | 发射链路与结构校验 | 规格对齐 → TX 构建 |
+| `RX_BUILD` | 接收链路与质量证据 | RX 规格对齐 → 构建与验证 |
+| `DIAGNOSE` | 诊断与可选修复 | 检查诊断；只读则跳过 repair；对照实验不改原图 |
+| `MODIFY_PROJECT` | 新工程版本与重验 | 检查计划 → 确认 → GraphPatch 或 recipe 应用 |
+| `OBSERVE` | 图、指标或结构 | 检查与测量 |
+| `HARDWARE_CONFIGURE` | 配置、运行或空口 Evidence | 见三套片段 |
 
-分类顺序：
+`HARDWARE_CONFIGURE` 三套片段：
 
-1. 提取显式操作词、期望产物、验收方式和硬件安全范围；
-2. 识别复合请求中的最终目标；
-3. 选择覆盖最终目标且能容纳前置能力的 Task；
-4. 使用 capabilities 添加条件 Stage；
-5. 对低置信或冲突槽位发起澄清。
-
-调制、协议、设备型号和频率属于槽位或能力，驱动 Stage 参数与 Tool 选择。
-
-`HARDWARE_CONFIGURE` 三套 Stage：
-
-- 默认 `stages`：预检 → 确认 → 记录配置；
-- `runtime_stages`：预检 → 发现探测 → RF 确认 → 配置 → 有限运行 → 观察确认 → 停止；
+- 默认 `stages`：预检 → 确认 → 记录配置。
+- `runtime_stages`：预检 → 发现探测 → 确认（`DEVICE_READ` 显示「配置确认」，`RF_RUN`/`DEVICE_CONFIG` 显示「RF 计划确认」）→ 配置 → 有限运行 → 观察确认 → 停止。
 - `deploy_stages`：BLE 协议构建与空口闭环（§10）。
 
+分类顺序：显式操作与否定约束 → 能力集合 → 用 `task_type` 选覆盖终态的片段 → 条件拼接硬件/构建组 → 缺槽则插入 alignment。调制、协议、设备、频率是槽位，不是 Task。
+
 ---
 
-## 4. User Turn 与活动 Workflow
+## 4. User Turn
 
-`turn_relation` 取值：`new_task`、`answer`、`adjustment`、`feedback`、`approval`、`rejection`、`cancel`。GUI 确认/取消按钮走 `ServiceAgent.step_command`，携带 `checkpoint_id` 与 `approved` / `rejected`。
+`turn_relation`：`new_task`、`answer`、`adjustment`、`feedback`、`approval`、`rejection`、`cancel`。GUI 确认/取消走 `ServiceAgent.step_command`，携带 `checkpoint_id` 与 `approved` / `rejected`。
 
 | 关系 | 处理 |
 |---|---|
-| `new_task` | 创建 Workflow；明确终止当前任务时先归档和停止 runtime |
-| `answer` | 填补对齐 Stage 的缺失槽位，保持 `workflow_id` |
-| `adjustment` | 在等待确认或待执行时合并槽位，递增 revision |
-| `approval` | 仅解决当前 `checkpoint_id` 的批准分支 |
+| `new_task` | 创建 Workflow；明确终止当前任务时先归档并停止 runtime |
+| `answer` | 填补 alignment 缺失槽位，保持 `workflow_id` |
+| `adjustment` | 等待确认或待执行时合并槽位，递增 revision |
+| `approval` | 只解决当前 `checkpoint_id`；追加 `decisions`；物化下一视距 |
 | `rejection` | 执行该 Checkpoint 的拒绝分支 |
 | `feedback` | 计算影响范围并失效相关 Stage/Claim |
-| `cancel` | 取消 Workflow（`outcome=cancelled`），停止 runtime，清除 armed 状态 |
+| `cancel` | `outcome=cancelled`，停止 runtime，清除 armed |
 
-「继续」和参数补充结合当前等待点解析。缺少活动 Checkpoint 的裸确认不触发受限操作。低置信关系判断保持当前 Workflow，并请求澄清。
+缺少活动 Checkpoint 的裸确认不触发受限操作。低置信关系保持当前 Workflow 并澄清。
 
 ---
 
@@ -159,26 +154,16 @@ ID、revision 或 Stage 不匹配时，结果被拒绝提交。
 
 ### 5.1 Workflow 与 Stage
 
-`execution_status`：
-
 ```text
-pending      尚未进入或待重跑
-running      正在执行
-waiting      等待输入或 Checkpoint
-completed    完成条件全部通过
-errored      执行器、工具或协议异常
-invalidated  上游事实变化，需要重验
+pending → running → waiting | completed | errored
+                ↘ invalidated（上游事实变化后待重验）
 ```
 
-Catalog 的转移目标 `waiting_user` 写入 `execution_status=waiting`。用户取消把 Workflow `outcome` 记为 `cancelled`，`execution_status` 为 `completed`。验收失败走 `failed` / `failed_without_improvement` 等 Catalog 转移，通常回到 `waiting`。
+Catalog 的 `waiting_user` 写入 `execution_status=waiting`。用户取消：Workflow `outcome=cancelled` 且 `execution_status=completed`。验收失败走 Catalog 转移，通常回到 `waiting`。
 
-Checkpoint `decision_status`：
+Checkpoint：`pending → approved | rejected`。`approved` 只表示允许进入下一视距；Stage 仍须 Completion。Checkpoint 带 `requested_effect` 与可选 `blocker`（例如 RF 进程能力缺失且 `retryable=false`）。
 
-```text
-pending → approved | rejected
-```
-
-`approved` 只表示允许进入下一阶段；Stage 还要过 CompletionEvaluator。Checkpoint 解决后写入 `completion_result`，Inspector 显示 `completion n/m`。
+`configure_device` 在 configure 已成功、arm 失败时设 `resume_from=arm_flowgraph`，重试跳过 configure。
 
 ### 5.2 Runtime
 
@@ -189,72 +174,100 @@ prepared → armed → starting → running → stopped/exited
 
 字段：`run_id`、pid、program、interpreter、started_at、deadline、ready、startup_health_passed、running、return_code、crashed。空口 Evidence、停止结果和 runtime Claim 引用同一 `run_id`。
 
----
-
-## 6. Stage 规划与能力装配
-
-Stage 建立准则：有明确中间产物及 Completion；有用户决策、风险授权或硬件连接边界；失败需要独立回退范围；所需能力或运行环境变化。
+### 5.3 Effect
 
 ```text
-Stage.required_capabilities
-→ Subagent capability match
-→ Skill instruction set
-→ Tool allowlist
+READ < ARTIFACT_WRITE < DEVICE_READ < DEVICE_CONFIG < RF_RUN
+```
+
+`DEVICE_CONFIG` / `RF_RUN` 在确认前检查 `GRC_AGENT_ENABLE_RF=1`。只读发现、离线建图、安全预览不因 RF 关闭而失败。
+
+---
+
+## 6. 计划编译
+
+```text
+Catalog 片段
+→ 可选 LLM propose_plan（无模型则为空）
+→ validate_proposal（未知 id/工具丢弃）
+→ attach PlanNode
+→ ensure_rf_bounds（RF_RUN 必有 duration）
+→ split_at_decision_boundary
+→ horizon 进入 Workflow.stages；其余进入 deferred_plan
+```
+
+Inspector 只显示到下一 checkpoint。`safety_finalizer`（停止发射）不是业务决策点。批准后 `replan_tail` 只改未执行尾部；空提案或非法提案保持原 deferred。
+
+能力装配：
+
+```text
+Stage.recommended_agents + completion
+→ Subagent 工具子集
+→ Skill
+→ Registry allowlist
 → TaskCard
 ```
 
-Subagent：
+Subagent：`spec_agent`、`radio_design_agent`、`flowgraph_agent`、`verification_agent`、`diagnosis_agent`、`protocol_agent`、`hardware_agent`。Skill 是给 LLM 的说明书；确定性路径直接 `registry.call`。
 
-- `spec_agent`：意图、规格、缺失槽位；
-- `radio_design_agent`：通信链路和配方选择；
-- `flowgraph_agent`：GRC 结构与参数修改；
-- `verification_agent`：结构、仿真、协议和测量验收；
-- `diagnosis_agent`：失败解释与修复建议；
-- `protocol_agent`：BLE PDU、PHY 和协议验证；
-- `hardware_agent`：设备、配置、运行和停止。
-
-一个 Subagent 可绑定多个 Skill。Skill 是给 LLM 的说明书；确定性路径直接 `registry.call`。
+改图两条工具，语义不同，不合并：`apply_grc_diff`（单参，调制/星座 DENY）与 `apply_flowgraph_patch`（多 op 原子回滚，含 GraphPatch 别名 `set_param` / `replace_block` / `connect`）。诊断两条工具不合并：`debug_by_metric`（判决与叙述）与 `run_diagnosis_experiment`（单因素对照，恢复原图）。
 
 ---
 
-## 7. 执行模式选择
+## 7. 执行模式
 
 ```text
-if Stage 属于主机控制面 或 已注册确定性 handler:
+if Stage 属于主机控制面 或 确定性 handler 优先:
     mode = deterministic
-elif Stage 需要语义推理且模型可用:
+elif 需要语义推理且模型可用:
     mode = llm_subagent
 else:
-    返回 waiting_user 或 errored
+    回落到确定性 handler；仍无法执行则 waiting 或 errored
 ```
 
-主机控制面 Stage：`build_ble_advertiser`、`offline_protocol_verify`、`discover_and_probe_device`、`discover_and_probe_hardware`、`configure_device`、`transmit_bounded`、`run_bounded`、`stop_and_finalize`、`stop_runtime`。
+主机控制面（LLM 不能省略、重排或用别的工具顶替）：
 
-适合确定性执行：PDU/CRC/白化/GFSK 与回环；GRC 原子构建和结构检查；设备发现与身份探测；解释器解析、启动、查询和停止；Manifest、哈希和 Claim 事务。
+```text
+hardware_precheck
+configure_and_check
+build_ble_advertiser
+offline_protocol_verify
+discover_and_probe_device
+discover_and_probe_hardware
+configure_device
+transmit_bounded
+run_bounded
+stop_and_finalize
+stop_runtime
+```
 
-LLM Subagent 负责语义不确定性、方案解释和开放式诊断。安全关键 Stage 的顺序和 Completion 由 Catalog 与 Engine 固定。事件记录 `mode`、`origin`、实际 executor、Tool 调用和耗时。
+另外强制走确定性 handler：`inspect_and_plan` / `inspect_and_diagnose` / `inspect_and_measure`；以及带 `hardware_configure` 的 `build_and_verify`、`tx_build_and_validate`、`rx_build_and_verify`、`apply_and_verify`。
+
+确定性适合：PDU/CRC/白化/GFSK 回环、原子建图与结构检查、设备发现与精确 probe、解释器启动/查询/停止、Manifest 与 Claim 事务。LLM 只处理语义不确定与开放解释。事件记录 `mode`、`origin`、executor、工具名和耗时。
 
 ---
 
-## 8. Completion 硬门槛
+## 8. Completion
 
-Stage 进入 `completed` 前逐项验证 Catalog 的 Completion：
+Stage 进入 `completed` 前逐项验证 Catalog Completion：
 
 ```text
 passed = all(
     产物存在且可解析，
-    Tool 返回 ok，
+    Tool 返回 ok 且非 DENY，
     Claim 绑定当前工程版本，
     ResultEnvelope 协议有效，
-    运行状态满足本 Stage 的安全条件
+    本 Stage 的安全谓词为真
 )
 ```
 
-硬件门槛：
+`open_questions` 或缺失槽位非空时，自治 Completion 全部失败。
 
-- `transmit_started`：`ok && running && ready && startup_health_passed && run_id`；
-- `over_air_observed`：runtime 仍在运行、未超 deadline、目标名称精确匹配、Evidence 绑定同一 `run_id`；
-- `transmit_stopped`：同一运行已终止、return code 合法、`crashed=false`。
+硬件谓词：
+
+- `transmit_started` / `runtime_started`：`ok && running && ready && startup_health_passed && run_id`。
+- `over_air_observed`：Intent 槽位已记录观察，且 `ota_observation.run_id` 等于当前 runtime `run_id`。名称比对发生在写入观察时（§10.3），不是 Completion 再算一遍。
+- `transmit_stopped` / `runtime_stopped`：同一 `run_id` 已终止、未 crashed。
 
 ---
 
@@ -262,26 +275,27 @@ passed = all(
 
 ```text
 changed_fields
-→ direct dependent stages
-→ downstream stages
-→ affected claims/evidence
+→ 直接依赖 Stage
+→ 下游 Stage
+→ 受影响 Claim / Evidence
 ```
 
-1. 更新 Intent/SharedState 并递增 revision；
-2. 将直接依赖和下游 Stage 标为 `invalidated` 或 `pending`；
-3. 失效绑定相应工程版本、设备身份或运行标识的 Claim；
-4. 保留无依赖关系的 Stage、产物和 Evidence；
-5. 从最早受影响 Stage 恢复执行。
+1. 更新 SharedState 并递增 revision；不覆盖用户 Intent。
+2. 直接依赖与下游标为 `invalidated` 或 `pending`。
+3. 失效绑定该工程版本、设备身份或 `run_id` 的 Claim。
+4. 保留无依赖的 Stage、产物和 Evidence。
+5. 从最早受影响 Stage 恢复。
 
-自动重试受 `max_attempts` 限制。相同结果指纹停止循环并进入 `waiting`。工程修改使用 snapshot 回滚。
+自动重试受 `max_attempts` 限制。相同结果指纹停止循环并 `waiting`。工程修改用 snapshot 回滚。Profile 在 pin 之后 observe 不改 score；同轮带 `profile_snapshot`。
 
 ---
 
 ## 10. BLE 部署
 
-`HARDWARE_CONFIGURE` 在 `operation=deploy` 且 `protocol=ble` 时选择：
+`operation=deploy` 且 `protocol=ble` 时选用 `deploy_stages`：
 
 ```text
+[protocol_spec_alignment 若缺槽]
 build_ble_advertiser
 → offline_protocol_verify
 → discover_and_probe_device
@@ -292,38 +306,40 @@ build_ble_advertiser
 → stop_and_finalize
 ```
 
-缺槽时前面插入 `protocol_spec_alignment`。
+能力声明仅为 `ble_advertising_single_channel`。不得声称三信道跳频或独立 sniffer。
 
 ### 10.1 离线协议
 
-1. 从 local name、地址、广告类型等槽位构造 Advertising PDU；
-2. 根据 PDU Header 和 Payload 计算 BLE CRC24；
-3. 根据广告信道生成白化序列；
-4. 组装 preamble、access address、白化后的 PDU+CRC；
-5. 以 Gaussian filter 和调制指数生成 GFSK IQ；
-6. 独立解析、解白化、CRC 重算、IQ 解调回环；
-7. 把协议字段、波形参数和校验结果写入 Artifact/Claim。
+1. 由 local name 等槽位构造 Advertising PDU。
+2. 计算 BLE CRC24。
+3. 按**单一**广告信道生成白化序列。
+4. 组装 preamble、access address、白化后的 PDU+CRC。
+5. Gaussian filter 与调制指数生成 GFSK IQ。
+6. 独立解析、解白化、CRC 重算、IQ 解调回环。
+7. 协议字段、波形参数和校验写入 Artifact/Claim。
 
-协议工具可按信道 37 / 38 / 39 单独生成。部署构建取 `advertising_channels[0]`：载频 2.402 / 2.426 / 2.480 GHz 分别对应 37 / 38 / 39；未指定载频时槽位为 `[37, 38, 39]`，构建使用 37。三信道跳频调度未实现。
+协议工具可按信道 37 / 38 / 39 **单独**生成。部署构建取 `advertising_channels[0]`。载频 2.402 / 2.426 / 2.480 GHz 对应 37 / 38 / 39。未指定载频时槽位默认为 `[37]`，与 2.402 GHz 对齐。三信道跳频调度未实现。
 
 ### 10.2 设备与受控发射
 
-设备名称映射到 `HardwareProfile`。Pluto 使用 USB IIO 扫描并提取 URI，再对精确 URI probe；B210 使用 UHD 发现和 `type=b200` probe。流图 Builder 由 Profile 选择。
+设备名映射到 `HardwareProfile`。Pluto：USB IIO 扫描提取 URI 后再精确 probe。B210：UHD 发现与 `type=b200` probe。Builder 由 Profile 选择，失败不得回退到其它 SDR 或 AWGN。
 
-批准 RF 计划后，按当前语义哈希创建 `.armed.grc`。Runtime 解析可导入所需 GNU Radio 模块的 Python 解释器，生成代码并有限时长启动。启动宽限期内退出直接失败。
+RF 计划批准后，按当前语义哈希生成 `.armed.grc`。Runtime 解析可导入所需模块的 Python 解释器，有限时长启动。启动宽限期内退出直接失败。`duration_seconds` 是最大窗口，空口确认或取消可提前 stop。
 
 ### 10.3 空口 Evidence
 
+写入观察时：
+
 ```text
 query_runtime_status
-→ 校验 running、deadline、run_id
-→ 校验 expected_name == observed_name
-→ 记录 observed_at 和 evidence_kind
+→ running && ready && run_id && 未超 deadline
+→ expected_name == observed_name
 → 可选复制截图到 final/evidence
-→ 创建 over_air_observed Claim
+→ 记录 ota_observation（含 run_id）与 over_air_observed 槽位
+→ Claim ota_ble_local_name_observed
 ```
 
-随后 `stop_and_finalize` 停止同一运行。`duration_seconds` 是最大运行窗口，空口确认可提前结束。
+无附件时 `evidence_complete=false`，GUI 标明人工确认、附件缺失；不得把 Evidence Gate 记为完整通过。随后 `stop_and_finalize` 停止同一 `run_id`，并要求观察已记录且 `run_id` 一致。
 
 ---
 
@@ -331,27 +347,19 @@ query_runtime_status
 
 | 文件 | 语义 |
 |---|---|
-| `state.json` | 当前领域事实与工程状态 |
-| `workflow.yaml` | 活动任务的执行控制状态 |
-| `events.jsonl` | 可追加、可计时、可审计的事件轨迹 |
+| `state.json` | 领域事实、工程版本、ArtifactIndex、runtime |
+| `workflow.yaml` | 控制面（JSON 内容）；invocations 已压缩 |
+| `events.jsonl` | 可追加审计轨迹 |
 
-恢复顺序：
+恢复：载入 SharedState → 载入 Workflow 并校验 schema/revision → 对比 `base_project_version` → 查询 runtime → 把中断的 `running` Stage 收敛为可重试、等待或失败 → 刷新 Claim 与 GUI digest。
 
-1. 载入 SharedState（相对路径解析到当前 session 根）；
-2. 载入 Workflow 并校验 schema/revision；
-3. 对比 `base_project_version` 和当前工程版本；
-4. 查询硬件 runtime；
-5. 将中断的 `running` Stage 收敛为可重试、等待用户或失败；
-6. 刷新 Claims 和 GUI digest。
-
-导出 Manifest 消费本轮显式产物集合，逐项写入相对路径、大小和 SHA-256。
+导出 Manifest 消费**累积** ArtifactIndex，逐项写相对路径、大小和 SHA-256。不得用本轮显式产物集合覆盖历史条目。
 
 ---
 
-## 12. 算法待办
+## 12. 未实现（不是当前算法缺口）
 
-1. BLE 广告信道 37/38/39 跳频调度、每信道白化和空口验收。
-2. runtime 超时、进程崩溃、重复启动的模型化故障注入覆盖率。
-3. 多轮反馈对 Stage 依赖图的覆盖率度量。
-4. Intent 数据集加入否定约束、模糊硬件名、复合操作和对抗性表达。
-5. 多 Task 排队与可并行 Stage 的资源锁（超出当前单任务产品范围）。
+1. BLE 37/38/39 跳频调度与每信道空口验收。实现前不得扩大 Claim。
+2. 删除 `task_catalog.yaml` 与七类 compose 分支（需 Session 迁移测试）。
+3. LLM 生成并执行未在 catalog/Registry 中的 PlanNode。
+4. 多 Task 排队与可并行 Stage 的资源锁。

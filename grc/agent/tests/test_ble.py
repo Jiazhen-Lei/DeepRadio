@@ -33,7 +33,11 @@ class BleDeployContractTest(unittest.TestCase):
         self.assertEqual(workflow.intent.slots["protocol"], "ble")
         self.assertEqual(workflow.intent.slots["local_name"], "deepradio")
         self.assertEqual(workflow.stages[0].id, "build_ble_advertiser")
-        self.assertEqual(workflow.stages[-1].id, "stop_and_finalize")
+        self.assertEqual(workflow.stages[-1].id, "rf_plan_confirmation")
+        self.assertIn(
+            "stop_and_finalize",
+            [item.get("id") for item in workflow.deferred_plan],
+        )
 
     def test_ble_packet_and_waveform_are_offline_artifacts(self):
         packet = registry.call(
@@ -142,6 +146,9 @@ class BleDeployContractTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"GRC_AGENT_ENABLE_RF": "1"}), \
                 mock.patch(
                     "grc.agent.tools.hardware_tools._rf_approved",
+                    return_value=True,
+                ), mock.patch(
+                    "grc.agent.tools.hardware_tools._completion_satisfied",
                     return_value=True,
                 ), mock.patch(
                     "grc.agent.tools.hardware_tools._run",
@@ -343,15 +350,20 @@ class BleProtocolSafetyTest(unittest.TestCase):
                     "id": "offline_protocol_verify",
                     "execution_status": "completed",
                     "outcome": "passed",
+                    "result": {"completion": {"ble_packet_valid": True}},
                 },
                 {
                     "id": "discover_and_probe_device",
                     "execution_status": "completed",
                     "outcome": "passed",
+                    "result": {"completion": {"device_probed": True}},
                 },
                 {
                     "id": "rf_plan_confirmation",
-                    "checkpoint": {"decision_status": "approved"},
+                    "checkpoint": {
+                        "decision_status": "approved",
+                        "requested_effect": "RF_RUN",
+                    },
                 },
             ],
         }

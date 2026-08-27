@@ -1,0 +1,318 @@
+"""Deterministic Plan Compiler / Policy Kernel.
+
+Task labels are evaluation tags.  This module only enforces generic schema,
+effect, and truncation rules.  It must not mention dataset utterances.
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
+from typing import Any, Iterable, Mapping
+
+from .planning import (
+    EffectLevel,
+    highest_effect,
+    normalize_effect,
+    split_at_decision_boundary,
+    stage_plan_item,
+)
+from .schema import Stage
+
+
+@dataclass
+class PlanNode:
+    id: str
+    objective: str = ""
+    requires: list[str] = field(default_factory=list)
+    produces: list[str] = field(default_factory=list)
+    effect_level: str = "READ"
+    success_predicates: list[str] = field(default_factory=list)
+    needs_user_decision: bool = False
+    tools: list[str] = field(default_factory=list)
+    stage_id: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "PlanNode":
+        stage_id = str(data.get("stage_id") or data.get("id") or "")
+        return cls(
+            id=str(data.get("id") or stage_id),
+            objective=str(data.get("objective") or stage_id),
+            requires=list(data.get("requires") or []),
+            produces=list(data.get("produces") or data.get("completion") or []),
+            effect_level=str(data.get("effect_level") or data.get("effect") or "READ"),
+            success_predicates=list(
+                data.get("success_predicates") or data.get("completion") or []
+            ),
+            needs_user_decision="checkpoint" in str(
+                data.get("interaction") or ""
+            ) or bool(data.get("needs_user_decision")),
+            tools=list(data.get("tools") or []),
+            stage_id=stage_id,
+        )
+
+
+def known_action_ids(catalog: Mapping[str, Any] | None = None) -> set[str]:
+    """Action ids the compiler may bind. Catalog fragments plus tool names."""
+    ids: set[str] = set()
+    candidates = dict((catalog or {}).get("task_candidates") or {})
+    for candidate in candidates.values():
+        if not isinstance(candidate, Mapping):
+            continue
+        for key in ("stages", "runtime_stages", "deploy_stages"):
+            for item in list(candidate.get(key) or []):
+                if isinstance(item, Mapping) and item.get("id"):
+                    ids.add(str(item["id"]))
+    try:
+        from ..tools import registry
+
+        registry.load_all()
+        ids.update(spec.name for spec in registry.all_specs())
+    except Exception:  # noqa: BLE001
+        pass
+    return ids
+
+
+def node_from_stage(stage: Stage) -> PlanNode:
+    interaction = str(getattr(stage, "interaction", "") or "")
+    produces = list(getattr(stage, "produces", None) or stage.completion or [])
+    return PlanNode(
+        id=stage.id,
+        objective=str(getattr(stage, "objective", "") or stage.id),
+        requires=list(getattr(stage, "requires", None) or stage.depends_on or []),
+        produces=produces,
+        effect_level=str(stage.effect_level or "READ"),
+        success_predicates=list(
+            getattr(stage, "success_predicates", None) or stage.completion or []
+        ),
+        needs_user_decision="checkpoint" in interaction,
+        tools=list(getattr(stage, "recommended_agents", None) or []),
+        stage_id=stage.id,
+    )
+
+
+def attach_plan_metadata(stages: Iterable[Stage]) -> list[PlanNode]:
+    """Fill generic PlanNode fields on executable Stages."""
+    nodes = []
+    for stage in stages:
+        node = node_from_stage(stage)
+        stage.objective = node.objective
+        stage.requires = list(node.requires)
+        stage.produces = list(node.produces)
+        stage.success_predicates = list(node.success_predicates)
+        nodes.append(node)
+    return nodes
+
+
+def validate_proposal(
+    proposal: Iterable[Any],
+    *,
+    catalog: Mapping[str, Any] | None = None,
+) -> tuple[list[PlanNode], list[str]]:
+    """Drop unknown actions; never invent Registry capabilities."""
+    known = known_action_ids(catalog)
+    accepted: list[PlanNode] = []
+    rejected: list[str] = []
+    for item in proposal or []:
+        node = item if isinstance(item, PlanNode) else PlanNode.from_dict(
+            item if isinstance(item, Mapping) else {"id": str(item)}
+        )
+        action_id = node.stage_id or node.id
+        tools = list(node.tools or [])
+        unknown_tools = [name for name in tools if known and name not in known]
+        if known and action_id not in known and not tools:
+            rejected.append(action_id)
+            continue
+        if unknown_tools:
+            rejected.extend(unknown_tools)
+            continue
+        accepted.append(node)
+    return accepted, rejected
+
+
+def ensure_rf_bounds(intent: Any) -> None:
+    """Deploy/RF_RUN plans always carry a duration cap. Prepare does not."""
+    slots = getattr(intent, "slots", None)
+    if not isinstance(slots, dict):
+        return
+    capabilities = set(getattr(intent, "capabilities", None) or [])
+    if slots.get("operation") != "deploy" and "deploy" not in capabilities:
+        return
+    slots.setdefault("duration_seconds", 30.0)
+    slots.setdefault("max_duration_seconds", slots.get("duration_seconds") or 30.0)
+
+
+def compile_stages(
+    intent: Any,
+    stages: list[Stage],
+    *,
+    catalog: Mapping[str, Any] | None = None,
+    proposal: Iterable[Any] | None = None,
+) -> tuple[list[Stage], list[PlanNode], list[str]]:
+    """Attach PlanNodes, apply generic RF bounds, optionally merge an LLM tail."""
+    ensure_rf_bounds(intent)
+    rejected: list[str] = []
+    if proposal:
+        accepted, rejected = validate_proposal(proposal, catalog=catalog)
+        by_id = {stage.id: stage for stage in stages}
+        for node in accepted:
+            stage = by_id.get(node.stage_id or node.id)
+            if stage is None:
+                continue
+            stage.objective = node.objective or stage.objective
+            if node.requires:
+                stage.requires = list(node.requires)
+            if node.produces:
+                stage.produces = list(node.produces)
+            if node.success_predicates:
+                stage.success_predicates = list(node.success_predicates)
+    nodes = attach_plan_metadata(stages)
+    return stages, nodes, rejected
+
+
+def proposal_fingerprint(nodes: Iterable[PlanNode | Mapping[str, Any]]) -> tuple[str, ...]:
+    names = []
+    for item in nodes:
+        if isinstance(item, PlanNode):
+            names.append(item.stage_id or item.id)
+        elif isinstance(item, Mapping):
+            names.append(str(item.get("stage_id") or item.get("id") or ""))
+        else:
+            names.append(str(item))
+    return tuple(name for name in names if name)
+
+
+def replan_tail(
+    deferred: list[dict[str, Any]],
+    *,
+    proposal: Iterable[Any] | None = None,
+    catalog: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Rebuild an unexecuted tail from a compiler-checked proposal.
+
+    Invalid or empty proposals keep the existing deferred plan.  A proposal
+    that matches the deferred fingerprint is treated as no-op.
+    """
+    if not proposal:
+        return list(deferred or [])
+    accepted, rejected = validate_proposal(proposal, catalog=catalog)
+    if rejected or not accepted:
+        return list(deferred or [])
+    proposed_ids = proposal_fingerprint(accepted)
+    current_ids = tuple(
+        str(item.get("id") or "") for item in deferred or [] if isinstance(item, Mapping)
+    )
+    if proposed_ids == current_ids:
+        return list(deferred or [])
+    rebuilt = []
+    deferred_by_id = {
+        str(item.get("id") or ""): item
+        for item in deferred or []
+        if isinstance(item, Mapping)
+    }
+    catalog_by_id = _catalog_stage_index(catalog)
+    for node in accepted:
+        action_id = node.stage_id or node.id
+        existing = deferred_by_id.get(action_id)
+        if existing is not None:
+            rebuilt.append(dict(existing))
+            continue
+        fragment = catalog_by_id.get(action_id)
+        if fragment is not None:
+            rebuilt.append(dict(fragment))
+    return rebuilt or list(deferred or [])
+
+
+def _catalog_stage_index(
+    catalog: Mapping[str, Any] | None,
+) -> dict[str, dict[str, Any]]:
+    index: dict[str, dict[str, Any]] = {}
+    candidates = dict((catalog or {}).get("task_candidates") or {})
+    for candidate in candidates.values():
+        if not isinstance(candidate, Mapping):
+            continue
+        for key in ("stages", "runtime_stages", "deploy_stages"):
+            for item in list(candidate.get(key) or []):
+                if isinstance(item, Mapping) and item.get("id"):
+                    index.setdefault(str(item["id"]), dict(item))
+    return index
+
+
+def compact_workflow_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Keep control-plane facts; drop bulky tool stdout from persisted Workflow."""
+    data = dict(payload or {})
+    for stage in list(data.get("stages") or []):
+        if not isinstance(stage, dict):
+            continue
+        result = dict(stage.get("result") or {})
+        if "invocations" in result:
+            result["invocations"] = compact_invocations(result.get("invocations"))
+        stage["result"] = result
+        history = []
+        for item in list(stage.get("result_history") or [])[-5:]:
+            if not isinstance(item, dict):
+                continue
+            entry = dict(item)
+            nested = dict(entry.get("result") or {})
+            if "invocations" in nested:
+                nested["invocations"] = compact_invocations(nested.get("invocations"))
+                entry["result"] = nested
+            history.append(entry)
+        stage["result_history"] = history
+    return data
+
+
+def compact_invocations(items: Any) -> list[dict[str, Any]]:
+    """Keep control-plane facts; raw tool stdout stays in Evidence artifacts."""
+    compact = []
+    for item in list(items or []):
+        if not isinstance(item, dict):
+            continue
+        result = dict(item.get("result") or {})
+        tools = []
+        for tool in list(item.get("tools") or []):
+            if not isinstance(tool, dict):
+                continue
+            payload = dict(tool.get("result") or {})
+            tools.append({
+                "name": str(tool.get("name") or ""),
+                "ok": bool(tool.get("ok", payload.get("ok", True))),
+                "report_path": str(
+                    tool.get("report_path")
+                    or payload.get("report_path")
+                    or payload.get("raw_output_artifact")
+                    or ""
+                ),
+                "error": str(
+                    tool.get("error") or payload.get("error") or ""
+                )[:500],
+            })
+        compact.append({
+            "task_id": str(item.get("task_id") or ""),
+            "target_agent": str(item.get("target_agent") or ""),
+            "protocol_valid": bool(item.get("protocol_valid")),
+            "result": {
+                "ok": bool(result.get("ok")),
+                "outcome": str(result.get("outcome") or ""),
+                "completion": dict(result.get("completion") or {}),
+                "artifacts": dict(result.get("artifacts") or {}),
+            },
+            "tools": tools,
+        })
+    return compact
+
+
+def compiled_plan_summary(
+    stages: Iterable[Stage], deferred: Iterable[Mapping[str, Any]] | None = None
+) -> list[dict[str, Any]]:
+    summary = [node_from_stage(stage).to_dict() for stage in stages]
+    for item in deferred or []:
+        if isinstance(item, Mapping):
+            summary.append(PlanNode.from_dict(item).to_dict())
+    return summary
+
+
+def next_horizon_effect(deferred: Iterable[Any]) -> EffectLevel:
+    return highest_effect(deferred)

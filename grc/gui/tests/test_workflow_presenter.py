@@ -59,6 +59,7 @@ class _PresenterHarness:
     _set_workflow_details = ClaimsPanel._set_workflow_details
     _set_timeline = ClaimsPanel._set_timeline
     _set_pending = ClaimsPanel._set_pending
+    refresh_runtime = ClaimsPanel.refresh_runtime
     _format_si = staticmethod(ClaimsPanel._format_si)
     _default_details = staticmethod(ClaimsPanel._default_details)
 
@@ -216,6 +217,7 @@ class WorkflowPresenterTest(unittest.TestCase):
     def test_checkpoint_buttons_are_stage_specific(self):
         self.panel._set_pending({
             "action": "rf_plan_confirmation",
+            "requested_effect": "RF_RUN",
             "max_duration_seconds": 30,
             "device": {"type": "pluto", "identity": "usb:test.pluto"},
             "center_frequency": 2_402_000_000.0,
@@ -234,6 +236,33 @@ class WorkflowPresenterTest(unittest.TestCase):
         self.assertFalse(self.panel._evidence_btn.visible)
 
         self.panel._set_pending({
+            "action": "rf_plan_confirmation",
+            "device": {"type": "pluto", "identity": "usb:test.pluto"},
+            "center_frequency": 2_402_000_000.0,
+            "sample_rate": 2_000_000.0,
+            "bandwidth": 2_000_000.0,
+            "tx_attenuation": 30.0,
+            "approved": False,
+        })
+        self.assertEqual(self.panel._confirm_btn.label, "确认配置")
+        self.assertIn("不启动射频", self.panel._pending_label.text)
+        self.assertNotIn("受控发射", self.panel._pending_label.text)
+
+        self.panel._set_pending({
+            "action": "rf_plan_confirmation",
+            "requested_effect": "DEVICE_READ",
+            "device": {"type": "pluto", "identity": "usb:test.pluto"},
+            "center_frequency": 2_402_000_000.0,
+            "sample_rate": 2_000_000.0,
+            "bandwidth": 2_000_000.0,
+            "tx_attenuation": 30.0,
+            "approved": False,
+        })
+        self.assertEqual(self.panel._confirm_btn.label, "确认配置")
+        self.assertIn("不启动射频", self.panel._pending_label.text)
+        self.assertNotIn("受控发射", self.panel._pending_label.text)
+
+        self.panel._set_pending({
             "action": "over_air_verification",
             "approved": False,
         })
@@ -241,6 +270,23 @@ class WorkflowPresenterTest(unittest.TestCase):
         self.assertEqual(self.panel._cancel_btn.label, "未看到")
         self.assertTrue(self.panel._evidence_btn.visible)
         self.assertTrue(self.panel._evidence_btn.sensitive)
+        self.assertIn("人工确认、附件缺失", self.panel._pending_label.text)
+
+    def test_completed_digest_clears_stale_checkpoint_buttons(self):
+        self.panel._last_pending = {
+            "action": "rf_plan_confirmation",
+            "checkpoint_id": "cp-old",
+            "requested_effect": "DEVICE_READ",
+        }
+        self.panel.refresh_runtime({
+            "execution_status": "completed",
+            "wait_kind": "",
+            "current_stage": "rf_plan_confirmation",
+            "checkpoint_id": "",
+            "stages": [],
+        })
+        self.assertFalse(self.panel._pending_row.visible)
+        self.assertEqual(self.panel._confirm_btn.label, "")
 
 
 if __name__ == "__main__":

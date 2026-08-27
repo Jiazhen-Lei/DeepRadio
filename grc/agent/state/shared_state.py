@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import time
+import uuid
 import warnings
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
@@ -36,11 +37,46 @@ class ProjectState:
 
 
 @dataclass
+class WorkflowDecision:
+    decision_id: str
+    key: str
+    value: Any
+    source: str
+    effect_level: str = "READ"
+    workflow_id: str = ""
+    stage_id: str = ""
+    ts: float = field(default_factory=time.time)
+
+
+@dataclass
+class RuntimeState:
+    current_node: str = ""
+    status: str = "planned"
+    requested_effect: str = "READ"
+    granted_effects: List[str] = field(default_factory=list)
+    blocker: Dict[str, Any] = field(default_factory=dict)
+    operations: List[Dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class ArtifactRecord:
+    artifact_id: str
+    role: str
+    path: str
+    sha256: str
+    size: int = 0
+    producer: str = ""
+    workflow_revision: int = 0
+    project_version: int = 0
+
+
+@dataclass
 class Evidence:
     test: str
     observation: Dict[str, Any]
     project_version: int
     artifact: str = ""
+    measurement_id: str = ""
     ts: float = field(default_factory=time.time)
 
 
@@ -52,6 +88,22 @@ class Claim:
     status: str = "NotTested"
     evidence: List[Evidence] = field(default_factory=list)
     project_version: int = 0
+    producer: str = ""
+    measurement_id: str = ""
+    stale_reason: str = ""
+
+
+@dataclass
+class MeasurementRun:
+    measurement_id: str
+    metric: str
+    project_version: int
+    run_id: str = ""
+    probe_ids: List[str] = field(default_factory=list)
+    sample_range: Dict[str, Any] = field(default_factory=dict)
+    algorithm: Dict[str, Any] = field(default_factory=dict)
+    result: Dict[str, Any] = field(default_factory=dict)
+    artifact_ids: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -118,6 +170,10 @@ class SharedState:
     project: ProjectState = field(default_factory=ProjectState)
     claims: List[Claim] = field(default_factory=list)
     coordination: Coordination = field(default_factory=Coordination)
+    decisions: List[WorkflowDecision] = field(default_factory=list)
+    runtime: RuntimeState = field(default_factory=RuntimeState)
+    artifacts: List[ArtifactRecord] = field(default_factory=list)
+    measurements: List[MeasurementRun] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -291,6 +347,7 @@ def _from_dict(data: Dict[str, Any]) -> SharedState:
     spec_data = data.get("spec") or {}
     project_data = data.get("project") or {}
     coord_data = data.get("coordination") or {}
+    runtime_data = data.get("runtime") or {}
     active_data = coord_data.get("active_task")
     spec = RadioSpec(
         goals=list(spec_data.get("goals") or []),
@@ -301,7 +358,18 @@ def _from_dict(data: Dict[str, Any]) -> SharedState:
     )
     claims = []
     for item in data.get("claims") or []:
-        evidence = [Evidence(**ev) for ev in item.get("evidence") or []]
+        evidence = [
+            Evidence(
+                test=str(ev.get("test") or ""),
+                observation=dict(ev.get("observation") or {}),
+                project_version=int(ev.get("project_version", 0) or 0),
+                artifact=str(ev.get("artifact") or ""),
+                measurement_id=str(ev.get("measurement_id") or ""),
+                ts=float(ev.get("ts") or time.time()),
+            )
+            for ev in item.get("evidence") or []
+            if isinstance(ev, dict)
+        ]
         claims.append(
             Claim(
                 id=item["id"],
@@ -310,6 +378,9 @@ def _from_dict(data: Dict[str, Any]) -> SharedState:
                 status=item.get("status", "NotTested"),
                 evidence=evidence,
                 project_version=int(item.get("project_version", 0)),
+                producer=str(item.get("producer") or ""),
+                measurement_id=str(item.get("measurement_id") or ""),
+                stale_reason=str(item.get("stale_reason") or ""),
             )
         )
     coordination = Coordination(
@@ -330,6 +401,41 @@ def _from_dict(data: Dict[str, Any]) -> SharedState:
         ),
         claims=claims,
         coordination=coordination,
+        decisions=[
+            WorkflowDecision(**item)
+            for item in data.get("decisions") or []
+            if isinstance(item, dict) and item.get("decision_id")
+        ],
+        runtime=RuntimeState(
+            current_node=str(runtime_data.get("current_node") or ""),
+            status=str(runtime_data.get("status") or "planned"),
+            requested_effect=str(
+                runtime_data.get("requested_effect") or "READ"
+            ),
+            granted_effects=list(runtime_data.get("granted_effects") or []),
+            blocker=dict(runtime_data.get("blocker") or {}),
+            operations=list(runtime_data.get("operations") or []),
+        ),
+        artifacts=[
+            ArtifactRecord(**item)
+            for item in data.get("artifacts") or []
+            if isinstance(item, dict) and item.get("artifact_id")
+        ],
+        measurements=[
+            MeasurementRun(
+                measurement_id=str(item.get("measurement_id") or ""),
+                metric=str(item.get("metric") or ""),
+                project_version=int(item.get("project_version", 0) or 0),
+                run_id=str(item.get("run_id") or ""),
+                probe_ids=list(item.get("probe_ids") or []),
+                sample_range=dict(item.get("sample_range") or {}),
+                algorithm=dict(item.get("algorithm") or {}),
+                result=dict(item.get("result") or {}),
+                artifact_ids=list(item.get("artifact_ids") or []),
+            )
+            for item in data.get("measurements") or []
+            if isinstance(item, dict) and item.get("measurement_id")
+        ],
     )
 
 
@@ -458,3 +564,69 @@ def _convert_path(root: str, path: str, to_relative: bool) -> str:
     if os.path.isabs(path) or looks_like_session_path(path):
         return to_abspath(root, path)
     return path
+
+
+def current_measurement_id(ctx: Any) -> str:
+    extra = getattr(ctx, "extra", None)
+    if not isinstance(extra, dict):
+        return f"meas-{uuid.uuid4().hex[:10]}"
+    mid = str(extra.get("measurement_id") or "")
+    if not mid:
+        mid = f"meas-{uuid.uuid4().hex[:10]}"
+        extra["measurement_id"] = mid
+    return mid
+
+
+def attach_measurement(
+    ctx: Any,
+    *,
+    metric: str,
+    result: Optional[Dict[str, Any]] = None,
+    probe_ids: Optional[List[str]] = None,
+    algorithm: Optional[Dict[str, Any]] = None,
+    artifact: str = "",
+) -> str:
+    """Bind a metric/plot/claim to one MeasurementRun identity for this round."""
+    extra = getattr(ctx, "extra", None)
+    if not isinstance(extra, dict):
+        extra = {}
+    mid = current_measurement_id(ctx)
+    state = extra.get("state")
+    payload = dict(result or {})
+    probes = [item for item in list(probe_ids or []) if item]
+    record = None
+    if state is not None:
+        records = getattr(state, "measurements", None)
+        if records is None:
+            state.measurements = []
+            records = state.measurements
+        record = next(
+            (item for item in records if item.measurement_id == mid),
+            None,
+        )
+        if record is None:
+            record = MeasurementRun(
+                measurement_id=mid,
+                metric=str(metric or ""),
+                project_version=int(
+                    getattr(getattr(state, "project", None), "flowgraph_version", 0) or 0
+                ),
+                run_id=str(extra.get("run_id") or payload.get("run_id") or ""),
+            )
+            records.append(record)
+        if metric and not record.metric:
+            record.metric = str(metric)
+        if payload:
+            record.result.update(payload)
+        for probe in probes:
+            if probe not in record.probe_ids:
+                record.probe_ids.append(probe)
+        if algorithm:
+            record.algorithm.update(dict(algorithm))
+        if artifact and artifact not in record.artifact_ids:
+            record.artifact_ids.append(artifact)
+    extra.setdefault("measurement_ids", [])
+    if mid not in extra["measurement_ids"]:
+        extra["measurement_ids"].append(mid)
+    extra["measurement_id"] = mid
+    return mid

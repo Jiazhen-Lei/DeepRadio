@@ -316,10 +316,33 @@ def chat(messages, config: dict = None) -> str:
 
 
 # ---------------------------------------------------------------------------- #
-# 后处理: 提取纯 .grc 文本
+# 后处理: JSON 对象 / .grc 文本
 # ---------------------------------------------------------------------------- #
 _FENCE_RE = re.compile(
     r"```(?:ya?ml|grc)?\s*\n(.*?)\n```", re.DOTALL | re.IGNORECASE)
+
+
+def parse_json_object(content: str) -> dict:
+    """Extract a JSON object from model text (fenced or raw)."""
+    text = (content or "").strip()
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL)
+    if fenced:
+        text = fenced.group(1)
+    else:
+        if text.startswith("```"):
+            text = text.strip("`")
+            if text.lower().startswith("json"):
+                text = text[4:]
+            text = text.strip()
+        start = text.find("{")
+        end = text.rfind("}")
+        if start < 0 or end <= start:
+            raise ValueError("LLM 返回值不是 JSON 对象")
+        text = text[start:end + 1]
+    data = json.loads(text)
+    if not isinstance(data, dict):
+        raise ValueError("LLM 返回值不是对象")
+    return data
 
 
 def extract_grc_text(content: str) -> str:

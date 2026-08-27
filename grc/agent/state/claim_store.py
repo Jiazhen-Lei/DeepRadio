@@ -64,6 +64,9 @@ class ClaimStore:
         for claim in self.state.claims:
             if claim.project_version < new_version:
                 claim.status = "Stale"
+                claim.stale_reason = (
+                    f"project_version {claim.project_version} < {new_version}"
+                )
                 invalidated.append(claim.id)
         return invalidated
 

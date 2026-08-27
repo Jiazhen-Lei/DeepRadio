@@ -10,23 +10,27 @@ import hashlib
 import json
 import logging
 import os
-import re
 import time
 import uuid
 from typing import Any, Dict, Optional
 
 from ..schema import AgentReply, ToolInvocation
 from ..memory.profile import UserProfile
-from ..state import Claim, ClaimStore, Decision, Evidence, SharedState
-from ..tools.registry import ToolContext
-from ..tools.hardware_profiles import (
-    device_args_for,
-    normalize_hardware,
-    resolve_hardware_profile,
+from ..state import (
+    Claim,
+    ClaimStore,
+    Decision,
+    Evidence,
+    SharedState,
+    WorkflowDecision,
 )
+from ..tools.registry import ToolContext
+from ..tools.hardware_profiles import device_args_for, normalize_hardware
 from ..workflow import WorkflowEngine
+from ..workflow.planning import is_rf_grant_effect, stage_display_label
 from . import orchestrator as _orch
 from . import session_store as _store
+from . import result_projector as _projector
 from . import stage_executor as _stage_executor
 
 logger = logging.getLogger(__name__)
@@ -162,6 +166,12 @@ class ServiceAgent:
         self._state = SharedState.load(
             _store.state_path(self.session_id), session_id=self.session_id
         )
+        # Waiting/running are runtime facts, not durable Claims.  Migrate the
+        # one legacy transient assertion that older sessions persisted.
+        self._state.claims = [
+            claim for claim in self._state.claims
+            if claim.id != "rf_plan_awaiting_decision"
+        ]
         self._tool_ctx: Optional[ToolContext] = None
         event_sink = self._sink_engine_event
         try:
@@ -219,6 +229,7 @@ class ServiceAgent:
         ctx.extra["export_dir"] = export_dir
         ctx.extra["session_id"] = self.session_id
         ctx.extra["mutation_forbidden"] = False
+        ctx.extra["profile_snapshot"] = self.profile.level
         ctx.extra.pop("proposed_decisions", None)
         if ctx.flow_graph is None:
             self._load_session_flowgraph(ctx)
@@ -337,6 +348,18 @@ class ServiceAgent:
             dict.fromkeys(
                 list(intent.missing_slots) + list(intent.validation_errors)
             )
+        )
+        self._sync_control_state()
+
+    def _sync_control_state(self) -> None:
+        """Project the compact Workflow control plane into SharedState."""
+        _projector.project_control(self._workflow, self._state)
+
+    def _sync_artifact_index(self, manifest_path: str) -> None:
+        _projector.project_artifact_index(
+            self._state,
+            manifest_path,
+            workflow=self._workflow.workflow,
         )
 
     def _load_session_flowgraph(self, ctx: ToolContext) -> None:
@@ -508,6 +531,33 @@ class ServiceAgent:
             )
         return _store.archive_workflow(self.session_id)
 
+    def record_profile_choice(
+        self, *, adaptive: bool, pinned: Optional[str] = None
+    ) -> None:
+        """GUI pin/unpin. Auto inference never writes Intent, Plan, or tool args."""
+        before = self.profile.level
+        self.ctx.adaptive = bool(adaptive)
+        if pinned:
+            self.profile.pin(str(pinned))
+            source = "user_pin"
+        else:
+            self.profile.unpin()
+            source = "user_unpin"
+        after = self.profile.level
+        if self._tool_ctx is not None:
+            self._tool_ctx.extra["profile_snapshot"] = after
+        if after != before or source == "user_pin":
+            _store.append_session_event(
+                self.session_id,
+                "profile_changed",
+                self._workflow_event_payload({
+                    "before": before,
+                    "after": after,
+                    "source": source,
+                    "pinned": self.profile.pinned,
+                }),
+            )
+
     def step(self, user_text: str, recipe: str = "",
              simulate: bool = True) -> AgentReply:
         """Consume one user Turn and run autonomous Stages to a boundary."""
@@ -544,7 +594,23 @@ class ServiceAgent:
                 return self._error_reply(f"Workflow 状态错误: {exc}")
             if getattr(self.ctx, "adaptive", True):
                 try:
+                    before_level = self.profile.level
                     self.profile.observe(user_text)
+                    after_level = self.profile.level
+                    if after_level != before_level:
+                        _store.append_session_event(
+                            self.session_id,
+                            "profile_changed",
+                            self._workflow_event_payload({
+                                "before": before_level,
+                                "after": after_level,
+                                "source": "adaptive_text_signals",
+                                "signals": (
+                                    self.profile.history[-1].get("signals")
+                                    if self.profile.history else {}
+                                ),
+                            }),
+                        )
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("profile.observe 失败,忽略: %s", exc)
         else:
@@ -867,6 +933,18 @@ class ServiceAgent:
         checkpoint_id = str(command.get("checkpoint_id") or "")
         if not checkpoint or checkpoint.id != checkpoint_id:
             return self._error_reply("Checkpoint 已变化，请刷新后重试。")
+        if checkpoint.blocker:
+            reply = self._workflow_waiting_reply()
+            reply.stage = "WAITING"
+            reply.needs_confirmation = False
+            reply.text = "{}{}".format(
+                checkpoint.blocker.get("message") or "当前系统能力不足。",
+                (
+                    "\n" + str(checkpoint.blocker.get("remediation") or "")
+                    if checkpoint.blocker.get("remediation") else ""
+                ),
+            )
+            return reply
         decision = str(command.get("decision") or "")
         if decision not in ("approved", "rejected"):
             return self._error_reply("Checkpoint decision 必须是 approved/rejected。")
@@ -878,10 +956,23 @@ class ServiceAgent:
             ),
         )
         stage_id = stage.id if stage else ""
+        self._state.decisions.append(WorkflowDecision(
+            decision_id=f"decision-{uuid.uuid4().hex[:8]}",
+            key="checkpoint_decision",
+            value=decision,
+            source="gui",
+            effect_level=str(checkpoint.requested_effect or "READ"),
+            workflow_id=str(self._workflow.workflow.workflow_id),
+            stage_id=stage_id,
+        ))
+        if decision == "approved":
+            effect = str(checkpoint.requested_effect or "READ")
+            if effect not in self._state.runtime.granted_effects:
+                self._state.runtime.granted_effects.append(effect)
         if stage_id == "rf_plan_confirmation":
             slots = self._workflow.workflow.intent.slots
-            slots["deploy_permission"] = decision
-            self._state.project.config["rf_plan"] = {
+            effect = str(checkpoint.requested_effect or "")
+            rf_plan = {
                 "status": decision,
                 "checkpoint_id": checkpoint_id,
                 "device": dict(
@@ -892,10 +983,14 @@ class ServiceAgent:
                 "bandwidth": slots.get("bandwidth") or slots.get("sample_rate"),
                 "tx_gain": slots.get("tx_gain"),
                 "tx_attenuation": slots.get("tx_attenuation"),
-                "max_duration_seconds": slots.get("max_duration_seconds")
-                or slots.get("duration_seconds")
-                or 30.0,
             }
+            if is_rf_grant_effect(effect):
+                rf_plan["max_duration_seconds"] = (
+                    slots.get("max_duration_seconds")
+                    or slots.get("duration_seconds")
+                    or 30.0
+                )
+            self._state.project.config["rf_plan"] = rf_plan
             self._record_claim(
                 "rf_plan_decision_recorded",
                 "User decision is bound to the typed RF plan checkpoint",
@@ -1010,6 +1105,7 @@ class ServiceAgent:
         except Exception as exc:  # noqa: BLE001
             logger.debug("同步 Policy confirmation 失败: %s", exc)
         self._workflow.resolve_checkpoint(decision)
+        self._sync_control_state()
         self._state.save(_store.state_path(self.session_id))
         if self._workflow.workflow.execution_status in ("completed", "errored"):
             if self._workflow.workflow.outcome == "cancelled":
@@ -1020,6 +1116,7 @@ class ServiceAgent:
                 done=True,
                 claims=ClaimStore(self._state).summary(),
                 spec_digest=self._state.spec_digest(),
+                artifacts=self._current_grc_artifacts(),
                 workflow_digest=self._digest_with_timeline(),
             )
         reply = self._step_once(
@@ -1036,6 +1133,16 @@ class ServiceAgent:
             or workflow.execution_status != "waiting"
         ):
             return self._error_reply("当前没有可重试的 Stage。")
+        blocker = dict(self._state.runtime.blocker or {})
+        if blocker and not blocker.get("retryable", False):
+            reply = self._workflow_waiting_reply()
+            reply.needs_confirmation = False
+            reply.text = "{}{}".format(
+                blocker.get("message") or "当前阻塞不可直接重试。",
+                "\n" + str(blocker.get("remediation") or "")
+                if blocker.get("remediation") else "",
+            )
+            return reply
         stage.execution_status = "pending"
         stage.outcome = ""
         stage.resume_pending = True
@@ -1317,6 +1424,7 @@ class ServiceAgent:
         )
         return self._fold(ctx, narrative, source="deterministic",
                           ok=bool(result.get("ok")))
+
     def _run_stage_deterministic(
         self,
         ctx: ToolContext,
@@ -1325,517 +1433,10 @@ class ServiceAgent:
         simulate: bool,
         stage_id: str,
     ) -> AgentReply:
-        """Minimal deterministic handlers sharing the same Stage semantics as LLM."""
-        from ..tools import registry
+        from .stage_handlers import run_deterministic_stage
 
-        active = self._state.coordination.active_task
-        _store.append_session_event(
-            self.session_id,
-            "stage_routed",
-            self._workflow_event_payload({
-                "target_agent": active.target_agent if active else "stage_handler",
-                "stage_id": stage_id,
-                "mode": "deterministic",
-                "executor": "deterministic_stage_handler",
-            }),
-        )
-        _store.append_session_event(
-            self.session_id,
-            "deterministic_handler_started",
-            self._workflow_event_payload({
-                "target_agent": active.target_agent if active else "stage_handler",
-                "stage_id": stage_id,
-                "mode": "deterministic",
-                "executor": "deterministic_stage_handler",
-            }),
-        )
-
-        capabilities = set(
-            self._workflow.workflow.intent.capabilities
-            if self._workflow.workflow else []
-        )
-        if (
-            "hardware_configure" in capabilities
-            and stage_id in {
-                "build_and_verify", "tx_build_and_validate",
-                "rx_build_and_verify", "apply_and_verify",
-            }
-        ):
-            if self._hardware_rx_spectrum_ready():
-                return self._run_hardware_rx_spectrum(ctx)
-            return self._run_hardware_endpoint_flowgraph(ctx)
-
-        if stage_id in {
-            "build_and_verify", "tx_build_and_validate", "rx_build_and_verify"
-        }:
-            return self._run_deterministic(ctx, user_text, recipe, simulate)
-        if stage_id == "apply_and_verify":
-            target_recipe = str(
-                (
-                    self._workflow.workflow.intent.slots
-                    if self._workflow.workflow
-                    else {}
-                ).get("target_recipe")
-                or ""
-            )
-            if target_recipe:
-                return self._run_deterministic(
-                    ctx, user_text, target_recipe, simulate
-                )
-            if recipe:
-                return self._run_deterministic(ctx, user_text, recipe, simulate)
-            request_text = (
-                self._workflow.workflow.intent.raw_text
-                if self._workflow.workflow else user_text
-            )
-            change = re.search(
-                r"([A-Za-z_]\w*)\.([A-Za-z_]\w*)\s*(?:改为|设为|改成|=)\s*([^，。\s]+)",
-                request_text,
-            )
-            if not change:
-                return self._fold(
-                    ctx, "无法从修改请求中确定 block.parameter 和新值。",
-                    source="deterministic-stage", ok=False,
-                )
-            result = registry.call("apply_grc_diff", {
-                "block_id": change.group(1),
-                "parameter": change.group(2),
-                "value": change.group(3),
-                "resimulate": simulate,
-            }, ctx)
-            self._record_tool_result(ctx, "apply_grc_diff", result)
-            validation = self._validate_loaded(ctx)
-            self._record_tool_result(ctx, "validate_flowgraph", validation)
-            if result.get("path"):
-                ctx.extra.setdefault("artifacts", {})["grc_path"] = result["path"]
-            return self._fold(
-                ctx,
-                result.get("error") or (
-                    f"已修改 {change.group(1)}.{change.group(2)}，完成重验。"
-                ),
-                source="deterministic-stage",
-                ok=bool(result.get("ok")) and bool(validation.get("valid")),
-            )
-        if stage_id == "inspect_and_plan":
-            result = registry.call("inspect_flowgraph", {}, ctx)
-            self._record_tool_result(ctx, "inspect_flowgraph", result)
-            slots = (
-                self._workflow.workflow.intent.slots
-                if self._workflow.workflow else {}
-            )
-            target = str(slots.get("target_recipe") or "")
-            current = str(self._state.project.config.get("recipe") or "")
-            if result.get("ok") and target:
-                note = (
-                    f"已检查当前工程（{current or '未命名'}）。"
-                    f"确认后将套用配方 {target}，其余信道与成形条件保持一致；现在不改图。"
-                )
-            elif result.get("ok"):
-                note = "已检查当前工程并形成变更计划；确认后才会应用并重验。"
-            else:
-                note = result.get("error", "工程检查失败")
-            return self._fold(
-                ctx, note, source="deterministic-stage", ok=bool(result.get("ok"))
-            )
-        if stage_id in ("inspect_and_measure", "inspect_and_diagnose"):
-            return self._inspect_measure_stage(
-                ctx, diagnose=stage_id == "inspect_and_diagnose"
-            )
-        if stage_id == "hardware_precheck":
-            hardware = str(
-                (self._workflow.workflow.intent.slots if self._workflow.workflow else {}).get("hardware") or ""
-            )
-            result = registry.call(
-                "hardware_preflight", {"device_type": hardware}, ctx
-            )
-            self._record_tool_result(ctx, "hardware_preflight", result)
-            missing = list(result.get("missing") or [])
-            note = result.get("note") or "硬件预检完成。"
-            if missing:
-                note = "硬件预检尚缺：{}。{}".format(", ".join(missing), note)
-            return self._fold(
-                ctx, note,
-                source="deterministic-stage", ok=bool(result.get("ok")),
-            )
-        if stage_id == "configure_and_check":
-            slots = self._workflow.workflow.intent.slots if self._workflow.workflow else {}
-            result = registry.call("configure_sdr", {
-                "device_type": slots.get("hardware") or "sdr",
-                "center_freq": slots.get("carrier_frequency"),
-                "sample_rate": slots.get("sample_rate"),
-            }, ctx)
-            self._record_tool_result(ctx, "configure_sdr", result)
-            preflight = registry.call(
-                "hardware_preflight",
-                {"device_type": slots.get("hardware") or "sdr"},
-                ctx,
-            )
-            self._record_tool_result(ctx, "hardware_preflight", preflight)
-            return self._fold(
-                ctx,
-                result.get("error") or "SDR 参数已记录；真实硬件操作保持禁用。",
-                source="deterministic-stage",
-                ok=bool(result.get("ok")) and bool(preflight.get("ok")),
-            )
-        if stage_id == "build_ble_advertiser":
-            # DeepRadio protocol + compose tools. Do not inline PDU/CRC/GFSK;
-            # GNU Radio has no BLE Complete Local Name generator.
-            slots = self._workflow.workflow.intent.slots
-            local_name = str(slots.get("local_name") or "")
-            channel = int((slots.get("advertising_channels") or [37])[0])
-            hardware = normalize_hardware(str(slots.get("hardware") or "b210"))
-            profile = resolve_hardware_profile(hardware)
-            pdu_args = {
-                "local_name": local_name, "channel": channel,
-            }
-            pdu = registry.call("build_ble_advertising_pdu", pdu_args, ctx)
-            self._record_tool_result(
-                ctx, "build_ble_advertising_pdu", pdu, pdu_args
-            )
-            waveform_args = {
-                "local_name": local_name,
-                "channel": channel,
-                "sample_rate": slots.get("sample_rate") or 2e6,
-                "interval_ms": slots.get("advertising_interval_ms") or 100.0,
-                "bt": slots.get("bt") or 0.5,
-                "modulation_index": slots.get("modulation_index") or 0.5,
-                "digital_amplitude": slots.get("digital_amplitude") or 0.5,
-            }
-            waveform = registry.call("generate_ble_1m_waveform", waveform_args, ctx)
-            self._record_tool_result(
-                ctx, "generate_ble_1m_waveform", waveform, waveform_args
-            )
-            if profile is None or not profile.ble_tx_builder:
-                return self._fold(
-                    ctx,
-                    f"所选硬件 {hardware or '(empty)'} 暂无 BLE TX builder；"
-                    "已停止，未替换成其他 SDR。",
-                    source="deterministic-stage",
-                    ok=False,
-                )
-            if profile.ble_tx_builder == "build_ble_pluto_tx_flowgraph":
-                build_args = {
-                    "waveform_path": waveform.get("path") or "",
-                    "channel": channel,
-                    "sample_rate": slots.get("sample_rate") or 2e6,
-                    "attenuation": slots.get("tx_attenuation", 30.0),
-                    "uri": slots.get("device_uri") or "",
-                    "duration_seconds": slots.get("duration_seconds") or 30.0,
-                }
-                built = registry.call(
-                    "build_ble_pluto_tx_flowgraph", build_args, ctx
-                )
-                builder = "build_ble_pluto_tx_flowgraph"
-                sink_note = "PlutoSDR TX 流图已生成；尚未启动 RF。"
-            elif profile.ble_tx_builder == "build_ble_uhd_tx_flowgraph":
-                build_args = {
-                    "waveform_path": waveform.get("path") or "",
-                    "channel": channel,
-                    "sample_rate": slots.get("sample_rate") or 2e6,
-                    "gain": slots.get("tx_gain", 0.0),
-                    "device_args": device_args_for(
-                        hardware, str(slots.get("device_args") or "")
-                    ),
-                    "duration_seconds": slots.get("duration_seconds") or 30.0,
-                }
-                built = registry.call(
-                    "build_ble_uhd_tx_flowgraph", build_args, ctx
-                )
-                builder = "build_ble_uhd_tx_flowgraph"
-                sink_note = "B210 TX 流图已生成；尚未启动 RF。"
-            else:
-                return self._fold(
-                    ctx,
-                    f"HardwareProfile {profile.key} 的 BLE builder 未实现。",
-                    source="deterministic-stage",
-                    ok=False,
-                )
-            self._record_tool_result(ctx, builder, built, build_args)
-            if built.get("grc_path"):
-                ctx.extra.setdefault("artifacts", {})["grc_path"] = built["grc_path"]
-                self._state.project.grc_path = built["grc_path"]
-                self._state.project.flowgraph_version += 1
-                self._state.project.config.update({
-                    "protocol": "ble",
-                    "local_name": local_name,
-                    "ble_channel": channel,
-                    "hardware": hardware,
-                    "rf_armed": False,
-                    "desired_device": {
-                        "type": hardware,
-                        "center_freq": slots.get("carrier_frequency"),
-                        "sample_rate": slots.get("sample_rate"),
-                    },
-                })
-            return self._fold(
-                ctx,
-                built.get("error") or f"BLE 广播 PDU、离线波形和{sink_note}",
-                source="deterministic-stage",
-                ok=bool(pdu.get("ok") and waveform.get("ok") and built.get("ok")),
-            )
-        if stage_id == "offline_protocol_verify":
-            slots = self._workflow.workflow.intent.slots
-            channel = int((slots.get("advertising_channels") or [37])[0])
-            verify_args = {
-                "local_name": slots.get("local_name") or "", "channel": channel,
-            }
-            verified = registry.call("verify_ble_packet_bits", verify_args, ctx)
-            self._record_tool_result(
-                ctx, "verify_ble_packet_bits", verified, verify_args
-            )
-            validation = self._validate_loaded(ctx)
-            self._record_tool_result(ctx, "validate_flowgraph", validation)
-            hardware = normalize_hardware(str(slots.get("hardware") or "b210"))
-            profile = resolve_hardware_profile(hardware)
-            sink = profile.label if profile else hardware or "SDR"
-            return self._fold(
-                ctx, f"BLE PDU/CRC/whitening 与 {sink} TX 流图离线校验完成。",
-                source="deterministic-stage",
-                ok=bool(verified.get("valid") and validation.get("valid")),
-            )
-        if stage_id == "discover_and_probe_device":
-            slots = self._workflow.workflow.intent.slots
-            hardware = normalize_hardware(str(slots.get("hardware") or "b210"))
-            profile = resolve_hardware_profile(hardware)
-            if profile is None:
-                return self._fold(
-                    ctx, f"不支持的 SDR 类型: {hardware or '(empty)'}。",
-                    source="deterministic-stage", ok=False,
-                )
-            args = {"device_type": hardware}
-            discovered = registry.call("discover_devices", args, ctx)
-            self._record_tool_result(ctx, "discover_devices", discovered, args)
-            if discovered.get("device_identity"):
-                args["device_args"] = discovered["device_identity"]
-            probed = registry.call("probe_device", args, ctx)
-            self._record_tool_result(ctx, "probe_device", probed, args)
-            if discovered.get("device_found") and probed.get("device_probed"):
-                self._state.project.config["observed_device"] = {
-                    "type": profile.key,
-                    "identity": probed.get("device_identity")
-                    or discovered.get("device_identity"),
-                    "driver_family": profile.driver_family,
-                }
-            label = profile.label
-            if not discovered.get("device_found"):
-                note = discovered.get("error") or f"未发现可用 {label}。"
-            elif not discovered.get("device_identity"):
-                note = f"已发现 {label}，但未能提取可用于精确探测的设备标识。"
-            elif not probed.get("device_probed"):
-                note = (
-                    probed.get("error")
-                    or f"已发现 {label} {discovered.get('device_identity')}，"
-                    "但精确 probe 未通过验收。"
-                )
-            else:
-                note = f"{label} 只读发现与 probe 完成；尚未打开 TX stream。"
-            return self._fold(
-                ctx,
-                note,
-                source="deterministic-stage",
-                ok=bool(discovered.get("device_found") and probed.get("device_probed")),
-            )
-        if stage_id == "discover_and_probe_hardware":
-            slots = self._workflow.workflow.intent.slots
-            hardware = normalize_hardware(str(slots.get("hardware") or ""))
-            profile = resolve_hardware_profile(hardware)
-            if profile is None:
-                return self._fold(
-                    ctx, f"不支持的 SDR 类型: {hardware or '(empty)'}。",
-                    source="deterministic-stage", ok=False,
-                )
-            args = {"device_type": hardware}
-            discovered = registry.call(
-                "discover_devices", args, ctx
-            )
-            self._record_tool_result(ctx, "discover_devices", discovered, args)
-            if discovered.get("device_identity"):
-                args["device_args"] = discovered["device_identity"]
-            probed = registry.call(
-                "probe_device", args, ctx
-            )
-            self._record_tool_result(ctx, "probe_device", probed, args)
-            if discovered.get("device_found") and probed.get("device_probed"):
-                self._state.project.config["observed_device"] = {
-                    "type": profile.key,
-                    "identity": probed.get("device_identity")
-                    or discovered.get("device_identity"),
-                    "driver_family": profile.driver_family,
-                    "observed_at": probed.get("observed_at")
-                    or discovered.get("observed_at")
-                    or time.time(),
-                }
-            if not discovered.get("device_found"):
-                note = discovered.get("error") or f"未发现可用 {profile.label}。"
-            elif not discovered.get("device_identity"):
-                note = (
-                    f"已发现 {profile.label}，但未能提取可用于精确探测的设备标识。"
-                )
-            elif not probed.get("device_probed"):
-                note = (
-                    probed.get("error")
-                    or f"已发现 {profile.label} {discovered.get('device_identity')}，"
-                    "但精确 probe 未通过验收。"
-                )
-            else:
-                note = f"{profile.label} 只读发现与探测完成；尚未启动 Flowgraph。"
-            return self._fold(
-                ctx,
-                note,
-                source="deterministic-stage",
-                ok=bool(discovered.get("device_found") and probed.get("device_probed")),
-            )
-        if stage_id == "configure_device":
-            slots = self._workflow.workflow.intent.slots
-            configure_args = {
-                "device_type": slots.get("hardware") or "b210",
-                "center_freq": slots.get("carrier_frequency"),
-                "sample_rate": slots.get("sample_rate"),
-            }
-            result = registry.call("configure_sdr", configure_args, ctx)
-            self._record_tool_result(ctx, "configure_sdr", result, configure_args)
-            hardware = normalize_hardware(str(slots.get("hardware") or "b210"))
-            profile = resolve_hardware_profile(hardware)
-            label = profile.label if profile else hardware or "SDR"
-            armed = {"ok": True, "armed": False}
-            tx_runtime = (
-                str(slots.get("protocol") or "").lower() == "ble"
-                or str(slots.get("direction") or "").lower() == "tx"
-            )
-            if tx_runtime and result.get("ok"):
-                arm_args = {
-                    "grc_path": self._state.project.grc_path,
-                    "device_identity": str(
-                        (self._state.project.config.get("observed_device") or {}).get(
-                            "identity"
-                        )
-                        or ""
-                    ),
-                }
-                armed = registry.call("arm_hardware_flowgraph", arm_args, ctx)
-                self._record_tool_result(
-                    ctx, "arm_hardware_flowgraph", armed, arm_args
-                )
-            return self._fold(
-                ctx,
-                result.get("error") or armed.get("error")
-                or (
-                    f"{label} 发射配置已记录并完成受控武装，等待启动。"
-                    if tx_runtime
-                    else f"{label} 接收配置已记录，等待有限时长运行。"
-                ),
-                source="deterministic-stage",
-                ok=bool(result.get("ok") and armed.get("ok")),
-            )
-        if stage_id == "transmit_bounded":
-            slots = self._workflow.workflow.intent.slots
-            start_args = {
-                "grc_path": self._state.project.grc_path,
-                "duration_seconds": slots.get("max_duration_seconds")
-                or slots.get("duration_seconds")
-                or 30.0,
-            }
-            result = registry.call("start_flowgraph", start_args, ctx)
-            self._record_tool_result(ctx, "start_flowgraph", result, start_args)
-            max_duration = start_args["duration_seconds"]
-            return self._fold(
-                ctx,
-                result.get("error")
-                or (
-                    f"受控发射已启动（最大时长 {max_duration:g} 秒；"
-                    "OTA 确认或取消后会提前停止）。"
-                    f" run_id={result.get('run_id')} pid={result.get('pid')}。"
-                    f"请在截止前检查广播名称 {slots.get('local_name') or '(未指定)'}。"
-                    "进程由 Workflow 管理，无需在 GRC 中点击运行。"
-                ),
-                source="deterministic-stage",
-                ok=bool(result.get("running") and result.get("ready")),
-            )
-        if stage_id == "run_bounded":
-            slots = self._workflow.workflow.intent.slots
-            max_duration = slots.get("max_duration_seconds") or slots.get("duration_seconds") or 30.0
-            result = registry.call("start_flowgraph", {
-                "grc_path": self._state.project.grc_path,
-                "duration_seconds": max_duration,
-            }, ctx)
-            self._record_tool_result(ctx, "start_flowgraph", result)
-            return self._fold(
-                ctx,
-                result.get("error")
-                or (
-                    f"受控运行已启动（最大时长 {max_duration:g} 秒）。"
-                    f" run_id={result.get('run_id')} pid={result.get('pid')}。"
-                    "无需在 GRC 中点击运行。"
-                ),
-                source="deterministic-stage",
-                ok=bool(result.get("running") and result.get("ready")),
-            )
-        if stage_id == "stop_and_finalize":
-            stopped = registry.call("stop_flowgraph", {}, ctx)
-            self._record_tool_result(ctx, "stop_flowgraph", stopped)
-            observed = bool(self._workflow.workflow.intent.slots.get("over_air_observed"))
-            ota = dict(
-                self._workflow.workflow.intent.slots.get("ota_observation") or {}
-            )
-            same_run = bool(
-                ota.get("run_id")
-                and ota.get("run_id") == stopped.get("run_id")
-            )
-            return self._fold(
-                ctx,
-                "发射已停止，LightBlue 空口观察已记录。"
-                if observed else "发射已停止，但用户未在 LightBlue 中观察到目标广播。",
-                source="deterministic-stage",
-                ok=bool(
-                    stopped.get("ok")
-                    and not stopped.get("crashed")
-                    and stopped.get("run_id")
-                    and observed
-                    and same_run
-                ),
-            )
-        if stage_id == "stop_runtime":
-            stopped = registry.call("stop_flowgraph", {}, ctx)
-            self._record_tool_result(ctx, "stop_flowgraph", stopped)
-            return self._fold(
-                ctx,
-                "硬件 Flowgraph 已停止，运行状态与用户观察结果已记录。",
-                source="deterministic-stage",
-                ok=bool(
-                    stopped.get("ok")
-                    and not stopped.get("running")
-                    and not stopped.get("crashed")
-                    and stopped.get("run_id")
-                ),
-            )
-        if stage_id == "repair_and_verify":
-            diagnosed = self._workflow.workflow.stage("inspect_and_diagnose")
-            changes = list((diagnosed.result if diagnosed else {}).get("proposed_changes") or [])
-            if not changes:
-                return self._fold(
-                    ctx, "没有可确定执行的修复参数，请先补充修改目标。",
-                    source="deterministic-stage", ok=False,
-                )
-            change = changes[0]
-            result = registry.call("apply_grc_diff", {
-                "block_id": change.get("block_id"),
-                "parameter": change.get("parameter"),
-                "value": change.get("value"),
-                "resimulate": simulate,
-            }, ctx)
-            self._record_tool_result(ctx, "apply_grc_diff", result)
-            validation = self._validate_loaded(ctx)
-            self._record_tool_result(ctx, "validate_flowgraph", validation)
-            if result.get("path"):
-                ctx.extra.setdefault("artifacts", {})["grc_path"] = result["path"]
-            return self._fold(
-                ctx, result.get("error") or "已应用最小修复并完成重验。",
-                source="deterministic-stage",
-                ok=bool(result.get("ok")) and bool(validation.get("valid")),
-            )
-        return self._fold(
-            ctx, f"Stage {stage_id} 没有可安全自动执行的确定性修改。",
-            source="deterministic-stage", ok=False,
+        return run_deterministic_stage(
+            self, ctx, user_text, recipe, simulate, stage_id
         )
 
     def _hardware_rx_spectrum_ready(self) -> bool:
@@ -1893,6 +1494,28 @@ class ServiceAgent:
                 source="deterministic-stage",
                 ok=False,
             )
+        if self._matching_unarmed_tx_preview(slots):
+            self._load_session_flowgraph(ctx)
+            validation = registry.call("validate_flowgraph", {}, ctx)
+            self._record_tool_result(ctx, "validate_flowgraph", validation)
+            path = str(self._state.project.grc_path or "")
+            ctx.extra.setdefault("artifacts", {})["grc_path"] = path
+            reused = {
+                "ok": bool(validation.get("valid")),
+                "valid": bool(validation.get("valid")),
+                "reused_preview": True,
+                "grc_path": path,
+                "preview_mode": self._state.project.config.get("preview_mode"),
+                "armed": False,
+                "not_started": True,
+            }
+            self._record_tool_result(ctx, "build_sdr_tx_flowgraph", reused)
+            return self._fold(
+                ctx,
+                self._tx_preview_note(slots, reused=True),
+                source="deterministic-stage",
+                ok=bool(validation.get("valid")),
+            )
         result = registry.call(
             "build_sdr_tx_flowgraph",
             {
@@ -1905,19 +1528,55 @@ class ServiceAgent:
         self._record_tool_result(ctx, "build_sdr_tx_flowgraph", result)
         if result.get("grc_path"):
             ctx.extra.setdefault("artifacts", {})["grc_path"] = result["grc_path"]
-        tone_note = (
-            "未指定调制时用低幅度测试音占位基带。"
-            if not slots.get("modulation") else ""
-        )
-        note = result.get("error") or (
-            "已生成未 arm 的 SDR 发射流图（sink 保持禁用）。"
-            f"{tone_note}"
-            "保存配置后停在发射确认，不会自动开机。"
-        )
         return self._fold(
-            ctx, note, source="deterministic-stage",
+            ctx,
+            result.get("error") or self._tx_preview_note(slots, reused=False),
+            source="deterministic-stage",
             ok=bool(result.get("ok")) and bool(result.get("valid")),
         )
+
+    def _matching_unarmed_tx_preview(self, slots: Dict[str, Any]) -> bool:
+        config = dict(self._state.project.config or {})
+        path = str(self._state.project.grc_path or "")
+        if not path or not os.path.isfile(path):
+            return False
+        if bool(config.get("rf_armed")) or str(config.get("direction") or "") != "tx":
+            return False
+        requested = normalize_hardware(slots.get("hardware") or "")
+        existing = normalize_hardware(config.get("hardware") or "")
+        if requested and existing and requested != existing:
+            return False
+        for key, cfg_key in (
+            ("carrier_frequency", "carrier_frequency"),
+            ("sample_rate", "sample_rate"),
+        ):
+            if slots.get(key) in (None, "") or config.get(cfg_key) in (None, ""):
+                continue
+            try:
+                left = float(slots[key])
+                right = float(config[cfg_key])
+            except (TypeError, ValueError):
+                return False
+            if abs(left - right) > max(1.0, abs(right) * 1e-9):
+                return False
+        return True
+
+    @staticmethod
+    def _tx_preview_note(slots: Dict[str, Any], *, reused: bool) -> str:
+        tone = (
+            "未指定调制时用 1 kHz 低幅度测试音占位基带。"
+            if not slots.get("modulation") else ""
+        )
+        grey = "灰色硬件 sink 表示未授权射频、保持禁用；亮的 Null Sink 是预览路径，不会发射。"
+        if reused:
+            head = "复用已保存的安全预览流图（sink 保持禁用）。"
+        else:
+            head = "已生成未 arm 的 SDR 发射流图（sink 保持禁用）。"
+        if slots.get("operation") == "deploy":
+            tail = "确认射频后才会 arm 并启动。"
+        else:
+            tail = "保存配置后停在确认，不会自动开机。"
+        return f"{head}{grey}{tone}{tail}"
 
     def _validate_loaded(self, ctx: ToolContext) -> Dict[str, Any]:
         from ..tools import registry
@@ -1938,197 +1597,6 @@ class ServiceAgent:
         except (AttributeError, KeyError, TypeError, ValueError):
             return 1e6
         return rate if rate > 0 else 1e6
-
-    def _inspect_measure_stage(
-        self, ctx: ToolContext, *, diagnose: bool = False
-    ) -> AgentReply:
-        from ..tools import registry
-
-        inspected = registry.call("inspect_flowgraph", {}, ctx)
-        self._record_tool_result(ctx, "inspect_flowgraph", inspected)
-        validation = self._validate_loaded(ctx)
-        self._record_tool_result(ctx, "validate", validation)
-        if not inspected.get("ok") or not validation.get("ok"):
-            return self._fold(
-                ctx, inspected.get("error") or validation.get("error") or "工程检查失败",
-                source="deterministic-stage", ok=False,
-            )
-        if not validation.get("valid"):
-            explained = registry.call(
-                "explain_error", {"errors": validation.get("errors") or []}, ctx
-            )
-            self._record_tool_result(ctx, "explain_error", explained)
-            return self._fold(
-                ctx, "结构校验未通过，已给出具体错误与修复建议。",
-                source="deterministic-stage", ok=False,
-            )
-        workflow = self._workflow.workflow
-        if workflow:
-            inferred_modulation = ""
-            inferred_channel = ""
-            for block in inspected.get("blocks") or []:
-                key = str(block.get("key") or "").lower()
-                params = dict(block.get("params") or {})
-                if "constellation" in key:
-                    token = str(
-                        params.get("type") or params.get("constellation") or ""
-                    ).lower()
-                    inferred_modulation = next(
-                        (name for name in ("qpsk", "bpsk", "ofdm", "gfsk")
-                         if name in token),
-                        inferred_modulation,
-                    )
-                if key == "channels_channel_model":
-                    inferred_channel = "awgn"
-            for name, value in (("modulation", inferred_modulation),
-                                ("channel", inferred_channel)):
-                if value and not workflow.intent.slots.get(name):
-                    workflow.intent.slots[name] = value
-                    workflow.intent.slot_sources[name] = "canvas"
-                    self._state.project.config[name] = value
-            workflow.intent.missing_slots = self._workflow._missing_slots(
-                workflow.task_type, workflow.intent.slots, self._state,
-                workflow.intent.capabilities,
-            )
-            self._sync_workflow_intent_to_state()
-        simulated = registry.call("run_simulation", {}, ctx)
-        self._record_tool_result(ctx, "simulate", simulated)
-        if not simulated.get("ok"):
-            return self._fold(
-                ctx, simulated.get("error") or "仿真失败",
-                source="deterministic-stage", ok=False,
-            )
-        slots = workflow.intent.slots if workflow else {}
-        requested = list(slots.get("requested_metrics") or [])
-        if diagnose and not requested:
-            requested = ["evm"]
-        if not requested:
-            requested = ["spectrum"]
-        modulation = str(
-            self._state.project.config.get("modulation") or slots.get("modulation") or "bpsk"
-        )
-        sps = 4
-        samp_rate = self._flowgraph_sample_rate(ctx)
-        metrics = ctx.extra.setdefault("metrics", {})
-        plot_for = {
-            "evm": ("constellation",),
-            "ber": (),
-            "spectrum": ("spectrum",),
-            "constellation": ("constellation",),
-            "eye": ("eye",),
-        }
-        plots: list[str] = []
-        for kind in requested:
-            if kind in ("evm", "ber", "spectrum"):
-                args = {
-                    "kind": kind,
-                    "modulation": modulation,
-                    "sps": 1 if kind == "ber" else sps,
-                }
-                if kind == "spectrum":
-                    args["samp_rate"] = samp_rate
-                if kind == "ber":
-                    args.update({"probe_id": "sink", "tx_bits_probe": "tx_sink"})
-                measured = registry.call("read_metric", args, ctx)
-                self._record_tool_result(ctx, "read_metric", measured)
-                if measured.get("ok") and measured.get("value") is not None:
-                    metrics["evm_pct" if kind == "evm" else (
-                        "spectrum_peak" if kind == "spectrum" else "ber"
-                    )] = measured["value"]
-                    if kind == "ber":
-                        metrics["ber_report"] = {
-                            key: value for key, value in measured.items()
-                            if key not in {"ok", "kind"}
-                        }
-                    elif kind == "spectrum":
-                        metrics["spectrum_peak_report"] = {
-                            key: value for key, value in measured.items()
-                            if key not in {"ok", "kind"}
-                        }
-                    if measured.get("peak_bin") is not None:
-                        metrics["spectrum_peak_bin"] = measured["peak_bin"]
-            for plot_kind in plot_for.get(kind, ()):
-                if plot_kind not in plots:
-                    plots.append(plot_kind)
-        for kind in plots:
-            plot_name = {
-                "spectrum": "plot_spectrum",
-                "constellation": "plot_constellation",
-                "eye": "plot_eye",
-            }.get(kind)
-            if not plot_name:
-                continue
-            if plot_name == "plot_spectrum":
-                plot_args = {"samp_rate": samp_rate}
-            elif plot_name == "plot_constellation":
-                plot_args = {"sps": sps, "modulation": modulation}
-            else:
-                plot_args = {"sps": sps}
-            plotted = registry.call(plot_name, plot_args, ctx)
-            self._record_tool_result(ctx, plot_name, plotted)
-            if plotted.get("path"):
-                key = {
-                    "plot_spectrum": "spectrum_png",
-                    "plot_constellation": "constellation_png",
-                    "plot_eye": "eye_png",
-                }[plot_name]
-                ctx.extra.setdefault("artifacts", {})[key] = plotted["path"]
-        if diagnose:
-            diagnosis = registry.call("debug_by_metric", {
-                "metric": "evm" if "evm" in requested else "spectrum",
-                "modulation": modulation,
-                "sps": sps,
-            }, ctx)
-            self._record_tool_result(ctx, "debug_by_metric", diagnosis)
-            issue = (
-                "偏高" in str(diagnosis.get("verdict") or "")
-                and not diagnosis.get("meets_claim")
-            )
-            forbidden = set(
-                (workflow.intent.context if workflow else {}).get("forbidden_capabilities")
-                or []
-            )
-            readonly = bool(
-                ctx.extra.get("mutation_forbidden") or "modify_project" in forbidden
-            )
-            reply = self._fold(
-                ctx,
-                diagnosis.get("narrative") or diagnosis.get("error") or "诊断完成。",
-                source="deterministic-stage",
-                ok=bool(diagnosis.get("ok")) if readonly else (
-                    not issue and bool(diagnosis.get("ok"))
-                ),
-            )
-            if issue and not readonly:
-                block = ctx.blocks.get("chan")
-                parameter = (getattr(block, "params", None) or {}).get("noise_voltage")
-                try:
-                    value = max(float(parameter.get_value()) / 2.0, 0.0)
-                except (AttributeError, TypeError, ValueError):
-                    value = 0.02
-                reply.pending = {
-                    "action": "workflow_checkpoint",
-                    "reason": "EVM 偏高，应用最小噪声参数修复",
-                    "approved": False,
-                    "proposed_changes": [{
-                        "block_id": "chan",
-                        "parameter": "noise_voltage",
-                        "value": value,
-                    }],
-                }
-            return reply
-        summary = "工程检查与测量完成。"
-        peak = metrics.get("spectrum_peak_report")
-        if isinstance(peak, dict) and peak.get("valid"):
-            summary += " 主峰 {:.3f} Hz，幅度 {:.2f} dBFS（FFT {}，{} 窗）。".format(
-                float(peak.get("frequency_hz") or 0.0),
-                float(peak.get("magnitude_dbfs") or 0.0),
-                int(peak.get("fft_size") or 0),
-                peak.get("window") or "unknown",
-            )
-        return self._fold(
-            ctx, summary, source="deterministic-stage", ok=True
-        )
 
     def _record_tool_result(
         self,
@@ -2247,8 +1715,10 @@ class ServiceAgent:
                     ).strip()
             result = vars(envelope)
             result["errored"] = reply.stage == "ERROR"
+            if getattr(stage, "resume_from", ""):
+                result["resume_from"] = stage.resume_from
             result["improvement_available"] = any(
-                invocation.name in ("explain_error", "debug_by_metric", "diagnose_by_metric")
+                invocation.name in ("explain_error", "debug_by_metric")
                 for invocation in reply.tool_invocations
             )
             if reply.stage == "DENY":
@@ -2265,6 +1735,7 @@ class ServiceAgent:
             self._workflow.save()
         current = self._workflow.current_stage()
         if current and current.execution_status == "waiting" and current.checkpoint:
+            capability_blocker = dict(current.checkpoint.blocker or {})
             pending_items = list(self._state.coordination.pending_confirmations or [])
             unresolved = next(
                 (item for item in reversed(pending_items) if not item.get("approved")),
@@ -2273,8 +1744,9 @@ class ServiceAgent:
             if unresolved is not None:
                 unresolved.setdefault("id", f"pending-{uuid.uuid4().hex[:8]}")
                 unresolved["checkpoint_id"] = current.checkpoint.id
-            reply.stage = "CONFIRM"
-            reply.needs_confirmation = True
+                unresolved["requested_effect"] = current.checkpoint.requested_effect
+            reply.stage = "WAITING" if capability_blocker else "CONFIRM"
+            reply.needs_confirmation = not bool(capability_blocker)
             if unresolved is not None:
                 reply.pending = dict(unresolved)
             elif not reply.pending:
@@ -2287,13 +1759,15 @@ class ServiceAgent:
                     "reason": current.checkpoint.reason,
                     "checkpoint_id": current.checkpoint.id,
                     "stage_id": current.id,
-                    "max_duration_seconds": (
+                    "requested_effect": current.checkpoint.requested_effect,
+                    "approved": False,
+                }
+                if is_rf_grant_effect(current.checkpoint.requested_effect):
+                    reply.pending["max_duration_seconds"] = (
                         slots.get("max_duration_seconds")
                         or slots.get("duration_seconds")
                         or 30.0
-                    ),
-                    "approved": False,
-                }
+                    )
             if current.id == "rf_plan_confirmation":
                 slots = (
                     self._workflow.workflow.intent.slots
@@ -2303,7 +1777,9 @@ class ServiceAgent:
                     self._state.project.config.get("observed_device") or {}
                 )
                 rf_plan = {
-                    "status": "awaiting_user",
+                    "status": (
+                        "blocked" if capability_blocker else "awaiting_user"
+                    ),
                     "checkpoint_id": current.checkpoint.id,
                     "device": observed,
                     "center_frequency": slots.get("carrier_frequency"),
@@ -2314,29 +1790,53 @@ class ServiceAgent:
                     "baseband_kind": slots.get("baseband_kind"),
                     "tone_frequency_hz": slots.get("tone_frequency_hz"),
                     "tone_amplitude": slots.get("tone_amplitude"),
-                    "max_duration_seconds": slots.get("max_duration_seconds")
-                    or slots.get("duration_seconds")
-                    or 30.0,
                 }
+                if is_rf_grant_effect(current.checkpoint.requested_effect):
+                    rf_plan["max_duration_seconds"] = (
+                        slots.get("max_duration_seconds")
+                        or slots.get("duration_seconds")
+                        or 30.0
+                    )
                 self._state.project.config["rf_plan"] = rf_plan
                 reply.pending.update(rf_plan)
+                if not is_rf_grant_effect(current.checkpoint.requested_effect):
+                    reply.pending.pop("max_duration_seconds", None)
                 reply.pending.update({
-                    "action": "rf_plan_confirmation",
-                    "reason": "确认设备身份、射频参数和有限运行时长",
+                    "action": (
+                        "capability_blocker"
+                        if capability_blocker else "rf_plan_confirmation"
+                    ),
+                    "reason": (
+                        capability_blocker.get("message")
+                        or current.checkpoint.reason
+                        or (
+                            "确认设备身份、射频参数和有限运行时长"
+                            if is_rf_grant_effect(current.checkpoint.requested_effect)
+                            else "确认设备身份与射频参数；确认后不启动射频"
+                        )
+                    ),
+                    "requested_effect": current.checkpoint.requested_effect,
+                    "blocker": capability_blocker,
+                    "can_confirm": not bool(capability_blocker),
+                    "can_retry": bool(
+                        capability_blocker.get("retryable", False)
+                    ),
                     "approved": False,
                 })
-                self._record_claim(
-                    "rf_plan_awaiting_decision",
-                    "Typed RF plan is visible and awaiting an explicit user decision",
-                    "hardware",
-                    "rf_plan_confirmation",
-                    dict(rf_plan),
-                    True,
-                )
+                if capability_blocker.get("remediation"):
+                    reply.text = "{}\n{}".format(
+                        capability_blocker.get("message") or reply.text,
+                        capability_blocker["remediation"],
+                    )
         reply.workflow_digest = self._digest_with_timeline()
         reply.done = reply.workflow_digest.get("execution_status") == "completed"
         reply.claims = ClaimStore(self._state).summary()
         reply.spec_digest = self._state.spec_digest()
+        if not (reply.artifacts or {}).get("grc_path"):
+            reply.artifacts = {
+                **dict(reply.artifacts or {}),
+                **self._current_grc_artifacts(),
+            }
 
     def _project_stage_effects(self, stage: Any, reply: AgentReply) -> None:
         """Commit host-observed artifacts for deterministic and LLM executors."""
@@ -2402,210 +1902,12 @@ class ServiceAgent:
                 }
 
     def _project_tool_results(self, stage: Any, reply: AgentReply) -> None:
-        """Project host-observed tool facts identically for every executor."""
-        results: Dict[str, list[Dict[str, Any]]] = {}
-        for invocation in reply.tool_invocations or []:
-            if isinstance(invocation.result, dict):
-                results.setdefault(invocation.name, []).append(invocation.result)
-        discovered = next(
-            (item for item in reversed(results.get("discover_devices", []))
-             if item.get("device_found")),
-            None,
+        _projector.project_tool_results(
+            self._state,
+            reply,
+            record_claim=self._record_claim,
+            semantic_hash=_flowgraph_semantic_hash,
         )
-        probed = next(
-            (item for item in reversed(results.get("probe_device", []))
-             if item.get("device_probed")),
-            None,
-        )
-        if discovered and probed:
-            self._state.project.config["observed_device"] = {
-                "type": probed.get("device_type") or discovered.get("device_type"),
-                "identity": probed.get("device_identity")
-                or discovered.get("device_identity"),
-                "driver_family": probed.get("driver_family")
-                or discovered.get("driver_family"),
-                "observed_at": probed.get("observed_at")
-                or discovered.get("observed_at")
-                or time.time(),
-            }
-            self._record_claim(
-                "hardware_device_probed",
-                "Selected SDR was discovered and probed by its explicit identity",
-                "hardware",
-                "discover_and_probe",
-                self._state.project.config["observed_device"],
-                True,
-                artifact=str(
-                    probed.get("report_path") or discovered.get("report_path") or ""
-                ),
-            )
-        built_tx = next(
-            (
-                item for item in reversed(results.get("build_sdr_tx_flowgraph", []))
-                if item.get("ok") and item.get("valid") and item.get("compiled")
-            ),
-            None,
-        )
-        if built_tx:
-            report = str(built_tx.get("report_path") or "")
-            self._record_claim(
-                "final_flowgraph_valid",
-                "Saved flowgraph passed structural validation and grcc compilation",
-                "structure",
-                "build_sdr_tx_flowgraph",
-                {
-                    "grc_path": built_tx.get("grc_path"),
-                    "preview_topology_valid": built_tx.get("preview_topology_valid"),
-                    "compiled": built_tx.get("compiled"),
-                },
-                True,
-                artifact=report,
-            )
-            self._record_claim(
-                "hardware_endpoint_configured",
-                "Requested SDR TX endpoint is present with the requested radio parameters",
-                "structure",
-                "build_sdr_tx_flowgraph",
-                {
-                    "hardware": built_tx.get("hardware"),
-                    "sink_key": built_tx.get("sink_key"),
-                    "center_freq": built_tx.get("center_freq"),
-                    "sample_rate": built_tx.get("sample_rate"),
-                },
-                True,
-                artifact=report,
-            )
-            self._record_claim(
-                "rf_not_started",
-                "Flowgraph artifact is in RF-safe preview mode and has not started RF",
-                "hardware",
-                "build_sdr_tx_flowgraph",
-                {
-                    "armed": bool(built_tx.get("armed")),
-                    "not_started": bool(built_tx.get("not_started")),
-                    "preview_mode": built_tx.get("preview_mode"),
-                },
-                bool(built_tx.get("not_started") and not built_tx.get("armed")),
-                artifact=report,
-            )
-        verified = next(
-            (item for item in reversed(results.get("verify_ble_packet_bits", []))
-             if item.get("valid")),
-            None,
-        )
-        if verified:
-            self._record_claim(
-                "ble_offline_protocol_valid",
-                "BLE packet and IQ waveform passed independent offline validation",
-                "structure",
-                "verify_ble_packet_bits",
-                {"checks": dict(verified.get("checks") or {})},
-                True,
-            )
-        armed = next(
-            (item for item in reversed(results.get("arm_hardware_flowgraph", []))
-             if item.get("ok") and item.get("armed")),
-            None,
-        )
-        if armed:
-            self._state.project.config["rf_armed"] = True
-            self._state.project.config["rf_armed_path"] = armed.get("grc_path")
-            semantic_hash = _flowgraph_semantic_hash(str(armed.get("grc_path") or ""))
-            if semantic_hash:
-                self._state.project.config["flowgraph_semantic_hash"] = semantic_hash
-        started = next(
-            (item for item in reversed(results.get("start_flowgraph", []))
-             if item.get("ok") and item.get("running") and item.get("ready")
-             and item.get("startup_health_passed") and item.get("run_id")),
-            None,
-        )
-        if started:
-            self._state.project.config["rf_started"] = True
-            self._record_claim(
-                "rf_not_started",
-                "Flowgraph artifact is in RF-safe preview mode and has not started RF",
-                "hardware",
-                "start_flowgraph",
-                {"run_id": started.get("run_id"), "running": True},
-                False,
-            )
-            self._record_claim(
-                "rf_runtime_started",
-                "Bounded RF runtime was started by the controlled service",
-                "hardware",
-                "start_flowgraph",
-                {
-                    "pid": started.get("pid"),
-                    "run_id": started.get("run_id"),
-                    "duration_seconds": started.get("duration_seconds"),
-                    "program": started.get("program"),
-                },
-                True,
-            )
-        terminal = next(
-            (
-                item
-                for name in (
-                    "stop_flowgraph", "emergency_stop", "query_runtime_status"
-                )
-                for item in reversed(results.get(name, []))
-                if item.get("run_id") and not item.get("running")
-            ),
-            None,
-        )
-        if terminal:
-            clean = bool(
-                terminal.get("ok")
-                and not terminal.get("crashed")
-                and terminal.get("reason")
-                in {"stopped", "emergency_stop", "exited"}
-                and terminal.get("return_code") in (0, -15, -9)
-            )
-            self._record_claim(
-                "rf_runtime_completed_cleanly",
-                "Controlled RF runtime reached a verified terminal state",
-                "hardware",
-                "runtime_terminal_status",
-                {
-                    "run_id": terminal.get("run_id"),
-                    "reason": terminal.get("reason"),
-                    "return_code": terminal.get("return_code"),
-                    "crashed": bool(terminal.get("crashed")),
-                },
-                clean,
-                artifact=str(terminal.get("log_path") or ""),
-            )
-            if not clean and ClaimStore(self._state).get("rf_runtime_started"):
-                self._record_claim(
-                    "rf_runtime_started",
-                    "Bounded RF runtime was started by the controlled service",
-                    "hardware",
-                    "runtime_failure",
-                    {
-                        "run_id": terminal.get("run_id"),
-                        "return_code": terminal.get("return_code"),
-                        "reason": terminal.get("reason"),
-                    },
-                    False,
-                    artifact=str(terminal.get("log_path") or ""),
-                )
-        output = "".join(
-            str(item.get("output") or "")
-            for name in (
-                "start_flowgraph", "query_runtime_status",
-                "stop_flowgraph", "emergency_stop",
-            )
-            for item in results.get(name, [])
-        )
-        if "UUU" in output or output.count("U") >= 8:
-            self._record_claim(
-                "rf_runtime_underflow",
-                "Hardware runtime log contains GNU Radio underflow markers",
-                "hardware",
-                "runtime_underflow",
-                {"run_id": (terminal or started or {}).get("run_id"), "markers": "U"},
-                False,
-            )
 
     def _record_claim(
         self,
@@ -2616,15 +1918,25 @@ class ServiceAgent:
         observation: Dict[str, Any],
         passed: bool,
         artifact: str = "",
+        *,
+        producer: str = "",
+        measurement_id: str = "",
     ) -> None:
         store = ClaimStore(self._state)
         version = int(self._state.project.flowgraph_version)
+        mid = str(
+            measurement_id
+            or observation.get("measurement_id")
+            or ""
+        )
         store.upsert(Claim(
             id=claim_id,
             statement=statement,
             layer=layer,
             status="NotTested",
             project_version=version,
+            producer=producer,
+            measurement_id=mid,
         ))
         store.add_evidence(
             claim_id,
@@ -2633,6 +1945,7 @@ class ServiceAgent:
                 observation=dict(observation or {}),
                 project_version=version,
                 artifact=artifact,
+                measurement_id=mid,
             ),
             passed=passed,
         )
@@ -2648,6 +1961,8 @@ class ServiceAgent:
         details.setdefault("observed", observed)
         details.setdefault("local_name", slots.get("local_name"))
         details.setdefault("evidence_kind", "human_confirmation")
+        artifact = str(details.get("artifact") or "")
+        details["evidence_complete"] = bool(artifact)
         self._record_claim(
             "ota_ble_local_name_observed",
             "External receiver observed the requested BLE Complete Local Name",
@@ -2655,9 +1970,18 @@ class ServiceAgent:
             source,
             details,
             observed,
-            artifact=str(details.get("artifact") or ""),
+            artifact=artifact,
+            producer="over_air_verification",
         )
+
+    def _current_grc_artifacts(self) -> Dict[str, str]:
+        path = str(getattr(self._state.project, "grc_path", "") or "")
+        if path and os.path.isfile(path):
+            return {"grc_path": path}
+        return {}
+
     def _digest_with_timeline(self) -> Dict[str, Any]:
+        self._sync_control_state()
         digest = self._workflow.digest()
         digest["timeline"] = _store.recent_events(self.session_id, limit=40)
         runtime = dict(self._state.project.config.get("runtime") or {})
@@ -2686,6 +2010,13 @@ class ServiceAgent:
             )
             runtime["do_not_run_grc"] = True
             digest["runtime"] = runtime
+        digest["control_state"] = {
+            "current_node": self._state.runtime.current_node,
+            "status": self._state.runtime.status,
+            "requested_effect": self._state.runtime.requested_effect,
+            "granted_effects": list(self._state.runtime.granted_effects),
+            "blocker": dict(self._state.runtime.blocker),
+        }
         return digest
 
     def peek_runtime_digest(self) -> Dict[str, Any]:
@@ -2732,6 +2063,22 @@ class ServiceAgent:
                 for item in validation_errors
             )
             pending = {}
+        elif stage and stage.checkpoint and stage.checkpoint.blocker:
+            blocker = dict(stage.checkpoint.blocker)
+            pending = {
+                "action": "capability_blocker",
+                "reason": blocker.get("message") or "当前系统能力不足。",
+                "blocker": blocker,
+                "can_confirm": False,
+                "can_retry": bool(blocker.get("retryable", False)),
+                "requires_restart": bool(blocker.get("requires_restart", False)),
+                "approved": False,
+            }
+            text = "{}{}".format(
+                pending["reason"],
+                "\n" + str(blocker.get("remediation") or "")
+                if blocker.get("remediation") else "",
+            )
         elif stage and stage.checkpoint:
             pending_items = list(self._state.coordination.pending_confirmations or [])
             pending = dict(pending_items[-1]) if pending_items else {
@@ -2742,17 +2089,36 @@ class ServiceAgent:
                     if stage.id == "rf_plan_confirmation"
                     else "workflow_checkpoint"
                 ),
-                "reason": stage.checkpoint.reason if stage and stage.checkpoint else "",
+                "reason": (
+                    stage.checkpoint.reason if stage and stage.checkpoint
+                    else stage_display_label(
+                        stage.id if stage else "",
+                        "",
+                        stage.checkpoint.requested_effect if stage and stage.checkpoint else "",
+                    )
+                ),
                 "checkpoint_id": stage.checkpoint.id if stage and stage.checkpoint else "",
                 "stage_id": stage.id,
+                "requested_effect": (
+                    stage.checkpoint.requested_effect if stage.checkpoint else ""
+                ),
                 "approved": False,
             }
+            rf_grant = is_rf_grant_effect(
+                (stage.checkpoint.requested_effect if stage.checkpoint else "")
+                or ""
+            )
             text = (
                 "请仅在 LightBlue 中实际看到目标 Complete Local Name 后点击“已看到目标名称”。"
                 "可附加上传截图；确认后受控进程会提前停止。"
                 if stage.id == "over_air_verification"
-                else "当前 Stage 等待你的确认；确认后继续，取消则保留现有工程。"
-                "批准后将由 Workflow 自动启动发射，无需在 GRC 中点击运行。"
+                else (
+                    "当前 Stage 等待你的确认；确认后继续，取消则保留现有工程。"
+                    "批准后将由 Workflow 自动启动发射，无需在 GRC 中点击运行。"
+                    if rf_grant
+                    else "当前已停在决策边界。确认后不启动射频。"
+                    "若要发射，请明确授权运行。"
+                )
                 if stage.id == "rf_plan_confirmation"
                 else "当前 Stage 等待你的确认；确认后继续，取消则保留现有工程。"
             )
@@ -2772,10 +2138,13 @@ class ServiceAgent:
                     "baseband_kind": slots.get("baseband_kind"),
                     "tone_frequency_hz": slots.get("tone_frequency_hz"),
                     "tone_amplitude": slots.get("tone_amplitude"),
-                    "max_duration_seconds": slots.get("max_duration_seconds")
-                    or slots.get("duration_seconds")
-                    or 30.0,
                 })
+                if rf_grant:
+                    pending["max_duration_seconds"] = (
+                        slots.get("max_duration_seconds")
+                        or slots.get("duration_seconds")
+                        or 30.0
+                    )
         else:
             pending = {}
             text = (
@@ -2784,11 +2153,18 @@ class ServiceAgent:
             )
         return AgentReply(
             text=text,
-            stage="CONFIRM" if stage and stage.checkpoint else "CRITIC",
-            needs_confirmation=bool(stage and stage.checkpoint),
+            stage=(
+                "WAITING"
+                if stage and stage.checkpoint and stage.checkpoint.blocker
+                else "CONFIRM" if stage and stage.checkpoint else "CRITIC"
+            ),
+            needs_confirmation=bool(
+                stage and stage.checkpoint and not stage.checkpoint.blocker
+            ),
             claims=ClaimStore(self._state).summary(),
             spec_digest=self._state.spec_digest(),
             pending=pending,
+            artifacts=self._current_grc_artifacts(),
             workflow_digest=self._digest_with_timeline(),
         )
 
@@ -2818,6 +2194,10 @@ class ServiceAgent:
                 statement=statement,
                 layer="sim",
                 project_version=version,
+                producer="read_metric",
+                measurement_id=str(
+                    report.get("measurement_id") or metrics.get("measurement_id") or ""
+                ),
             ))
             store.add_evidence(
                 claim_id,
@@ -2825,6 +2205,11 @@ class ServiceAgent:
                     test=report_key,
                     observation=dict(report),
                     project_version=version,
+                    measurement_id=str(
+                        report.get("measurement_id")
+                        or metrics.get("measurement_id")
+                        or ""
+                    ),
                 ),
                 passed=True,
             )
@@ -2888,6 +2273,7 @@ class ServiceAgent:
         reply.artifacts = artifacts
         manifest = _store.write_artifact_manifest(self.session_id, artifacts)
         artifacts["manifest"] = manifest
+        self._sync_artifact_index(manifest)
         self._state.project.config["artifact_refs"] = {
             key: os.path.relpath(value, _store.session_root(self.session_id))
             for key, value in artifacts.items()
