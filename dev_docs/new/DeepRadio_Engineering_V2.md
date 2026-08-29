@@ -1,11 +1,62 @@
 # DeepRadio 工程方案 V2
 
-> 更新日期：2026-08-28<br>
+> 更新日期：2026-08-29<br>
 > 当前证据：`local/agent_sessions/0827/V3/`、`local/output/0827/V3/`、`local/agent_sessions/0828/V2/plutoble/`、`local/output/0828/V2/plutoble/` 与当前工作区代码<br>
 > 状态口径：实验已暴露但尚未由修改后全量回归证明关闭的问题，统一视为活动问题或待回归问题。<br>
 > 约束：不替换现有框架，不引入第二套编排器，不把系统改成纯 LLM 执行。
 
 ---
+
+## 0. 2026-08-29 增量：问题分析与当前实现
+
+### 0.1 工程问题分析
+
+| ID | 问题 | 根因 | 风险 |
+|---|---|---|---|
+| E-17 | 不完整输入在 Workflow 内才逐步暴露 | 缺少独立 Alignment Gate | Workflow 过早建立，歧义被当作执行事实 |
+| E-18 | 意图未形成可共享、可版本化的单一事实源 | SharedState 只有 RadioSpec 投影，TaskCard 无 intent identity | Subagent/skill 偏离后难审计 |
+| E-19 | GUI 只有通用确认/取消 | Pending 只表达 Checkpoint，缺少字段、choices 和 revision | 选择题、过期回答和意图确认无法可靠处理 |
+| E-20 | 执行中改要求没有统一影响分析 | 槽位合并与 Stage 状态迁移耦合 | 旧产物/旧授权可能被错误复用 |
+| E-21 | 硬件诊断结果分散 | discover/probe/运行/人工连接各自返回 | 容易将“设备可见”误报为“物理链路正确” |
+| E-22 | 硬件诊断被 `current_project` 阻塞 | Task 标签规则没有区分软件与硬件诊断 | 没有 `.grc` 时无法回答设备接入问题 |
+
+### 0.2 不改主框架的实现方案与落点
+
+保留：
+
+```text
+GUI/API → ServiceAgent → WorkflowEngine → StageExecutor
+        → deterministic handler / LLM subagent → Completion → SharedState
+```
+
+新增/修改：
+
+| 文件 | 当前修改 |
+|---|---|
+| `grc/agent/state/intent_state.py` | 新增 `SharedIntent`、semantic hash、revision 和 patch history |
+| `grc/agent/state/shared_state.py` | SharedState 持久化 SharedIntent；TaskCard/ResultEnvelope 绑定 intent identity |
+| `grc/agent/knowledge/specs/requirements.json` | capability/protocol 驱动的字段问题、choices 和来源参考 |
+| `grc/agent/knowledge/spec_requirements.py` | 加载并解析 required fields，不依赖七类测试句 |
+| `grc/agent/workflow/intent_alignment.py` | Workflow 前的 IntentDraft、逐字段问答、意图确认和结构化 response |
+| `grc/agent/workflow/revision.py` | 字段级 patch 影响范围、停止与重新确认条件 |
+| `grc/agent/workflow/engine.py` | 确认 intent id 绑定 workflow id；硬件诊断不再强制当前工程 |
+| `grc/agent/service/adapter.py` | 接入 Alignment Gate；共享 intent 给 ToolContext；活动 RF 变更先停止 |
+| `grc/agent/service/stage_executor.py` | TaskCard/ResultEnvelope 携带 SharedIntent 快照与版本 |
+| `grc/agent/tools/diagnosis_checks.py` | 统一、只读、证据分级的硬件/环境/runtime/RF path 诊断报告 |
+| `grc/agent/service/stage_handlers.py` | 无 `.grc` 的硬件诊断直接走统一诊断；软件诊断保留原链路 |
+| `grc/gui/ClaimsPanel.py` | choices、自定义输入、意图确认按钮、SharedIntent Inspector |
+| `grc/gui/AgentPanel.py` | 结构化 `interaction_response` 异步提交 |
+
+没有新增第三方依赖，因此 `environment.yml` 无需更新。
+
+### 0.3 边界与后续工程要求
+
+- `SharedIntent` 只能由 host coordinator 写；不要给 subagent 暴露文件写工具。
+- Reference 只能描述规范、候选项和条件，不得写某个测试答案或固定 CRC/结果。
+- GUI 必须通过 command API 修改状态，不能直接改 `state.json`。
+- 已实现中途 patch 的停止和重新确认；更细粒度的 Stage/Artifact 失效应继续复用现有 Completion、project version 和 dependency，不新增平行状态机。
+- 新硬件只应新增 `HardwareProfile`/诊断适配器；新协议只应新增 protocol reference/builder/validator；不在 Adapter 中堆设备或任务专用分支。
+- 运行中的 RF 变更必须重新经过设备事实、离线校验和新的 `rf_authorization`，旧 grant 不可跨 intent revision。
 
 ## 1. 当前工程结论
 

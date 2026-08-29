@@ -1046,7 +1046,11 @@ class WorkflowEngine:
             and slots.get("ebn0_db") is None
         ):
             missing.append("ebn0_db")
-        if task_type in {"DIAGNOSE", "MODIFY_PROJECT", "OBSERVE"}:
+        hardware_diagnosis = task_type == "DIAGNOSE" and bool(
+            slots.get("hardware")
+            or set(capabilities).intersection({"hardware_configure", "hardware_runtime"})
+        )
+        if task_type in {"DIAGNOSE", "MODIFY_PROJECT", "OBSERVE"} and not hardware_diagnosis:
             project = getattr(shared_state, "project", None)
             if not (getattr(project, "grc_path", "") or getattr(project, "config", {}).get("recipe")):
                 missing.append("current_project")
@@ -1116,8 +1120,13 @@ class WorkflowEngine:
             runtime.quality = "clean"
             runtime.warnings = []
         deferred_items = [stage_plan_item(item) for item in deferred]
+        shared_intent_ref = dict((intent.context or {}).get("shared_intent") or {})
+        shared_intent_id = str(shared_intent_ref.get("intent_id") or "")
         self.workflow = Workflow(
-            workflow_id=f"wf-{uuid.uuid4().hex[:8]}",
+            workflow_id=(
+                "wf-" + shared_intent_id.removeprefix("intent-")
+                if shared_intent_id else f"wf-{uuid.uuid4().hex[:8]}"
+            ),
             task_type=intent.task_type,
             intent=intent,
             stages=list(horizon),

@@ -1,10 +1,121 @@
 # DeepRadio Workflow 算法 V2
 
-> 更新日期：2026-08-28<br>
+> 更新日期：2026-08-29<br>
 > 读者：算法、Agent、Workflow 和评测开发人员<br>
 > 约束：保留当前 WorkflowEngine、IntentIR、Catalog、Plan Compiler、SharedState、Completion 和执行器，只优化其输入输出契约与决策规则。
 
 ---
+
+## 0. 2026-08-29 增量：Alignment Gate、SharedIntent 与动态重编织
+
+### 0.1 问题分析
+
+1. 当前 Intent 能提取槽位，但“规则/LLM 推断出的草案”“用户已经确认的意图”“Workflow 内执行快照”边界不够清楚。
+2. 缺参逻辑分散在 `WorkflowEngine._missing_slots` 和对话文案中，无法用通信参考资料统一解释字段来源、候选项和默认值。
+3. Subagent/skill 主要收到 Workflow Intent 和 TaskCard，缺少稳定的共享意图版本，无法证明执行没有偏离用户确认目标。
+4. 用户在执行中修改参数时，旧链路可以合并槽位，但没有统一的 IntentPatch 影响分析，无法可靠决定只改后续、失效产物、重建 Workflow，或先停止 RF。
+5. 诊断分类容易把“硬件接入问题”错误地要求为“必须有当前 `.grc`”，且各诊断维度没有统一 `pass/fail/unknown` 口径。
+
+### 0.2 目标算法
+
+```mermaid
+flowchart TD
+    A[User Text] --> B[Rule parser + optional LLM intent completion]
+    B --> C[IntentDraft]
+    C --> D[RequirementResolver<br/>capability/protocol/device references]
+    D --> E{missing or invalid?}
+    E -- yes --> F[InteractionRequest<br/>ask_user_question]
+    F --> G[User choice / custom answer]
+    G --> H[IntentPatch + revision]
+    H --> D
+    E -- no --> I{alignment introduced choices?}
+    I -- yes --> J[Intent confirmation]
+    J -- revise --> H
+    J -- approve --> K[Confirmed SharedIntent]
+    I -- no, explicit request --> K
+    K --> L[Existing WorkflowEngine + Plan Compiler]
+    L --> M[TaskCard with SharedIntent snapshot]
+    M --> N[Subagent / skill / deterministic tool]
+    N --> O[Completion + Evidence]
+    O --> P{new user turn?}
+    P -- no --> L
+    P -- yes --> Q[IntentPatch impact analysis]
+    Q --> R{runtime active and semantic change?}
+    R -- yes --> S[stop / emergency_stop]
+    R -- no --> T[reconfirm affected intent]
+    S --> T
+    T --> L
+```
+
+主框架不变：`GUI/API → ServiceAgent → WorkflowEngine → StageExecutor`。新增的是 Workflow 之前的 `IntentAlignmentCoordinator` 和旁路的 `analyze_intent_patch`，不是第二套 Stage 编排器。
+
+### 0.3 SharedIntent 算法契约
+
+`SharedIntent` 是用户目标的单一事实源，至少包含：
+
+```text
+intent_id, revision, status, raw_text
+task_type（兼容评测标签）, capabilities
+parameters + parameter_sources
+goals, constraints, success_criteria
+missing_fields, validation_errors, assumptions
+intent_ir, semantic_hash, patch_history
+```
+
+状态精简为：`idle → draft → awaiting_input → awaiting_confirmation → confirmed`，旧意图被新任务替代时可标记 `superseded`。这些是**意图状态**，不是 Task/Stage 执行状态。Task/Stage 仍使用现有 `pending/running/waiting/completed/errored/invalidated`。
+
+写权限规则：
+
+- `IntentAlignmentCoordinator` 是唯一直接写者；
+- 用户通过结构化 `InteractionResponse` 或文本回答触发写入；
+- MainAgent 负责协调和确认；
+- Subagent/skill 只读 TaskCard 中的快照，只能返回候选 `IntentPatch`；
+- GUI 不直接编辑 JSON 文件，而是提交带 `interaction_id + base_intent_revision` 的命令；
+- 过期 revision 的回答必须拒绝，防止覆盖新意图。
+
+`TaskCard` 与 `ResultEnvelope` 同时携带 `intent_id / intent_revision / intent_hash`。因此可以检查任意结果是否基于用户确认的同一版本。
+
+### 0.4 RequirementResolver 规则
+
+参考资料放在运行时知识目录 `grc/agent/knowledge/specs/`，与论文、开发文档和 agent prompt 分离。规则必须按 capability/protocol/effect 声明，禁止按七个测试句或固定结果写死。
+
+当前通用规则：
+
+- 需要 `hardware_configure/hardware_runtime/deploy` 时要求设备、中心频率和采样率；
+- BLE 外部接收验收要求 `local_name`；
+- RX BER 要求 Eb/N0；
+- 软件诊断需要当前工程，明确的硬件接入诊断不要求 `.grc`；
+- 协议默认、安全默认和用户输入分别记录来源，默认值不伪装成用户决定。
+
+LLM 适合提取目标、复合约束和开放字段；RequirementResolver 负责确定“是否足以执行”，Policy 负责“是否允许执行”。三者不可合并。
+
+### 0.5 IntentPatch 与影响范围
+
+影响分析由确定性字段规则完成，LLM 只提出候选变化：
+
+| 变化 | scope | 动作 |
+|---|---|---|
+| 语言/解释档位 | `presentation_only` | 不改变 Workflow |
+| 只影响尚未执行的展示或可选项 | `future_only` | 修改未来计划 |
+| 名称、频率、采样率、带宽、payload、Eb/N0 | `downstream` | 失效相关产物和后续证据，重新确认 |
+| 协议、调制、方向、硬件、operation、来源域 | `supersede` | 替代原语义计划并重新编织 |
+
+只要活动 runtime 中发生非展示变化，必须先 stop，再应用 patch。任何旧 `RF_RUN` grant 都不能自动迁移到新 intent revision。
+
+### 0.6 诊断算法
+
+诊断输出统一为 `diagnosis_report.json`，每项包含：
+
+```text
+check_id, dimension, status(pass/fail/unknown), observation,
+evidence_grade, remediation, requires_human
+```
+
+维度至少覆盖 intent、environment/driver、device discovery、requested/observed identity、exact probe、parameters、project、runtime、RF path、OTA。无法由主机证明的天线/线缆/衰减器/端口连接必须为 `unknown + requires_human`，除非存在回环、功率计、频谱仪或独立 sniffer 证据。
+
+### 0.7 修改与测试顺序
+
+正确顺序不是“算法全部做完再测试”，而是：先冻结真实短输入和多轮对话数据集；为 SharedIntent/Interaction/Policy 写红色契约测试；实现 Alignment Gate；通过单元和离线集成测试；再做 UI 人工实验；最后做只读硬件和有限 RF 实验。七类单句 happy path 作为回归集保留，但不再是主要鲁棒性证据。
 
 ## 1. 当前算法是什么
 

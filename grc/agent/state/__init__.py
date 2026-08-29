@@ -20,6 +20,7 @@ from .shared_state import (
     current_measurement_id,
 )
 from .snapshot import create_snapshot, restore_snapshot
+from .intent_state import INTENT_STATUSES, SharedIntent
 
 __all__ = [
     "ALLOW",
@@ -37,6 +38,8 @@ __all__ = [
     "RadioSpec",
     "ResultEnvelope",
     "SharedState",
+    "SharedIntent",
+    "INTENT_STATUSES",
     "TaskCard",
     "RuntimeState",
     "WorkflowDecision",

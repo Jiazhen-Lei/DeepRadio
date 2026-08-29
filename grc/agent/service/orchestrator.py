@@ -35,6 +35,7 @@ _STAGE_TOOLS = {
         "inspect_flowgraph", "validate_flowgraph", "run_simulation", "read_metric",
         "plot_spectrum", "plot_constellation", "debug_by_metric",
         "explain_error",
+        "run_diagnosis_checks",
     },
     "inspect_and_measure": {
         "inspect_flowgraph", "validate_flowgraph", "run_simulation", "read_metric",

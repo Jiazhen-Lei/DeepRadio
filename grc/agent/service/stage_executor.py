@@ -51,6 +51,9 @@ def synthesize_deterministic_invocations(
         stage_id=parent.stage_id,
         workflow_revision=parent.workflow_revision,
         base_project_version=parent.base_project_version,
+        intent_id=parent.intent_id,
+        intent_revision=parent.intent_revision,
+        intent_hash=parent.intent_hash,
     )
     envelope.validate()
     record = vars(card)
@@ -63,12 +66,16 @@ def synthesize_deterministic_invocations(
         "stage_id": envelope.stage_id,
         "workflow_revision": envelope.workflow_revision,
         "base_project_version": envelope.base_project_version,
+        "intent_id": envelope.intent_id,
+        "intent_revision": envelope.intent_revision,
+        "intent_hash": envelope.intent_hash,
     }
     record["tools"] = tools
     return [record]
 
 
 def make_task_card(workflow: Any, stage: Any, state: Any, user_text: str) -> TaskCard:
+    shared_intent = getattr(state, "intent", None)
     prior = [
         {
             "stage_id": item.id,
@@ -103,12 +110,18 @@ def make_task_card(workflow: Any, stage: Any, state: Any, user_text: str) -> Tas
                 str(item.id): _claim_fingerprint(item)
                 for item in list(getattr(state, "claims", None) or [])
             },
+            "shared_intent": (
+                shared_intent.snapshot() if shared_intent is not None else {}
+            ),
         },
         expected_results=list(stage.completion),
         workflow_id=workflow.workflow_id,
         stage_id=stage.id,
         workflow_revision=workflow.revision,
         base_project_version=workflow.base_project_version,
+        intent_id=str(getattr(shared_intent, "intent_id", "") or ""),
+        intent_revision=int(getattr(shared_intent, "revision", 0) or 0),
+        intent_hash=str(getattr(shared_intent, "semantic_hash", "") or ""),
     )
     card.validate()
     return card
@@ -127,6 +140,9 @@ def make_invocation_card(parent: TaskCard, target_agent: str, instruction: str =
         stage_id=parent.stage_id,
         workflow_revision=parent.workflow_revision,
         base_project_version=parent.base_project_version,
+        intent_id=parent.intent_id,
+        intent_revision=parent.intent_revision,
+        intent_hash=parent.intent_hash,
     )
     card.validate()
     return card
@@ -235,6 +251,9 @@ def make_result_envelope(
         stage_id=stage.id,
         workflow_revision=workflow.revision,
         base_project_version=workflow.base_project_version,
+        intent_id=task_card.intent_id,
+        intent_revision=task_card.intent_revision,
+        intent_hash=task_card.intent_hash,
         ok=succeeded,
         outcome="inconclusive" if errored else ("passed" if succeeded else "failed"),
         quality=str(getattr(getattr(state, "runtime", None), "quality", "clean")),

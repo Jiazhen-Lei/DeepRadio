@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "fields": {
+    "modulation": {
+      "prompt": "请选择或填写调制方式。",
+      "choices": [
+        {"id": "bpsk", "label": "BPSK", "value": "bpsk"},
+        {"id": "qpsk", "label": "QPSK", "value": "qpsk"},
+        {"id": "ofdm", "label": "OFDM", "value": "ofdm"}
+      ],
+      "allow_custom": true
+    },
+    "hardware": {
+      "prompt": "请选择实际要使用的 SDR；系统稍后会核对发现到的型号。",
+      "choices": [
+        {"id": "pluto", "label": "PlutoSDR", "value": "pluto"},
+        {"id": "b210", "label": "USRP B210", "value": "b210"}
+      ],
+      "allow_custom": true
+    },
+    "local_name": {
+      "prompt": "请输入希望外部接收端看到的 BLE Complete Local Name。",
+      "choices": [],
+      "allow_custom": true
+    },
+    "carrier_frequency": {
+      "prompt": "请选择或填写中心频率。",
+      "choices": [
+        {"id": "ble37", "label": "BLE CH37 / 2.402 GHz", "value": 2402000000.0},
+        {"id": "ble38", "label": "BLE CH38 / 2.426 GHz", "value": 2426000000.0},
+        {"id": "ble39", "label": "BLE CH39 / 2.480 GHz", "value": 2480000000.0}
+      ],
+      "allow_custom": true
+    },
+    "sample_rate": {
+      "prompt": "请选择或填写采样率。",
+      "choices": [
+        {"id": "1m", "label": "1 Msps", "value": 1000000.0},
+        {"id": "2m", "label": "2 Msps", "value": 2000000.0},
+        {"id": "4m", "label": "4 Msps", "value": 4000000.0}
+      ],
+      "allow_custom": true
+    },
+    "ebn0_db": {
+      "prompt": "请选择或填写 BER 仿真的 Eb/N0。",
+      "choices": [
+        {"id": "4db", "label": "4 dB", "value": 4.0},
+        {"id": "8db", "label": "8 dB", "value": 8.0},
+        {"id": "12db", "label": "12 dB", "value": 12.0}
+      ],
+      "allow_custom": true
+    },
+    "current_project": {
+      "prompt": "请先在 GRC 打开要检查的 .grc 工程，然后选择“已打开”。",
+      "choices": [
+        {"id": "opened", "label": "已打开当前工程", "value": "current_canvas"}
+      ],
+      "allow_custom": false
+    }
+  },
+  "rules": [
+    {
+      "id": "hardware_effect",
+      "when_any_capability": ["hardware_configure", "hardware_runtime", "deploy"],
+      "required": ["hardware", "carrier_frequency", "sample_rate"]
+    },
+    {
+      "id": "ble_external_acceptance",
+      "when_slots": {"protocol": "ble", "operation": "deploy"},
+      "required": ["local_name"]
+    }
+  ]
+}

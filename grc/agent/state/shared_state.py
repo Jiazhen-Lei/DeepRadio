@@ -11,6 +11,8 @@ import warnings
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
 
+from .intent_state import SharedIntent
+
 
 @dataclass
 class Decision:
@@ -122,6 +124,9 @@ class TaskCard:
     stage_id: str = ""
     workflow_revision: int = 0
     base_project_version: int = 0
+    intent_id: str = ""
+    intent_revision: int = 0
+    intent_hash: str = ""
 
     def validate(self) -> None:
         if not all((self.task_id, self.workflow_id, self.stage_id, self.target_agent)):
@@ -148,6 +153,9 @@ class ResultEnvelope:
     completion: Dict[str, bool] = field(default_factory=dict)
     invocations: List[Dict[str, Any]] = field(default_factory=list)
     acceptance: Dict[str, Any] = field(default_factory=dict)
+    intent_id: str = ""
+    intent_revision: int = 0
+    intent_hash: str = ""
 
     def validate(self) -> None:
         if not all((self.task_id, self.workflow_id, self.stage_id)):
@@ -173,6 +181,7 @@ class Coordination:
 @dataclass
 class SharedState:
     session_id: str = ""
+    intent: SharedIntent = field(default_factory=SharedIntent)
     spec: RadioSpec = field(default_factory=RadioSpec)
     project: ProjectState = field(default_factory=ProjectState)
     claims: List[Claim] = field(default_factory=list)
@@ -377,6 +386,7 @@ def _spec_summary_line(digest: Dict[str, Any]) -> str:
 
 
 def _from_dict(data: Dict[str, Any]) -> SharedState:
+    intent_data = data.get("intent") or {}
     spec_data = data.get("spec") or {}
     project_data = data.get("project") or {}
     coord_data = data.get("coordination") or {}
@@ -429,6 +439,7 @@ def _from_dict(data: Dict[str, Any]) -> SharedState:
     )
     return SharedState(
         session_id=str(data.get("session_id") or ""),
+        intent=SharedIntent.from_dict(intent_data),
         spec=spec,
         project=ProjectState(
             grc_path=str(project_data.get("grc_path") or ""),

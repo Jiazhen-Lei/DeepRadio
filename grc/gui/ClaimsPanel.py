@@ -21,6 +21,7 @@ class ClaimsPanel(Gtk.Frame):
         ),
         "confirm-pending": (GObject.SignalFlags.RUN_FIRST, None, ()),
         "cancel-pending": (GObject.SignalFlags.RUN_FIRST, None, ()),
+        "interaction-response": (GObject.SignalFlags.RUN_FIRST, None, (str,)),
         "retry-transmit": (GObject.SignalFlags.RUN_FIRST, None, ()),
     }
 
@@ -155,6 +156,15 @@ class ClaimsPanel(Gtk.Frame):
         self._pending_label.set_line_wrap(True)
         self._pending_label.set_hexpand(True)
         pending_row.pack_start(self._pending_label, True, True, 4)
+        self._interaction_combo = Gtk.ComboBoxText()
+        self._interaction_combo.set_no_show_all(True)
+        pending_row.pack_start(self._interaction_combo, False, False, 0)
+        self._interaction_entry = Gtk.Entry()
+        self._interaction_entry.set_placeholder_text("填写自定义答案")
+        self._interaction_entry.set_no_show_all(True)
+        self._interaction_entry.set_width_chars(16)
+        pending_row.pack_start(self._interaction_entry, False, False, 0)
+        self._interaction_choices = []
         self._confirm_btn = Gtk.Button(label="确认")
         self._confirm_btn.connect("clicked", self._on_confirm_pending)
         self._cancel_btn = Gtk.Button(label="取消")
@@ -284,7 +294,9 @@ class ClaimsPanel(Gtk.Frame):
         pending_view = dict(pending or {})
         workflow_view = workflow or {}
         wait = str(workflow_view.get("wait_kind") or "")
-        if wait == "approval":
+        if pending_view.get("action") == "intent_alignment":
+            pass
+        elif wait == "approval":
             pending_view.setdefault(
                 "requested_effect", workflow_view.get("requested_effect") or ""
             )
@@ -318,7 +330,7 @@ class ClaimsPanel(Gtk.Frame):
                 "can_retry": bool(blocker.get("retryable", False)),
                 "approved": False,
             }
-        else:
+        elif wait != "intent":
             pending_view = {}
         if pending_view:
             pending_view["can_retry"] = bool(
@@ -391,6 +403,7 @@ class ClaimsPanel(Gtk.Frame):
                     "recovery": "等待恢复选择",
                     "denied": "改图被拒绝",
                     "capability": "系统能力未就绪",
+                    "intent": "等待意图对齐",
                 }
                 text += "  ·  " + wait_labels.get(wait_kind, wait_kind)
             if quality != "clean":
@@ -474,6 +487,16 @@ class ClaimsPanel(Gtk.Frame):
                 "interaction={}  reason={}".format(
                     interaction.get("kind") or "—",
                     interaction.get("reason") or "—",
+                )
+            )
+        shared_intent = workflow.get("shared_intent") or {}
+        if shared_intent.get("intent_id"):
+            lines.append(
+                "shared_intent={} rev={} status={} hash={}".format(
+                    shared_intent.get("intent_id"),
+                    shared_intent.get("revision") or 0,
+                    shared_intent.get("status") or "—",
+                    str(shared_intent.get("semantic_hash") or "")[:12],
                 )
             )
         runtime = workflow.get("runtime") or {}
@@ -617,9 +640,41 @@ class ClaimsPanel(Gtk.Frame):
         self._spec_revealer.set_reveal_child(False)
 
     def _on_confirm_pending(self, _button):
+        if str((self._last_pending or {}).get("action") or "") == "intent_alignment":
+            pending = dict(self._last_pending or {})
+            payload = {
+                "action": "interaction_response",
+                "interaction_id": pending.get("interaction_id"),
+                "base_intent_revision": pending.get("base_intent_revision"),
+            }
+            if pending.get("kind") == "intent_confirmation":
+                payload["decision"] = "approved"
+            else:
+                index = self._interaction_combo.get_active()
+                if 0 <= index < len(self._interaction_choices):
+                    payload["value"] = self._interaction_choices[index].get("value")
+                custom = self._interaction_entry.get_text().strip()
+                if custom:
+                    payload["custom_value"] = custom
+                if payload.get("value") in (None, "") and not custom:
+                    self._interaction_entry.grab_focus()
+                    return
+            self.emit("interaction-response", json.dumps(payload, ensure_ascii=False))
+            return
         self.emit("confirm-pending")
 
     def _on_cancel_pending(self, _button):
+        if str((self._last_pending or {}).get("action") or "") == "intent_alignment":
+            pending = dict(self._last_pending or {})
+            if pending.get("kind") == "intent_confirmation":
+                payload = {
+                    "action": "interaction_response",
+                    "interaction_id": pending.get("interaction_id"),
+                    "base_intent_revision": pending.get("base_intent_revision"),
+                    "decision": "revise",
+                }
+                self.emit("interaction-response", json.dumps(payload, ensure_ascii=False))
+            return
         self.emit("cancel-pending")
 
     def _on_retry_transmit(self, _button):
@@ -694,8 +749,30 @@ class ClaimsPanel(Gtk.Frame):
         recipe = str(pending.get("recipe") or "")
         from_recipe = str(pending.get("from_recipe") or "")
         visible = bool(action) and not pending.get("approved")
+        interaction_combo = getattr(self, "_interaction_combo", None)
+        interaction_entry = getattr(self, "_interaction_entry", None)
+        if interaction_combo is not None:
+            interaction_combo.remove_all()
+        if interaction_entry is not None:
+            interaction_entry.set_text("")
+        self._interaction_choices = list(pending.get("choices") or [])
+        for choice in self._interaction_choices:
+            if interaction_combo is not None:
+                interaction_combo.append_text(str(choice.get("label") or choice.get("id") or "选项"))
+        if self._interaction_choices and interaction_combo is not None:
+            interaction_combo.set_active(0)
+        is_intent = visible and action == "intent_alignment"
+        ask_intent = is_intent and pending.get("kind") == "ask_user_question"
+        if interaction_combo is not None:
+            interaction_combo.set_visible(ask_intent and bool(self._interaction_choices))
+        if interaction_entry is not None:
+            interaction_entry.set_visible(ask_intent and bool(pending.get("allow_custom")))
         if visible:
-            if action == "design_link" and recipe:
+            if action == "intent_alignment":
+                text = str(pending.get("prompt") or pending.get("reason") or "请补充意图信息。")
+                if pending.get("kind") == "intent_confirmation" and pending.get("summary"):
+                    text += "  " + str(pending.get("summary"))
+            elif action == "design_link" and recipe:
                 text = "待确认: {} → {}".format(
                     from_recipe or "当前工程", recipe)
             elif action == "over_air_verification":
@@ -765,7 +842,14 @@ class ClaimsPanel(Gtk.Frame):
             else:
                 text = "待确认: {}".format(action)
             self._pending_label.set_text(text)
-            if action == "over_air_verification":
+            if action == "intent_alignment":
+                if pending.get("kind") == "intent_confirmation":
+                    self._confirm_btn.set_label("确认并建立 Workflow")
+                    self._cancel_btn.set_label("继续修改")
+                else:
+                    self._confirm_btn.set_label("提交答案")
+                    self._cancel_btn.set_label("")
+            elif action == "over_air_verification":
                 self._confirm_btn.set_label("已看到目标名称")
                 self._cancel_btn.set_label("未看到")
             elif action == "rf_plan_confirmation":
@@ -795,6 +879,9 @@ class ClaimsPanel(Gtk.Frame):
         self._confirm_btn.set_visible(visible and can_confirm)
         self._confirm_btn.set_sensitive(visible and can_confirm)
         self._cancel_btn.set_sensitive(visible)
+        self._cancel_btn.set_visible(
+            visible and not (ask_intent and pending.get("kind") != "intent_confirmation")
+        )
         ota = visible and action == "over_air_verification"
         self._evidence_btn.set_visible(ota)
         self._evidence_btn.set_sensitive(ota)

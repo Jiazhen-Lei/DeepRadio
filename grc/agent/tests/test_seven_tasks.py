@@ -241,6 +241,31 @@ class SevenTaskServiceAgentTest(unittest.TestCase):
         agent._tool_ctx = None
         return agent
 
+    def test_vague_ble_uses_structured_alignment_before_workflow(self):
+        agent = self.agent("seven-vague-ble")
+        first = agent.step("我要用硬件发射一段 BLE 信号")
+        self.assertEqual(first.stage, "ALIGN")
+        self.assertIsNone(agent._workflow.workflow)
+        self.assertEqual(first.pending.get("field"), "hardware")
+
+        def answer(reply, **values):
+            return agent.step_command({
+                "action": "interaction_response",
+                "interaction_id": reply.pending["interaction_id"],
+                "base_intent_revision": reply.pending["base_intent_revision"],
+                **values,
+            })
+
+        second = answer(first, value="pluto")
+        self.assertEqual(second.pending.get("field"), "local_name")
+        third = answer(second, custom_value="alignment-demo")
+        self.assertEqual(third.pending.get("kind"), "intent_confirmation")
+        reply = answer(third, decision="approved")
+        self.assertIsNotNone(agent._workflow.workflow)
+        self.assertEqual(agent._state.intent.status, "confirmed")
+        self.assertEqual(agent._workflow.workflow.intent.slots["local_name"], "alignment-demo")
+        self.assertNotIn("start_flowgraph", self._events("seven-vague-ble"))
+
     def _assert_no_rf_side_effects(self, session_id: str) -> None:
         events = self._events(session_id)
         self.assertNotIn("discover_devices", events)
@@ -481,7 +506,12 @@ class SevenTaskServiceAgentTest(unittest.TestCase):
         self.assertEqual(waiting.workflow_digest.get("wait_kind"), "input")
         self.assertIn("ebn0_db", waiting.workflow_digest.get("missing_slots") or [])
         workflow_id = waiting.workflow_digest["workflow_id"]
-        reply = agent.step("Eb/N0 8 dB")
+        aligned = agent.step("Eb/N0 8 dB")
+        self.assertEqual(aligned.stage, "ALIGN")
+        self.assertEqual(
+            aligned.pending.get("kind"), "intent_confirmation"
+        )
+        reply = agent.step("确认")
         self.assertEqual(reply.workflow_digest["workflow_id"], workflow_id)
         self.assertEqual(reply.workflow_digest["task_type"], "RX_BUILD")
         self.assertEqual(reply.workflow_digest.get("execution_status"), "completed")
@@ -491,7 +521,11 @@ class SevenTaskServiceAgentTest(unittest.TestCase):
         agent = self.agent("seven-rx-bare")
         waiting = agent.step("构建 BPSK 接收机并测 BER")
         self.assertIn("ebn0_db", waiting.workflow_digest.get("missing_slots") or [])
-        reply = agent.step("8dB")
+        aligned = agent.step("8dB")
+        self.assertEqual(
+            aligned.pending.get("kind"), "intent_confirmation"
+        )
+        reply = agent.step("确认")
         self.assertEqual(reply.workflow_digest.get("execution_status"), "completed")
         self.assertEqual(agent._workflow.workflow.intent.slots.get("ebn0_db"), 8.0)
         self.assertEqual(agent._state.project.config.get("recipe"), "rx_bpsk_awgn")

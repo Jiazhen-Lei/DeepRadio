@@ -14,6 +14,8 @@ from grc.agent.service.stage_executor import (
 )
 from grc.agent.state import Claim, Evidence, SharedState
 from grc.agent.workflow import WorkflowEngine
+from grc.agent.workflow.intent_alignment import IntentAlignmentCoordinator
+from grc.agent.workflow.revision import analyze_intent_patch
 
 
 class DynamicWorkflowV2ContractTest(unittest.TestCase):
@@ -1647,6 +1649,100 @@ class RecipeIndexAndSpecHygieneTest(unittest.TestCase):
         self.assertEqual(state.spec.goals, [])
         self.assertTrue(filled["complete"])
         self.assertEqual(filled["open_questions"], [])
+
+
+class IntentAlignmentContractTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.state = SharedState(session_id="intent-contract")
+        self.engine = WorkflowEngine(
+            str(Path(self.temp.name) / "workflow.json")
+        )
+        self.alignment = IntentAlignmentCoordinator(self.engine, self.state)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def respond(self, **payload):
+        interaction = self.state.intent.interaction
+        return self.alignment.consume_response({
+            "interaction_id": interaction["interaction_id"],
+            "base_intent_revision": interaction["base_intent_revision"],
+            **payload,
+        })
+
+    def test_vague_ble_request_aligns_then_confirms(self):
+        first = self.alignment.consume_text("我要用硬件发射一段ble信号")
+        self.assertTrue(first.pending)
+        self.assertEqual(self.state.intent.interaction["field"], "hardware")
+        self.respond(value="pluto")
+        self.assertEqual(self.state.intent.interaction["field"], "local_name")
+        self.respond(custom_value="deepradio")
+        self.assertEqual(
+            self.state.intent.interaction["kind"], "intent_confirmation"
+        )
+        final = self.respond(decision="approved")
+        self.assertFalse(final.pending)
+        self.assertEqual(self.state.intent.status, "confirmed")
+        self.assertEqual(final.intent.slots["hardware"], "pluto")
+        self.assertEqual(final.intent.slots["local_name"], "deepradio")
+        self.assertTrue(self.state.intent.semantic_hash)
+
+    def test_task_card_receives_shared_intent_snapshot(self):
+        outcome = self.alignment.consume_text("构建 BPSK 过 AWGN 并测 EVM")
+        self.assertIsNotNone(outcome.intent)
+        workflow = self.engine.instantiate(outcome.intent, self.state)
+        stage = self.engine.start_stage()
+        card = make_task_card(workflow, stage, self.state, "")
+        self.assertEqual(card.intent_id, self.state.intent.intent_id)
+        self.assertEqual(
+            card.inputs["shared_intent"]["semantic_hash"],
+            self.state.intent.semantic_hash,
+        )
+
+    def test_stale_interaction_response_cannot_overwrite_new_intent(self):
+        self.alignment.consume_text("我要用硬件发射一段ble信号")
+        interaction = dict(self.state.intent.interaction)
+        result = self.alignment.consume_response({
+            "interaction_id": interaction["interaction_id"],
+            "base_intent_revision": interaction["base_intent_revision"] - 1,
+            "value": "pluto",
+        })
+        self.assertTrue(result.pending)
+        self.assertNotIn("hardware", self.state.intent.parameters)
+        self.assertIn("版本已变化", result.message)
+
+    def test_revision_impact_is_field_based(self):
+        impact = analyze_intent_patch(
+            {"hardware": "pluto", "local_name": "old"},
+            {"hardware": "pluto", "local_name": "new"},
+            runtime_active=True,
+        )
+        self.assertEqual(impact["scope"], "downstream")
+        self.assertTrue(impact["requires_stop"])
+        self.assertTrue(impact["requires_reconfirmation"])
+
+    def test_physical_rf_path_is_never_invented_as_passed(self):
+        from grc.agent.tools.diagnosis_checks import run_diagnosis_checks
+        from grc.agent.tools.registry import ToolContext
+
+        ctx = ToolContext(
+            out_dir=self.temp.name,
+            extra={
+                "state": self.state,
+                "shared_intent": {"parameters": {"hardware": "pluto"}},
+            },
+        )
+        result = run_diagnosis_checks(
+            ctx,
+            device_type="pluto",
+            dimensions=["rf_path"],
+            live_probe=False,
+        )
+        finding = result["findings"][0]
+        self.assertEqual(finding["status"], "unknown")
+        self.assertTrue(finding["requires_human"])
+        self.assertTrue(Path(result["report_path"]).is_file())
 
 
 if __name__ == "__main__":

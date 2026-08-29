@@ -361,6 +361,13 @@ def evaluate(stage: Any, workflow: Any, state: Any, reply: Any) -> Dict[str, boo
         ),
         "diagnosis_created": bool(
             any(
+                item.get("ok") and item.get("diagnosis_complete")
+                and item.get("report_path")
+                and item.get("project_unchanged") is True
+                for item in tool_results.get("run_diagnosis_checks", [])
+            )
+            or
+            any(
                 item.get("ok") and item.get("report_path")
                 and item.get("project_unchanged") is True
                 for item in tool_results.get("run_diagnosis_experiment", [])

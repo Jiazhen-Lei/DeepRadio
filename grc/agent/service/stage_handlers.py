@@ -691,6 +691,34 @@ def inspect_measure_stage(
 ) -> AgentReply:
     from ..tools import registry
 
+    workflow = self._workflow.workflow
+    slots = workflow.intent.slots if workflow else {}
+    hardware_report = {}
+    if diagnose and slots.get("hardware"):
+        hardware_report = registry.call(
+            "run_diagnosis_checks",
+            {"device_type": slots.get("hardware"), "live_probe": True},
+            ctx,
+        )
+        self._record_tool_result(ctx, "run_diagnosis_checks", hardware_report)
+        if hardware_report.get("report_path"):
+            ctx.extra.setdefault("artifacts", {})["diagnosis_report"] = (
+                hardware_report["report_path"]
+            )
+        if not self._state.project.grc_path:
+            summary = dict(hardware_report.get("summary") or {})
+            return self._fold(
+                ctx,
+                "硬件诊断完成：pass={pass_count}，fail={fail_count}，"
+                "unknown={unknown_count}；unknown 项需要外部或人工证据。".format(
+                    pass_count=summary.get("pass", 0),
+                    fail_count=summary.get("fail", 0),
+                    unknown_count=summary.get("unknown", 0),
+                ),
+                source="deterministic-stage",
+                ok=bool(hardware_report.get("ok")),
+            )
+
     inspected = registry.call("inspect_flowgraph", {}, ctx)
     self._record_tool_result(ctx, "inspect_flowgraph", inspected)
     validation = self._validate_loaded(ctx)
@@ -709,7 +737,6 @@ def inspect_measure_stage(
             ctx, "结构校验未通过，已给出具体错误与修复建议。",
             source="deterministic-stage", ok=False,
         )
-    workflow = self._workflow.workflow
     if workflow:
         inferred_modulation = ""
         inferred_channel = ""

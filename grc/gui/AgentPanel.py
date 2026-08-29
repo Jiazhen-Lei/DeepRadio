@@ -16,6 +16,7 @@ Agent 右侧对话面板 (多轮协商版 GTK 界面)。
 SPDX-License-Identifier: GPL-2.0-or-later
 """
 
+import json
 import logging
 import math
 import os
@@ -381,6 +382,9 @@ class AgentPanel(Gtk.VBox):
         self.claims_panel.connect("confirm-pending", self._on_confirm_pending)
         self.claims_panel.connect("cancel-pending", self._on_cancel_pending)
         self.claims_panel.connect("retry-transmit", self._on_retry_transmit)
+        self.claims_panel.connect(
+            "interaction-response", self._on_interaction_response
+        )
         split = Gtk.Paned.new(Gtk.Orientation.VERTICAL)
         if hasattr(split, "set_wide_handle"):
             split.set_wide_handle(True)
@@ -526,6 +530,24 @@ class AgentPanel(Gtk.VBox):
             target=self._handle_agent_command,
             args=({"action": "retry_transmit"},),
             daemon=True,
+        ).start()
+
+    def _on_interaction_response(self, _panel, payload):
+        if self._busy:
+            return
+        try:
+            command = json.loads(payload or "{}")
+        except (TypeError, ValueError):
+            self._append("DeepRadio", "意图回答格式无效，请重试。")
+            return
+        label = "确认意图" if command.get("decision") == "approved" else (
+            "继续修改意图" if command.get("decision") == "revise" else
+            str(command.get("custom_value") or command.get("value") or "提交答案")
+        )
+        self._append("我", label)
+        self._set_busy(True)
+        threading.Thread(
+            target=self._handle_agent_command, args=(command,), daemon=True
         ).start()
 
     def _submit_checkpoint_decision(self, decision):

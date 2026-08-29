@@ -98,6 +98,7 @@ _TOOL_MODULES = (
     "design_link",
     "debug_by_metric",
     "diagnosis_experiment",
+    "diagnosis_checks",
 )
 
 

@@ -27,7 +27,9 @@ from ..state import (
 from ..tools.registry import ToolContext
 from ..tools.hardware_profiles import device_args_for, normalize_hardware
 from ..workflow import WorkflowEngine
+from ..workflow.intent_alignment import IntentAlignmentCoordinator
 from ..workflow.planning import is_rf_grant_effect, stage_display_label
+from ..workflow.revision import analyze_intent_patch
 from . import orchestrator as _orch
 from . import session_store as _store
 from . import result_projector as _projector
@@ -188,6 +190,9 @@ class ServiceAgent:
         self._workflow.reconcile_project_version(
             self._state.project.flowgraph_version
         )
+        self._alignment = IntentAlignmentCoordinator(
+            self._workflow, self._state, event_sink=self._sink_engine_event
+        )
         # GUI 兼容层:agent.ctx.{tool_ctx.out_dir, adaptive, profile}
         self.ctx = _CtxShim(self)
         self._spec_workflow_id = None
@@ -231,6 +236,7 @@ class ServiceAgent:
         ctx.extra["session_id"] = self.session_id
         ctx.extra["mutation_forbidden"] = False
         ctx.extra["profile_snapshot"] = self.profile.level
+        ctx.extra["shared_intent"] = self._state.intent.snapshot()
         ctx.extra.pop("proposed_decisions", None)
         if ctx.flow_graph is None:
             self._load_session_flowgraph(ctx)
@@ -274,6 +280,7 @@ class ServiceAgent:
         if workflow is None:
             return
         intent = workflow.intent
+        self._alignment.project_confirmed(intent, source="workflow_sync")
         from ..tools.state_tools import looks_like_task_dump
 
         if self._spec_workflow_id != workflow.workflow_id:
@@ -588,11 +595,62 @@ class ServiceAgent:
                 "user_turn_received",
                 self._workflow_event_payload({"text": user_text}),
             )
+            active = bool(
+                self._workflow.workflow is not None
+                and self._workflow.workflow.execution_status
+                not in ("completed", "errored")
+            )
+            if not active or self._alignment.needs_alignment():
+                try:
+                    aligned = self._alignment.consume_text(user_text)
+                    self._state.save(_store.state_path(self.session_id))
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("Intent alignment 失败")
+                    return self._error_reply(f"意图对齐失败: {exc}")
+                if aligned.pending or aligned.intent is None:
+                    return self._alignment_waiting_reply(aligned.message)
+                try:
+                    workflow = self._workflow.instantiate(
+                        aligned.intent, self._state
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("Workflow instantiate 失败")
+                    return self._error_reply(f"Workflow 建立失败: {exc}")
+            else:
+                workflow = None
+            intent_before_turn = dict(self._state.intent.parameters or {})
             try:
-                workflow = self._workflow.consume_turn(user_text, self._state)
+                workflow = workflow or self._workflow.consume_turn(
+                    user_text, self._state
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Workflow consume_turn 失败")
                 return self._error_reply(f"Workflow 状态错误: {exc}")
+            if active and workflow is not None:
+                impact = analyze_intent_patch(
+                    intent_before_turn,
+                    dict(workflow.intent.slots or {}),
+                    runtime_active=str(self._state.runtime.status or "") == "running",
+                )
+                if impact.get("requires_stop"):
+                    from .hardware_runtime import RUNTIME
+
+                    stopped = RUNTIME.stop(self.session_id, emergency=True)
+                    self._state.project.config["rf_armed"] = False
+                    self._state.project.config.pop("rf_armed_path", None)
+                    _store.append_session_event(
+                        self.session_id,
+                        "runtime_stopped_for_intent_patch",
+                        self._workflow_event_payload(stopped),
+                    )
+                if impact.get("requires_reconfirmation") and workflow.intent.turn_relation in {
+                    "adjustment", "feedback", "answer"
+                }:
+                    aligned = self._alignment.request_patch_confirmation(
+                        workflow.intent, impact
+                    )
+                    self._state.save(_store.state_path(self.session_id))
+                    return self._alignment_waiting_reply(aligned.message)
             if getattr(self.ctx, "adaptive", True):
                 try:
                     before_level = self.profile.level
@@ -928,6 +986,24 @@ class ServiceAgent:
     def step_command(self, command: Dict[str, Any]) -> AgentReply:
         """Structured GUI command entry; text remains a compatibility transport."""
         action = str((command or {}).get("action") or "")
+        if action == "interaction_response":
+            try:
+                aligned = self._alignment.consume_response(command)
+                self._state.save(_store.state_path(self.session_id))
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Structured intent interaction 失败")
+                return self._error_reply(f"意图交互失败: {exc}")
+            if aligned.pending or aligned.intent is None:
+                return self._alignment_waiting_reply(aligned.message)
+            try:
+                self._workflow.instantiate(aligned.intent, self._state)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Workflow instantiate 失败")
+                return self._error_reply(f"Workflow 建立失败: {exc}")
+            reply = self._step_once(
+                "", recipe="", simulate=True, consume_turn=False
+            )
+            return self._continue_autonomous(reply, recipe="", simulate=True)
         if action == "retry_transmit":
             return self._retry_transmit()
         if action == "retry_stage":
@@ -2015,6 +2091,32 @@ class ServiceAgent:
     def _digest_with_timeline(self) -> Dict[str, Any]:
         self._sync_control_state()
         digest = self._workflow.digest()
+        shared_intent = self._state.intent
+        digest["shared_intent"] = {
+            **shared_intent.snapshot(),
+            "interaction": dict(shared_intent.interaction or {}),
+        }
+        if self._alignment.needs_alignment():
+            interaction = dict(shared_intent.interaction or {})
+            digest.update({
+                "task_type": shared_intent.task_type or "INTENT_ALIGNMENT",
+                "task_label": "意图对齐",
+                "execution_status": "waiting",
+                "current_stage": "intent_alignment",
+                "stage_label": "意图识别与参数对齐",
+                "stage_index": 0,
+                "stage_total": 0,
+                "wait_kind": "input",
+                "waiting_reason": interaction.get("prompt") or "等待补充意图",
+                "interaction_request": interaction,
+                "needs_confirmation": True,
+                "can_confirm": True,
+                "workflow_id": "wf-" + shared_intent.intent_id.removeprefix("intent-"),
+                "revision": shared_intent.revision,
+                "capabilities": list(shared_intent.capabilities),
+                "missing_slots": list(shared_intent.missing_fields),
+                "validation_errors": list(shared_intent.validation_errors),
+            })
         digest["timeline"] = _store.recent_events(self.session_id, limit=40)
         runtime = dict(self._state.project.config.get("runtime") or {})
         if runtime:
@@ -2052,6 +2154,28 @@ class ServiceAgent:
             "warnings": list(self._state.runtime.warnings),
         }
         return digest
+
+    def _alignment_waiting_reply(self, message: str = "") -> AgentReply:
+        interaction = dict(self._state.intent.interaction or {})
+        self._state.spec.open_questions = list(dict.fromkeys(
+            list(self._state.intent.missing_fields)
+            + list(self._state.intent.validation_errors)
+        ))
+        try:
+            self._state.save(_store.state_path(self.session_id))
+        except OSError as exc:
+            logger.warning("意图等待态 SharedState 落盘失败: %s", exc)
+        text = str(message or interaction.get("prompt") or "请补充意图信息。")
+        return AgentReply(
+            text=text,
+            stage="ALIGN",
+            needs_confirmation=True,
+            claims=ClaimStore(self._state).summary(),
+            spec_digest=self._state.spec_digest(),
+            pending=interaction,
+            artifacts=self._current_grc_artifacts(),
+            workflow_digest=self._digest_with_timeline(),
+        )
 
     def peek_runtime_digest(self) -> Dict[str, Any]:
         """Refresh hardware runtime for GUI polling without advancing Workflow."""

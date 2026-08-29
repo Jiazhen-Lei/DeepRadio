@@ -1,11 +1,128 @@
 # DeepRadio 测试与实验 V2
 
-> 更新日期：2026-08-28<br>
+> 更新日期：2026-08-29<br>
 > 当前证据：0827 V3 七类 GUI 实验与 0828 V2 PlutoSDR BLE 实验<br>
 > 环境：所有自动测试和 GUI/HIL 实验均使用 `gnuradio` Conda 环境<br>
 > 原则：历史实验保留为版本基线；代码发生行为相关修改后，必须在新目录重跑，不能覆盖旧记录。
 
 ---
+
+## 0. 2026-08-29 增量：意图对齐、共享意图和泛化诊断实验
+
+### 0.1 测试问题分析
+
+旧实验主要使用参数完整、正交的七个单句，能够证明 happy path，但不能证明：短输入能被逐步补齐；回答顺序变化时状态仍正确；执行中改要求会失效旧产物；Subagent 使用的是用户确认版本；诊断不会混淆设备可见、物理连接和 OTA；UI 选择能反向改变 Workflow。
+
+因此测试单位应从“一个 Text 对应一个 Task”升级为“一个 session 中的多轮轨迹”：输入草案、系统问题、用户选择、意图 revision、Workflow revision、工具事实、人工证据和最终结果必须一起验收。
+
+### 0.2 自动/人工分类与顺序
+
+| 类别 | 内容 | 顺序 |
+|---|---|---|
+| 完全自动 | Intent/RequirementResolver、SharedIntent 序列化、stale response、TaskCard hash、IntentPatch scope、离线建图/仿真/协议校验、Policy/Completion、诊断报告 schema | 每次提交先运行 |
+| 先自动后人工 | GUI choices 和状态展示、discover/probe、设备型号一致性、流图编译、bounded runtime、日志与 underflow、OTA Evidence 绑定 | 自动 Gate 通过后再人工 |
+| 主要人工 | 语言是否清楚、选择题是否符合预期、天线/端口/衰减器/线缆是否正确、LightBlue 是否看到名称、用户是否能理解和控制回退 | 最后执行并留截图/观察记录 |
+
+固定顺序：
+
+```text
+Gate 0 静态/单元
+→ Gate 1 Intent 多轮契约
+→ Gate 2 GNU Radio 离线集成
+→ Gate 3 GUI 人工交互
+→ Gate 4 硬件只读 discover/probe
+→ Gate 5 生成并编译未 arm 流图
+→ Gate 6 独立 RF 授权后的有限时长运行
+→ Gate 7 OTA/外部仪器 Evidence
+```
+
+任一 Gate 失败不得用后续人工结果覆盖。例如 LightBlue 偶然收到信号不能替代离线协议校验、设备身份匹配和有界停止能力。
+
+### 0.3 人工输入字段清单
+
+人工实验记录以下字段；“条件必填”由 RequirementResolver 决定，不要求用户第一句话全部给出：
+
+| 字段 | 何时需要 | 示例 |
+|---|---|---|
+| `goal/operation` | 始终 | 生成、接收、观察、诊断、修改、配置、部署 |
+| `protocol/modulation` | 协议或波形任务 | BLE、BPSK、QPSK、OFDM |
+| `direction` | 收发或硬件任务 | tx / rx |
+| `hardware` | DEVICE_READ 以上 | PlutoSDR、USRP B210 |
+| `carrier_frequency` | 硬件或频域约束 | 2.402 GHz |
+| `sample_rate/bandwidth/symbol_rate` | 构建或硬件配置 | 2 Msps |
+| `local_name/payload` | BLE 广播或指定数据 | `manual-align-01` |
+| `duration` | 有界 runtime | 10–30 s |
+| `gain/attenuation` | RF 计划 | 低功率或 30 dB attenuation |
+| `signal_source_scope` | 观察/诊断 | current project / live device / generated fixture |
+| `desired_artifacts` | 有明确交付要求时 | `.grc`、频谱、报告、抓包 |
+| `success/evidence` | 验收 | LightBlue 显示目标名称并附截图 |
+| `safety constraints` | 硬件任务 | 不发射、停在确认、屏蔽箱、最大时长 |
+
+每次人工记录还必须包含：session id、Git/dirty 指纹、Conda/GNU Radio、模型/LLM fallback、硬件序列或脱敏 identity、选择项、自由文本回答、所有 intent/workflow revision、最终证据路径。
+
+### 0.4 人工实验教程 A：短输入逐步对齐
+
+1. 在 `gnuradio` 环境启动 GRC，不设置 RF 开关也可完成对齐阶段。
+2. 输入：`我要用硬件发射一段 BLE 信号`。
+3. 预期系统先问硬件；选择 `PlutoSDR`（也应允许自定义其他受支持型号）。
+4. 预期系统再问 `local_name`；输入 `manual-align-01`。
+5. 预期显示完整意图摘要；此时仍没有 RF 授权，也不应启动设备。
+6. 展开 Inspector：检查同一 `intent_id`、递增 revision、状态从 `awaiting_input` 到 `awaiting_confirmation`。
+7. 点击“确认并建立 Workflow”。检查 Workflow 此时才出现，TaskCard 中的 intent id/revision/hash 与 SharedIntent 一致。
+
+正确结果：问题顺序由缺失字段产生，不从固定测试句补答案；协议/安全默认有来源；确认意图不等于批准发射。UI 展示需人工检查，状态/hash/事件可自动检查。
+
+### 0.5 人工实验教程 B：执行中修改与反向控制
+
+1. 使用实验 A 建立 BLE Workflow，并推进到 RF 计划确认前。
+2. 不批准 RF，在聊天中输入：`把 local name 改为 manual-align-02，其余不变`。
+3. 预期生成新的 intent revision，并显示 `downstream` 影响；旧波形/流图/证据不能直接作为新名称的证明。
+4. 确认新意图后，检查重新生成和离线校验包含 `manual-align-02`。
+5. 若在受控 runtime 已运行时再改语义参数，预期先出现 `runtime_stopped_for_intent_patch`，`rf_active=false`；新 revision 必须重新走 RF 授权。
+6. 在 UI 选择“继续修改”后输入另一个名称，确认 Workflow 跟随 UI/用户操作变化。这是“用户操作 UI 反向控制 Workflow”的验收。
+
+自动检查：event 顺序、revision、hash、旧 grant 未复用、runtime 已停。人工检查：用户能否理解影响范围、按钮是否明确。
+
+### 0.6 人工实验教程 C：泛化硬件诊断
+
+连接 PlutoSDR 后输入：
+
+```text
+只读诊断当前连接的 PlutoSDR：检查驱动、设备发现、实际型号是否与我说的一致、exact probe、运行状态和还需要人工检查的连接；不要修改工程，不要发射。
+```
+
+预期 `diagnosis_report.json` 至少有 intent、environment、device discovery、identity match、exact probe、parameters/project/runtime/RF path 维度。设备正常时 discover/probe 应为 pass；没有运行时 runtime 可以为 unknown；物理线缆/天线必须为 unknown + requires_human，不能因为 `iio_info -S` 成功而 pass。拔掉设备重跑时 discovery/probe 应 fail 并给 remediation；换成 B210 而仍声称 Pluto 时 identity 不匹配不得静默改写用户意图。
+
+报告 schema、工具结果和工程 hash 可自动检查；端口、天线、线缆和实际换设备需人工操作。
+
+### 0.7 人工实验教程 D：Pluto BLE 端到端
+
+1. 检查 Pluto、天线/衰减和合法实验环境；`conda activate gnuradio`。
+2. 运行 `iio_info -S usb`，只把它登记为“主机可发现”，不要登记为物理 RF 路径通过。
+3. `export GRC_AGENT_ENABLE_RF=1` 后启动 `PYTHONPATH=$PWD python -m grc --gtk --fresh`。
+4. 输入：`用 PlutoSDR 发射 BLE 广播，希望手机看到名称 manual-ota-01`。其余参数让系统提问或展示默认来源。
+5. 完成意图确认；检查 PDU/PHY 离线校验、未 arm 流图、discover/probe 和型号匹配。
+6. 核对 RF 计划的设备 identity、频率、采样率、带宽、增益/衰减、最大时长后，单独批准有限时长发射。
+7. 不手工点击 GRC Run。用 LightBlue 扫描 `manual-ota-01`，上传截图后确认 OTA。
+8. 检查进程提前或到时停止，`runtime.status=stopped`、`rf_active=false`；日志若有 underflow，结果应为 passed with warning。
+
+这项实验必须人工核对实验环境和 LightBlue；离线校验、身份绑定、启动时长、停止和证据 hash 可以自动验收。
+
+### 0.8 本次自动回归记录
+
+2026-08-29 在 `gnuradio` Conda 环境执行：
+
+```bash
+PATH=/Users/cindysha/miniforge3/envs/gnuradio/bin:$PATH \
+/Users/cindysha/miniforge3/envs/gnuradio/bin/python \
+  -m unittest discover -s grc/agent/tests -p 'test_*.py'
+
+PATH=/Users/cindysha/miniforge3/envs/gnuradio/bin:$PATH \
+/Users/cindysha/miniforge3/envs/gnuradio/bin/python \
+  -m unittest discover -s grc/gui/tests -p 'test_*.py'
+```
+
+结果：agent `181 OK, skipped=1`（需要显式 HIL 条件的 Gate 跳过）；GUI `14 OK`。另执行 `compileall` 和 `git diff --check` 均通过。自动结果不替代 0.4～0.7 的 GTK 可用性、真实设备连接和 LightBlue OTA 人工实验。
 
 ## 1. 当前证据如何定性
 
