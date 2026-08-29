@@ -7,8 +7,10 @@ passed through the Plan Compiler before execution.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
-from typing import Any
+import time
+from typing import Any, Callable
 
 from .plan_compiler import PlanNode, known_action_ids
 
@@ -31,13 +33,20 @@ def propose_plan(
     shared_state: Any = None,
     *,
     catalog: dict[str, Any] | None = None,
+    event_sink: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> list[PlanNode] | None:
     """Return a compiler-bound proposal, or None to keep the capability plan."""
+    emit = event_sink or (lambda _event, _payload: None)
     try:
-        from ..llm import chat, is_configured
-    except Exception:  # noqa: BLE001
+        from ..llm import chat, get_config, is_configured
+    except Exception as exc:  # noqa: BLE001
+        emit("plan_llm_fallback", {
+            "reason": "llm_import_unavailable",
+            "error_type": type(exc).__name__,
+        })
         return None
     if not is_configured():
+        emit("plan_llm_fallback", {"reason": "not_configured"})
         return None
     allowed = sorted(known_action_ids(catalog))
     payload = {
@@ -52,6 +61,20 @@ def propose_plan(
         ),
         "allowed_actions": allowed,
     }
+    request_hash = hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    model = ""
+    try:
+        model = str(get_config().get("model") or "")
+    except Exception:  # noqa: BLE001
+        pass
+    emit("plan_llm_started", {
+        "model": model,
+        "request_hash": request_hash,
+        "allowed_action_count": len(allowed),
+    })
+    started_at = time.perf_counter()
     try:
         content = chat(
             [
@@ -64,8 +87,30 @@ def propose_plan(
         parsed = parse_json_object(content)
     except Exception as exc:  # noqa: BLE001
         logger.info("LLM 短期计划失败，沿用能力计划: %s", exc)
+        emit("plan_llm_fallback", {
+            "reason": "request_failed",
+            "model": model,
+            "request_hash": request_hash,
+            "latency_ms": round((time.perf_counter() - started_at) * 1000, 3),
+            "error_type": type(exc).__name__,
+        })
         return None
     nodes = parsed.get("nodes") if isinstance(parsed, dict) else None
     if not isinstance(nodes, list) or not nodes:
+        emit("plan_llm_fallback", {
+            "reason": "empty_or_invalid_nodes",
+            "model": model,
+            "request_hash": request_hash,
+            "response_hash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            "latency_ms": round((time.perf_counter() - started_at) * 1000, 3),
+        })
         return None
-    return [PlanNode.from_dict(item) for item in nodes if isinstance(item, dict)]
+    proposal = [PlanNode.from_dict(item) for item in nodes if isinstance(item, dict)]
+    emit("plan_llm_succeeded", {
+        "model": model,
+        "request_hash": request_hash,
+        "response_hash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        "latency_ms": round((time.perf_counter() - started_at) * 1000, 3),
+        "proposed_action_ids": [item.stage_id or item.id for item in proposal],
+    })
+    return proposal

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import time
 from typing import Any, Callable
@@ -70,6 +72,74 @@ def _slots(self) -> dict:
     )
 
 
+def _recipe_graph_patch(from_recipe: str, to_recipe: str) -> dict:
+    """Compile a semantic recipe delta without replacing the whole canvas."""
+    from ..knowledge import recipes
+
+    before = recipes.get_recipe(from_recipe)
+    after = recipes.get_recipe(to_recipe)
+    if before is None or after is None:
+        return {}
+    old_blocks = {block_id: (key, dict(params)) for key, block_id, params in before.blocks}
+    new_blocks = {block_id: (key, dict(params)) for key, block_id, params in after.blocks}
+    operations = []
+    def connection_key(item: Any) -> tuple[str, int, str, int]:
+        values = tuple(item or ())
+        if len(values) < 2:
+            raise ValueError("recipe connection 至少需要 src_id 和 dst_id")
+        if len(values) >= 4:
+            return (
+                str(values[0]), int(values[2]),
+                str(values[1]), int(values[3]),
+            )
+        return str(values[0]), 0, str(values[1]), 0
+
+    old_connections = {connection_key(item) for item in before.connections}
+    new_connections = {connection_key(item) for item in after.connections}
+    for src, src_port, dst, dst_port in sorted(old_connections - new_connections):
+        operations.append({
+            "op": "disconnect", "src_id": src, "src_port": src_port,
+            "dst_id": dst, "dst_port": dst_port,
+        })
+    for block_id in sorted(old_blocks.keys() - new_blocks.keys()):
+        operations.append({"op": "remove", "id": block_id})
+    for block_id in sorted(old_blocks.keys() & new_blocks.keys()):
+        old_key, old_params = old_blocks[block_id]
+        new_key, new_params = new_blocks[block_id]
+        if old_key != new_key:
+            operations.extend([
+                {"op": "remove", "id": block_id},
+                {"op": "add", "id": block_id, "key": new_key,
+                 "params": new_params},
+            ])
+            continue
+        for name, value in new_params.items():
+            if str(old_params.get(name)) != str(value):
+                operations.append({
+                    "op": "set", "id": block_id, "name": name,
+                    "value": value,
+                })
+    for block_id in sorted(new_blocks.keys() - old_blocks.keys()):
+        key, params = new_blocks[block_id]
+        operations.append({
+            "op": "add", "id": block_id, "key": key, "params": params,
+        })
+    for src, src_port, dst, dst_port in sorted(new_connections - old_connections):
+        operations.append({
+            "op": "connect", "src_id": src, "src_port": src_port,
+            "dst_id": dst, "dst_port": dst_port,
+        })
+    return {
+        "operations": operations,
+        "preconditions": sorted(old_blocks),
+        "from_recipe": before.name,
+        "to_recipe": after.name,
+        "preserved_block_ids": sorted(
+            set(old_blocks).intersection(new_blocks)
+        ),
+    }
+
+
 def _bind_preview_identity(self, ctx: ToolContext, identity: str) -> None:
     from ..tools.hardware_tools import bind_endpoint_identity
 
@@ -88,6 +158,9 @@ def _bind_preview_identity(self, ctx: ToolContext, identity: str) -> None:
 
 
 def _handle_build(self, ctx, user_text, recipe, simulate) -> AgentReply:
+    scope = str(_slots(self).get("signal_source_scope") or "")
+    if scope:
+        ctx.extra.setdefault("metrics", {})["signal_source_scope"] = scope
     return self._run_deterministic(ctx, user_text, recipe, simulate)
 
 
@@ -97,7 +170,7 @@ def _handle_apply(self, ctx, user_text, recipe, simulate) -> AgentReply:
     slots = _slots(self)
     target_recipe = str(slots.get("target_recipe") or "")
     graph_patch = slots.get("graph_patch")
-    if graph_patch and not target_recipe:
+    if graph_patch:
         payload = (
             graph_patch if isinstance(graph_patch, dict)
             else {"operations": graph_patch}
@@ -105,12 +178,20 @@ def _handle_apply(self, ctx, user_text, recipe, simulate) -> AgentReply:
         result = registry.call("apply_flowgraph_patch", {
             "operations": payload.get("operations") or [],
             "preconditions": payload.get("preconditions") or [],
+            "resimulate": bool(simulate),
         }, ctx)
         self._record_tool_result(ctx, "apply_flowgraph_patch", result)
         validation = self._validate_loaded(ctx)
         self._record_tool_result(ctx, "validate_flowgraph", validation)
         if result.get("path"):
             ctx.extra.setdefault("artifacts", {})["grc_path"] = result["path"]
+        if result.get("ok") and target_recipe:
+            from ..knowledge import recipes
+
+            self._state.project.config["recipe"] = target_recipe
+            modulation = recipes.guess_modulation(target_recipe)
+            if modulation:
+                self._state.project.config["modulation"] = modulation
         return self._fold(
             ctx,
             result.get("error") or "已应用 GraphPatch 并完成重验。",
@@ -164,10 +245,25 @@ def _handle_inspect_plan(self, ctx, user_text, recipe, simulate) -> AgentReply:
     target = str(slots.get("target_recipe") or "")
     current = str(self._state.project.config.get("recipe") or "")
     if result.get("ok") and target:
-        note = (
-            f"已检查当前工程（{current or '未命名'}）。"
-            f"确认后将套用配方 {target}，其余信道与成形条件保持一致；现在不改图。"
-        )
+        patch = _recipe_graph_patch(current, target)
+        if patch.get("operations"):
+            slots["graph_patch"] = patch
+            slots["change_type"] = "multi_block_change"
+            plan_path = os.path.join(ctx.out_dir, "change_plan.json")
+            with open(plan_path, "w", encoding="utf-8") as handle:
+                json.dump(patch, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            ctx.extra.setdefault("artifacts", {})["change_plan"] = plan_path
+            note = (
+                f"已检查当前工程（{current or '未命名'}）并生成 GraphPatch："
+                f"{len(patch['operations'])} 项原位修改；确认前画布不变。"
+            )
+        else:
+            slots["rebuild_required"] = True
+            slots["rebuild_reason"] = "当前与目标结构无法生成受约束的语义差异"
+            note = (
+                "已检查当前工程，但无法形成可验证的原位 GraphPatch。"
+                "若继续，将明确按重建路径处理。"
+            )
     elif result.get("ok"):
         note = "已检查当前工程并形成变更计划；确认后才会应用并重验。"
     else:
@@ -650,6 +746,17 @@ def inspect_measure_stage(
             source="deterministic-stage", ok=False,
         )
     slots = workflow.intent.slots if workflow else {}
+    source_scope = str(
+        slots.get("signal_source_scope") or "current_project_offline"
+    )
+    if source_scope == "live_device":
+        return self._fold(
+            ctx,
+            "实时设备观察必须经设备身份探测和受控 RX runtime；"
+            "不会用当前工程的离线仿真替代。",
+            source="deterministic-stage",
+            ok=False,
+        )
     requested = list(slots.get("requested_metrics") or [])
     if diagnose and not requested:
         requested = ["evm"]
@@ -661,6 +768,7 @@ def inspect_measure_stage(
     sps = 4
     samp_rate = self._flowgraph_sample_rate(ctx)
     metrics = ctx.extra.setdefault("metrics", {})
+    metrics["signal_source_scope"] = source_scope
     plot_for = {
         "evm": ("constellation",),
         "ber": (),
@@ -734,6 +842,10 @@ def inspect_measure_stage(
             "samp_rate": samp_rate,
         }, ctx)
         self._record_tool_result(ctx, "run_diagnosis_experiment", experiment)
+        if experiment.get("report_path"):
+            ctx.extra.setdefault("artifacts", {})["diagnosis_report"] = (
+                experiment["report_path"]
+            )
         diagnosis = registry.call("debug_by_metric", {
             "metric": "evm" if "evm" in requested else "spectrum",
             "modulation": modulation,
@@ -769,24 +881,13 @@ def inspect_measure_stage(
                     "parameter": top.get("param"),
                     "value": top.get("trial_value"),
                 }
-            if not proposed:
-                block = ctx.blocks.get("chan")
-                parameter = (getattr(block, "params", None) or {}).get("noise_voltage")
-                try:
-                    value = max(float(parameter.get_value()) / 2.0, 0.0)
-                except (AttributeError, TypeError, ValueError):
-                    value = 0.02
-                proposed = {
-                    "block_id": "chan",
-                    "parameter": "noise_voltage",
-                    "value": value,
+            if proposed:
+                reply.pending = {
+                    "action": "workflow_checkpoint",
+                    "reason": "对照实验指出主要因素，确认后才修改原工程",
+                    "approved": False,
+                    "proposed_changes": [proposed],
                 }
-            reply.pending = {
-                "action": "workflow_checkpoint",
-                "reason": "对照实验指出主要因素，确认后才修改原工程",
-                "approved": False,
-                "proposed_changes": [proposed],
-            }
         return reply
     summary = "工程检查与测量完成。"
     peak = metrics.get("spectrum_peak_report")

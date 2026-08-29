@@ -196,7 +196,9 @@ def project_tool_results(
         ),
     )
     if started:
-        state.project.config["rf_started"] = True
+        state.project.config["rf_started"] = True  # compatibility key
+        state.project.config["rf_ever_started"] = True
+        state.project.config["rf_active"] = True
         record_claim(
             "rf_not_started",
             "Flowgraph artifact is in RF-safe preview mode and has not started RF",
@@ -230,6 +232,7 @@ def project_tool_results(
         None,
     )
     if terminal:
+        state.project.config["rf_active"] = False
         clean = bool(
             terminal.get("ok")
             and not terminal.get("crashed")
@@ -238,8 +241,8 @@ def project_tool_results(
             and terminal.get("return_code") in (0, -15, -9)
         )
         record_claim(
-            "rf_runtime_completed_cleanly",
-            "Controlled RF runtime reached a verified terminal state",
+            "rf_runtime_reached_terminal_state",
+            "Controlled RF process reached a verified terminal state",
             "hardware",
             "runtime_terminal_status",
             {
@@ -252,6 +255,7 @@ def project_tool_results(
             artifact=str(terminal.get("log_path") or ""),
         )
         if not clean and ClaimStore(state).get("rf_runtime_started"):
+            state.runtime.quality = "failed"
             record_claim(
                 "rf_runtime_started",
                 "Bounded RF runtime was started by the controlled service",
@@ -265,20 +269,37 @@ def project_tool_results(
                 False,
                 artifact=str(terminal.get("log_path") or ""),
             )
-    output = "".join(
-        str(item.get("output") or "")
+    quality_samples = [
+        item
         for name in (
             "start_flowgraph", "query_runtime_status",
             "stop_flowgraph", "emergency_stop",
         )
         for item in results.get(name, [])
-    )
-    if "UUU" in output or output.count("U") >= 8:
+        if "underrun_count" in item or "overrun_count" in item
+    ]
+    quality = quality_samples[-1] if quality_samples else {}
+    underruns = int(quality.get("underrun_count") or 0)
+    overruns = int(quality.get("overrun_count") or 0)
+    if underruns or overruns:
+        state.runtime.quality = "warning" \
+            if state.runtime.quality != "failed" else "failed"
+        warning = {
+            "code": "rf_stream_quality",
+            "underrun_count": underruns,
+            "overrun_count": overruns,
+            "run_id": (terminal or started or quality).get("run_id"),
+        }
+        state.runtime.warnings = [
+            item for item in state.runtime.warnings
+            if item.get("code") != "rf_stream_quality"
+        ] + [warning]
         record_claim(
             "rf_runtime_underflow",
-            "Hardware runtime log contains GNU Radio underflow markers",
+            "Hardware runtime reported scheduler underflow or overrun markers",
             "hardware",
-            "runtime_underflow",
-            {"run_id": (terminal or started or {}).get("run_id"), "markers": "U"},
+            "runtime_stream_quality",
+            warning,
             False,
+            artifact=str((terminal or quality).get("log_path") or ""),
         )

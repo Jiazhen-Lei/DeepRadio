@@ -18,7 +18,10 @@ import json
 import hashlib
 import logging
 import os
+import platform as runtime_platform
 import shutil
+import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -44,11 +47,15 @@ def sessions_root() -> str:
 
     project_root 由本文件位置推算:grc/agent/service/session_store.py -> 上四级。
     """
-    root = os.path.dirname(os.path.dirname(os.path.dirname(
-        os.path.dirname(os.path.abspath(__file__)))))
-    path = os.path.join(root, "local", "agent_sessions")
+    path = os.path.join(project_root(), "local", "agent_sessions")
     os.makedirs(path, exist_ok=True)
     return path
+
+
+def project_root() -> str:
+    """Return the repository root without depending on the current cwd."""
+    return os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__)))))
 
 
 def session_root(session_id: str) -> str:
@@ -65,6 +72,139 @@ def state_path(session_id: str) -> str:
 
 def workflow_path(session_id: str) -> str:
     return os.path.join(session_root(session_id), "workflow.yaml")
+
+
+def run_metadata_path(session_id: str) -> str:
+    return os.path.join(session_root(session_id), "run_metadata.json")
+
+
+def ensure_run_metadata(session_id: str) -> str:
+    """Freeze non-secret code, environment and model provenance once per session."""
+    path = run_metadata_path(session_id)
+    if os.path.isfile(path):
+        return path
+    root = project_root()
+    git_commit = _command_text(["git", "rev-parse", "HEAD"], root)
+    git_status = _command_text(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"], root
+    )
+    diff = _command_bytes(
+        ["git", "diff", "--no-ext-diff", "--binary", "HEAD", "--", "grc/agent", "grc/gui"],
+        root,
+    )
+    source_tree_hash = _source_tree_hash(root)
+    dirty_material = git_status.encode("utf-8", errors="replace") + diff
+    model = {"configured": False, "name": ""}
+    try:
+        from ..llm import get_config, is_configured
+
+        if is_configured():
+            config = get_config()
+            model = {
+                "configured": True,
+                "name": str(config.get("model") or ""),
+            }
+    except Exception:  # noqa: BLE001
+        pass
+    gnuradio_version = ""
+    try:
+        from gnuradio import gr
+
+        gnuradio_version = str(gr.version())
+    except Exception:  # noqa: BLE001
+        pass
+    environment = {
+        "python": runtime_platform.python_version(),
+        "python_executable": sys.executable,
+        "gnuradio": gnuradio_version,
+        "conda_environment": str(os.environ.get("CONDA_DEFAULT_ENV") or ""),
+        "platform": runtime_platform.platform(),
+        "rf_enabled": os.environ.get("GRC_AGENT_ENABLE_RF") == "1",
+    }
+    environment_hash = _stable_hash(environment)
+    payload = {
+        "schema_version": 1,
+        "session_id": session_id,
+        "created_at": time.time(),
+        "source": {
+            "git_commit": git_commit,
+            "git_dirty": bool(git_status),
+            "dirty_diff_hash": hashlib.sha256(dirty_material).hexdigest(),
+            "source_tree_hash": source_tree_hash,
+        },
+        "environment": environment,
+        "environment_hash": environment_hash,
+        "model": model,
+        "configuration": {
+            "export_mode": _export_mode(),
+        },
+    }
+    tmp = f"{path}.tmp"
+    try:
+        with _event_lock(path):
+            if os.path.isfile(path):
+                return path
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+    except OSError as exc:
+        logger.warning("写 run metadata 失败: %s", exc)
+    return path
+
+
+def _command_text(command: List[str], cwd: str) -> str:
+    return _command_bytes(command, cwd).decode("utf-8", errors="replace").strip()
+
+
+def _command_bytes(command: List[str], cwd: str) -> bytes:
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=3.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return b""
+    return completed.stdout if completed.returncode == 0 else b""
+
+
+def _source_tree_hash(root: str) -> str:
+    digest = hashlib.sha256()
+    for relative_root in ("grc/agent", "grc/gui"):
+        start = os.path.join(root, relative_root)
+        if not os.path.isdir(start):
+            continue
+        for current_root, dirnames, names in os.walk(start):
+            dirnames[:] = sorted(
+                name for name in dirnames if name != "__pycache__"
+            )
+            for name in sorted(names):
+                if not name.endswith((".py", ".yaml", ".yml", ".json")):
+                    continue
+                path = os.path.join(current_root, name)
+                relative = os.path.relpath(path, root).replace(os.sep, "/")
+                digest.update(relative.encode("utf-8"))
+                try:
+                    with open(path, "rb") as handle:
+                        digest.update(handle.read())
+                except OSError:
+                    continue
+    return digest.hexdigest()
+
+
+def _stable_hash(value: Any) -> str:
+    encoded = json.dumps(
+        _jsonable(value), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _export_mode() -> str:
+    value = str(os.environ.get("GRC_AGENT_EXPORT_MODE") or "display").strip().lower()
+    return value if value in {"display", "reproducible"} else "display"
 
 
 def archive_session(session_id: str, destination: str) -> str:
@@ -514,6 +654,9 @@ def write_artifact_manifest(
             if _skip_manifest_name(name):
                 continue
             listed.append(os.path.join(current_root, name))
+    metadata = ensure_run_metadata(session_id)
+    if os.path.isfile(metadata):
+        listed.append(metadata)
     entries = []
     for path in listed:
         try:
@@ -578,6 +721,9 @@ def write_export_manifest(
     session_id: str,
     destination_dir: str,
     exported_paths: List[str] | None = None,
+    *,
+    export_mode: str = "display",
+    source_map: Dict[str, str] | None = None,
 ) -> str:
     """Create a cumulative manifest for every artifact in an export root."""
     os.makedirs(destination_dir, exist_ok=True)
@@ -616,10 +762,13 @@ def write_export_manifest(
         artifact_id = "art-" + hashlib.sha256(
             f"{rel}\0{digest}".encode("utf-8")
         ).hexdigest()[:16]
+        source = str((source_map or {}).get(abs_path) or "")
         entries.append({
             "artifact_id": artifact_id,
             "role": role,
             "path": rel,
+            "export_path": rel,
+            "source_path": source,
             "size": size,
             "sha256": digest,
         })
@@ -629,6 +778,9 @@ def write_export_manifest(
         "schema_version": 1,
         "session_id": session_id,
         "path_base": "export_root",
+        "export_mode": (
+            export_mode if export_mode in {"display", "reproducible"} else "display"
+        ),
         "artifacts": entries,
     }
     tmp = f"{path}.tmp"
@@ -636,6 +788,64 @@ def write_export_manifest(
         json.dump(payload, handle, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
     return path
+
+
+def export_session_artifacts(
+    session_id: str,
+    destination_dir: str,
+    explicit_sources: List[str] | None = None,
+    *,
+    export_mode: str | None = None,
+) -> List[str]:
+    """Export either the visible result set or the complete reproducible set."""
+    mode = export_mode or _export_mode()
+    sources = list(explicit_sources or [])
+    if mode == "reproducible":
+        final_dir = os.path.join(session_root(session_id), "final")
+        for current_root, dirnames, names in os.walk(final_dir):
+            dirnames[:] = [
+                name for name in dirnames if not _skip_manifest_name(name)
+            ]
+            for name in sorted(names):
+                if _skip_manifest_name(name):
+                    continue
+                sources.append(os.path.join(current_root, name))
+        for path in (
+            state_path(session_id), workflow_path(session_id),
+            os.path.join(session_root(session_id), "events.jsonl"),
+        ):
+            if os.path.isfile(path):
+                sources.append(path)
+    sources.append(ensure_run_metadata(session_id))
+    exported: List[str] = []
+    source_map: Dict[str, str] = {}
+    seen = set()
+    for source in sources:
+        if not isinstance(source, str) or not os.path.isfile(source):
+            continue
+        absolute = os.path.abspath(source)
+        if absolute in seen or os.path.basename(absolute) == "manifest.json":
+            continue
+        seen.add(absolute)
+        copied = export_artifact(absolute, destination_dir)
+        if copied:
+            exported.append(copied)
+            try:
+                source_path = os.path.relpath(absolute, session_root(session_id))
+                if source_path.startswith(".."):
+                    source_path = absolute
+            except ValueError:
+                source_path = absolute
+            source_map[os.path.abspath(copied)] = source_path
+    rewrite_exported_grc_paths(session_id, destination_dir)
+    write_export_manifest(
+        session_id,
+        destination_dir,
+        exported,
+        export_mode=mode,
+        source_map=source_map,
+    )
+    return exported
 
 
 def _skip_manifest_name(name: str) -> bool:
@@ -649,6 +859,8 @@ def _skip_manifest_name(name: str) -> bool:
 def _infer_artifact_role(relative_path: str) -> str:
     low = str(relative_path or "").replace("\\", "/").lower()
     name = os.path.basename(low)
+    if name == "run_metadata.json":
+        return "run_metadata"
     if "/evidence/" in f"/{low}" or name.endswith(".meta.json"):
         return "human_evidence"
     if "runtime" in low and name.endswith((".log", ".json")):

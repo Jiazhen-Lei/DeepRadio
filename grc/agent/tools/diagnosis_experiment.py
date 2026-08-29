@@ -7,6 +7,10 @@ user confirms a later GraphPatch.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
+import time
 from typing import Any, Dict, List
 
 from .registry import ToolContext, tool
@@ -126,6 +130,121 @@ def _measure(ctx: ToolContext, metric: str, args: Dict[str, Any]) -> Dict[str, A
     return measured
 
 
+def _file_hash(path: str) -> str:
+    if not path or not os.path.isfile(path):
+        return ""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _write_report(
+    ctx: ToolContext,
+    *,
+    metric: str,
+    baseline: Any,
+    factors: List[Dict[str, Any]],
+    trials: List[Dict[str, Any]],
+    ranked: List[Dict[str, Any]],
+    version_before: int,
+    project_hash_before: str,
+    baseline_error: str = "",
+) -> Dict[str, Any]:
+    state = (getattr(ctx, "extra", None) or {}).get("state")
+    project = getattr(state, "project", None)
+    path = str(getattr(project, "grc_path", "") or "")
+    version_after = int(getattr(project, "flowgraph_version", 0) or 0)
+    project_hash_after = _file_hash(path)
+    unchanged = bool(
+        version_after == version_before
+        and project_hash_after == project_hash_before
+    )
+    experiments = [
+        {
+            "experiment_id": f"factor-{index + 1}",
+            "factor": {
+                "block": item.get("block"),
+                "parameter": item.get("param"),
+            },
+            "baseline": item.get("baseline"),
+            "intervention": item.get("trial_value"),
+            "measurement": item.get("metric_value"),
+            "delta": item.get("delta"),
+            "ok": bool(item.get("ok")),
+            "restored": bool(item.get("restored")),
+            "error": item.get("error"),
+        }
+        for index, item in enumerate(trials)
+    ]
+    ranked_causes = [
+        {
+            "rank": index + 1,
+            "factor": {
+                "block": item.get("block"),
+                "parameter": item.get("param"),
+            },
+            "absolute_metric_delta": abs(float(item.get("delta") or 0.0)),
+            "experiment_id": "factor-{}".format(
+                trials.index(item) + 1
+            ) if item in trials else "",
+        }
+        for index, item in enumerate(ranked)
+    ]
+    recommendations = [
+        {
+            "action": "review_factor_before_editing",
+            "block": item["factor"]["block"],
+            "parameter": item["factor"]["parameter"],
+            "because": item["experiment_id"],
+        }
+        for item in ranked_causes[:3]
+    ]
+    report = {
+        "schema_version": 1,
+        "created_at": time.time(),
+        "metric": metric,
+        "observations": [{
+            "observation_id": "baseline",
+            "value": baseline,
+            "error": baseline_error,
+        }],
+        "hypotheses": [
+            {
+                "hypothesis_id": f"hypothesis-{index + 1}",
+                "factor": {
+                    "block": item.get("block"),
+                    "parameter": item.get("param"),
+                },
+            }
+            for index, item in enumerate(factors)
+        ],
+        "experiments": experiments,
+        "ranked_causes": ranked_causes,
+        "recommendations": recommendations,
+        "project": {
+            "path": path,
+            "version_before": version_before,
+            "version_after": version_after,
+            "sha256_before": project_hash_before,
+            "sha256_after": project_hash_after,
+        },
+        "project_unchanged": unchanged,
+    }
+    out_dir = ctx.out_dir or os.getcwd()
+    os.makedirs(out_dir, exist_ok=True)
+    report_path = os.path.join(out_dir, "diagnosis_report.json")
+    with open(report_path, "w", encoding="utf-8") as handle:
+        json.dump(report, handle, ensure_ascii=False, indent=2, sort_keys=True)
+    return {
+        "report": report,
+        "report_path": report_path,
+        "recommendations": recommendations,
+        "project_unchanged": unchanged,
+    }
+
+
 @tool(
     name="run_diagnosis_experiment",
     description=(
@@ -146,7 +265,7 @@ def _measure(ctx: ToolContext, metric: str, args: Dict[str, Any]) -> Dict[str, A
     group="sim",
     origin="deepradio_runtime",
     runtime="gnuradio",
-    effect_level="READ",
+    effect_level="ARTIFACT_WRITE",
     idempotent=True,
 )
 def run_diagnosis_experiment(
@@ -159,15 +278,23 @@ def run_diagnosis_experiment(
 ) -> Dict[str, Any]:
     state = (getattr(ctx, "extra", None) or {}).get("state")
     version_before = int(getattr(getattr(state, "project", None), "flowgraph_version", 0) or 0)
+    project_path = str(getattr(getattr(state, "project", None), "grc_path", "") or "")
+    project_hash_before = _file_hash(project_path)
     baseline_sim = getattr(ctx, "last_sim", None)
     factors = discover_factors(ctx)
     if not factors:
+        report = _write_report(
+            ctx, metric=metric, baseline=None, factors=[], trials=[], ranked=[],
+            version_before=version_before,
+            project_hash_before=project_hash_before,
+        )
         return {
             "ok": True,
             "ranked": [],
             "trials": [],
             "flowgraph_version": version_before,
             "restored": True,
+            **report,
         }
 
     measure_args = {
@@ -192,6 +319,12 @@ def run_diagnosis_experiment(
             baseline = _measure(ctx, metric, measure_args)
             ctx.last_sim = baseline_sim
         if not baseline.get("ok"):
+            report = _write_report(
+                ctx, metric=metric, baseline=None, factors=factors,
+                trials=[], ranked=[], version_before=version_before,
+                project_hash_before=project_hash_before,
+                baseline_error=str(baseline.get("error") or ""),
+            )
             return {
                 "ok": True,
                 "ranked": [],
@@ -199,6 +332,7 @@ def run_diagnosis_experiment(
                 "baseline_error": baseline.get("error"),
                 "flowgraph_version": version_before,
                 "restored": True,
+                **report,
             }
         baseline_value = float(baseline["value"])
 
@@ -239,6 +373,11 @@ def run_diagnosis_experiment(
     if state is not None and version_after != version_before:
         state.project.flowgraph_version = version_before
         version_after = version_before
+    report = _write_report(
+        ctx, metric=metric, baseline=baseline_value, factors=factors,
+        trials=trials, ranked=ranked, version_before=version_before,
+        project_hash_before=project_hash_before,
+    )
     return {
         "ok": True,
         "metric": metric,
@@ -247,4 +386,5 @@ def run_diagnosis_experiment(
         "trials": trials,
         "flowgraph_version": version_after,
         "restored": True,
+        **report,
     }

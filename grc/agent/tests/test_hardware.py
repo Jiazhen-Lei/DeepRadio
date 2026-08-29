@@ -854,6 +854,24 @@ class UsrpRxSpectrumContractTest(unittest.TestCase):
         self.assertIn("qtgui_freq_sink_x", text)
         self.assertIn("2402000000", text.replace(" ", ""))
 
+    def test_generic_rx_builder_supports_pluto_without_starting(self):
+        built = registry.call(
+            "build_sdr_rx_spectrum_flowgraph",
+            {
+                "device_type": "pluto",
+                "center_freq": 2.402e9,
+                "sample_rate": 2e6,
+                "device_args": "usb:test.pluto",
+            },
+            self.ctx,
+        )
+        self.assertTrue(built["ok"], built)
+        self.assertTrue(built["not_started"])
+        self.assertEqual(built["signal_source_scope"], "live_device")
+        text = Path(built["grc_path"]).read_text(encoding="utf-8")
+        self.assertIn("iio_pluto_source", text)
+        self.assertIn("qtgui_freq_sink_x", text)
+
     def test_service_agent_builds_offline_and_does_not_start_rf(self):
         sessions = self.root / "sessions"
         with mock.patch.object(store, "sessions_root", return_value=str(sessions)), mock.patch(
@@ -895,6 +913,66 @@ class B210HilGateTest(unittest.TestCase):
             self.skipTest("B210 not found: " + str(discovered.get("error") or discovered))
         probed = registry.call("probe_device", {"device_type": "b210"}, ctx)
         self.assertTrue(probed.get("device_probed"))
+
+
+class RuntimeQualityProjectionTest(unittest.TestCase):
+    def test_structured_stream_counters_raise_visible_warning(self):
+        from grc.agent.schema import AgentReply, ToolInvocation
+        from grc.agent.service.result_projector import project_tool_results
+
+        state = SharedState(session_id="quality-projection")
+        recorded = []
+
+        def record_claim(*args, **kwargs):
+            recorded.append((args, kwargs))
+
+        reply = AgentReply(tool_invocations=[ToolInvocation(
+            name="query_runtime_status",
+            result={
+                "ok": True,
+                "running": False,
+                "run_id": "run-quality",
+                "reason": "exited",
+                "return_code": 0,
+                "crashed": False,
+                "underrun_count": 4,
+                "overrun_count": 1,
+            },
+        )])
+        project_tool_results(
+            state,
+            reply,
+            record_claim=record_claim,
+            semantic_hash=lambda _path: "",
+        )
+
+        self.assertEqual(state.runtime.quality, "warning")
+        self.assertEqual(state.runtime.warnings[0]["underrun_count"], 4)
+        self.assertEqual(state.runtime.warnings[0]["overrun_count"], 1)
+        self.assertTrue(any(
+            args and args[0] == "rf_runtime_underflow" and args[5] is False
+            for args, _kwargs in recorded
+        ))
+
+    def test_generated_script_reload_uses_current_source_bytes(self):
+        from grc.agent.runtime.simulate import _load_top_block_class
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            script = Path(temp_dir) / "generated.py"
+            first = (
+                "class top_block:\n"
+                "    marker = 1\n"
+                "    def start(self): pass\n"
+            )
+            second = first.replace("marker = 1", "marker = 2")
+            script.write_text(first, encoding="utf-8")
+            original_times = (script.stat().st_atime_ns, script.stat().st_mtime_ns)
+            self.assertEqual(_load_top_block_class(str(script)).marker, 1)
+
+            script.write_text(second, encoding="utf-8")
+            os.utime(script, ns=original_times)
+
+            self.assertEqual(_load_top_block_class(str(script)).marker, 2)
 
 
 # --- test_hardware_runtime_contracts.py ---

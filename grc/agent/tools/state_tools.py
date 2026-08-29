@@ -28,7 +28,7 @@ _CANCEL_HINTS = (
 )
 _READ_ONLY_HINTS = (
     "先不要修改", "先不要改", "不要修改", "不要改图", "只诊断", "只分析", "先别改",
-    "保持工程不变", "先保持工程不变", "工程不变",
+    "保持工程不变", "先保持工程不变", "工程不变", "只观察", "不修改",
 )
 
 
@@ -317,6 +317,12 @@ def verify_state_claims(ctx: ToolContext, metrics: Dict[str, Any]) -> Dict[str, 
             continue
         if value is None:
             continue
+        report_key = "evm_report" if metric_name == "evm_pct" else "ber_report"
+        report = metrics.get(report_key)
+        measurement_id = str(
+            (report or {}).get("measurement_id")
+            if isinstance(report, dict) else ""
+        ) or str(metrics.get("measurement_id") or ctx.extra.get("measurement_id") or "")
         evidence = Evidence(
             test="read_metric",
             observation={
@@ -327,6 +333,8 @@ def verify_state_claims(ctx: ToolContext, metrics: Dict[str, Any]) -> Dict[str, 
             },
             project_version=state.project.flowgraph_version,
             artifact=str(ctx.extra.get("artifacts", {}).get(artifact_key, "")),
+            measurement_id=measurement_id,
+            evidence_grade="system_measurement",
         )
         store.add_evidence(claim.id, evidence, passed=float(value) < threshold)
         updated.append(claim.id)
@@ -634,6 +642,7 @@ def apply_grc_diff(
                 "type": "array",
                 "items": {},
             },
+            "resimulate": {"type": "boolean"},
         },
         "required": ["operations"],
     },
@@ -644,6 +653,7 @@ def apply_flowgraph_patch(
     ctx: ToolContext,
     operations: List[Dict[str, Any]],
     preconditions: Optional[List[Any]] = None,
+    resimulate: bool = True,
 ):
     from . import registry
 
@@ -773,12 +783,17 @@ def apply_flowgraph_patch(
     state.project.flowgraph_version += 1
     state.project.config["canvas_dirty"] = False
     ClaimStore(state).invalidate_by_version(state.project.flowgraph_version)
+    reverify = _resimulate_and_verify(ctx, state) if resimulate else {
+        "ok": True, "skipped": True,
+    }
     return {
         "ok": True,
         "outcome": "passed",
         "path": target,
         "flowgraph_version": state.project.flowgraph_version,
         "applied": applied,
+        "reverify": reverify,
+        "affected_claims_evaluated": bool(reverify.get("ok")),
     }
 
 
@@ -886,7 +901,25 @@ def _resimulate_and_verify(ctx: ToolContext, state) -> Dict[str, Any]:
     recipe_name = str(state.project.config.get("recipe") or "")
     selected = recipes.get_recipe(recipe_name)
     want_evm = selected is None or "evm" in (selected.metrics or [])
-    modulation = str(state.project.config.get("modulation") or "bpsk")
+    modulation = ""
+    for block in (ctx.blocks or {}).values():
+        params = getattr(block, "params", None) or {}
+        for name in ("type", "constellation"):
+            param = params.get(name)
+            try:
+                raw = str(param.get_value()).lower()
+            except AttributeError:
+                raw = ""
+            found = next(
+                (item for item in ("bpsk", "qpsk", "ofdm", "gfsk") if item in raw),
+                "",
+            )
+            if found:
+                modulation = found
+                break
+        if modulation:
+            break
+    modulation = modulation or str(state.project.config.get("modulation") or "bpsk")
     notes = []
     if want_evm:
         metric = registry.call(
@@ -905,6 +938,8 @@ def _resimulate_and_verify(ctx: ToolContext, state) -> Dict[str, Any]:
     out = {
         "ok": True,
         "evm_pct": (ctx.extra.get("metrics") or {}).get("evm_pct"),
+        "modulation": modulation,
+        "measurement_id": str(ctx.extra.get("measurement_id") or ""),
         "claims": bound.get("updated", []),
     }
     if notes:

@@ -125,8 +125,13 @@ def _activity_from_reply(reply):
     if pending and not pending.get("approved"):
         action = str(pending.get("action") or "")
         if action == "rf_plan_confirmation":
-            effect = str(pending.get("requested_effect") or "")
-            rf_grant = effect in ("DEVICE_CONFIG", "RF_RUN")
+            rf_grant = (
+                str(pending.get("purpose") or "") == "rf_authorization"
+                or (
+                    not pending.get("purpose")
+                    and str(pending.get("requested_effect") or "") == "RF_RUN"
+                )
+            )
             return {
                 "loop": "确认",
                 "agent": "Hardware",
@@ -560,7 +565,8 @@ class AgentPanel(Gtk.VBox):
             self._append("DeepRadio", "当前没有待确认的 Checkpoint。")
             return
         current_stage = str(digest.get("current_stage") or "")
-        is_ota = current_stage == "over_air_verification"
+        purpose = str(digest.get("checkpoint_purpose") or "")
+        is_ota = purpose == "ota_observation" or current_stage == "over_air_verification"
         self._append(
             "我",
             ("已看到目标名称" if is_ota else "确认")

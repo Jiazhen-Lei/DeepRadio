@@ -19,6 +19,7 @@ MUTATING_TOOLS = frozenset(
         "build_ble_pluto_tx_flowgraph",
         "arm_hardware_flowgraph",
         "build_usrp_rx_spectrum_flowgraph",
+        "build_sdr_rx_spectrum_flowgraph",
         "build_sdr_tx_flowgraph",
     }
 )
@@ -351,12 +352,20 @@ def evaluate(stage: Any, workflow: Any, state: Any, reply: Any) -> Dict[str, boo
             )
         ),
         "structural_validation_completed": structural_validation(),
-        "affected_claims_evaluated": claims_current(),
+        "affected_claims_evaluated": claims_current() or any(
+            item.get("ok") and item.get("affected_claims_evaluated") is True
+            for item in tool_results.get("apply_flowgraph_patch", [])
+        ),
         "receive_quality_evaluated": _receive_quality_evaluated(
             metrics, artifacts, slots, tool_results, claims, project_version
         ),
         "diagnosis_created": bool(
-            tool_names.intersection({"debug_by_metric", "diagnose_by_metric", "explain_error"})
+            any(
+                item.get("ok") and item.get("report_path")
+                and item.get("project_unchanged") is True
+                for item in tool_results.get("run_diagnosis_experiment", [])
+            )
+            or tool_names.intersection({"diagnose_by_metric", "explain_error"})
         ),
         "repair_decision_recorded": True,
         "repair_applied": _mutated_flowgraph(invocations),

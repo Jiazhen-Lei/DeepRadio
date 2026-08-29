@@ -18,6 +18,7 @@ from grc.agent.tools.state_tools import (
 from grc.agent.workflow.plan_compiler import (
     compile_stages,
     replan_tail,
+    tail_needs_replan_proposal,
     validate_proposal,
 )
 from grc.agent.workflow.planning import (
@@ -55,6 +56,44 @@ class PlanCompilerContractTest(unittest.TestCase):
             deferred,
         )
 
+    def test_replan_keeps_rf_tail_when_proposal_drops_arm(self):
+        deferred = [
+            {"id": "configure_device", "effect_level": "DEVICE_CONFIG"},
+            {"id": "transmit_bounded", "effect_level": "RF_RUN"},
+            {"id": "over_air_verification", "interaction": "checkpoint"},
+            {"id": "stop_and_finalize", "effect_level": "RF_RUN", "safety_finalizer": True},
+        ]
+        catalog = {
+            "task_candidates": {
+                "HARDWARE_CONFIGURE": {
+                    "stages": [{"id": "hardware_precheck"}],
+                    "deploy_stages": list(deferred) + [
+                        {"id": "discover_and_probe_hardware"},
+                        {"id": "build_ble_advertiser"},
+                        {"id": "tx_build_and_validate"},
+                        {"id": "rf_plan_confirmation"},
+                    ],
+                }
+            }
+        }
+        kept = replan_tail(
+            deferred,
+            proposal=[
+                {"id": "discover_and_probe_hardware"},
+                {"id": "build_ble_advertiser"},
+                {"id": "hardware_precheck"},
+                {"id": "tx_build_and_validate"},
+                {"id": "rf_plan_confirmation"},
+            ],
+            catalog=catalog,
+        )
+        self.assertEqual([item["id"] for item in kept], [item["id"] for item in deferred])
+        self.assertTrue(tail_needs_replan_proposal(deferred))
+        self.assertFalse(tail_needs_replan_proposal([]))
+        self.assertFalse(tail_needs_replan_proposal([
+            {"id": "stop_and_finalize", "safety_finalizer": True},
+        ]))
+
     def test_compile_attaches_plan_metadata(self):
         stages = [
             Stage.from_dict({
@@ -66,6 +105,38 @@ class PlanCompilerContractTest(unittest.TestCase):
         self.assertFalse(rejected)
         self.assertEqual(stages[0].objective, "inspect_and_measure")
         self.assertEqual(nodes[0].produces, ["metrics_recorded"])
+
+    def test_effect_is_floored_by_bound_tool_metadata(self):
+        stage = Stage.from_dict({
+            "id": "apply_and_verify",
+            "effect_level": "READ",
+        })
+        compile_stages(object(), [stage])
+        self.assertEqual(stage.effect_level, "ARTIFACT_WRITE")
+
+    def test_natural_language_predicate_is_unbound_not_executable(self):
+        stage = Stage.from_dict({
+            "id": "inspect_and_measure",
+            "completion": ["measurement_completed"],
+        })
+        catalog = {"task_candidates": {"OBSERVE": {"stages": [
+            {"id": "inspect_and_measure"},
+        ]}}}
+        compile_stages(
+            object(),
+            [stage],
+            catalog=catalog,
+            proposal=[{
+                "id": "inspect_and_measure",
+                "success_predicates": [
+                    "measurement_completed", "the constellation looks good",
+                ],
+            }],
+        )
+        self.assertIn("measurement_completed", stage.success_predicates)
+        self.assertEqual(
+            stage.unbound_predicates, ["the constellation looks good"]
+        )
 
     def test_config_confirm_label_is_not_rf_grant(self):
         self.assertFalse(is_rf_grant_effect("DEVICE_READ"))
@@ -136,11 +207,58 @@ class WorkflowPlannerCompatTest(unittest.TestCase):
 
 class DiagnosisAndPatchTest(unittest.TestCase):
     def test_diagnosis_without_factors_is_ok_and_empty(self):
-        ctx = ToolContext()
-        result = run_diagnosis_experiment(ctx)
+        with tempfile.TemporaryDirectory() as out_dir:
+            ctx = ToolContext(out_dir=out_dir)
+            result = run_diagnosis_experiment(ctx)
+            self.assertTrue(Path(result["report_path"]).is_file())
         self.assertTrue(result["ok"])
         self.assertEqual(result["ranked"], [])
         self.assertTrue(result["restored"])
+        self.assertTrue(result["project_unchanged"])
+
+    def test_recipe_change_compiles_to_graph_patch(self):
+        from grc.agent.service.stage_handlers import _recipe_graph_patch
+
+        patch = _recipe_graph_patch("bpsk_awgn", "qpsk_awgn")
+        self.assertTrue(patch["operations"])
+        self.assertIn("chan", patch["preserved_block_ids"])
+        self.assertTrue(any(
+            item.get("op") == "set" and item.get("id") == "mod"
+            for item in patch["operations"]
+        ))
+        self.assertFalse(any(
+            item.get("op") == "remove" and item.get("id") == "chan"
+            for item in patch["operations"]
+        ))
+
+    def test_recipe_patch_preserves_explicit_connection_ports(self):
+        from types import SimpleNamespace
+        from grc.agent.service.stage_handlers import _recipe_graph_patch
+
+        before = SimpleNamespace(
+            name="before",
+            blocks=[],
+            connections=[("source", "sink", 1, 2)],
+        )
+        after = SimpleNamespace(
+            name="after",
+            blocks=[],
+            connections=[("source", "sink", 3, 4)],
+        )
+        with mock.patch(
+            "grc.agent.knowledge.recipes.get_recipe",
+            side_effect=[before, after],
+        ):
+            patch = _recipe_graph_patch("before", "after")
+
+        self.assertIn({
+            "op": "disconnect", "src_id": "source", "src_port": 1,
+            "dst_id": "sink", "dst_port": 2,
+        }, patch["operations"])
+        self.assertIn({
+            "op": "connect", "src_id": "source", "src_port": 3,
+            "dst_id": "sink", "dst_port": 4,
+        }, patch["operations"])
 
     def test_graph_patch_aliases_and_preconditions(self):
         expanded, error = expand_patch_operations([
@@ -184,6 +302,16 @@ class MeasurementAndProfileTest(unittest.TestCase):
         self.assertEqual(record.measurement_id, first)
         self.assertIn("/tmp/constellation.png", record.artifact_ids)
         self.assertEqual(record.result["value"], 8.0)
+
+    def test_zero_ber_is_reported_with_finite_sample_upper_bound(self):
+        from grc.agent.runtime.simulate import ber_report
+
+        bits = [0, 1] * 256
+        report = ber_report(bits, bits, max_delay=0)
+        self.assertEqual(report["value"], 0.0)
+        self.assertEqual(report["compared_bits"], len(bits))
+        self.assertGreater(report["confidence_upper_bound"], 0.0)
+        self.assertEqual(report["confidence_method"], "wilson_one_sided")
 
     def test_stale_claim_records_reason(self):
         state = SharedState(session_id="stale")

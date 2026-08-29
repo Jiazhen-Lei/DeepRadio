@@ -27,6 +27,24 @@ class DynamicWorkflowV2ContractTest(unittest.TestCase):
     def engine(self):
         return WorkflowEngine(str(self.root / "workflow.yaml"))
 
+    def test_new_workflow_resets_runtime_quality_not_historical_claims(self):
+        state = SharedState(session_id="quality-reset")
+        state.runtime.quality = "warning"
+        state.runtime.warnings = [{"code": "old_run_warning"}]
+        state.claims.append(Claim(
+            id="historical_failure",
+            statement="Prior run had a warning",
+            layer="hardware",
+            status="Failed",
+            project_version=0,
+        ))
+
+        self.engine().consume_turn("构建 BPSK AWGN 并测 EVM", state)
+
+        self.assertEqual(state.runtime.quality, "clean")
+        self.assertEqual(state.runtime.warnings, [])
+        self.assertEqual(state.claims[0].status, "Failed")
+
     def test_completion_is_a_hard_gate(self):
         state = SharedState(session_id="completion")
         engine = self.engine()
@@ -422,6 +440,35 @@ class WorkflowCapabilityCompositionTest(unittest.TestCase):
         self.assertTrue({
             "build_rx", "hardware_configure", "observe", "realtime_observe"
         }.issubset(workflow.intent.capabilities))
+        self.assertEqual(
+            workflow.intent.slots["signal_source_scope"], "live_device"
+        )
+
+    def test_offline_observation_and_generated_fixture_are_distinguished(self):
+        offline = self.engine().classify(
+            "查看当前工程的频谱和星座图，只观察不修改",
+            project_state(),
+        )
+        self.assertEqual(
+            offline.slots["signal_source_scope"], "current_project_offline"
+        )
+        fixture = self.engine().classify(
+            "构建 BPSK 接收机并测 BER", SharedState()
+        )
+        self.assertEqual(
+            fixture.slots["signal_source_scope"], "generated_fixture"
+        )
+
+    def test_pluto_live_receive_observation_uses_hardware_rx_path(self):
+        intent = self.engine().classify(
+            "查看当前 PlutoSDR 天线口接收信号的实时频谱，"
+            "中心频率 2.402 GHz，采样率 2 Msps",
+            SharedState(),
+        )
+        self.assertEqual(intent.task_type, "RX_BUILD")
+        self.assertEqual(intent.slots["direction"], "rx")
+        self.assertEqual(intent.slots["signal_source_scope"], "live_device")
+        self.assertIn("hardware_configure", intent.capabilities)
 
     def test_primary_action_is_stable_across_device_and_task_variants(self):
         cases = [
@@ -622,6 +669,10 @@ class WorkflowCapabilityCompositionTest(unittest.TestCase):
                 workflow.stage("rf_plan_confirmation").checkpoint.requested_effect,
                 "RF_RUN",
             )
+            self.assertEqual(
+                workflow.stage("rf_plan_confirmation").checkpoint.purpose,
+                "rf_authorization",
+            )
             engine.resolve_checkpoint("approved")
             self.assertIn("transmit_bounded", [stage.id for stage in workflow.stages])
             self.assertEqual(workflow.current_stage, "configure_device")
@@ -629,6 +680,66 @@ class WorkflowCapabilityCompositionTest(unittest.TestCase):
                 "stop_and_finalize",
                 [item.get("id") for item in workflow.deferred_plan],
             )
+
+    def test_rf_grant_keeps_arm_start_when_llm_replans_away(self):
+        """gui-f9463acf: LLM replaced the granted deploy tail after RF approval."""
+        bad_proposal = [
+            {"id": "discover_and_probe_hardware"},
+            {"id": "build_ble_advertiser"},
+            {"id": "hardware_precheck"},
+            {"id": "tx_build_and_validate"},
+            {"id": "rf_plan_confirmation"},
+        ]
+        with mock.patch.dict(os.environ, {"GRC_AGENT_ENABLE_RF": "1"}):
+            engine = self.engine()
+            workflow = engine.consume_turn(
+                "用 plutosdr 发射 ble 信号，local name 为 loveu",
+                SharedState(),
+            )
+            workflow.current_stage = "rf_plan_confirmation"
+            engine._activate_current()
+            with mock.patch(
+                "grc.agent.workflow.llm_planner.propose_plan",
+                return_value=bad_proposal,
+            ):
+                engine.resolve_checkpoint("approved")
+        ids = [stage.id for stage in workflow.stages] + [
+            str(item.get("id") or "") for item in workflow.deferred_plan
+        ]
+        self.assertEqual(workflow.current_stage, "configure_device")
+        self.assertIn("configure_device", ids)
+        self.assertIn("transmit_bounded", ids)
+        self.assertIn("stop_and_finalize", ids)
+        self.assertTrue(
+            workflow.stage("rf_plan_confirmation").result["completion"]["rf_plan_approved"]
+        )
+        self.assertNotIn(
+            "discover_and_probe_hardware",
+            [stage.id for stage in workflow.stages],
+        )
+
+    def test_rf_grant_skips_llm_replan_when_only_stop_remains(self):
+        """gui-cacf1e84: post-grant LLM replan blocked TX start for ~55s."""
+        with mock.patch.dict(os.environ, {"GRC_AGENT_ENABLE_RF": "1"}):
+            engine = self.engine()
+            with mock.patch(
+                "grc.agent.workflow.llm_planner.propose_plan",
+                return_value=None,
+            ) as planner:
+                workflow = engine.consume_turn(
+                    "用 plutosdr 发射 ble 信号，local name 为 loveu",
+                    SharedState(),
+                )
+                planner.reset_mock()
+                workflow.current_stage = "rf_plan_confirmation"
+                engine._activate_current()
+                engine.resolve_checkpoint("approved")
+                planner.assert_not_called()
+        self.assertEqual(workflow.current_stage, "configure_device")
+        self.assertEqual(
+            [item.get("id") for item in workflow.deferred_plan],
+            ["stop_and_finalize"],
+        )
 
     def test_stop_at_boundary_approval_does_not_materialize_rf(self):
         engine = self.engine()
@@ -646,6 +757,11 @@ class WorkflowCapabilityCompositionTest(unittest.TestCase):
             workflow.stage("rf_plan_confirmation").checkpoint.requested_effect,
             "DEVICE_READ",
         )
+        self.assertEqual(
+            workflow.stage("rf_plan_confirmation").checkpoint.purpose,
+            "config_handoff",
+        )
+        self.assertEqual(digest.get("checkpoint_purpose"), "config_handoff")
         self.assertEqual(digest.get("stage_label"), "配置确认")
         self.assertEqual(
             next(
@@ -1203,6 +1319,16 @@ class Round2ContractTest(unittest.TestCase):
             stage="FINAL",
             artifacts={"metrics": {"evm_pct": 12.0}},
             tool_invocations=[
+                ToolInvocation(
+                    name="run_diagnosis_experiment",
+                    args={},
+                    result={
+                        "ok": True,
+                        "report_path": "/tmp/diagnosis_report.json",
+                        "project_unchanged": True,
+                    },
+                    ok=True,
+                ),
                 ToolInvocation(
                     name="debug_by_metric",
                     args={},

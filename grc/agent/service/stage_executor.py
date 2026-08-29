@@ -46,6 +46,7 @@ def synthesize_deterministic_invocations(
         outcome="passed" if reply_ok else "failed",
         artifacts=dict(getattr(reply, "artifacts", None) or {}),
         note=str(getattr(reply, "text", "") or ""),
+        quality="clean",
         workflow_id=parent.workflow_id,
         stage_id=parent.stage_id,
         workflow_revision=parent.workflow_revision,
@@ -236,6 +237,7 @@ def make_result_envelope(
         base_project_version=workflow.base_project_version,
         ok=succeeded,
         outcome="inconclusive" if errored else ("passed" if succeeded else "failed"),
+        quality=str(getattr(getattr(state, "runtime", None), "quality", "clean")),
         artifacts=dict(getattr(reply, "artifacts", None) or {}),
         produced_claims=produced_claims,
         proposed_changes=list(

@@ -46,6 +46,7 @@ _STAGE_TOOLS = {
     },
     "rx_build_and_verify": {
         "select_recipe", "design_flowgraph", "build_usrp_rx_spectrum_flowgraph",
+        "build_sdr_rx_spectrum_flowgraph",
         "validate_flowgraph", "inspect_flowgraph",
     },
     "tx_build_and_validate": {
@@ -81,6 +82,11 @@ _STAGE_TOOLS = {
     "run_bounded": {"start_flowgraph", "query_runtime_status", "emergency_stop"},
     "stop_runtime": {"stop_flowgraph", "emergency_stop", "query_runtime_status"},
 }
+
+
+def stage_tool_names(stage_id: str) -> set[str]:
+    """Return the host allowlist used by a Stage, without building an agent."""
+    return set(_STAGE_TOOLS.get(str(stage_id or ""), set()))
 
 
 def deepagents_available() -> bool:

@@ -251,6 +251,10 @@ def design_link(ctx, profile=None, intent: str = "",
                 if m.get("ok"):
                     metrics["evm_pct"] = m["value"]
                     metrics["n_symbols"] = m.get("n_symbols")
+                    metrics["evm_report"] = {
+                        key: value for key, value in m.items()
+                        if key not in {"ok", "kind"}
+                    }
             if "ber" in rc.metrics:
                 ber_sps = 1 if rc.probe_dtype in {"uint8", "int8"} else rc.sps
                 m = _c("read_metric", kind="ber", probe_id=probe_id,

@@ -56,6 +56,8 @@ class RuntimeState:
     granted_effects: List[str] = field(default_factory=list)
     blocker: Dict[str, Any] = field(default_factory=dict)
     operations: List[Dict[str, Any]] = field(default_factory=list)
+    quality: str = "clean"
+    warnings: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -77,6 +79,7 @@ class Evidence:
     project_version: int
     artifact: str = ""
     measurement_id: str = ""
+    evidence_grade: str = "system_verified"
     ts: float = field(default_factory=time.time)
 
 
@@ -136,6 +139,8 @@ class ResultEnvelope:
     artifacts: Dict[str, Any] = field(default_factory=dict)
     note: str = ""
     outcome: str = ""
+    quality: str = "clean"
+    evidence_grade: str = ""
     workflow_id: str = ""
     stage_id: str = ""
     workflow_revision: int = 0
@@ -149,6 +154,8 @@ class ResultEnvelope:
             raise ValueError("ResultEnvelope 缺少 task/workflow/stage 标识")
         if self.outcome not in ("passed", "failed", "inconclusive"):
             raise ValueError(f"ResultEnvelope outcome 非法: {self.outcome}")
+        if self.quality not in ("clean", "warning", "failed"):
+            raise ValueError(f"ResultEnvelope quality 非法: {self.quality}")
         if self.workflow_revision < 1 or self.base_project_version < 0:
             raise ValueError("ResultEnvelope Workflow/Project 版本非法")
         if any(not isinstance(value, bool) for value in self.completion.values()):
@@ -259,6 +266,9 @@ class SharedState:
             "carrier_frequency": carrier,
             "sample_rate": config.get("sample_rate"),
             "direction": str(config.get("direction") or ""),
+            "signal_source_scope": str(
+                config.get("signal_source_scope") or ""
+            ),
             "rf_armed": bool(config.get("rf_armed")),
             "max_duration_seconds": duration,
             "spec_kind": "ble" if protocol.lower() == "ble" else "link",
@@ -324,6 +334,27 @@ def _spec_summary_line(digest: Dict[str, Any]) -> str:
         return " · ".join(part for part in parts if part)
     hardware = str(digest.get("hardware") or "")
     recipe = str(digest.get("recipe") or "")
+    source_scope = str(digest.get("signal_source_scope") or "")
+    if source_scope == "live_device":
+        parts = [_hardware_label(hardware) or "SDR", "RX", "live device"]
+        for value in (
+            _format_hz(digest.get("carrier_frequency")),
+            _format_rate(digest.get("sample_rate")),
+        ):
+            if value:
+                parts.append(value)
+        return " · ".join(parts)
+    if source_scope == "current_project_offline":
+        return " · ".join(
+            item for item in ("Observe", "current project offline", recipe)
+            if item
+        )
+    if source_scope == "generated_fixture":
+        modulation = str(digest.get("modulation") or "").upper()
+        return " · ".join(
+            item for item in (modulation, "generated test fixture", recipe)
+            if item
+        )
     if hardware and not recipe:
         parts = [_hardware_label(hardware)]
         direction = str(digest.get("direction") or "").upper()
@@ -337,10 +368,12 @@ def _spec_summary_line(digest: Dict[str, Any]) -> str:
             parts.append(rate)
         parts.append("RF armed" if digest.get("rf_armed") else "sink 未 arm")
         return " · ".join(part for part in parts if part)
-    modulation = str(digest.get("modulation") or "").upper() or "?"
-    channel = str(digest.get("channel") or "").upper() or "?"
-    recipe_name = recipe or "?"
-    return f"{modulation} → {channel} → {recipe_name}"
+    parts = [
+        str(digest.get("modulation") or "").upper(),
+        str(digest.get("channel") or "").upper(),
+        recipe,
+    ]
+    return " → ".join(item for item in parts if item) or "尚未提取"
 
 
 def _from_dict(data: Dict[str, Any]) -> SharedState:
@@ -365,6 +398,9 @@ def _from_dict(data: Dict[str, Any]) -> SharedState:
                 project_version=int(ev.get("project_version", 0) or 0),
                 artifact=str(ev.get("artifact") or ""),
                 measurement_id=str(ev.get("measurement_id") or ""),
+                evidence_grade=str(
+                    ev.get("evidence_grade") or "system_verified"
+                ),
                 ts=float(ev.get("ts") or time.time()),
             )
             for ev in item.get("evidence") or []
@@ -415,6 +451,8 @@ def _from_dict(data: Dict[str, Any]) -> SharedState:
             granted_effects=list(runtime_data.get("granted_effects") or []),
             blocker=dict(runtime_data.get("blocker") or {}),
             operations=list(runtime_data.get("operations") or []),
+            quality=str(runtime_data.get("quality") or "clean"),
+            warnings=list(runtime_data.get("warnings") or []),
         ),
         artifacts=[
             ArtifactRecord(**item)

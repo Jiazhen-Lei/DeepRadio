@@ -17,6 +17,7 @@ from .planning import (
     stage_plan_item,
 )
 from .schema import Stage
+from .completion import KNOWN_COMPLETIONS
 
 
 @dataclass
@@ -30,6 +31,7 @@ class PlanNode:
     needs_user_decision: bool = False
     tools: list[str] = field(default_factory=list)
     stage_id: str = ""
+    unbound_predicates: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -51,6 +53,7 @@ class PlanNode:
             ) or bool(data.get("needs_user_decision")),
             tools=list(data.get("tools") or []),
             stage_id=stage_id,
+            unbound_predicates=list(data.get("unbound_predicates") or []),
         )
 
 
@@ -90,6 +93,7 @@ def node_from_stage(stage: Stage) -> PlanNode:
         needs_user_decision="checkpoint" in interaction,
         tools=list(getattr(stage, "recommended_agents", None) or []),
         stage_id=stage.id,
+        unbound_predicates=list(getattr(stage, "unbound_predicates", None) or []),
     )
 
 
@@ -102,6 +106,7 @@ def attach_plan_metadata(stages: Iterable[Stage]) -> list[PlanNode]:
         stage.requires = list(node.requires)
         stage.produces = list(node.produces)
         stage.success_predicates = list(node.success_predicates)
+        stage.unbound_predicates = list(node.unbound_predicates)
         nodes.append(node)
     return nodes
 
@@ -167,9 +172,42 @@ def compile_stages(
             if node.produces:
                 stage.produces = list(node.produces)
             if node.success_predicates:
-                stage.success_predicates = list(node.success_predicates)
+                bound = [
+                    name for name in node.success_predicates
+                    if name in KNOWN_COMPLETIONS
+                ]
+                unbound = [
+                    name for name in node.success_predicates
+                    if name not in KNOWN_COMPLETIONS
+                ]
+                if bound:
+                    stage.success_predicates = list(dict.fromkeys(
+                        list(stage.success_predicates or stage.completion) + bound
+                    ))
+                stage.unbound_predicates = list(dict.fromkeys(
+                    list(stage.unbound_predicates) + unbound
+                ))
+    for stage in stages:
+        _apply_tool_effect_floor(stage)
     nodes = attach_plan_metadata(stages)
     return stages, nodes, rejected
+
+
+def _apply_tool_effect_floor(stage: Stage) -> None:
+    """A Stage can never claim less effect than its executable tool allowlist."""
+    try:
+        from ..service.orchestrator import stage_tool_names
+        from ..tools import registry
+
+        registry.load_all()
+        effects = [normalize_effect(stage.effect_level)]
+        for name in stage_tool_names(stage.id):
+            spec = registry.get(name)
+            if spec is not None:
+                effects.append(normalize_effect(spec.effect_level))
+        stage.effect_level = max(effects).name
+    except Exception:  # noqa: BLE001
+        stage.effect_level = normalize_effect(stage.effect_level).name
 
 
 def proposal_fingerprint(nodes: Iterable[PlanNode | Mapping[str, Any]]) -> tuple[str, ...]:
@@ -184,6 +222,64 @@ def proposal_fingerprint(nodes: Iterable[PlanNode | Mapping[str, Any]]) -> tuple
     return tuple(name for name in names if name)
 
 
+_PROTECTED_TAIL_IDS = frozenset({
+    "configure_device",
+    "transmit_bounded",
+    "run_bounded",
+    "over_air_verification",
+    "runtime_observation",
+    "stop_and_finalize",
+    "stop_runtime",
+})
+_PROTECTED_EFFECTS = frozenset({"DEVICE_CONFIG", "RF_RUN"})
+
+
+def protected_tail_ids(deferred: Iterable[Any]) -> set[str]:
+    """Stage ids a replan must not drop: granted RF work and safety stop."""
+    ids: set[str] = set()
+    for item in deferred or []:
+        if isinstance(item, Mapping):
+            stage_id = str(item.get("id") or item.get("stage_id") or "")
+            effect = str(item.get("effect_level") or item.get("effect") or "")
+            finalizer = bool(item.get("safety_finalizer"))
+        else:
+            stage_id = str(getattr(item, "id", "") or getattr(item, "stage_id", "") or "")
+            effect = str(getattr(item, "effect_level", "") or "")
+            finalizer = bool(getattr(item, "safety_finalizer", False))
+        if not stage_id:
+            continue
+        if (
+            stage_id in _PROTECTED_TAIL_IDS
+            or effect in _PROTECTED_EFFECTS
+            or finalizer
+        ):
+            ids.add(stage_id)
+    return ids
+
+
+def tail_needs_replan_proposal(deferred: Iterable[Any]) -> bool:
+    """True when an LLM tail rewrite could still change upcoming work.
+
+    An empty tail, or a tail that is only the safety stop, is already bound
+    by the grant.  Calling the model here only adds a blocking round-trip.
+    """
+    items = list(deferred or [])
+    if not items:
+        return False
+    stop_ids = {"stop_and_finalize", "stop_runtime"}
+    for item in items:
+        if isinstance(item, Mapping):
+            stage_id = str(item.get("id") or "")
+            finalizer = bool(item.get("safety_finalizer"))
+        else:
+            stage_id = str(getattr(item, "id", "") or "")
+            finalizer = bool(getattr(item, "safety_finalizer", False))
+        if finalizer or stage_id in stop_ids:
+            continue
+        return True
+    return False
+
+
 def replan_tail(
     deferred: list[dict[str, Any]],
     *,
@@ -193,7 +289,9 @@ def replan_tail(
     """Rebuild an unexecuted tail from a compiler-checked proposal.
 
     Invalid or empty proposals keep the existing deferred plan.  A proposal
-    that matches the deferred fingerprint is treated as no-op.
+    that matches the deferred fingerprint is treated as no-op.  A proposal
+    that drops already-authorized device/RF or safety-finalizer stages is
+    also treated as invalid.
     """
     if not proposal:
         return list(deferred or [])
@@ -206,13 +304,16 @@ def replan_tail(
     )
     if proposed_ids == current_ids:
         return list(deferred or [])
+    protected = protected_tail_ids(deferred)
+    if protected and not protected.issubset(set(proposed_ids)):
+        return list(deferred or [])
     rebuilt = []
     deferred_by_id = {
         str(item.get("id") or ""): item
         for item in deferred or []
         if isinstance(item, Mapping)
     }
-    catalog_by_id = _catalog_stage_index(catalog)
+    catalog_by_id = catalog_stage_index(catalog)
     for node in accepted:
         action_id = node.stage_id or node.id
         existing = deferred_by_id.get(action_id)
@@ -222,10 +323,12 @@ def replan_tail(
         fragment = catalog_by_id.get(action_id)
         if fragment is not None:
             rebuilt.append(dict(fragment))
+    if protected and not protected.issubset(protected_tail_ids(rebuilt)):
+        return list(deferred or [])
     return rebuilt or list(deferred or [])
 
 
-def _catalog_stage_index(
+def catalog_stage_index(
     catalog: Mapping[str, Any] | None,
 ) -> dict[str, dict[str, Any]]:
     index: dict[str, dict[str, Any]] = {}

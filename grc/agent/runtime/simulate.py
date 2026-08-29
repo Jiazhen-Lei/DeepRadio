@@ -31,12 +31,12 @@
 
 from __future__ import annotations
 
-import importlib.util
 import logging
 import math
 import os
 import tempfile
 import threading
+import types
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -303,6 +303,12 @@ def spectrum_peak_report(iq, samp_rate: float, fft_size: int = 4096) -> dict:
         "fft_bin": peak_bin, "peak_bin": peak_bin, "fft_size": n,
         "sample_rate": float(samp_rate), "window": "hann",
         "fft_shifted": True, "dc_excluded": dc_excluded,
+        "bin_resolution_hz": float(samp_rate) / float(n),
+        "peak_interpretation": (
+            "strongest_non_dc_bin_after_dc_spike_exclusion"
+            if dc_excluded else "strongest_fft_bin"
+        ),
+        "dc_exclusion_policy": "exclude_center_bin_only_when_6db_above_neighbors",
         "dc_dbfs": float(magnitude_dbfs[dc_bin]) if 0 <= dc_bin < n else None,
     }
 
@@ -434,6 +440,18 @@ def ber_report(tx_bits, rx_bits, *, max_delay: int = 512,
                 "error": "alignment_failed", "compared_bits": 0,
                 "bit_errors": 0, "inversion_applied": False}
     value, _, delay, direction, inverted, errors, compared = best
+    # Wilson one-sided 95% upper bound.  A measured BER of zero therefore
+    # remains a finite-sample statement rather than an assertion of zero
+    # population error rate.
+    z = 1.6448536269514722
+    proportion = errors / compared
+    denominator = 1.0 + (z * z) / compared
+    center = proportion + (z * z) / (2.0 * compared)
+    radius = z * math.sqrt(
+        (proportion * (1.0 - proportion) / compared)
+        + (z * z) / (4.0 * compared * compared)
+    )
+    confidence_upper_bound = min(1.0, (center + radius) / denominator)
     return {
         "valid": True,
         "metric": "ber",
@@ -445,6 +463,9 @@ def ber_report(tx_bits, rx_bits, *, max_delay: int = 512,
         "alignment_method": "bounded_delay_search",
         "max_delay_bits": search,
         "inversion_applied": inverted,
+        "confidence_level": 0.95,
+        "confidence_method": "wilson_one_sided",
+        "confidence_upper_bound": confidence_upper_bound,
     }
 
 
@@ -497,10 +518,18 @@ def generate_script(flow_graph, out_dir: str) -> str:
 
 
 def _load_top_block_class(script_path: str):
-    """动态载入生成的脚本,取出 top_block 类(有 start 方法者)。"""
-    spec = importlib.util.spec_from_file_location("_grc_sim_gen", script_path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    """Compile the current generated source without consulting ``.pyc``.
+
+    A flowgraph can be regenerated at the same path, with the same byte size,
+    within one filesystem timestamp tick.  Import loaders may then accept the
+    previous bytecode cache and execute a stale graph.  Simulation is a
+    verification boundary, so it must compile the bytes just generated.
+    """
+    module = types.ModuleType("_grc_sim_gen")
+    module.__file__ = script_path
+    with open(script_path, "rb") as handle:
+        source = handle.read()
+    exec(compile(source, script_path, "exec"), module.__dict__)
     for _name, obj in vars(module).items():
         if (isinstance(obj, type) and hasattr(obj, "start")
                 and getattr(obj, "__module__", None) == module.__name__):

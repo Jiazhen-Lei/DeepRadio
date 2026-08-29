@@ -159,6 +159,7 @@ class ServiceAgent:
     def __init__(self, session_id: Optional[str] = None,
                  profile: Any = None, platform: Any = None):
         self.session_id = session_id or f"gui-{uuid.uuid4().hex[:8]}"
+        _store.ensure_run_metadata(self.session_id)
         # 统一用 memory.profile.UserProfile(创新 B);GUI 通过 ctx.profile 驱动。
         self.profile = profile if isinstance(profile, UserProfile) \
             else UserProfile()
@@ -792,6 +793,13 @@ class ServiceAgent:
     def _execute_stage(
         self, ctx: ToolContext, stage: Any, stage_text: str, recipe: str, simulate: bool
     ) -> AgentReply:
+        if (
+            str(getattr(stage, "interaction", "") or "") == "checkpoint"
+            and not getattr(stage, "resume_pending", False)
+        ):
+            if stage.execution_status != "waiting":
+                self._workflow._activate_current()
+            return self._workflow_waiting_reply()
         if stage.id in _HOST_CONTROLLED_STAGES or self._prefer_host_stage(stage, recipe):
             return self._run_stage_deterministic(
                 ctx, stage_text, recipe, simulate, stage.id
@@ -952,13 +960,14 @@ class ServiceAgent:
             self.session_id,
             "checkpoint_command_received",
             self._workflow_event_payload(
-                {"checkpoint_id": checkpoint_id, "decision": decision}
+                {"checkpoint_id": checkpoint_id, "decision": decision,
+                 "purpose": checkpoint.purpose}
             ),
         )
         stage_id = stage.id if stage else ""
         self._state.decisions.append(WorkflowDecision(
             decision_id=f"decision-{uuid.uuid4().hex[:8]}",
-            key="checkpoint_decision",
+            key=f"checkpoint:{checkpoint.purpose}",
             value=decision,
             source="gui",
             effect_level=str(checkpoint.requested_effect or "READ"),
@@ -967,6 +976,10 @@ class ServiceAgent:
         ))
         if decision == "approved":
             effect = str(checkpoint.requested_effect or "READ")
+            if is_rf_grant_effect(effect) and checkpoint.purpose != "rf_authorization":
+                return self._error_reply(
+                    "只有 rf_authorization Checkpoint 可以授予 RF_RUN。"
+                )
             if effect not in self._state.runtime.granted_effects:
                 self._state.runtime.granted_effects.append(effect)
         if stage_id == "rf_plan_confirmation":
@@ -975,6 +988,7 @@ class ServiceAgent:
             rf_plan = {
                 "status": decision,
                 "checkpoint_id": checkpoint_id,
+                "purpose": checkpoint.purpose,
                 "device": dict(
                     self._state.project.config.get("observed_device") or {}
                 ),
@@ -1458,21 +1472,27 @@ class ServiceAgent:
 
         slots = self._workflow.workflow.intent.slots if self._workflow.workflow else {}
         result = registry.call(
-            "build_usrp_rx_spectrum_flowgraph",
+            "build_sdr_rx_spectrum_flowgraph",
             {
+                "device_type": slots.get("hardware"),
                 "center_freq": slots.get("carrier_frequency"),
                 "sample_rate": slots.get("sample_rate"),
-                "device_args": device_args_for("b210"),
+                "device_args": str(
+                    (self._state.project.config.get("observed_device") or {}).get(
+                        "identity"
+                    )
+                    or device_args_for(str(slots.get("hardware") or ""))
+                ),
             },
             ctx,
         )
-        self._record_tool_result(ctx, "build_usrp_rx_spectrum_flowgraph", result)
+        self._record_tool_result(ctx, "build_sdr_rx_spectrum_flowgraph", result)
         if result.get("grc_path"):
             ctx.extra.setdefault("artifacts", {})["grc_path"] = result["grc_path"]
         validation = self._validate_loaded(ctx)
         self._record_tool_result(ctx, "validate_flowgraph", validation)
         note = result.get("error") or (
-            "已生成 B210 接收实时频谱流图（QT GUI Frequency Sink）。"
+            "已生成所选 SDR 的实时接收频谱流图（QT GUI Frequency Sink）。"
             "尚未启动 RF；实时频谱会在 GNU Radio QT 窗口中显示，而不是对话里的 PNG。"
             if result.get("ok")
             else "无法生成 B210 接收频谱流图。"
@@ -1745,6 +1765,7 @@ class ServiceAgent:
                 unresolved.setdefault("id", f"pending-{uuid.uuid4().hex[:8]}")
                 unresolved["checkpoint_id"] = current.checkpoint.id
                 unresolved["requested_effect"] = current.checkpoint.requested_effect
+                unresolved["purpose"] = current.checkpoint.purpose
             reply.stage = "WAITING" if capability_blocker else "CONFIRM"
             reply.needs_confirmation = not bool(capability_blocker)
             if unresolved is not None:
@@ -1760,6 +1781,7 @@ class ServiceAgent:
                     "checkpoint_id": current.checkpoint.id,
                     "stage_id": current.id,
                     "requested_effect": current.checkpoint.requested_effect,
+                    "purpose": current.checkpoint.purpose,
                     "approved": False,
                 }
                 if is_rf_grant_effect(current.checkpoint.requested_effect):
@@ -1781,6 +1803,7 @@ class ServiceAgent:
                         "blocked" if capability_blocker else "awaiting_user"
                     ),
                     "checkpoint_id": current.checkpoint.id,
+                    "purpose": current.checkpoint.purpose,
                     "device": observed,
                     "center_frequency": slots.get("carrier_frequency"),
                     "sample_rate": slots.get("sample_rate"),
@@ -1816,6 +1839,7 @@ class ServiceAgent:
                         )
                     ),
                     "requested_effect": current.checkpoint.requested_effect,
+                    "purpose": current.checkpoint.purpose,
                     "blocker": capability_blocker,
                     "can_confirm": not bool(capability_blocker),
                     "can_retry": bool(
@@ -1871,6 +1895,7 @@ class ServiceAgent:
             for key in (
                 "modulation", "channel", "protocol", "local_name", "hardware",
                 "carrier_frequency", "sample_rate", "duration_seconds",
+                "signal_source_scope",
             ):
                 value = slots.get(key)
                 if value not in (None, "", []):
@@ -1908,6 +1933,8 @@ class ServiceAgent:
             record_claim=self._record_claim,
             semantic_hash=_flowgraph_semantic_hash,
         )
+        if self._workflow.workflow is not None:
+            self._workflow.workflow.quality = self._state.runtime.quality
 
     def _record_claim(
         self,
@@ -1921,6 +1948,7 @@ class ServiceAgent:
         *,
         producer: str = "",
         measurement_id: str = "",
+        evidence_grade: str = "system_verified",
     ) -> None:
         store = ClaimStore(self._state)
         version = int(self._state.project.flowgraph_version)
@@ -1946,6 +1974,7 @@ class ServiceAgent:
                 project_version=version,
                 artifact=artifact,
                 measurement_id=mid,
+                evidence_grade=evidence_grade,
             ),
             passed=passed,
         )
@@ -1963,6 +1992,8 @@ class ServiceAgent:
         details.setdefault("evidence_kind", "human_confirmation")
         artifact = str(details.get("artifact") or "")
         details["evidence_complete"] = bool(artifact)
+        evidence_grade = "attached_capture" if artifact else "human_statement"
+        details["evidence_grade"] = evidence_grade
         self._record_claim(
             "ota_ble_local_name_observed",
             "External receiver observed the requested BLE Complete Local Name",
@@ -1972,6 +2003,7 @@ class ServiceAgent:
             observed,
             artifact=artifact,
             producer="over_air_verification",
+            evidence_grade=evidence_grade,
         )
 
     def _current_grc_artifacts(self) -> Dict[str, str]:
@@ -2016,6 +2048,8 @@ class ServiceAgent:
             "requested_effect": self._state.runtime.requested_effect,
             "granted_effects": list(self._state.runtime.granted_effects),
             "blocker": dict(self._state.runtime.blocker),
+            "quality": self._state.runtime.quality,
+            "warnings": list(self._state.runtime.warnings),
         }
         return digest
 
@@ -2183,6 +2217,7 @@ class ServiceAgent:
         store = ClaimStore(self._state)
         version = int(self._state.project.flowgraph_version)
         for claim_id, statement, report_key in (
+            ("evm_measured", "EVM measured from a bound IQ probe", "evm_report"),
             ("ber_measured", "BER measured from bound TX/RX probes", "ber_report"),
             ("spectrum_peak_measured", "Spectrum peak measured with calibrated frequency axis", "spectrum_peak_report"),
         ):
@@ -2210,6 +2245,7 @@ class ServiceAgent:
                         or metrics.get("measurement_id")
                         or ""
                     ),
+                    evidence_grade="system_measurement",
                 ),
                 passed=True,
             )
@@ -2281,22 +2317,14 @@ class ServiceAgent:
         }
         export_dir = str(ctx.extra.get("export_dir") or "")
         if export_dir:
-            exported = []
-            seen_src = set()
-            for value in artifacts.values():
-                if not isinstance(value, str) or not os.path.isfile(value):
-                    continue
-                if os.path.basename(value) == "manifest.json":
-                    continue
-                abs_src = os.path.abspath(value)
-                if abs_src in seen_src:
-                    continue
-                seen_src.add(abs_src)
-                copied = _store.export_artifact(value, export_dir)
-                if copied:
-                    exported.append(copied)
-            _store.rewrite_exported_grc_paths(self.session_id, export_dir)
-            _store.write_export_manifest(self.session_id, export_dir, exported)
+            _store.export_session_artifacts(
+                self.session_id,
+                export_dir,
+                [
+                    value for value in artifacts.values()
+                    if isinstance(value, str) and os.path.isfile(value)
+                ],
+            )
         state = ctx.extra.get("state")
         if state is not None:
             reply.claims = ClaimStore(state).summary()
@@ -2425,6 +2453,25 @@ class ServiceAgent:
                     )
                 marks.append(label)
             parts = list(dict.fromkeys(marks))
+            metrics = dict(ctx.extra.get("metrics") or {})
+            source_scope = str(metrics.get("signal_source_scope") or "")
+            source_labels = {
+                "generated_fixture": "测量来源：自包含生成测试夹具（不是当前空口）。",
+                "current_project_offline": "测量来源：当前工程离线仿真（不是实时接收）。",
+                "live_device": "测量来源：已绑定的实时硬件接收路径。",
+            }
+            if source_labels.get(source_scope):
+                parts.append(source_labels[source_scope])
+            ber = metrics.get("ber_report")
+            if isinstance(ber, dict) and ber.get("valid"):
+                parts.append(
+                    "BER={}（{}/{} bit；95% 单侧上界={}；{}）。".format(
+                        ber.get("value"), ber.get("bit_errors"),
+                        ber.get("compared_bits"),
+                        ber.get("confidence_upper_bound"),
+                        ber.get("alignment_method") or "alignment unavailable",
+                    )
+                )
             if narrative:
                 parts.append(narrative)
             return "\n".join(parts) if parts else (narrative or "")

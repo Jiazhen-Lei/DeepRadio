@@ -288,12 +288,16 @@ class ClaimsPanel(Gtk.Frame):
             pending_view.setdefault(
                 "requested_effect", workflow_view.get("requested_effect") or ""
             )
+            pending_view.setdefault(
+                "purpose", workflow_view.get("checkpoint_purpose") or ""
+            )
             if not pending_view.get("checkpoint_id") and workflow_view.get("checkpoint_id"):
                 pending_view = {
                     "action": workflow_view.get("current_stage") or "workflow_checkpoint",
                     "reason": workflow_view.get("waiting_reason") or "继续当前 Workflow",
                     "checkpoint_id": workflow_view.get("checkpoint_id"),
                     "requested_effect": workflow_view.get("requested_effect") or "",
+                    "purpose": workflow_view.get("checkpoint_purpose") or "",
                     "approved": False,
                 }
         elif wait == "recovery":
@@ -375,6 +379,7 @@ class ClaimsPanel(Gtk.Frame):
             total = workflow.get("stage_total") or 0
             status = str(workflow.get("execution_status") or "")
             outcome = str(workflow.get("outcome") or "")
+            quality = str(workflow.get("quality") or "clean")
             text = "任务: {}  |  阶段: {} {}/{}  |  状态: {}".format(
                 task, stage, index, total, outcome or status or "—"
             )
@@ -388,6 +393,8 @@ class ClaimsPanel(Gtk.Frame):
                     "capability": "系统能力未就绪",
                 }
                 text += "  ·  " + wait_labels.get(wait_kind, wait_kind)
+            if quality != "clean":
+                text += "  ·  质量: " + quality
             self._activity_label.set_text(text)
             self._set_runtime_line(workflow)
             return
@@ -447,6 +454,15 @@ class ClaimsPanel(Gtk.Frame):
         capabilities = workflow.get("capabilities") or []
         if capabilities:
             lines.append("capabilities=" + ", ".join(capabilities))
+        quality = str(workflow.get("quality") or "clean")
+        lines.append("quality=" + quality)
+        warnings = list(
+            ((workflow.get("control_state") or {}).get("warnings") or [])
+        )
+        for warning in warnings:
+            lines.append("warning=" + json.dumps(
+                warning, ensure_ascii=False, sort_keys=True
+            ))
         blockers = list(workflow.get("missing_slots") or []) + list(
             workflow.get("validation_errors") or []
         )
@@ -655,6 +671,11 @@ class ClaimsPanel(Gtk.Frame):
                     or pending.get("requested_effect")
                     or ""
                 ),
+                "purpose": (
+                    self._last_workflow.get("checkpoint_purpose")
+                    or pending.get("purpose")
+                    or ""
+                ),
                 "can_retry": bool(
                     (self._last_workflow.get("runtime") or {}).get("can_retry")
                 ),
@@ -667,6 +688,9 @@ class ClaimsPanel(Gtk.Frame):
     def _set_pending(self, pending):
         pending = pending or {}
         action = str(pending.get("action") or "")
+        purpose = str(pending.get("purpose") or "")
+        if not purpose and str(pending.get("requested_effect") or "") == "RF_RUN":
+            purpose = "rf_authorization"
         recipe = str(pending.get("recipe") or "")
         from_recipe = str(pending.get("from_recipe") or "")
         visible = bool(action) and not pending.get("approved")
@@ -705,8 +729,7 @@ class ClaimsPanel(Gtk.Frame):
                     if pending.get("tx_gain") is not None
                     else "功率参数未设置"
                 )
-                effect = str(pending.get("requested_effect") or "")
-                if effect in ("DEVICE_CONFIG", "RF_RUN"):
+                if purpose == "rf_authorization":
                     text = (
                         "RF 安全确认: {} [{}] · {} · {} · BW {} · {}。"
                         "批准后将启动最长 {} 秒的受控发射；"
@@ -746,9 +769,10 @@ class ClaimsPanel(Gtk.Frame):
                 self._confirm_btn.set_label("已看到目标名称")
                 self._cancel_btn.set_label("未看到")
             elif action == "rf_plan_confirmation":
-                effect = str(pending.get("requested_effect") or "")
-                if effect in ("DEVICE_CONFIG", "RF_RUN"):
+                if purpose == "rf_authorization":
                     self._confirm_btn.set_label("批准有限时长发射")
+                elif purpose == "config_handoff":
+                    self._confirm_btn.set_label("确认已保存")
                 else:
                     self._confirm_btn.set_label("确认配置")
                 self._cancel_btn.set_label("取消")

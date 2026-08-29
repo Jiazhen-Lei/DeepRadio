@@ -31,6 +31,19 @@ from .hardware_profiles import (
 from .registry import ToolContext, call, tool
 
 
+def _grc_number(value: float) -> str:
+    """Render a numeric literal without introducing an invalid float suffix.
+
+    GRC propagates expression types between connected block parameters.  A
+    mathematically integral sample rate therefore needs an integer literal
+    (``2000000``), while genuinely fractional values keep their precision.
+    """
+    number = float(value)
+    if number.is_integer():
+        return str(int(number))
+    return format(number, ".15g")
+
+
 def _run(command: list[str], timeout: float = 15.0) -> Dict[str, Any]:
     executable = shutil.which(command[0])
     if not executable:
@@ -830,7 +843,11 @@ def build_sdr_tx_flowgraph(
     )
     invoke(
         "add_block",
-        {"key": "variable", "id": "samp_rate", "params": {"value": str(rate)}},
+        {
+            "key": "variable",
+            "id": "samp_rate",
+            "params": {"value": _grc_number(rate)},
+        },
     )
     invoke(
         "add_block",
@@ -1051,7 +1068,7 @@ def build_usrp_rx_spectrum_flowgraph(
         {
             "key": "variable",
             "id": "samp_rate",
-            "params": {"value": str(rate)},
+            "params": {"value": _grc_number(rate)},
         },
     )
     source = invoke(
@@ -1128,4 +1145,153 @@ def build_usrp_rx_spectrum_flowgraph(
         "gain": rx_gain,
         "not_started": True,
         "realtime_ui": "qtgui_freq_sink_x",
+    }
+
+
+@tool(
+    name="build_sdr_rx_spectrum_flowgraph",
+    description=(
+        "Build a receive-only SDR to QT frequency-sink flowgraph for the "
+        "selected HardwareProfile. Saves and validates it without starting."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "device_type": {"type": "string"},
+            "center_freq": {"type": "number"},
+            "sample_rate": {"type": "number"},
+            "gain": {"type": "number"},
+            "device_args": {"type": "string"},
+        },
+        "required": ["device_type", "center_freq", "sample_rate"],
+    },
+    group="hardware",
+    origin="deepradio_compose",
+    runtime="gnuradio_blocks",
+    effect_level="ARTIFACT_WRITE",
+)
+def build_sdr_rx_spectrum_flowgraph(
+    ctx: ToolContext,
+    device_type: str,
+    center_freq: float,
+    sample_rate: float,
+    gain: float = 20.0,
+    device_args: str = "",
+) -> Dict[str, Any]:
+    hardware = normalize_hardware(device_type)
+    profile = resolve_hardware_profile(hardware)
+    if profile is None:
+        return {"ok": False, "error": f"未知 SDR 类型: {device_type}"}
+    freq = float(center_freq)
+    rate = float(sample_rate)
+    if freq <= 0 or rate <= 0:
+        return {"ok": False, "error": "中心频率和采样率必须为正数"}
+    low, high = profile.frequency_range
+    if not low <= freq <= high:
+        return {
+            "ok": False,
+            "error": f"中心频率超出 {profile.label} 的声明能力范围",
+        }
+    if profile.driver_family == "uhd":
+        result = build_usrp_rx_spectrum_flowgraph(
+            ctx,
+            center_freq=freq,
+            sample_rate=rate,
+            gain=gain,
+            device_args=device_args_for(hardware, device_args),
+        )
+        result.update({
+            "hardware": hardware,
+            "signal_source_scope": "live_device",
+        })
+        state = ctx.extra.get("state")
+        if state is not None and result.get("ok"):
+            state.project.config["signal_source_scope"] = "live_device"
+        return result
+    if profile.driver_family != "iio":
+        return {
+            "ok": False,
+            "error": f"{profile.label} 尚无接收频谱 builder",
+        }
+
+    steps: list[Dict[str, Any]] = []
+
+    def invoke(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        result = call(name, args, ctx)
+        steps.append({
+            "tool": name,
+            "ok": bool(result.get("ok")),
+            "error": result.get("error"),
+        })
+        return result
+
+    invoke(
+        "init_flow_graph",
+        {"flowgraph_id": f"{hardware}_rx_spectrum", "generate_options": "qt_gui"},
+    )
+    invoke("add_block", {
+        "key": "variable",
+        "id": "samp_rate",
+        "params": {"value": _grc_number(rate)},
+    })
+    source = invoke("add_block", {
+        "key": "iio_pluto_source",
+        "id": "sdr_source",
+        "params": {
+            "type": "fc32",
+            "uri": repr(device_args),
+            "frequency": str(int(freq)),
+            "samplerate": "samp_rate",
+            "bandwidth": str(int(rate)),
+            "buffer_size": "32768",
+            "gain1": repr("slow_attack"),
+            "filter_source": repr("Auto"),
+        },
+    })
+    sink = invoke("add_block", {
+        "key": "qtgui_freq_sink_x",
+        "id": "rx_spectrum",
+        "params": {
+            "type": "complex",
+            "name": repr(f"{profile.label} RX Spectrum"),
+            "fftsize": "1024",
+            "fc": str(freq),
+            "bw": "samp_rate",
+            "wintype": "window.WIN_BLACKMAN_hARRIS",
+        },
+    })
+    connected = invoke("connect", {
+        "src_id": "sdr_source", "dst_id": "rx_spectrum",
+    }) if source.get("ok") and sink.get("ok") else {"ok": False}
+    validation = invoke("validate_flowgraph", {})
+    rendered = invoke("render_grc", {}) if validation.get("valid") else {"ok": False}
+    if rendered.get("path"):
+        ctx.extra.setdefault("artifacts", {})["grc_path"] = rendered["path"]
+        state = ctx.extra.get("state")
+        if state is not None:
+            state.project.grc_path = rendered["path"]
+            state.project.flowgraph_version += 1
+            state.project.config.update({
+                "recipe": f"{hardware}_rx_spectrum",
+                "hardware": hardware,
+                "direction": "rx",
+                "carrier_frequency": freq,
+                "sample_rate": rate,
+                "signal_source_scope": "live_device",
+                "rf_active": False,
+            })
+    return {
+        "ok": bool(validation.get("valid") and rendered.get("ok") and connected.get("ok")),
+        "valid": bool(validation.get("valid")),
+        "grc_path": rendered.get("path"),
+        "steps": steps,
+        "errors": validation.get("errors", []),
+        "center_freq": freq,
+        "sample_rate": rate,
+        "gain_mode": "slow_attack",
+        "hardware": hardware,
+        "source_key": "iio_pluto_source",
+        "not_started": True,
+        "realtime_ui": "qtgui_freq_sink_x",
+        "signal_source_scope": "live_device",
     }

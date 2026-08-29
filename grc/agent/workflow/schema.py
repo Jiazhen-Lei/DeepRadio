@@ -17,6 +17,7 @@ TURN_RELATIONS = frozenset(
 EFFECT_LEVELS = frozenset(
     {"READ", "ARTIFACT_WRITE", "DEVICE_READ", "DEVICE_CONFIG", "RF_RUN"}
 )
+QUALITY_LEVELS = frozenset({"clean", "warning", "failed"})
 
 
 @dataclass
@@ -77,6 +78,7 @@ class WorkflowIntent:
 @dataclass
 class Checkpoint:
     id: str
+    purpose: str = "generic_approval"
     decision_status: str = "pending"
     reason: str = ""
     action: str = ""
@@ -93,6 +95,7 @@ class Checkpoint:
     def from_dict(cls, data: Dict[str, Any]) -> "Checkpoint":
         item = cls(
             id=str(data.get("id") or ""),
+            purpose=str(data.get("purpose") or "generic_approval"),
             decision_status=str(data.get("decision_status") or "pending"),
             reason=str(data.get("reason") or ""),
             action=str(data.get("action") or ""),
@@ -130,6 +133,7 @@ class Stage:
     requires: List[str] = field(default_factory=list)
     produces: List[str] = field(default_factory=list)
     success_predicates: List[str] = field(default_factory=list)
+    unbound_predicates: List[str] = field(default_factory=list)
 
     def validate(self) -> None:
         if not self.id:
@@ -175,6 +179,7 @@ class Stage:
             requires=list(data.get("requires") or []),
             produces=list(data.get("produces") or []),
             success_predicates=list(data.get("success_predicates") or []),
+            unbound_predicates=list(data.get("unbound_predicates") or []),
         )
         item.validate()
         return item
@@ -188,6 +193,7 @@ class Workflow:
     stages: List[Stage]
     execution_status: str = "pending"
     outcome: str = ""
+    quality: str = "clean"
     revision: int = 1
     base_project_version: int = 0
     current_stage: str = ""
@@ -204,6 +210,8 @@ class Workflow:
             raise ValueError(f"非法 Workflow execution_status: {self.execution_status}")
         if self.outcome not in OUTCOMES:
             raise ValueError(f"非法 Workflow outcome: {self.outcome}")
+        if self.quality not in QUALITY_LEVELS:
+            raise ValueError(f"非法 Workflow quality: {self.quality}")
         if self.revision < 1 or self.base_project_version < 0:
             raise ValueError("Workflow revision/base_project_version 非法")
         self.intent.validate()
@@ -231,6 +239,7 @@ class Workflow:
             stages=[Stage.from_dict(stage) for stage in data.get("stages") or []],
             execution_status=str(data.get("execution_status") or "pending"),
             outcome=str(data.get("outcome") or ""),
+            quality=str(data.get("quality") or "clean"),
             revision=int(data.get("revision", 1)),
             base_project_version=int(data.get("base_project_version", 0)),
             current_stage=str(data.get("current_stage") or ""),

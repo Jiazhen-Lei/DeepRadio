@@ -28,6 +28,11 @@ class ClaimStore:
         current.statement = claim.statement
         current.layer = claim.layer
         current.project_version = claim.project_version
+        if claim.producer:
+            current.producer = claim.producer
+        if claim.measurement_id:
+            current.measurement_id = claim.measurement_id
+        current.stale_reason = claim.stale_reason
         if claim.evidence:
             current.evidence = claim.evidence
         elif not unchanged:
@@ -46,11 +51,14 @@ class ClaimStore:
             and item.observation == evidence.observation
             and item.project_version == evidence.project_version
             and item.artifact == evidence.artifact
+            and item.measurement_id == evidence.measurement_id
+            and item.evidence_grade == evidence.evidence_grade
             for item in claim.evidence
         )
         if not duplicate:
             claim.evidence.append(evidence)
         claim.project_version = evidence.project_version
+        claim.stale_reason = ""
         if passed is True:
             claim.status = "Passed"
         elif passed is False:

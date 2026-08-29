@@ -217,6 +217,7 @@ class WorkflowPresenterTest(unittest.TestCase):
     def test_checkpoint_buttons_are_stage_specific(self):
         self.panel._set_pending({
             "action": "rf_plan_confirmation",
+            "purpose": "rf_authorization",
             "requested_effect": "RF_RUN",
             "max_duration_seconds": 30,
             "device": {"type": "pluto", "identity": "usb:test.pluto"},
@@ -237,6 +238,7 @@ class WorkflowPresenterTest(unittest.TestCase):
 
         self.panel._set_pending({
             "action": "rf_plan_confirmation",
+            "purpose": "config_handoff",
             "device": {"type": "pluto", "identity": "usb:test.pluto"},
             "center_frequency": 2_402_000_000.0,
             "sample_rate": 2_000_000.0,
@@ -244,12 +246,13 @@ class WorkflowPresenterTest(unittest.TestCase):
             "tx_attenuation": 30.0,
             "approved": False,
         })
-        self.assertEqual(self.panel._confirm_btn.label, "确认配置")
+        self.assertEqual(self.panel._confirm_btn.label, "确认已保存")
         self.assertIn("不启动射频", self.panel._pending_label.text)
         self.assertNotIn("受控发射", self.panel._pending_label.text)
 
         self.panel._set_pending({
             "action": "rf_plan_confirmation",
+            "purpose": "device_configuration",
             "requested_effect": "DEVICE_READ",
             "device": {"type": "pluto", "identity": "usb:test.pluto"},
             "center_frequency": 2_402_000_000.0,
@@ -264,6 +267,7 @@ class WorkflowPresenterTest(unittest.TestCase):
 
         self.panel._set_pending({
             "action": "over_air_verification",
+            "purpose": "ota_observation",
             "approved": False,
         })
         self.assertEqual(self.panel._confirm_btn.label, "已看到目标名称")
@@ -271,6 +275,29 @@ class WorkflowPresenterTest(unittest.TestCase):
         self.assertTrue(self.panel._evidence_btn.visible)
         self.assertTrue(self.panel._evidence_btn.sensitive)
         self.assertIn("人工确认、附件缺失", self.panel._pending_label.text)
+
+    def test_quality_warning_is_visible_in_activity_and_inspector(self):
+        workflow = {
+            "task_label": "有限时长发射",
+            "stage_label": "运行观察",
+            "stage_index": 1,
+            "stage_total": 1,
+            "execution_status": "completed",
+            "quality": "warning",
+            "control_state": {
+                "warnings": [{
+                    "code": "rf_stream_quality",
+                    "underrun_count": 3,
+                    "overrun_count": 0,
+                }],
+            },
+            "stages": [],
+        }
+        self.panel._set_activity({}, workflow)
+        self.panel._set_workflow_details(workflow)
+        self.assertIn("质量: warning", self.panel._activity_label.text)
+        self.assertIn("quality=warning", self.panel._workflow_details.buffer.text)
+        self.assertIn("rf_stream_quality", self.panel._workflow_details.buffer.text)
 
     def test_completed_digest_clears_stale_checkpoint_buttons(self):
         self.panel._last_pending = {

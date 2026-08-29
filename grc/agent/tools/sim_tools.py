@@ -135,6 +135,9 @@ def run_simulation(ctx: ToolContext, probes: dict = None, timeout: float = 30.0)
                 norm[pid] = (str(spec.get("path")), str(spec.get("dtype", "complex64")))
     if not norm:
         norm = derive_probes(ctx) or None
+    # One simulation execution is one MeasurementRun.  Subsequent metric and
+    # plot tools share the new id, but never inherit the preceding run's id.
+    ctx.extra.pop("measurement_id", None)
     result = simulate.run(fg, ctx.platform, probes=norm,
                           out_dir=ctx.out_dir, timeout=timeout)
     ctx.last_sim = result
