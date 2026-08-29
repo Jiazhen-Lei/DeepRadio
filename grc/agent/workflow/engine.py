@@ -662,7 +662,7 @@ class WorkflowEngine:
             if "duration_seconds" in slots:
                 slot_sources["duration_seconds"] = (
                     "user" if re.search(
-                        r"(?:运行|持续|时长|duration)\s*[:=为]?\s*"
+                        r"(?:运行|持续|时长|发射|duration)\s*[:=为]?\s*"
                         r"\d+(?:\.\d+)?\s*(?:秒|s|sec(?:onds?)?)",
                         low,
                     ) else "safety_default"
@@ -1007,8 +1007,16 @@ class WorkflowEngine:
         if device and any(word in low for word in _BUILD_HINTS):
             slots["requires_build"] = True
         success = re.findall(r"(?:evm|ber)\s*(?:小于|低于|<|≤)\s*\d+(?:\.\d+)?\s*%?", low)
+        semantic_success = re.search(
+            r"(?:成功条件|验收条件|判定成功)\s*(?:为|是|[:：])?\s*"
+            r"([^，。；\n]+)",
+            str(text or ""),
+            re.I,
+        )
+        if semantic_success:
+            success.append(semantic_success.group(1).strip())
         if success:
-            slots["success_conditions"] = success
+            slots["success_conditions"] = list(dict.fromkeys(success))
         if slots.get("protocol") == "ble":
             ghz = re.search(r"(?<![0-9.])(\d+(?:\.\d+)?)\s*ghz", low)
             if ghz:
@@ -1066,6 +1074,11 @@ class WorkflowEngine:
     @staticmethod
     def _validate_slots(slots: Dict[str, Any]) -> list[str]:
         errors: list[str] = []
+        if (
+            str(slots.get("protocol") or "").lower() == "ble"
+            and str(slots.get("modulation") or "gfsk").lower() != "gfsk"
+        ):
+            errors.append("modulation_incompatible_with_ble")
         frequency = slots.get("carrier_frequency")
         if frequency is not None:
             try:

@@ -7,6 +7,100 @@
 
 ---
 
+## UI 目标对齐与实施记录（2026-08-29）
+
+### 结论
+
+目标界面以 `local/docs/jensen/273b186c647dde8b1425086f7f4724be.png` 和 `local/docs/jensen/deepradio-task-walkthrough-plan.md` 为准。此前方案只做到方向一致，尚未完全对齐：已有 SharedIntent、选择题和 Workflow Inspector，但 Radio Specification 仍是单行摘要，诊断结果没有形成可视步骤，Claims/日志/内部 ID 混在默认面板，而且旧工程的 BLE 配置会污染新诊断任务的规格视图。
+
+本轮修订后采用以下界面结构：
+
+```text
+真实 GRC Canvas（左）        DeepRadio 对话与交互卡片（右）
+                              ├── Radio Specification 可编辑表格
+                              ├── Workflow Stage 框图
+                              └── Diagnosis 步骤卡（仅诊断时出现）
+──────────────────────────────────────────────────────────
+右下角紧凑区：Task/Stage + Runtime controls + Claim summary
+```
+
+这仍是 GNU Radio Companion 内嵌界面，不改成 Web dashboard，也不把图中的 BLE 六格故事板写成固定流水线。Phase 由当前 state/checkpoint 推导；不同任务可跳过或回退阶段。
+
+### 默认保留、条件展示与隐藏字段
+
+| 层 | 默认展示 | 条件展示 | 仅保留的审计数据 |
+|---|---|---|---|
+| 意图 | 对话中的当前任务与等待原因 | 规格是否已对齐 | intent id/revision/hash、capabilities、原始 IntentIR 仅落 session，不进入用户界面 |
+| Radio Specification | 在对话内显示 Goal、协议/调制、Device、Channel/Carrier、Sample rate、时长、Success condition、字段来源 | 每个可编辑字段提供候选项与自定义填写；可一次提交整个表格 | 全量 slots、规则命中过程只落 session |
+| Workflow | 对话内以 Stage 框图显示 Passed/Failed/Current | 成功条件；验收条件数量只通过 tooltip 解释 | attempt、completion 明细、workflow id 仅落 session，不展示 |
+| Diagnosis | 对话内显示用户请求的检查维度、Passed/Failed/Unknown、短证据、修复建议 | 只有诊断任务出现；物理连接必须是 Unknown/人工证据，不能伪造 Passed | 原始 report JSON、厂商 CLI 全输出只落 session |
+| Claims | 右下角只显示 Failed/Stale/Not tested/Passed 摘要 | 用户主动展开时显示简短断言 | 完整 Evidence JSON、measurement id 不默认展示 |
+| Runtime | 右下角显示 RF 状态、run id、剩余时长、Stop/Emergency Stop | 授权或运行时出现 | PID、return code、原始 `U/O` 日志只落 session，不展示 |
+
+字段来源必须区分 `User`、`Protocol Default`、`Safety Default`、`Derived`、`Canvas` 和 `Unresolved`。默认值可以帮助补全规格，但安全时长和任务成功条件不能静默冒充用户决定。
+
+### 数据与展示边界
+
+保持主链不变：
+
+```text
+GUI → ServiceAgent → WorkflowEngine → StageExecutor
+    → deterministic handler / LLM subagent → Completion → SharedState
+```
+
+新增纯展示投影：
+
+```text
+SharedState + Workflow digest
+        ↓
+workflow_presenter（无 GTK、可单测）
+        ↓
+Phase / Specification / Diagnosis / Claims / Runtime ViewModel
+        ↓
+AgentPanel 对话卡 + ClaimsPanel 紧凑运行/证据区
+```
+
+GTK 不再自行解释底层 JSON。Subagent 也不能直接写 UI；它只能返回 ResultEnvelope/工具事实，由 host 投影到 SharedState，再生成 ViewModel。
+
+### 同步修复的底层问题
+
+1. `SharedState.spec_digest()` 以当前 `SharedIntent.parameters` 为规格真值，并携带 `parameter_sources` 与 `radio_specification` 行；存在活动意图时不从旧 `project.config` 补入无关协议、Local Name 或设备。
+2. BLE 物理部署的 Alignment Gate 除硬件和 Local Name 外，还要求用户显式确认最大时长与成功证据；Carrier、Channel 和 Sample rate 可保留协议默认并显示来源。
+3. 诊断按 `diagnosis_dimensions` 或用户文本中的领域维度生成 scope。纯硬件诊断不会因为画布上恰好打开旧 BLE 工程就进入 EVM 离线诊断。
+4. 硬件诊断与信号诊断分别使用 `hardware_diagnosis_report` 和 `signal_diagnosis_report`，禁止同名产物互相覆盖。
+5. 最新诊断以 `intent_id + intent_revision` 绑定保存；GUI 只展示与当前意图版本一致的 findings。Unknown 是合法诊断结论但会显示 warning，不会被渲染成 Passed。
+6. Claim 写入时绑定 `intent_id + intent_revision`。项目修改/重验仍可复用项目级 Claim，但纯硬件诊断等新 scope 的默认视图不会混入旧 BLE/仿真断言；完整历史仍保存在 SharedState。
+7. Runtime 卡新增可执行的 `Stop` 与 `Emergency Stop`；命令直接进入 host control plane，停止后撤销 RF grant，不依赖 LLM，也不推进或伪造 Workflow 完成状态。
+
+### 修改落点
+
+| 文件 | 修改职责 |
+|---|---|
+| `grc/gui/workflow_presenter.py` | 新增纯 ViewModel：Phase、Radio Specification、Diagnosis、Claims、Runtime |
+| `grc/gui/ClaimsPanel.py` | 精简为运行控制与 Claim 摘要；移除用户可见的内部 Workflow dump、PID 和原始日志 |
+| `grc/gui/AgentPanel.py` | 在对话流中渲染可编辑规格表、Workflow Stage 框图和 Diagnosis 卡；移除输入框上方重复状态字 |
+| `grc/agent/state/shared_state.py` | 当前意图优先的规格投影；增加版本绑定的 DiagnosisSnapshot |
+| `grc/agent/state/claim_store.py` | Claim 绑定意图版本；支持当前意图视图与完整历史两种投影 |
+| `grc/agent/knowledge/specs/requirements.json` | 声明式补充有界 RF 时长和成功证据要求 |
+| `grc/agent/knowledge/spec_requirements.py` | 识别“值存在但仍是未确认安全默认”的字段 |
+| `grc/agent/workflow/intent_alignment.py` | 处理结构化答案与来源；支持一次提交完整 Radio Specification，并对更新后的意图重新确认 |
+| `grc/agent/service/stage_handlers.py` | 诊断 scope 路由、报告角色分离、Unknown quality |
+| `grc/agent/service/adapter.py` | 将当前 intent revision 对应的 diagnosis 放入 workflow digest；处理 Stop/Emergency Stop host command |
+
+### 验收口径
+
+- 输入“我要用硬件发射一段 BLE 信号”时，先显示带未决项和来源的完整 Radio Specification，再逐项/成组补齐，不得只显示当前一个问题。
+- 对齐完成前不建立可执行 Workflow；用户修改任意规格后，卡片与 intent revision 同步更新。
+- 只读 PlutoSDR/B210 接入诊断只展示请求的驱动、发现、身份、probe、runtime、物理连接等步骤，不得自动插入 EVM。
+- 新任务不得显示上一任务的 Radio Specification、Claims 或 RF grant；诊断快照必须匹配当前 intent revision。
+- 画布被用户修改后，project version 增长，相关 Claims 变 Stale，并返回验证；重新 Passed 必须有新版本证据。
+- RF proposal 和 RF authorization 是两个 checkpoint；运行卡必须提供有界时长、Stop/Emergency Stop，并把 task success 与 runtime quality 分开。
+- 默认界面不出现 workflow hash、attempt/completion 明细、PID 和 `UUU`；这些信息保存在 session/state 中供离线审计，不在 GUI 保留旧 Developer Inspector。
+
+以上实现对齐的是目标图的信息架构和交互机制，不承诺每个像素与生成图一致；最终论文截图仍需在真实 GRC 中按 `(a)`～`(f)` 六个状态逐帧人工验收。
+
+自动验证结果（`gnuradio` Conda 环境）：agent tests `187 passed, 1 skipped`（跳过项为预期 HIL 条件），GUI tests `16 passed`；新增测试覆盖规格字段来源/未决项、Radio Specification 表格的一次性批量对齐、诊断卡 scope、模糊 BLE 对齐、新意图不继承旧 BLE 工程字段、Claim 的 intent 视图隔离，以及 GUI Emergency Stop 撤销 RF grant。GTK 像素布局、真实画布编辑回流与六帧论文截图仍属于人工 GUI 验收，不以 headless 单测替代。
+
 ## 0. 2026-08-29 增量：问题分析与当前实现
 
 ### 0.1 工程问题分析

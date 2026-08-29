@@ -86,6 +86,75 @@ class IntentAlignmentCoordinator:
             str(interaction.get("field") or ""), value, source="user_choice"
         )
 
+    def consume_updates(self, response: Dict[str, Any]) -> AlignmentOutcome:
+        """Apply one Radio Specification table submission atomically."""
+        shared = self.state.intent
+        interaction = dict(shared.interaction or {})
+        interaction_id = str(response.get("interaction_id") or "")
+        if interaction and interaction_id != str(interaction.get("interaction_id") or ""):
+            return AlignmentOutcome(True, message="意图交互已变化，请刷新后重试。")
+        if str(response.get("intent_id") or shared.intent_id) != shared.intent_id:
+            return AlignmentOutcome(True, message="意图已变化，请按最新规格修改。")
+        try:
+            base_revision = int(response.get("base_intent_revision") or 0)
+        except (TypeError, ValueError):
+            base_revision = 0
+        if base_revision != shared.revision:
+            return AlignmentOutcome(True, message="意图版本已变化，请按最新规格修改。")
+        updates = dict(response.get("updates") or {})
+        if not updates:
+            if interaction.get("kind") == "intent_confirmation":
+                return self._confirm()
+            return self._evaluate(
+                self._to_workflow_intent(shared), had_user_questions=True
+            )
+        changed = []
+        before = dict(shared.parameters or {})
+        for field, raw_value in updates.items():
+            field = str(field or "")
+            if not field:
+                continue
+            value = self._coerce(field, raw_value)
+            if value in (None, "", []):
+                continue
+            if field == "success_conditions" and not isinstance(value, list):
+                value = [str(value)]
+            if field == "advertising_channels":
+                if not isinstance(value, list):
+                    match = re.search(r"\d+", str(value))
+                    value = [int(match.group(0))] if match else []
+                if value:
+                    channel = int(value[0])
+                    centers = {37: 2_402_000_000.0, 38: 2_426_000_000.0, 39: 2_480_000_000.0}
+                    if channel in centers:
+                        shared.parameters["carrier_frequency"] = centers[channel]
+                        shared.parameter_sources["carrier_frequency"] = "derived"
+            if shared.parameters.get(field) != value or field in shared.missing_fields:
+                shared.parameters[field] = value
+                shared.parameter_sources[field] = "user_choice"
+                changed.append(field)
+            if field == "duration_seconds":
+                shared.parameters["max_duration_seconds"] = value
+                shared.parameter_sources["max_duration_seconds"] = "user_choice"
+        if not changed:
+            return self._evaluate(
+                self._to_workflow_intent(shared), had_user_questions=True
+            )
+        shared.revision += 1
+        shared.record_patch(
+            changed_fields=changed,
+            scope="intent_only",
+            source="radio_specification_table",
+            note="{} -> {}".format(before, shared.parameters),
+        )
+        self.event_sink(
+            "specification_table_updated",
+            {**self._event_payload(), "changed_fields": changed},
+        )
+        return self._evaluate(
+            self._to_workflow_intent(shared), had_user_questions=True
+        )
+
     def project_confirmed(self, intent: WorkflowIntent, *, source: str = "workflow") -> None:
         """Synchronize an active Workflow without granting it mutation authority."""
         shared = self.state.intent
@@ -159,6 +228,11 @@ class IntentAlignmentCoordinator:
         before = shared.parameters.get(field)
         shared.parameters[field] = value
         shared.parameter_sources[field] = source
+        if field == "duration_seconds":
+            shared.parameters["max_duration_seconds"] = value
+            shared.parameter_sources["max_duration_seconds"] = source
+        if field == "success_conditions" and not isinstance(value, list):
+            shared.parameters[field] = [str(value)]
         if field == "carrier_frequency" and str(shared.parameters.get("protocol") or "").lower() == "ble":
             channel_map = {2402000000.0: 37, 2426000000.0: 38, 2480000000.0: 39}
             try:
@@ -209,7 +283,8 @@ class IntentAlignmentCoordinator:
                 intent.task_type, intent.slots, self.state, intent.capabilities
             ))
             + missing_required_fields(
-                capabilities=intent.capabilities, slots=intent.slots
+                capabilities=intent.capabilities, slots=intent.slots,
+                slot_sources=intent.slot_sources,
             )
         ))
         intent.validation_errors = self.engine._validate_slots(intent.slots)
@@ -220,6 +295,8 @@ class IntentAlignmentCoordinator:
             field = str(intent.validation_errors[0]).removesuffix("_invalid")
             if field == "carrier_frequency_out_of_device_range":
                 field = "carrier_frequency"
+            if field == "modulation_incompatible_with_ble":
+                field = "modulation"
             return self._ask(field, validation_error=intent.validation_errors[0])
         if intent.missing_slots:
             return self._ask(intent.missing_slots[0])
@@ -404,6 +481,14 @@ class IntentAlignmentCoordinator:
         if field == "ebn0_db":
             match = re.search(r"[-+]?\d+(?:\.\d+)?", text)
             return float(match.group(0)) if match else text
+        if field == "duration_seconds":
+            match = re.search(r"\d+(?:\.\d+)?", text)
+            return float(match.group(0)) if match else text
+        if field == "success_conditions":
+            return [text] if text else []
+        if field == "advertising_channels":
+            match = re.search(r"\d+", text)
+            return [int(match.group(0))] if match else []
         if field == "current_project":
             return "current_canvas"
         return text

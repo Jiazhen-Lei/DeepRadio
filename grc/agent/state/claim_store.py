@@ -16,6 +16,10 @@ class ClaimStore:
         return next((c for c in self.state.claims if c.id == claim_id), None)
 
     def upsert(self, claim: Claim) -> Claim:
+        active = self.state.intent
+        if active.intent_id:
+            claim.intent_id = active.intent_id
+            claim.intent_revision = active.revision
         current = self.get(claim.id)
         if current is None:
             self.state.claims.append(claim)
@@ -33,6 +37,8 @@ class ClaimStore:
         if claim.measurement_id:
             current.measurement_id = claim.measurement_id
         current.stale_reason = claim.stale_reason
+        current.intent_id = claim.intent_id
+        current.intent_revision = claim.intent_revision
         if claim.evidence:
             current.evidence = claim.evidence
         elif not unchanged:
@@ -78,5 +84,9 @@ class ClaimStore:
                 invalidated.append(claim.id)
         return invalidated
 
-    def summary(self) -> List[dict]:
-        return [asdict(claim) for claim in self.state.claims]
+    def summary(self, *, active_intent_only: bool = False) -> List[dict]:
+        claims = list(self.state.claims)
+        intent_id = str(self.state.intent.intent_id or "")
+        if active_intent_only and intent_id:
+            claims = [claim for claim in claims if claim.intent_id == intent_id]
+        return [asdict(claim) for claim in claims]

@@ -6,9 +6,11 @@ import os
 import gi
 
 gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
 from gi.repository import Gdk, GObject, Gtk, Pango
 
 from grc.agent.knowledge.recipes import list_recipes
+from .workflow_presenter import present
 
 _MODULATIONS = ("bpsk", "qpsk", "ofdm")
 _CHANNELS = ("awgn",)
@@ -23,13 +25,18 @@ class ClaimsPanel(Gtk.Frame):
         "cancel-pending": (GObject.SignalFlags.RUN_FIRST, None, ()),
         "interaction-response": (GObject.SignalFlags.RUN_FIRST, None, (str,)),
         "retry-transmit": (GObject.SignalFlags.RUN_FIRST, None, ()),
+        "stop-runtime": (GObject.SignalFlags.RUN_FIRST, None, ()),
+        "emergency-stop": (GObject.SignalFlags.RUN_FIRST, None, ()),
     }
 
     def __init__(self):
-        Gtk.Frame.__init__(self, label="状态")
+        Gtk.Frame.__init__(self, label="运行与证据")
         self.set_size_request(-1, 120)
         root = Gtk.VBox(spacing=4)
-        self.add(root)
+        panel_scroll = Gtk.ScrolledWindow()
+        panel_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        panel_scroll.add(root)
+        self.add(panel_scroll)
 
         self._claims = []
         self._font_pt = 13
@@ -40,10 +47,19 @@ class ClaimsPanel(Gtk.Frame):
         self._last_pending = {}
         self._last_spec = {}
 
+        self._phase_label = Gtk.Label(label="ALIGN INTENT")
+        self._phase_label.set_halign(Gtk.Align.START)
+        self._phase_label.set_margin_start(4)
         root.pack_start(self._build_activity_bar(), False, False, 2)
-        root.pack_start(self._build_spec_bar(), False, False, 0)
+        self._hidden_spec_card = self._build_spec_bar()
+        self._hidden_diagnosis_card = self._build_diagnosis_card()
         root.pack_start(self._build_metrics_row(), False, False, 0)
-        root.pack_start(self._build_workflow_inspector(), False, False, 0)
+
+        self._claim_summary = Gtk.Label(label="Claims: 尚无可验证断言")
+        self._claim_summary.set_halign(Gtk.Align.START)
+        self._claim_summary.set_xalign(0.0)
+        self._claim_summary.set_margin_start(4)
+        root.pack_start(self._claim_summary, False, False, 0)
 
         self._store = Gtk.ListStore(str, str, str, int)
         self._view = Gtk.TreeView(model=self._store)
@@ -74,7 +90,7 @@ class ClaimsPanel(Gtk.Frame):
         scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scroll.set_min_content_height(48)
         scroll.add(self._view)
-        claims_expander = Gtk.Expander(label="Claims")
+        claims_expander = Gtk.Expander(label="Claims 证据详情")
         claims_expander.add(scroll)
         self._claims_expander = claims_expander
         root.pack_start(claims_expander, False, False, 0)
@@ -85,7 +101,6 @@ class ClaimsPanel(Gtk.Frame):
         self._hint.set_line_wrap(True)
         self._hint.set_halign(Gtk.Align.START)
         self._hint.set_margin_start(4)
-        root.pack_start(self._hint, False, False, 0)
 
         self._details = Gtk.TextView()
         self._details.set_editable(False)
@@ -99,39 +114,7 @@ class ClaimsPanel(Gtk.Frame):
         self._detail_scroll.set_size_request(-1, 48)
         self._detail_scroll.set_no_show_all(True)
         self._detail_scroll.add(self._details)
-        root.pack_start(self._detail_scroll, False, True, 0)
         self._apply_font()
-
-    def _build_workflow_inspector(self):
-        expander = Gtk.Expander(label="执行详情")
-        box = Gtk.VBox(spacing=2)
-        self._workflow_details = Gtk.TextView()
-        self._workflow_details.set_editable(False)
-        self._workflow_details.set_cursor_visible(False)
-        self._workflow_details.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
-        self._workflow_details.set_size_request(-1, 90)
-        box.pack_start(self._workflow_details, False, False, 0)
-
-        self._timeline_store = Gtk.ListStore(str, str, str, str)
-        view = Gtk.TreeView(model=self._timeline_store)
-        view.set_headers_visible(True)
-        for index, title in enumerate(("Seq", "Event", "Stage", "Actor")):
-            renderer = Gtk.CellRendererText()
-            renderer.set_property("ellipsize", Pango.EllipsizeMode.END)
-            column = Gtk.TreeViewColumn(title, renderer, text=index)
-            column.set_resizable(True)
-            if index == 1:
-                column.set_expand(True)
-            view.append_column(column)
-        scroll = Gtk.ScrolledWindow()
-        scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        scroll.set_min_content_height(72)
-        scroll.add(view)
-        box.pack_start(scroll, True, True, 0)
-        expander.add(box)
-        self._workflow_expander = expander
-        self._timeline_expander = expander
-        return expander
 
     def _build_activity_bar(self):
         box = Gtk.VBox(spacing=2)
@@ -149,6 +132,20 @@ class ClaimsPanel(Gtk.Frame):
         self._runtime_label.set_selectable(True)
         self._runtime_label.set_no_show_all(True)
         box.pack_start(self._runtime_label, False, False, 0)
+
+        runtime_controls = Gtk.HBox(spacing=4)
+        stop_btn = Gtk.Button(label="Stop")
+        stop_btn.connect("clicked", lambda _button: self.emit("stop-runtime"))
+        emergency_btn = Gtk.Button(label="Emergency Stop")
+        emergency_btn.connect(
+            "clicked", lambda _button: self.emit("emergency-stop")
+        )
+        runtime_controls.pack_start(stop_btn, False, False, 4)
+        runtime_controls.pack_start(emergency_btn, False, False, 0)
+        runtime_controls.set_no_show_all(True)
+        runtime_controls.set_visible(False)
+        self._runtime_controls = runtime_controls
+        box.pack_start(runtime_controls, False, False, 0)
 
         pending_row = Gtk.HBox(spacing=4)
         self._pending_label = Gtk.Label(label="")
@@ -209,6 +206,15 @@ class ClaimsPanel(Gtk.Frame):
         row.pack_start(self._spec_toggle, False, False, 2)
         box.pack_start(row, False, False, 0)
 
+        self._spec_rows = Gtk.Label(label="")
+        self._spec_rows.set_halign(Gtk.Align.START)
+        self._spec_rows.set_xalign(0.0)
+        self._spec_rows.set_line_wrap(True)
+        self._spec_rows.set_selectable(True)
+        self._spec_rows.set_margin_start(6)
+        self._spec_rows.set_margin_end(6)
+        box.pack_start(self._spec_rows, False, False, 2)
+
         editor = Gtk.HBox(spacing=4)
         self._mod_combo = Gtk.ComboBoxText()
         self._mod_combo.append_text("(调制)")
@@ -241,7 +247,24 @@ class ClaimsPanel(Gtk.Frame):
         self._spec_revealer.set_reveal_child(False)
         self._spec_revealer.add(editor)
         box.pack_start(self._spec_revealer, False, False, 0)
-        return box
+        frame = Gtk.Frame(label="Radio Specification")
+        frame.add(box)
+        return frame
+
+    def _build_diagnosis_card(self):
+        frame = Gtk.Frame(label="Diagnosis")
+        self._diagnosis_label = Gtk.Label(label="")
+        self._diagnosis_label.set_halign(Gtk.Align.START)
+        self._diagnosis_label.set_xalign(0.0)
+        self._diagnosis_label.set_line_wrap(True)
+        self._diagnosis_label.set_selectable(True)
+        self._diagnosis_label.set_margin_start(6)
+        self._diagnosis_label.set_margin_end(6)
+        frame.add(self._diagnosis_label)
+        frame.set_no_show_all(True)
+        frame.set_visible(False)
+        self._diagnosis_frame = frame
+        return frame
 
     def set_font_pt(self, pt):
         self._font_pt = max(10, int(pt))
@@ -261,13 +284,26 @@ class ClaimsPanel(Gtk.Frame):
             self._pending_label,
             self._hint,
             self._runtime_label,
+            self._phase_label,
+            self._spec_rows,
+            self._diagnosis_label,
+            self._claim_summary,
         ):
             widget.override_font(small)
 
     def update_data(self, claims, spec_digest, pending=None,
                     metrics=None, activity=None, workflow=None):
         self._updating = True
-        self._claims = list(claims or [])
+        raw_claims = list(claims or [])
+        spec = spec_digest or {}
+        self._last_spec = spec
+        workflow_view = workflow or {}
+        view_model = present(
+            spec=spec, workflow=workflow_view, claims=raw_claims
+        )
+        self._claims = list(
+            (view_model.get("claims") or {}).get("details") or []
+        )
         self._store.clear()
         for claim in self._claims:
             self._store.append(
@@ -278,24 +314,21 @@ class ClaimsPanel(Gtk.Frame):
                     int(claim.get("project_version", 0)),
                 ]
             )
-        spec = spec_digest or {}
-        self._last_spec = spec
+        self._set_paper_view(view_model)
         self._set_combo(self._mod_combo, _MODULATIONS, spec.get("modulation"))
         self._set_combo(self._chan_combo, _CHANNELS, spec.get("channel"))
         recipe_names = [item["name"] for item in self._recipes]
         self._set_combo(self._recipe_combo, recipe_names, spec.get("recipe"))
         self._spec_summary.set_text("规格: " + self._summary_text(spec))
         self._apply_spec_editor_mode(spec)
-        self._last_workflow = workflow or {}
+        self._last_workflow = workflow_view
         self._set_activity(activity or {}, self._last_workflow)
-        self._set_workflow_details(workflow or {})
-        self._set_timeline((workflow or {}).get("timeline") or [])
         self._set_metrics(metrics, self._claims)
         pending_view = dict(pending or {})
-        workflow_view = workflow or {}
         wait = str(workflow_view.get("wait_kind") or "")
         if pending_view.get("action") == "intent_alignment":
-            pass
+            # Intent choices live in the conversation Radio Specification card.
+            pending_view = {}
         elif wait == "approval":
             pending_view.setdefault(
                 "requested_effect", workflow_view.get("requested_effect") or ""
@@ -359,6 +392,11 @@ class ClaimsPanel(Gtk.Frame):
         recipe_names = [item["name"] for item in self._recipes]
         self._set_combo(self._recipe_combo, recipe_names, "")
         self._spec_summary.set_text("规格: 尚未提取")
+        self._spec_rows.set_text("")
+        self._phase_label.set_text("ALIGN INTENT")
+        self._diagnosis_label.set_text("")
+        self._diagnosis_frame.set_visible(False)
+        self._claim_summary.set_text("Claims: 尚无可验证断言")
         self._activity_label.set_text("闭环: —  |  当前: 就绪")
         self._set_runtime_line({})
         self.evidence_path = ""
@@ -366,17 +404,72 @@ class ClaimsPanel(Gtk.Frame):
         self._set_details("")
         self._set_pending({})
         self._last_spec = {}
-        self._set_workflow_details({})
-        self._set_timeline([])
         self._hint.set_visible(True)
         self._spec_revealer.set_reveal_child(False)
         if hasattr(self, "_spec_toggle"):
             self._spec_toggle.set_visible(True)
-        if hasattr(self, "_workflow_expander"):
-            self._workflow_expander.set_expanded(False)
         if hasattr(self, "_claims_expander"):
             self._claims_expander.set_expanded(False)
         self._updating = False
+
+    def _set_paper_view(self, view_model):
+        phase = dict(view_model.get("phase") or {})
+        phase_id = str(phase.get("id") or "align_intent")
+        phase_color = {
+            "align_intent": "#4B3F8F",
+            "co_construct": "#C45B08",
+            "verify_operate": "#3C7A49",
+        }.get(phase_id, "#4B3F8F")
+        self._phase_label.set_markup(
+            "<b><span foreground='{}'>{}</span></b>".format(
+                phase_color, phase.get("label") or "ALIGN INTENT"
+            )
+        )
+
+        specification = dict(view_model.get("specification") or {})
+        lines = []
+        for row in specification.get("rows") or []:
+            lines.append("{:<18} {}  [{}]".format(
+                str(row.get("label") or ""),
+                str(row.get("value") or "?"),
+                str(row.get("source") or "System"),
+            ))
+        if specification.get("aligned"):
+            lines.append("✓ Specification aligned")
+        self._spec_rows.set_text("\n".join(lines))
+
+        diagnosis = dict(view_model.get("diagnosis") or {})
+        diagnosis_lines = []
+        status_icon = {
+            "pass": "✓", "passed": "✓", "fail": "✕", "failed": "✕",
+            "unknown": "?", "stale": "○",
+        }
+        for finding in diagnosis.get("findings") or []:
+            status_id = str(finding.get("status_id") or "unknown")
+            line = "{} {} — {}".format(
+                status_icon.get(status_id, "•"),
+                finding.get("label") or finding.get("id") or "Check",
+                finding.get("status") or "Unknown",
+            )
+            if finding.get("observation"):
+                line += "\n   " + str(finding["observation"])
+            if finding.get("remediation") and status_id != "pass":
+                line += "\n   建议: " + str(finding["remediation"])
+            diagnosis_lines.append(line)
+        self._diagnosis_label.set_text("\n".join(diagnosis_lines))
+        self._diagnosis_frame.set_visible(bool(diagnosis.get("visible")))
+
+        claim_view = dict(view_model.get("claims") or {})
+        counts = dict(claim_view.get("counts") or {})
+        if counts:
+            ordered = ("Failed", "Inconclusive", "Stale", "Not tested", "Passed")
+            summary = " · ".join(
+                "{} {}".format(name, counts[name])
+                for name in ordered if counts.get(name)
+            )
+            self._claim_summary.set_text("Claims: " + summary)
+        else:
+            self._claim_summary.set_text("Claims: 尚无可验证断言")
 
     def _set_activity(self, activity, workflow=None):
         workflow = workflow or {}
@@ -427,152 +520,26 @@ class ClaimsPanel(Gtk.Frame):
         if not runtime:
             self._runtime_label.set_text("")
             self._runtime_label.set_visible(False)
+            if hasattr(self, "_runtime_controls"):
+                self._runtime_controls.set_visible(False)
             return
         status = str(runtime.get("status") or ("running" if runtime.get("running") else "—"))
         remaining = float(runtime.get("remaining_seconds") or 0.0)
         max_duration = runtime.get("max_duration_seconds") or runtime.get("duration_seconds")
         parts = [
-            "发射: {}".format(status),
-            "pid={}".format(runtime.get("pid") or "—"),
-            "run_id={}".format(runtime.get("run_id") or "—"),
+            "运行: {}".format(status),
         ]
+        if runtime.get("run_id"):
+            parts.append("run_id={}".format(runtime.get("run_id")))
         if runtime.get("running"):
             parts.append("剩余 {:.1f}s".format(remaining))
-        elif runtime.get("return_code") is not None:
-            parts.append("return_code={}".format(runtime.get("return_code")))
         if max_duration not in (None, ""):
             parts.append("最大时长 {}s".format(max_duration))
-        if runtime.get("running") or runtime.get("do_not_run_grc"):
-            parts.append("无需点击 GRC Run")
         text = "  |  ".join(parts)
-        tail = str(runtime.get("log_tail") or "").strip()
-        if tail:
-            last = tail.splitlines()[-1]
-            text += "\nlog: " + last
         self._runtime_label.set_text(text)
         self._runtime_label.set_visible(True)
-
-    def _set_workflow_details(self, workflow):
-        buffer_ = self._workflow_details.get_buffer()
-        if not workflow:
-            buffer_.set_text("尚无活动 Workflow")
-            return
-        lines = [
-            "workflow_id={}  revision={}  project_version={}".format(
-                workflow.get("workflow_id") or "—",
-                workflow.get("revision") or "—",
-                workflow.get("base_project_version") or 0,
-            )
-        ]
-        capabilities = workflow.get("capabilities") or []
-        if capabilities:
-            lines.append("capabilities=" + ", ".join(capabilities))
-        quality = str(workflow.get("quality") or "clean")
-        lines.append("quality=" + quality)
-        warnings = list(
-            ((workflow.get("control_state") or {}).get("warnings") or [])
-        )
-        for warning in warnings:
-            lines.append("warning=" + json.dumps(
-                warning, ensure_ascii=False, sort_keys=True
-            ))
-        blockers = list(workflow.get("missing_slots") or []) + list(
-            workflow.get("validation_errors") or []
-        )
-        if blockers:
-            lines.append("blockers=" + ", ".join(blockers))
-        interaction = workflow.get("interaction_request") or {}
-        if interaction:
-            lines.append(
-                "interaction={}  reason={}".format(
-                    interaction.get("kind") or "—",
-                    interaction.get("reason") or "—",
-                )
-            )
-        shared_intent = workflow.get("shared_intent") or {}
-        if shared_intent.get("intent_id"):
-            lines.append(
-                "shared_intent={} rev={} status={} hash={}".format(
-                    shared_intent.get("intent_id"),
-                    shared_intent.get("revision") or 0,
-                    shared_intent.get("status") or "—",
-                    str(shared_intent.get("semantic_hash") or "")[:12],
-                )
-            )
-        runtime = workflow.get("runtime") or {}
-        if runtime:
-            lines.append(
-                "runtime={}  run_id={}  pid={}  remaining={:.1f}s  return_code={}".format(
-                    runtime.get("status") or "—",
-                    runtime.get("run_id") or "—",
-                    runtime.get("pid") or "—",
-                    float(runtime.get("remaining_seconds") or 0.0),
-                    runtime.get("return_code")
-                    if runtime.get("return_code") is not None else "—",
-                )
-            )
-            if runtime.get("do_not_run_grc"):
-                lines.append("受控进程由 Workflow 管理，无需点击 GRC Run")
-            tail = str(runtime.get("log_tail") or "").strip()
-            if tail:
-                lines.append("runtime.log:")
-                lines.extend(tail.splitlines()[-8:])
-        for stage in workflow.get("stages") or []:
-            marker = "▶" if stage.get("id") == workflow.get("current_stage") else "•"
-            completion = stage.get("completion") or []
-            results = stage.get("completion_result") or {}
-            passed = sum(1 for name in completion if results.get(name) is True)
-            outcome = stage.get("outcome") or ""
-            status = stage.get("execution_status") or "—"
-            if completion:
-                all_passed = passed == len(completion) and all(
-                    results.get(name) is True for name in completion
-                )
-                if outcome == "failed":
-                    display = "failed"
-                elif all_passed:
-                    display = "passed"
-                elif outcome == "passed":
-                    display = "incomplete"
-                else:
-                    display = outcome or status
-            else:
-                display = outcome or status
-            attempt = int(stage.get("attempt") or 0)
-            max_attempts = int(stage.get("max_attempts") or 1)
-            if display == "passed" and attempt <= 1:
-                attempt_text = "attempt {}".format(max(attempt, 1))
-            else:
-                attempt_text = "attempt {}/{}".format(attempt, max_attempts)
-            lines.append(
-                "{} {}  {}  {}  completion {}/{}".format(
-                    marker,
-                    stage.get("label") or stage.get("id") or "—",
-                    display,
-                    attempt_text,
-                    passed,
-                    len(completion),
-                )
-            )
-        spec_extra = self._default_details(getattr(self, "_last_spec", {}) or {})
-        if spec_extra:
-            lines.append("")
-            lines.append(spec_extra)
-        buffer_.set_text("\n".join(lines))
-
-    def _set_timeline(self, events):
-        if not hasattr(self, "_timeline_store"):
-            return
-        self._timeline_store.clear()
-        for item in events or []:
-            self._timeline_store.append(
-                [
-                    str(item.get("seq") or ""),
-                    str(item.get("event") or ""),
-                    str(item.get("stage_id") or ""),
-                    str(item.get("actor") or ""),
-                ]
-            )
+        if hasattr(self, "_runtime_controls"):
+            self._runtime_controls.set_visible(bool(runtime.get("running")))
 
     def _set_metrics(self, metrics, _claims):
         parts = []
@@ -713,8 +680,6 @@ class ClaimsPanel(Gtk.Frame):
     def refresh_runtime(self, workflow):
         self._last_workflow = workflow or {}
         self._set_activity({}, self._last_workflow)
-        self._set_workflow_details(self._last_workflow)
-        self._set_timeline(self._last_workflow.get("timeline") or [])
         wait = str(self._last_workflow.get("wait_kind") or "")
         if wait == "approval" and self._last_workflow.get("checkpoint_id"):
             pending = dict(self._last_pending or {})
@@ -1027,20 +992,8 @@ class ClaimsPanel(Gtk.Frame):
             self._spec_revealer.set_reveal_child(False)
 
     def _sync_expanders(self, workflow, claims):
-        wait = str((workflow or {}).get("wait_kind") or "")
-        running = bool(((workflow or {}).get("runtime") or {}).get("running"))
-        need_exec = wait in ("input", "recovery", "denied") or (
-            wait == "approval" and not running
-        )
-        if need_exec and hasattr(self, "_workflow_expander"):
-            self._workflow_expander.set_expanded(True)
-        failed = any(
-            str(claim.get("status") or "").lower()
-            in ("failed", "fail", "inconclusive", "error")
-            for claim in claims or []
-        )
-        if failed and hasattr(self, "_claims_expander"):
-            self._claims_expander.set_expanded(True)
+        # Expanding evidence is always a deliberate user action.
+        del workflow, claims
 
 
 def _fmt_metric(value):

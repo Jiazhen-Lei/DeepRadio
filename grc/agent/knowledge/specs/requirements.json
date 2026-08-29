@@ -4,9 +4,17 @@
     "modulation": {
       "prompt": "请选择或填写调制方式。",
       "choices": [
+        {"id": "gfsk", "label": "GFSK", "value": "gfsk"},
         {"id": "bpsk", "label": "BPSK", "value": "bpsk"},
         {"id": "qpsk", "label": "QPSK", "value": "qpsk"},
         {"id": "ofdm", "label": "OFDM", "value": "ofdm"}
+      ],
+      "allow_custom": true
+    },
+    "protocol": {
+      "prompt": "请选择或填写通信协议。",
+      "choices": [
+        {"id": "ble", "label": "BLE", "value": "ble"}
       ],
       "allow_custom": true
     },
@@ -32,12 +40,38 @@
       ],
       "allow_custom": true
     },
+    "advertising_channels": {
+      "prompt": "请选择 BLE 广播信道。",
+      "choices": [
+        {"id": "ble37", "label": "CH37", "value": [37]},
+        {"id": "ble38", "label": "CH38", "value": [38]},
+        {"id": "ble39", "label": "CH39", "value": [39]}
+      ],
+      "allow_custom": true
+    },
     "sample_rate": {
       "prompt": "请选择或填写采样率。",
       "choices": [
         {"id": "1m", "label": "1 Msps", "value": 1000000.0},
         {"id": "2m", "label": "2 Msps", "value": 2000000.0},
         {"id": "4m", "label": "4 Msps", "value": 4000000.0}
+      ],
+      "allow_custom": true
+    },
+    "duration_seconds": {
+      "prompt": "本次物理操作最长允许运行多久？安全默认值只能作为建议，需由你确认。",
+      "choices": [
+        {"id": "10s", "label": "最多 10 秒", "value": 10.0},
+        {"id": "30s", "label": "最多 30 秒", "value": 30.0},
+        {"id": "60s", "label": "最多 60 秒", "value": 60.0}
+      ],
+      "allow_custom": true
+    },
+    "success_conditions": {
+      "prompt": "应使用什么可观察证据判定任务成功？",
+      "choices": [
+        {"id": "receiver_observed", "label": "独立接收端观察到", "value": "独立接收端观察到目标信号"},
+        {"id": "capture_attached", "label": "接收截图或抓包", "value": "附加接收端截图或抓包证据"}
       ],
       "allow_custom": true
     },
@@ -67,7 +101,8 @@
     {
       "id": "ble_external_acceptance",
       "when_slots": {"protocol": "ble", "operation": "deploy"},
-      "required": ["local_name"]
+      "required": ["local_name", "duration_seconds", "success_conditions"],
+      "require_explicit_sources": ["duration_seconds", "success_conditions"]
     }
   ]
 }

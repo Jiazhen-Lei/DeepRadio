@@ -12,7 +12,7 @@ from grc.agent.service.stage_executor import (
     make_task_card,
     synthesize_deterministic_invocations,
 )
-from grc.agent.state import Claim, Evidence, SharedState
+from grc.agent.state import Claim, ClaimStore, Evidence, SharedIntent, SharedState
 from grc.agent.workflow import WorkflowEngine
 from grc.agent.workflow.intent_alignment import IntentAlignmentCoordinator
 from grc.agent.workflow.revision import analyze_intent_patch
@@ -1678,6 +1678,10 @@ class IntentAlignmentContractTest(unittest.TestCase):
         self.respond(value="pluto")
         self.assertEqual(self.state.intent.interaction["field"], "local_name")
         self.respond(custom_value="deepradio")
+        self.assertEqual(self.state.intent.interaction["field"], "duration_seconds")
+        self.respond(value=30.0)
+        self.assertEqual(self.state.intent.interaction["field"], "success_conditions")
+        self.respond(custom_value="LightBlue 观察到 deepradio")
         self.assertEqual(
             self.state.intent.interaction["kind"], "intent_confirmation"
         )
@@ -1686,7 +1690,53 @@ class IntentAlignmentContractTest(unittest.TestCase):
         self.assertEqual(self.state.intent.status, "confirmed")
         self.assertEqual(final.intent.slots["hardware"], "pluto")
         self.assertEqual(final.intent.slots["local_name"], "deepradio")
+        self.assertEqual(final.intent.slots["max_duration_seconds"], 30.0)
+        self.assertEqual(
+            final.intent.slots["success_conditions"],
+            ["LightBlue 观察到 deepradio"],
+        )
         self.assertTrue(self.state.intent.semantic_hash)
+
+    def test_radio_specification_table_fills_open_fields_atomically(self):
+        first = self.alignment.consume_text("我要用硬件发射一段ble信号")
+        interaction = dict(self.state.intent.interaction)
+        outcome = self.alignment.consume_updates({
+            "intent_id": self.state.intent.intent_id,
+            "interaction_id": interaction["interaction_id"],
+            "base_intent_revision": interaction["base_intent_revision"],
+            "updates": {
+                "hardware": "pluto",
+                "local_name": "table-demo",
+                "advertising_channels": [37],
+                "duration_seconds": 30.0,
+                "success_conditions": "独立接收端观察到 table-demo",
+            },
+        })
+        self.assertTrue(first.pending)
+        self.assertTrue(outcome.pending)
+        self.assertEqual(
+            self.state.intent.interaction["kind"], "intent_confirmation"
+        )
+        self.assertEqual(self.state.intent.missing_fields, [])
+        self.assertEqual(
+            self.state.intent.parameters["success_conditions"],
+            ["独立接收端观察到 table-demo"],
+        )
+        self.assertEqual(
+            self.state.intent.parameter_sources["duration_seconds"], "user_choice"
+        )
+
+    def test_radio_specification_exposes_default_and_edit_choices(self):
+        self.alignment.consume_text("我要用硬件发射一段ble信号")
+        digest = self.state.spec_digest()
+        rows = {item["key"]: item for item in digest["radio_specification"]}
+        duration = rows["duration_seconds"]
+        self.assertEqual(duration["display_value"], "30 s")
+        self.assertEqual(duration["source"], "safety_default")
+        self.assertTrue(duration["needs_confirmation"])
+        self.assertTrue(duration["choices"])
+        self.assertTrue(rows["modulation"]["editable"])
+        self.assertEqual(rows["modulation"]["display_value"], "GFSK")
 
     def test_task_card_receives_shared_intent_snapshot(self):
         outcome = self.alignment.consume_text("构建 BPSK 过 AWGN 并测 EVM")
@@ -1699,6 +1749,35 @@ class IntentAlignmentContractTest(unittest.TestCase):
             card.inputs["shared_intent"]["semantic_hash"],
             self.state.intent.semantic_hash,
         )
+
+    def test_spec_digest_is_scoped_to_current_intent_not_previous_project(self):
+        self.state.project.config.update({
+            "protocol": "ble", "local_name": "old-name", "hardware": "pluto",
+        })
+        self.state.intent.status = "confirmed"
+        self.state.intent.task_type = "DIAGNOSE"
+        self.state.intent.parameters = {"hardware": "b210"}
+        self.state.intent.parameter_sources = {"hardware": "user"}
+        self.state.intent.goals = ["诊断当前 B210 设备"]
+        digest = self.state.spec_digest()
+        self.assertEqual(digest["hardware"], "b210")
+        self.assertEqual(digest["protocol"], "")
+        self.assertEqual(digest["local_name"], "")
+        self.assertNotIn("old-name", str(digest["radio_specification"]))
+
+    def test_claim_summary_is_scoped_to_current_intent(self):
+        self.state.intent = SharedIntent.new("first")
+        ClaimStore(self.state).upsert(Claim(
+            id="old-claim", statement="old task", layer="sim"
+        ))
+        self.assertEqual(
+            len(ClaimStore(self.state).summary(active_intent_only=True)), 1
+        )
+        self.state.intent = SharedIntent.new("second")
+        self.assertEqual(
+            ClaimStore(self.state).summary(active_intent_only=True), []
+        )
+        self.assertEqual(len(ClaimStore(self.state).summary(active_intent_only=False)), 1)
 
     def test_stale_interaction_response_cannot_overwrite_new_intent(self):
         self.alignment.consume_text("我要用硬件发射一段ble信号")

@@ -259,12 +259,48 @@ class SevenTaskServiceAgentTest(unittest.TestCase):
         second = answer(first, value="pluto")
         self.assertEqual(second.pending.get("field"), "local_name")
         third = answer(second, custom_value="alignment-demo")
-        self.assertEqual(third.pending.get("kind"), "intent_confirmation")
-        reply = answer(third, decision="approved")
+        self.assertEqual(third.pending.get("field"), "duration_seconds")
+        fourth = answer(third, value=30.0)
+        self.assertEqual(fourth.pending.get("field"), "success_conditions")
+        fifth = answer(fourth, custom_value="LightBlue 观察到 alignment-demo")
+        self.assertEqual(fifth.pending.get("kind"), "intent_confirmation")
+        reply = answer(fifth, decision="approved")
         self.assertIsNotNone(agent._workflow.workflow)
         self.assertEqual(agent._state.intent.status, "confirmed")
         self.assertEqual(agent._workflow.workflow.intent.slots["local_name"], "alignment-demo")
         self.assertNotIn("start_flowgraph", self._events("seven-vague-ble"))
+
+    def test_vague_ble_accepts_one_radio_specification_table(self):
+        agent = self.agent("seven-spec-table")
+        first = agent.step("我要用硬件发射一段 BLE 信号")
+        aligned = agent.step_command({
+            "action": "specification_update",
+            "intent_id": agent._state.intent.intent_id,
+            "interaction_id": first.pending["interaction_id"],
+            "base_intent_revision": first.pending["base_intent_revision"],
+            "updates": {
+                "hardware": "pluto",
+                "local_name": "spec-table",
+                "advertising_channels": [37],
+                "duration_seconds": 30.0,
+                "success_conditions": "独立接收端观察到 spec-table",
+            },
+        })
+        self.assertEqual(aligned.pending.get("kind"), "intent_confirmation")
+        confirmed = agent.step_command({
+            "action": "interaction_response",
+            "interaction_id": aligned.pending["interaction_id"],
+            "base_intent_revision": aligned.pending["base_intent_revision"],
+            "decision": "approved",
+        })
+        self.assertIsNotNone(agent._workflow.workflow)
+        self.assertNotEqual(
+            confirmed.workflow_digest.get("current_stage"), "intent_alignment"
+        )
+        self.assertEqual(
+            agent._workflow.workflow.intent.slots["success_conditions"],
+            ["独立接收端观察到 spec-table"],
+        )
 
     def _assert_no_rf_side_effects(self, session_id: str) -> None:
         events = self._events(session_id)

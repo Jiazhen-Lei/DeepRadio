@@ -29,6 +29,7 @@ from gi.repository import Gtk, GLib, GObject, Gdk, GdkPixbuf, Pango
 
 from .ClaimsPanel import ClaimsPanel
 from .chat_markup import escape_pango, markdown_to_pango
+from .workflow_presenter import present
 
 log = logging.getLogger(__name__)
 
@@ -375,6 +376,8 @@ class AgentPanel(Gtk.VBox):
         scroll.add(viewport)
         self._scroll = scroll
         self._chat_width = 0
+        self._live_cards = []
+        self._spec_controls = {}
         scroll.connect("size-allocate", self._on_chat_size_allocate)
         self.claims_panel = ClaimsPanel()
         self.claims_panel.set_font_pt(self._font_pt)
@@ -382,6 +385,8 @@ class AgentPanel(Gtk.VBox):
         self.claims_panel.connect("confirm-pending", self._on_confirm_pending)
         self.claims_panel.connect("cancel-pending", self._on_cancel_pending)
         self.claims_panel.connect("retry-transmit", self._on_retry_transmit)
+        self.claims_panel.connect("stop-runtime", self._on_stop_runtime)
+        self.claims_panel.connect("emergency-stop", self._on_emergency_stop)
         self.claims_panel.connect(
             "interaction-response", self._on_interaction_response
         )
@@ -394,21 +399,6 @@ class AgentPanel(Gtk.VBox):
         self._split = split
         self._split_inited = False
         self.pack_start(split, expand=True, fill=True, padding=0)
-
-        # ---- 状态栏: 显示当前阶段 / 档位 ----
-        self.status = Gtk.Label()
-        self.status.set_use_markup(True)
-        self.status.set_markup(
-            "<span foreground='#4B5563'>就绪</span>")
-        self.status.set_halign(Gtk.Align.START)
-        self.status.set_line_wrap(True)
-        self.status.set_line_wrap_mode(Gtk.WrapMode.WORD_CHAR)
-        self.status.set_xalign(0.0)
-        self.status.set_hexpand(True)
-        self.status.set_max_width_chars(1)
-        self.status.set_margin_start(8)
-        self.status._dr_role = "caption"
-        self.pack_start(self.status, expand=False, fill=False, padding=2)
 
         # ---- 输入区: 文本框 + 发送按钮 ----
         input_box = Gtk.HBox()
@@ -532,6 +522,23 @@ class AgentPanel(Gtk.VBox):
             daemon=True,
         ).start()
 
+    def _on_stop_runtime(self, _panel):
+        self._submit_runtime_stop(emergency=False)
+
+    def _on_emergency_stop(self, _panel):
+        self._submit_runtime_stop(emergency=True)
+
+    def _submit_runtime_stop(self, *, emergency):
+        if self._busy or self._agent is None:
+            return
+        self._append("我", "紧急停止" if emergency else "停止运行")
+        self._set_busy(True)
+        threading.Thread(
+            target=self._handle_agent_command,
+            args=({"action": "emergency_stop" if emergency else "stop_runtime"},),
+            daemon=True,
+        ).start()
+
     def _on_interaction_response(self, _panel, payload):
         if self._busy:
             return
@@ -643,6 +650,12 @@ class AgentPanel(Gtk.VBox):
             },
             workflow=result.get("workflow_digest") or {},
         )
+        self._replace_interaction_cards(
+            result.get("spec_digest") or {},
+            result.get("workflow_digest") or {},
+            result.get("claims") or [],
+            {},
+        )
         self._set_status(
             "画布已保存，工程版本 {}，Claim 待重验。".format(
                 result.get("version", "?")))
@@ -743,7 +756,6 @@ class AgentPanel(Gtk.VBox):
         cap = self._font_desc(-3)
         self.entry.override_font(body)
         self._apply_font_walk(self._log_box, body, cap)
-        self._apply_font_walk(self.status, body, cap)
         self.claims_panel.set_font_pt(self._font_pt)
 
     def _apply_font_walk(self, widget, body, cap):
@@ -769,6 +781,8 @@ class AgentPanel(Gtk.VBox):
         self._baseline_history = []
         for child in self._log_box.get_children():
             self._log_box.remove(child)
+        self._live_cards = []
+        self._spec_controls = {}
         self.claims_panel.clear()
         self.emit('reset_workspace')
         self._append("DeepRadio", "已重置会话与画布。请描述新的需求。")
@@ -832,6 +846,12 @@ class AgentPanel(Gtk.VBox):
             metrics=metrics,
             activity=_activity_from_reply(reply),
             workflow=getattr(reply, "workflow_digest", None) or {},
+        )
+        self._replace_interaction_cards(
+            getattr(reply, "spec_digest", {}) or {},
+            getattr(reply, "workflow_digest", None) or {},
+            getattr(reply, "claims", []) or [],
+            getattr(reply, "pending", None) or {},
         )
         # 交付与确认都刷画布；DENY/CANCELLED 不覆盖用户当前图。
         stage = getattr(reply, "stage", "") or ""
@@ -910,6 +930,7 @@ class AgentPanel(Gtk.VBox):
         name = os.path.basename(grc_path)
         self._set_status("已生成 {}，画布已刷新".format(name))
         self.claims_panel.clear()
+        self._replace_interaction_cards({}, {}, [], {})
         self._baseline_history.append(("assistant", "已生成 " + name))
         self._set_busy(False)
         self.emit('open_flow_graph', grc_path)
@@ -961,6 +982,12 @@ class AgentPanel(Gtk.VBox):
             },
             workflow=result.get("workflow_digest") or {},
         )
+        self._replace_interaction_cards(
+            result.get("spec_digest") or {},
+            result.get("workflow_digest") or {},
+            result.get("claims") or [],
+            {},
+        )
         grc_path = result.get("grc_path")
         if grc_path and os.path.exists(grc_path):
             self.emit('open_flow_graph', grc_path)
@@ -992,10 +1019,10 @@ class AgentPanel(Gtk.VBox):
             self._runtime_poll_id = GLib.timeout_add(1000, self._on_runtime_poll)
 
     def _set_status(self, text):
-        self.status.set_markup(
-            "<span foreground='#4B5563'>{}</span>".format(
-                escape_pango(text or "")))
-        self.status.override_font(self._font_desc(-3))
+        # User-facing state is rendered as conversation cards.  Keep this
+        # compatibility hook for existing call sites without creating a
+        # second status line above the input box.
+        log.debug("DeepRadio UI state: %s", text or "")
 
     def _make_caption(self, text, theme, align_end=False):
         cap = _CaptionLabel()
@@ -1081,6 +1108,307 @@ class AgentPanel(Gtk.VBox):
         wrap.show_all()
         self._log_box.pack_start(wrap, False, False, 0)
         self._scroll_to_bottom()
+
+    def _new_conversation_card(self, title, fill, border):
+        wrap = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        wrap.set_hexpand(True)
+        wrap.set_halign(Gtk.Align.FILL)
+        wrap.set_margin_start(6)
+        wrap.set_margin_end(6)
+        wrap.pack_start(
+            self._make_caption(title, _THEME["agent"]), False, False, 0
+        )
+        bubble = _ChatBubble(fill, border, radius=12)
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        body.set_margin_top(10)
+        body.set_margin_bottom(10)
+        body.set_margin_start(10)
+        body.set_margin_end(10)
+        bubble.pack_start(body, False, False, 0)
+        wrap.pack_start(bubble, False, False, 0)
+        return wrap, body
+
+    def _replace_interaction_cards(self, spec, workflow, claims, pending):
+        for widget in list(self._live_cards):
+            parent = widget.get_parent()
+            if parent is not None:
+                parent.remove(widget)
+        self._live_cards = []
+        self._spec_controls = {}
+        view = present(spec=spec, workflow=workflow, claims=claims)
+        specification = dict(view.get("specification") or {})
+        meaningful = [
+            row for row in specification.get("rows") or []
+            if row.get("key") != "summary"
+        ]
+        if meaningful:
+            self._append_specification_card(
+                specification, spec, workflow, pending
+            )
+        workflow_card = dict(view.get("workflow") or {})
+        if workflow_card.get("visible"):
+            self._append_workflow_card(workflow_card)
+        diagnosis = dict(view.get("diagnosis") or {})
+        if diagnosis.get("visible"):
+            self._append_diagnosis_card(diagnosis)
+        for widget in self._live_cards:
+            widget.show_all()
+        self._scroll_to_bottom()
+
+    def _append_specification_card(self, specification, spec, workflow, pending):
+        wrap, body = self._new_conversation_card(
+            "Radio Specification", "#F5F2FF", "#8A6FD1"
+        )
+        grid = Gtk.Grid()
+        grid.set_row_spacing(6)
+        grid.set_column_spacing(8)
+        grid.set_hexpand(True)
+        source_colors = {
+            "User": "#2F6FED",
+            "Protocol Default": "#6B4EFF",
+            "Safety Default": "#C45B08",
+            "Derived": "#6B4EFF",
+            "Canvas": "#2F6FED",
+            "Unresolved": "#7A7A7A",
+        }
+        for index, row in enumerate(specification.get("rows") or []):
+            label = Gtk.Label(label=str(row.get("label") or row.get("key") or ""))
+            label.set_halign(Gtk.Align.START)
+            label.set_xalign(0.0)
+            grid.attach(label, 0, index, 1, 1)
+            control = self._make_spec_control(row)
+            grid.attach(control, 1, index, 1, 1)
+            source = str(row.get("source") or "System")
+            suffix = " · 待确认" if row.get("needs_confirmation") else ""
+            badge = Gtk.Label()
+            badge.set_halign(Gtk.Align.END)
+            badge.set_markup(
+                "<span foreground='{}'>[{}{}]</span>".format(
+                    source_colors.get(source, "#52606D"),
+                    escape_pango(source), escape_pango(suffix),
+                )
+            )
+            grid.attach(badge, 2, index, 1, 1)
+        body.pack_start(grid, False, False, 0)
+
+        button_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        aligned = bool(specification.get("aligned"))
+        if aligned:
+            aligned_label = Gtk.Label(label="✓ Specification aligned")
+            aligned_label.set_halign(Gtk.Align.START)
+            button_row.pack_start(aligned_label, True, True, 0)
+        else:
+            hint = Gtk.Label(label="可接受建议值，也可直接选择或填写修改")
+            hint.set_halign(Gtk.Align.START)
+            hint.set_line_wrap(True)
+            button_row.pack_start(hint, True, True, 0)
+        submit = Gtk.Button(label=(
+            "确认并建立 Workflow"
+            if pending.get("kind") == "intent_confirmation"
+            else "更新 Radio Specification"
+        ))
+        submit.connect(
+            "clicked", self._on_specification_submit, spec, workflow, pending
+        )
+        button_row.pack_start(submit, False, False, 0)
+        body.pack_start(button_row, False, False, 0)
+        self._log_box.pack_start(wrap, False, False, 0)
+        self._live_cards.append(wrap)
+
+    def _make_spec_control(self, row):
+        field = str(row.get("key") or "")
+        display = str(row.get("value") or "")
+        raw = row.get("raw_value")
+        if not row.get("editable"):
+            value = Gtk.Label(label=display or "?")
+            value.set_halign(Gtk.Align.START)
+            value.set_xalign(0.0)
+            value.set_line_wrap(True)
+            value.set_max_width_chars(24)
+            return value
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        choices = list(row.get("choices") or [])
+        entry = Gtk.Entry()
+        entry.set_width_chars(16)
+        combo = None
+        values = []
+        if choices:
+            combo = Gtk.ComboBoxText()
+            selected = -1
+            for choice in choices:
+                combo.append_text(str(choice.get("label") or choice.get("value") or ""))
+                values.append(choice.get("value"))
+                if self._same_spec_value(choice.get("value"), raw):
+                    selected = len(values) - 1
+            if selected < 0 and raw not in (None, "", []):
+                combo.append_text(display or str(raw))
+                values.append(raw)
+                selected = len(values) - 1
+            if row.get("allow_custom"):
+                combo.append_text("自定义…")
+                values.append(None)
+            combo.set_active(selected if selected >= 0 else 0)
+            combo.connect("changed", self._on_spec_combo_changed, entry, values)
+            box.pack_start(combo, True, True, 0)
+            custom = combo.get_active() >= 0 and values[combo.get_active()] is None
+            entry.set_visible(custom)
+            entry.set_no_show_all(not custom)
+        else:
+            entry.set_text("" if row.get("unresolved") else display)
+            box.pack_start(entry, True, True, 0)
+        self._spec_controls[field] = {
+            "combo": combo,
+            "entry": entry,
+            "values": values,
+            "original": raw,
+            "unresolved": bool(row.get("unresolved")),
+            "needs_confirmation": bool(row.get("needs_confirmation")),
+        }
+        return box
+
+    @staticmethod
+    def _same_spec_value(left, right):
+        return json.dumps(left, ensure_ascii=False, sort_keys=True) == json.dumps(
+            right, ensure_ascii=False, sort_keys=True
+        )
+
+    def _on_spec_combo_changed(self, combo, entry, values):
+        index = combo.get_active()
+        custom = 0 <= index < len(values) and values[index] is None
+        entry.set_no_show_all(not custom)
+        entry.set_visible(custom)
+        if custom:
+            entry.grab_focus()
+
+    def _spec_control_value(self, item):
+        combo = item.get("combo")
+        entry = item.get("entry")
+        if combo is None:
+            return entry.get_text().strip()
+        index = combo.get_active()
+        values = item.get("values") or []
+        if not 0 <= index < len(values):
+            return ""
+        value = values[index]
+        return entry.get_text().strip() if value is None else value
+
+    def _on_specification_submit(self, _button, spec, workflow, pending):
+        if self._busy:
+            return
+        updates = {}
+        for field, item in self._spec_controls.items():
+            value = self._spec_control_value(item)
+            if value in (None, "", []):
+                continue
+            changed = not self._same_spec_value(value, item.get("original"))
+            if changed or item.get("unresolved") or item.get("needs_confirmation"):
+                updates[field] = value
+        if not updates and pending.get("kind") == "intent_confirmation":
+            command = {
+                "action": "interaction_response",
+                "interaction_id": pending.get("interaction_id"),
+                "base_intent_revision": pending.get("base_intent_revision"),
+                "decision": "approved",
+            }
+            label = "确认 Radio Specification 并建立 Workflow"
+        elif updates:
+            shared = dict((workflow or {}).get("shared_intent") or {})
+            command = {
+                "action": "specification_update",
+                "intent_id": shared.get("intent_id") or spec.get("intent_id"),
+                "interaction_id": pending.get("interaction_id") or "",
+                "base_intent_revision": (
+                    pending.get("base_intent_revision")
+                    or shared.get("revision") or spec.get("intent_revision")
+                ),
+                "updates": updates,
+            }
+            label = "更新 Radio Specification：" + "，".join(updates)
+        else:
+            self._append("DeepRadio", "请先修改一个字段，或继续在输入框中描述需求。")
+            return
+        self._append("我", label)
+        self._set_busy(True)
+        threading.Thread(
+            target=self._handle_agent_command, args=(command,), daemon=True
+        ).start()
+
+    def _append_workflow_card(self, workflow):
+        wrap, body = self._new_conversation_card(
+            "Workflow", "#FFF7ED", "#D9822B"
+        )
+        title = Gtk.Label(label=str(
+            workflow.get("task_label") or workflow.get("task_type") or "Workflow"
+        ))
+        title.set_halign(Gtk.Align.START)
+        title.set_xalign(0.0)
+        body.pack_start(title, False, False, 0)
+        flow = Gtk.FlowBox()
+        flow.set_selection_mode(Gtk.SelectionMode.NONE)
+        flow.set_max_children_per_line(3)
+        flow.set_row_spacing(5)
+        flow.set_column_spacing(5)
+        for stage in workflow.get("stages") or []:
+            status = str(stage.get("status") or "pending")
+            passed = status == "passed"
+            failed = status in {"failed", "error", "errored"}
+            active = bool(stage.get("current"))
+            fill = "#EAF7ED" if passed else "#FDECEC" if failed else "#F2F4F7"
+            marker = "✓ " if passed else "✕ " if failed else "▶ " if active else "○ "
+            event = Gtk.EventBox()
+            event.override_background_color(Gtk.StateFlags.NORMAL, _parse_rgba(fill))
+            label = Gtk.Label(label=marker + str(stage.get("label") or stage.get("id") or "Stage"))
+            label.set_line_wrap(True)
+            label.set_margin_top(7)
+            label.set_margin_bottom(7)
+            label.set_margin_start(7)
+            label.set_margin_end(7)
+            acceptance_count = int(stage.get("acceptance_count") or 0)
+            if acceptance_count:
+                label.set_tooltip_text(
+                    "{} 项独立验收条件；这不是重复执行次数。".format(
+                        acceptance_count
+                    )
+                )
+            event.add(label)
+            flow.add(event)
+        body.pack_start(flow, False, False, 0)
+        conditions = list(workflow.get("success_conditions") or [])
+        if conditions:
+            success = Gtk.Label(
+                label="成功条件：" + "；".join(map(str, conditions))
+            )
+            success.set_halign(Gtk.Align.START)
+            success.set_xalign(0.0)
+            success.set_line_wrap(True)
+            body.pack_start(success, False, False, 0)
+        note = Gtk.Label(label="每个框代表一个 Stage；✓ 表示该阶段的验收条件均已满足。")
+        note.set_halign(Gtk.Align.START)
+        note.set_xalign(0.0)
+        note.set_line_wrap(True)
+        body.pack_start(note, False, False, 0)
+        self._log_box.pack_start(wrap, False, False, 0)
+        self._live_cards.append(wrap)
+
+    def _append_diagnosis_card(self, diagnosis):
+        wrap, body = self._new_conversation_card(
+            "Diagnosis", "#F3F8FF", "#4C78C2"
+        )
+        for item in diagnosis.get("findings") or []:
+            status = str(item.get("status_id") or "unknown")
+            marker = "✓" if status == "pass" else "✕" if status == "fail" else "?"
+            text = "{} {} — {}".format(
+                marker, item.get("label") or "Check", item.get("status") or "Unknown"
+            )
+            if item.get("remediation") and status != "pass":
+                text += "\n建议：" + str(item.get("remediation"))
+            label = Gtk.Label(label=text)
+            label.set_halign(Gtk.Align.START)
+            label.set_xalign(0.0)
+            label.set_line_wrap(True)
+            body.pack_start(label, False, False, 0)
+        self._log_box.pack_start(wrap, False, False, 0)
+        self._live_cards.append(wrap)
 
     def _scroll_to_bottom(self):
         adj = self._scroll.get_vadjustment()

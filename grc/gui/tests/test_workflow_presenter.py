@@ -7,6 +7,7 @@ without constructing a real GTK window.  Visual layout remains a manual check.
 import unittest
 
 from grc.gui.ClaimsPanel import ClaimsPanel
+from grc.gui.workflow_presenter import present
 
 
 class _Widget:
@@ -29,35 +30,9 @@ class _Widget:
         self.sensitive = bool(value)
 
 
-class _Buffer:
-    def __init__(self):
-        self.text = ""
-
-    def set_text(self, value):
-        self.text = value
-
-
-class _TextView:
-    def __init__(self):
-        self.buffer = _Buffer()
-
-    def get_buffer(self):
-        return self.buffer
-
-
-class _Store(list):
-    def clear(self):
-        del self[:]
-
-    def append(self, row):
-        super().append(row)
-
-
 class _PresenterHarness:
     _set_runtime_line = ClaimsPanel._set_runtime_line
     _set_activity = ClaimsPanel._set_activity
-    _set_workflow_details = ClaimsPanel._set_workflow_details
-    _set_timeline = ClaimsPanel._set_timeline
     _set_pending = ClaimsPanel._set_pending
     refresh_runtime = ClaimsPanel.refresh_runtime
     _format_si = staticmethod(ClaimsPanel._format_si)
@@ -66,8 +41,7 @@ class _PresenterHarness:
     def __init__(self):
         self._activity_label = _Widget()
         self._runtime_label = _Widget()
-        self._workflow_details = _TextView()
-        self._timeline_store = _Store()
+        self._runtime_controls = _Widget()
         self._pending_label = _Widget()
         self._pending_row = _Widget()
         self._confirm_btn = _Widget()
@@ -111,11 +85,12 @@ class WorkflowPresenterTest(unittest.TestCase):
         self.assertIn("等待批准", self.panel._activity_label.text)
         self.assertIn("run_id=run-test123", self.panel._runtime_label.text)
         self.assertIn("剩余 12.5s", self.panel._runtime_label.text)
-        self.assertIn("无需点击 GRC Run", self.panel._runtime_label.text)
-        self.assertIn("log: UUU", self.panel._runtime_label.text)
+        self.assertNotIn("pid=", self.panel._runtime_label.text)
+        self.assertNotIn("UUU", self.panel._runtime_label.text)
         self.assertTrue(self.panel._runtime_label.visible)
+        self.assertTrue(self.panel._runtime_controls.visible)
 
-    def test_inspector_reports_completion_and_runtime(self):
+    def test_workflow_card_hides_internal_bookkeeping(self):
         workflow = {
             "workflow_id": "wf-test",
             "revision": 3,
@@ -151,17 +126,18 @@ class WorkflowPresenterTest(unittest.TestCase):
             ],
         }
 
-        self.panel._set_workflow_details(workflow)
-        text = self.panel._workflow_details.buffer.text
+        card = present(spec={}, workflow=workflow, claims=[])["workflow"]
+        text = str(card)
 
-        self.assertIn("workflow_id=wf-test", text)
-        self.assertIn("runtime=stopped", text)
-        self.assertIn("return_code=0", text)
-        self.assertIn("构建 BLE 广播  passed", text)
-        self.assertIn("attempt 1", text)
-        self.assertIn("completion 1/1", text)
-        self.assertIn("BLE 离线协议校验  running", text)
-        self.assertIn("completion 0/1", text)
+        self.assertTrue(card["visible"])
+        self.assertEqual(card["stages"][0]["status"], "passed")
+        self.assertEqual(card["stages"][1]["status"], "running")
+        self.assertEqual(card["stages"][0]["acceptance_count"], 1)
+        self.assertNotIn("workflow_id", text)
+        self.assertNotIn("attempt", text)
+        self.assertNotIn("completion_result", text)
+        self.assertNotIn("return_code", text)
+        self.assertNotIn("pid", text)
 
     def test_inspector_failed_outcome_not_masked_by_completion(self):
         workflow = {
@@ -179,10 +155,9 @@ class WorkflowPresenterTest(unittest.TestCase):
                 },
             ],
         }
-        self.panel._set_workflow_details(workflow)
-        text = self.panel._workflow_details.buffer.text
-        self.assertIn("failed", text)
-        self.assertNotIn("发射机构建与校验  passed", text)
+        card = present(spec={}, workflow=workflow, claims=[])["workflow"]
+        self.assertEqual(card["stages"][0]["status"], "failed")
+        self.assertEqual(card["stages"][0]["acceptance_count"], 4)
 
     def test_recovery_buttons_are_actionable(self):
         self.panel._set_pending({
@@ -194,25 +169,17 @@ class WorkflowPresenterTest(unittest.TestCase):
         self.assertEqual(self.panel._cancel_btn.label, "取消任务")
         self.assertTrue(self.panel._pending_row.visible)
 
-    def test_timeline_keeps_execution_actor(self):
-        self.panel._set_timeline([
-            {
-                "seq": 7,
-                "event": "executor_completed",
-                "stage_id": "offline_protocol_verify",
-                "actor": "deterministic_stage_handler [deepradio]",
-            }
-        ])
-
-        self.assertEqual(
-            self.panel._timeline_store,
-            [[
-                "7",
-                "executor_completed",
-                "offline_protocol_verify",
-                "deterministic_stage_handler [deepradio]",
-            ]],
-        )
+    def test_completion_count_is_projected_as_acceptance_predicates(self):
+        card = present(spec={}, claims=[], workflow={
+            "current_stage": "verify",
+            "stages": [{
+                "id": "verify", "label": "校验", "execution_status": "running",
+                "attempt": 3, "max_attempts": 5,
+                "completion": ["packet_valid", "parameters_match"],
+            }],
+        })["workflow"]
+        self.assertEqual(card["stages"][0]["acceptance_count"], 2)
+        self.assertNotIn("attempt", str(card))
 
     def test_checkpoint_buttons_are_stage_specific(self):
         self.panel._set_pending({
@@ -276,7 +243,7 @@ class WorkflowPresenterTest(unittest.TestCase):
         self.assertTrue(self.panel._evidence_btn.sensitive)
         self.assertIn("人工确认、附件缺失", self.panel._pending_label.text)
 
-    def test_quality_warning_is_visible_in_activity_and_inspector(self):
+    def test_quality_warning_is_visible_without_raw_warning_dump(self):
         workflow = {
             "task_label": "有限时长发射",
             "stage_label": "运行观察",
@@ -294,10 +261,10 @@ class WorkflowPresenterTest(unittest.TestCase):
             "stages": [],
         }
         self.panel._set_activity({}, workflow)
-        self.panel._set_workflow_details(workflow)
         self.assertIn("质量: warning", self.panel._activity_label.text)
-        self.assertIn("quality=warning", self.panel._workflow_details.buffer.text)
-        self.assertIn("rf_stream_quality", self.panel._workflow_details.buffer.text)
+        runtime = present(spec={}, workflow=workflow, claims=[])["runtime"]
+        self.assertEqual(runtime["quality"], "warning")
+        self.assertNotIn("rf_stream_quality", str(runtime))
 
     def test_completed_digest_clears_stale_checkpoint_buttons(self):
         self.panel._last_pending = {
@@ -314,6 +281,55 @@ class WorkflowPresenterTest(unittest.TestCase):
         })
         self.assertFalse(self.panel._pending_row.visible)
         self.assertEqual(self.panel._confirm_btn.label, "")
+
+    def test_paper_view_exposes_phase_spec_sources_and_unresolved_fields(self):
+        view = present(
+            spec={
+                "intent_status": "awaiting_input",
+                "radio_specification": [
+                    {"key": "goal", "label": "Goal", "value": "BLE advertising", "source": "user"},
+                    {"key": "carrier_frequency", "label": "Carrier", "display_value": "2.402 GHz", "source": "protocol_default"},
+                    {"key": "success_conditions", "label": "Success condition", "unresolved": True},
+                ],
+            },
+            workflow={
+                "task_type": "INTENT_ALIGNMENT",
+                "current_stage": "intent_alignment",
+                "shared_intent": {"status": "awaiting_input"},
+            },
+            claims=[],
+        )
+        self.assertEqual(view["phase"]["label"], "ALIGN INTENT")
+        rows = {item["key"]: item for item in view["specification"]["rows"]}
+        self.assertEqual(rows["goal"]["source"], "User")
+        self.assertEqual(rows["carrier_frequency"]["source"], "Protocol Default")
+        self.assertEqual(rows["success_conditions"]["value"], "?")
+        self.assertFalse(view["specification"]["aligned"])
+
+    def test_diagnosis_card_only_uses_scoped_findings(self):
+        view = present(
+            spec={}, claims=[{
+                "id": "old-ble", "statement": "old BLE packet passed",
+                "layer": "protocol", "status": "Passed",
+                "intent_id": "intent-old",
+            }],
+            workflow={
+                "task_type": "DIAGNOSE",
+                "shared_intent": {"intent_id": "intent-current"},
+                "diagnosis": {
+                    "requested_dimensions": ["device", "runtime"],
+                    "findings": [
+                        {"check_id": "device.discovery", "dimension": "device", "status": "pass", "observation": {"identity": "usb:pluto"}},
+                        {"check_id": "runtime.process_status", "dimension": "runtime", "status": "unknown", "observation": {"status": "not_started"}, "remediation": "启动后再检查"},
+                    ],
+                }
+            },
+        )
+        diagnosis = view["diagnosis"]
+        self.assertTrue(diagnosis["visible"])
+        self.assertEqual([item["status"] for item in diagnosis["findings"]], ["Passed", "Unknown"])
+        self.assertNotIn("EVM", str(diagnosis))
+        self.assertEqual(view["claims"]["rows"], [])
 
 
 if __name__ == "__main__":

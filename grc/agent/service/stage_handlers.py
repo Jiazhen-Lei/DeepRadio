@@ -686,6 +686,36 @@ def _handle_repair(self, ctx, user_text, recipe, simulate) -> AgentReply:
     )
 
 
+def _diagnosis_dimensions(raw_text: str, slots: dict) -> list[str]:
+    """Infer a diagnosis scope without coupling it to catalog task names.
+
+    An LLM/planner may provide ``diagnosis_dimensions`` directly.  The lexical
+    fallback only maps domain nouns to reusable check dimensions; it never
+    selects a canned task result.
+    """
+    explicit = slots.get("diagnosis_dimensions") or []
+    if isinstance(explicit, str):
+        explicit = [explicit]
+    if explicit:
+        return list(dict.fromkeys(str(item) for item in explicit if item))
+    text = str(raw_text or "").lower()
+    groups = (
+        ("environment", ("驱动", "环境", "依赖", "driver", "uhd", "libiio")),
+        ("device", ("设备", "型号", "发现", "探测", "probe", "identity", "sdr")),
+        ("parameters", ("参数", "频率", "采样率", "带宽", "增益", "衰减")),
+        ("project", ("流图", "工程", ".grc", "block", "连接边")),
+        ("runtime", ("运行", "进程", "日志", "报错", "崩溃", "runtime")),
+        ("rf_path", ("接线", "线缆", "端口", "天线", "连接", "射频链路")),
+        ("signal", ("evm", "ber", "星座", "频谱", "波形", "信号质量")),
+    )
+    selected = [name for name, hints in groups if any(hint in text for hint in hints)]
+    if not selected:
+        selected = ["intent", "environment", "device", "parameters", "runtime", "rf_path"]
+    elif "device" in selected and "intent" not in selected:
+        selected.insert(0, "intent")
+    return list(dict.fromkeys(selected))
+
+
 def inspect_measure_stage(
     self, ctx: ToolContext, *, diagnose: bool = False
 ) -> AgentReply:
@@ -695,19 +725,41 @@ def inspect_measure_stage(
     slots = workflow.intent.slots if workflow else {}
     hardware_report = {}
     if diagnose and slots.get("hardware"):
+        dimensions = _diagnosis_dimensions(workflow.intent.raw_text, slots)
         hardware_report = registry.call(
             "run_diagnosis_checks",
-            {"device_type": slots.get("hardware"), "live_probe": True},
+            {
+                "device_type": slots.get("hardware"),
+                "dimensions": [
+                    item for item in dimensions
+                    if item in {
+                        "intent", "environment", "device", "parameters",
+                        "project", "runtime", "rf_path",
+                    }
+                ],
+                "live_probe": True,
+            },
             ctx,
         )
         self._record_tool_result(ctx, "run_diagnosis_checks", hardware_report)
         if hardware_report.get("report_path"):
-            ctx.extra.setdefault("artifacts", {})["diagnosis_report"] = (
+            ctx.extra.setdefault("artifacts", {})["hardware_diagnosis_report"] = (
                 hardware_report["report_path"]
             )
-        if not self._state.project.grc_path:
+        snapshot = self._state.diagnosis
+        snapshot.intent_id = self._state.intent.intent_id
+        snapshot.intent_revision = self._state.intent.revision
+        snapshot.requested_dimensions = list(dimensions)
+        snapshot.findings = list(hardware_report.get("findings") or [])
+        snapshot.summary = dict(hardware_report.get("summary") or {})
+        snapshot.report_path = str(hardware_report.get("report_path") or "")
+        snapshot.created_at = time.time()
+        hardware_only = not set(dimensions).intersection({
+            "project", "signal", "waveform", "metrics",
+        })
+        if hardware_only or not self._state.project.grc_path:
             summary = dict(hardware_report.get("summary") or {})
-            return self._fold(
+            reply = self._fold(
                 ctx,
                 "硬件诊断完成：pass={pass_count}，fail={fail_count}，"
                 "unknown={unknown_count}；unknown 项需要外部或人工证据。".format(
@@ -716,8 +768,17 @@ def inspect_measure_stage(
                     unknown_count=summary.get("unknown", 0),
                 ),
                 source="deterministic-stage",
-                ok=bool(hardware_report.get("ok")),
+                ok=bool(hardware_report.get("diagnosis_complete"))
+                and not bool(summary.get("fail")),
             )
+            if summary.get("unknown"):
+                reply.quality = "warning"
+                self._state.runtime.quality = "warning"
+                self._state.runtime.warnings.append({
+                    "code": "diagnosis_unknown_requires_evidence",
+                    "count": int(summary.get("unknown") or 0),
+                })
+            return reply
 
     inspected = registry.call("inspect_flowgraph", {}, ctx)
     self._record_tool_result(ctx, "inspect_flowgraph", inspected)
@@ -870,7 +931,7 @@ def inspect_measure_stage(
         }, ctx)
         self._record_tool_result(ctx, "run_diagnosis_experiment", experiment)
         if experiment.get("report_path"):
-            ctx.extra.setdefault("artifacts", {})["diagnosis_report"] = (
+            ctx.extra.setdefault("artifacts", {})["signal_diagnosis_report"] = (
                 experiment["report_path"]
             )
         diagnosis = registry.call("debug_by_metric", {

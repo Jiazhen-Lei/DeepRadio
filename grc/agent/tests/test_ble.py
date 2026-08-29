@@ -113,7 +113,8 @@ class BleDeployContractTest(unittest.TestCase):
         ):
             agent = ServiceAgent(session_id="ble-pluto-service")
             built = agent.step(
-                "用plutosdr发射一段2.402GHz的ble信号，local name为deepradio"
+                "用plutosdr发射一段2.402GHz的ble信号，local name为deepradio，"
+                "发射30秒，成功条件为LightBlue观察到deepradio"
             )
             self.assertIn(
                 built.workflow_digest["current_stage"],
@@ -123,7 +124,8 @@ class BleDeployContractTest(unittest.TestCase):
             text = Path(built.artifacts["grc_path"]).read_text(encoding="utf-8")
             self.assertIn("iio_pluto_sink", text)
             self.assertEqual(agent._workflow.workflow.intent.raw_text,
-                             "用plutosdr发射一段2.402GHz的ble信号，local name为deepradio")
+                             "用plutosdr发射一段2.402GHz的ble信号，local name为deepradio，"
+                             "发射30秒，成功条件为LightBlue观察到deepradio")
             self.assertGreaterEqual(agent._state.project.flowgraph_version, 1)
             self.assertEqual(agent._state.project.config["hardware"], "pluto")
             self.assertNotIn("modulation", agent._state.spec.open_questions)
@@ -169,7 +171,8 @@ class BleDeployContractTest(unittest.TestCase):
         ):
             agent = ServiceAgent(session_id="ble-hackrf-service")
             reply = agent.step(
-                "用 HackRF 发射 BLE 信号，local name 为 deepradio，直接部署"
+                "用 HackRF 发射 BLE 信号，local name 为 deepradio，发射30秒，"
+                "成功条件为独立接收端观察到deepradio，直接部署"
             )
             self.assertEqual(reply.workflow_digest["current_stage"],
                              "build_ble_advertiser")
@@ -197,7 +200,8 @@ class BleDeployContractTest(unittest.TestCase):
         ):
             agent = ServiceAgent(session_id="ble-service")
             built = agent.step(
-                "用 B210 发射 BLE 信号，localname 为 deepradio，让 LightBlue 收到"
+                "用 B210 发射 BLE 信号，localname 为 deepradio，发射30秒，"
+                "成功条件为LightBlue收到deepradio"
             )
             self.assertEqual(
                 built.workflow_digest["current_stage"], "discover_and_probe_device"

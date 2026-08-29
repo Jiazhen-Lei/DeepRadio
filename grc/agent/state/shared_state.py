@@ -96,6 +96,8 @@ class Claim:
     producer: str = ""
     measurement_id: str = ""
     stale_reason: str = ""
+    intent_id: str = ""
+    intent_revision: int = 0
 
 
 @dataclass
@@ -109,6 +111,19 @@ class MeasurementRun:
     algorithm: Dict[str, Any] = field(default_factory=dict)
     result: Dict[str, Any] = field(default_factory=dict)
     artifact_ids: List[str] = field(default_factory=list)
+
+
+@dataclass
+class DiagnosisSnapshot:
+    """Latest scoped diagnosis, bound to one intent revision."""
+
+    intent_id: str = ""
+    intent_revision: int = 0
+    requested_dimensions: List[str] = field(default_factory=list)
+    findings: List[Dict[str, Any]] = field(default_factory=list)
+    summary: Dict[str, Any] = field(default_factory=dict)
+    report_path: str = ""
+    created_at: float = 0.0
 
 
 @dataclass
@@ -190,6 +205,7 @@ class SharedState:
     runtime: RuntimeState = field(default_factory=RuntimeState)
     artifacts: List[ArtifactRecord] = field(default_factory=list)
     measurements: List[MeasurementRun] = field(default_factory=list)
+    diagnosis: DiagnosisSnapshot = field(default_factory=DiagnosisSnapshot)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -235,53 +251,143 @@ class SharedState:
 
     def spec_digest(self) -> Dict[str, Any]:
         decided = {item.key: item.value for item in self.spec.decisions}
+        decision_sources = {item.key: item.source for item in self.spec.decisions}
         config = self.project.config
+        shared = self.intent
+        active_intent = bool(
+            shared.task_type or shared.parameters or shared.status != "idle"
+        )
+        parameters = dict(shared.parameters or {}) if active_intent else {}
+        sources = dict(shared.parameter_sources or {}) if active_intent else {}
+
+        def value(key: str, *fallback_keys: str) -> Any:
+            if key in parameters and parameters.get(key) not in (None, "", []):
+                return parameters.get(key)
+            for fallback in fallback_keys:
+                if fallback in parameters and parameters.get(fallback) not in (None, "", []):
+                    return parameters.get(fallback)
+            if active_intent:
+                return None
+            for candidate in (key,) + fallback_keys:
+                if config.get(candidate) not in (None, "", []):
+                    return config.get(candidate)
+                if decided.get(candidate) not in (None, "", []):
+                    return decided.get(candidate)
+            return None
+
+        def source(key: str, *fallback_keys: str) -> str:
+            for candidate in (key,) + fallback_keys:
+                if sources.get(candidate):
+                    return str(sources[candidate])
+                if not active_intent and decision_sources.get(candidate):
+                    return str(decision_sources[candidate])
+            return ""
+
         protocol = str(
-            config.get("protocol") or decided.get("protocol") or ""
+            value("protocol") or ""
         )
         hardware = str(
-            config.get("hardware") or decided.get("hardware") or ""
+            value("hardware") or ""
         )
         local_name = str(
-            config.get("local_name") or decided.get("local_name") or ""
+            value("local_name") or ""
         )
-        ble_channel = config.get("ble_channel")
+        ble_channel = value("ble_channel")
         if ble_channel is None:
-            channels = config.get("advertising_channels") or []
+            channels = value("advertising_channels") or []
             ble_channel = channels[0] if channels else ""
-        carrier = config.get("carrier_frequency")
+        carrier = value("carrier_frequency")
         duration = (
-            config.get("max_duration_seconds")
-            or config.get("duration_seconds")
+            value("max_duration_seconds", "duration_seconds")
             or ""
         )
+        goals = list(shared.goals or self.spec.goals) if active_intent else list(self.spec.goals)
+        success_conditions = list(
+            shared.success_criteria or parameters.get("success_conditions") or []
+        ) if active_intent else list(self.spec.success_conditions)
         digest = {
-            "goals": list(self.spec.goals),
-            "success_conditions": list(self.spec.success_conditions),
-            "constraints": dict(self.spec.constraints),
+            "goals": goals,
+            "success_conditions": success_conditions,
+            "constraints": dict(shared.constraints or self.spec.constraints)
+            if active_intent else dict(self.spec.constraints),
             "decisions": [asdict(item) for item in self.spec.decisions],
-            "open_questions": list(self.spec.open_questions),
-            "recipe": str(config.get("recipe") or ""),
+            "open_questions": list(shared.missing_fields or self.spec.open_questions)
+            if active_intent else list(self.spec.open_questions),
+            "recipe": str(value("recipe") or ""),
             "modulation": str(
-                config.get("modulation") or decided.get("modulation") or ""
+                value("modulation") or ""
             ),
             "channel": str(
-                config.get("channel") or decided.get("channel") or ""
+                value("channel") or ""
             ),
             "protocol": protocol,
             "hardware": hardware,
             "local_name": local_name,
             "ble_channel": ble_channel,
             "carrier_frequency": carrier,
-            "sample_rate": config.get("sample_rate"),
-            "direction": str(config.get("direction") or ""),
+            "sample_rate": value("sample_rate"),
+            "direction": str(value("direction") or ""),
             "signal_source_scope": str(
-                config.get("signal_source_scope") or ""
+                value("signal_source_scope") or ""
             ),
             "rf_armed": bool(config.get("rf_armed")),
             "max_duration_seconds": duration,
             "spec_kind": "ble" if protocol.lower() == "ble" else "link",
+            "intent_id": shared.intent_id if active_intent else "",
+            "intent_revision": shared.revision if active_intent else 0,
+            "intent_status": shared.status if active_intent else "idle",
+            "parameter_sources": sources,
         }
+        missing = set(digest["open_questions"])
+        rows = []
+
+        def add_row(key: str, label: str, raw: Any, raw_source: str,
+                    display: str = "") -> None:
+            from ..knowledge.spec_requirements import question_for
+
+            unresolved = raw in (None, "", [])
+            needs_confirmation = key in missing and not unresolved
+            interaction = question_for(key)
+            rows.append({
+                "key": key,
+                "label": label,
+                "value": raw,
+                "display_value": "" if unresolved else (display or str(raw)),
+                "source": raw_source,
+                "unresolved": unresolved,
+                "needs_confirmation": needs_confirmation,
+                "editable": key != "goal",
+                "choices": list(interaction.get("choices") or []),
+                "allow_custom": bool(interaction.get("allow_custom", True)),
+            })
+
+        goal_text = "；".join(str(item) for item in goals if item)
+        add_row("goal", "Goal", goal_text, "user" if shared.raw_text else "system")
+        if hardware or "hardware" in missing:
+            add_row("hardware", "Device", hardware, source("hardware"), _hardware_label(hardware))
+        if protocol or "protocol" in missing:
+            add_row("protocol", "Protocol", protocol, source("protocol"), protocol.upper())
+        if digest["modulation"] or "modulation" in missing:
+            add_row("modulation", "Modulation", digest["modulation"], source("modulation"), digest["modulation"].upper())
+        if protocol.lower() == "ble" or ble_channel not in (None, ""):
+            channels = value("advertising_channels") or (
+                [ble_channel] if ble_channel not in (None, "") else []
+            )
+            add_row("advertising_channels", "Channel", channels, source("advertising_channels", "carrier_frequency"), f"CH{ble_channel}" if ble_channel not in (None, "") else "")
+        elif digest["channel"] or "channel" in missing:
+            add_row("channel", "Channel", digest["channel"], source("channel"), digest["channel"].upper())
+        if carrier is not None or "carrier_frequency" in missing:
+            add_row("carrier_frequency", "Carrier", carrier, source("carrier_frequency"), _format_hz(carrier))
+        if digest["sample_rate"] is not None or "sample_rate" in missing:
+            add_row("sample_rate", "Sample rate", digest["sample_rate"], source("sample_rate"), _format_rate(digest["sample_rate"]))
+        if duration not in (None, "") or missing.intersection({"duration_seconds", "max_duration_seconds"}):
+            add_row("duration_seconds", "Maximum duration", duration, source("max_duration_seconds", "duration_seconds"), f"{duration:g} s" if isinstance(duration, (int, float)) else str(duration))
+        success_text = "；".join(str(item) for item in success_conditions if item)
+        if success_text or "success_conditions" in missing:
+            add_row("success_conditions", "Success condition", success_text, source("success_conditions"))
+        if protocol.lower() == "ble" and (local_name or "local_name" in missing):
+            add_row("local_name", "Advertising name", local_name, source("local_name"))
+        digest["radio_specification"] = rows
         digest["summary"] = _spec_summary_line(digest)
         if protocol.lower() == "ble" and duration not in ("", None):
             digest["duration_note"] = (
@@ -427,6 +533,8 @@ def _from_dict(data: Dict[str, Any]) -> SharedState:
                 producer=str(item.get("producer") or ""),
                 measurement_id=str(item.get("measurement_id") or ""),
                 stale_reason=str(item.get("stale_reason") or ""),
+                intent_id=str(item.get("intent_id") or ""),
+                intent_revision=int(item.get("intent_revision", 0) or 0),
             )
         )
     coordination = Coordination(
@@ -485,6 +593,23 @@ def _from_dict(data: Dict[str, Any]) -> SharedState:
             for item in data.get("measurements") or []
             if isinstance(item, dict) and item.get("measurement_id")
         ],
+        diagnosis=DiagnosisSnapshot(
+            intent_id=str((data.get("diagnosis") or {}).get("intent_id") or ""),
+            intent_revision=int(
+                (data.get("diagnosis") or {}).get("intent_revision", 0) or 0
+            ),
+            requested_dimensions=list(
+                (data.get("diagnosis") or {}).get("requested_dimensions") or []
+            ),
+            findings=list((data.get("diagnosis") or {}).get("findings") or []),
+            summary=dict((data.get("diagnosis") or {}).get("summary") or {}),
+            report_path=str(
+                (data.get("diagnosis") or {}).get("report_path") or ""
+            ),
+            created_at=float(
+                (data.get("diagnosis") or {}).get("created_at", 0.0) or 0.0
+            ),
+        ),
     )
 
 

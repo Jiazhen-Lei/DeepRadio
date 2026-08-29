@@ -986,6 +986,36 @@ class ServiceAgent:
     def step_command(self, command: Dict[str, Any]) -> AgentReply:
         """Structured GUI command entry; text remains a compatibility transport."""
         action = str((command or {}).get("action") or "")
+        if action == "specification_update":
+            runtime = dict(self._state.project.config.get("runtime") or {})
+            if runtime.get("running"):
+                from .hardware_runtime import RUNTIME
+
+                stopped = RUNTIME.stop(self.session_id, emergency=True)
+                self._state.project.config["rf_armed"] = False
+                self._state.project.config.pop("rf_armed_path", None)
+                _store.append_session_event(
+                    self.session_id,
+                    "runtime_stopped_for_specification_update",
+                    self._workflow_event_payload(stopped),
+                )
+            try:
+                aligned = self._alignment.consume_updates(command)
+                self._state.save(_store.state_path(self.session_id))
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Radio Specification 更新失败")
+                return self._error_reply(f"规格更新失败: {exc}")
+            if aligned.pending or aligned.intent is None:
+                return self._alignment_waiting_reply(aligned.message)
+            try:
+                self._workflow.instantiate(aligned.intent, self._state)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Workflow instantiate 失败")
+                return self._error_reply(f"Workflow 建立失败: {exc}")
+            reply = self._step_once(
+                "", recipe="", simulate=True, consume_turn=False
+            )
+            return self._continue_autonomous(reply, recipe="", simulate=True)
         if action == "interaction_response":
             try:
                 aligned = self._alignment.consume_response(command)
@@ -1006,6 +1036,8 @@ class ServiceAgent:
             return self._continue_autonomous(reply, recipe="", simulate=True)
         if action == "retry_transmit":
             return self._retry_transmit()
+        if action in {"stop_runtime", "emergency_stop"}:
+            return self._stop_runtime_command(emergency=action == "emergency_stop")
         if action == "retry_stage":
             return self._retry_waiting_stage()
         if action == "cancel_workflow":
@@ -1286,6 +1318,36 @@ class ServiceAgent:
         self._project_tool_results(stage, reply)
         self._finish_workflow_reply(reply, ok=bool(result.get("running")))
         return reply
+
+    def _stop_runtime_command(self, *, emergency: bool) -> AgentReply:
+        """Always-available host stop; it does not advance the Workflow."""
+        from ..tools import registry
+
+        ctx = self._make_ctx()
+        name = "emergency_stop" if emergency else "stop_flowgraph"
+        result = registry.call(name, {}, ctx)
+        self._record_tool_result(ctx, name, result, {})
+        self._state.project.config["rf_armed"] = False
+        self._state.project.config.pop("rf_armed_path", None)
+        self._state.runtime.granted_effects = [
+            effect for effect in self._state.runtime.granted_effects
+            if not is_rf_grant_effect(effect)
+        ]
+        self._state.runtime.status = "stopped"
+        self._state.save(_store.state_path(self.session_id))
+        reply = self._fold(
+            ctx,
+            ("已执行紧急停止。" if emergency else "已停止当前运行。")
+            + (f" run_id={result.get('run_id')}" if result.get("run_id") else ""),
+            source="host-runtime-control",
+            ok=bool(result.get("ok", True)),
+        )
+        reply.stage = "RUNTIME"
+        reply.spec_digest = self._state.spec_digest()
+        reply.claims = ClaimStore(self._state).summary()
+        reply.workflow_digest = self._digest_with_timeline()
+        return reply
+
     def _run_deep(self, agent: Any, ctx: ToolContext,
                   user_text: str) -> AgentReply:
         ctx.extra["execution_mode"] = "deepagents"
@@ -2096,6 +2158,24 @@ class ServiceAgent:
             **shared_intent.snapshot(),
             "interaction": dict(shared_intent.interaction or {}),
         }
+        digest["project_version"] = int(
+            self._state.project.flowgraph_version or 0
+        )
+        diagnosis = self._state.diagnosis
+        if (
+            diagnosis.intent_id
+            and diagnosis.intent_id == shared_intent.intent_id
+            and diagnosis.intent_revision == shared_intent.revision
+        ):
+            digest["diagnosis"] = {
+                "intent_id": diagnosis.intent_id,
+                "intent_revision": diagnosis.intent_revision,
+                "requested_dimensions": list(diagnosis.requested_dimensions),
+                "findings": list(diagnosis.findings),
+                "summary": dict(diagnosis.summary),
+                "report_path": diagnosis.report_path,
+                "created_at": diagnosis.created_at,
+            }
         if self._alignment.needs_alignment():
             interaction = dict(shared_intent.interaction or {})
             digest.update({

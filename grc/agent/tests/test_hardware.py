@@ -690,7 +690,8 @@ class V6FollowupContractTest(unittest.TestCase):
         ):
             agent = ServiceAgent(session_id="ble-events")
             reply = agent.step(
-                "用plutosdr发射一段2.402GHz的ble信号，local name为loveu"
+                "用plutosdr发射一段2.402GHz的ble信号，local name为loveu，"
+                "发射30秒，成功条件为LightBlue观察到loveu"
             )
         events = (self.sessions / "ble-events" / "events.jsonl").read_text(
             encoding="utf-8"
@@ -701,6 +702,26 @@ class V6FollowupContractTest(unittest.TestCase):
         self.assertIn("BLE 1M", reply.spec_digest.get("summary") or "")
         self.assertIn("loveu", reply.spec_digest.get("summary") or "")
         self.assertIn("✓ BLE PDU generated", reply.text or "")
+
+    def test_gui_emergency_stop_command_revokes_rf_grant(self):
+        from grc.agent.service.adapter import ServiceAgent
+
+        with mock.patch(
+            "grc.agent.service.orchestrator.build_agent", return_value=None
+        ), mock.patch(
+            "grc.agent.tools.registry.call",
+            return_value={
+                "ok": True, "run_id": "run-ui", "running": False,
+                "reason": "emergency_stop", "return_code": -9,
+            },
+        ) as called:
+            agent = ServiceAgent(session_id="gui-emergency-stop")
+            agent._state.runtime.granted_effects = ["READ", "RF_RUN"]
+            reply = agent.step_command({"action": "emergency_stop"})
+        called.assert_called_once_with("emergency_stop", {}, mock.ANY)
+        self.assertEqual(reply.stage, "RUNTIME")
+        self.assertIn("紧急停止", reply.text)
+        self.assertNotIn("RF_RUN", agent._state.runtime.granted_effects)
 
 
 # --- test_tool_origin_and_profiles.py ---
