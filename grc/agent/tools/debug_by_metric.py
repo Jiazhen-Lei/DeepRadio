@@ -55,7 +55,7 @@ def debug_by_metric(ctx, profile=None, metric: str = "evm",
                           {"kind": "evm", "probe_id": probe_id,
                            "modulation": modulation, "sps": sps}, ctx)
         if not m.get("ok"):
-            return {"ok": False, "error": m.get("error", "读 EVM 失败")}
+            return {"ok": False, "error": m.get("error", "Failed to read EVM")}
         value = m["value"]
         state = None
         try:
@@ -78,15 +78,15 @@ def debug_by_metric(ctx, profile=None, metric: str = "evm",
                           {"kind": "spectrum_peak", "probe_id": probe_id},
                           ctx)
         if not m.get("ok"):
-            return {"ok": False, "error": m.get("error", "读频谱失败")}
+            return {"ok": False, "error": m.get("error", "Failed to read the spectrum")}
         diag = {"ok": True, "metric": "spectrum_peak",
                 "value": m.get("peak"), "peak_bin": m.get("peak_bin"),
-                "verdict": "已定位频谱主峰,可据此核对载波/单音频率是否符合预期。",
+                "verdict": "The spectrum peak was located and can be used to verify the expected carrier or tone frequency.",
                 "suggestions": []}
         diag["narrative"] = narrate_debug(diag, profile)
         return diag
 
-    return {"ok": False, "error": f"暂不支持的指标: {metric}"}
+    return {"ok": False, "error": f"Unsupported metric: {metric}"}
 
 
 def _diagnose_evm(
@@ -102,41 +102,41 @@ def _diagnose_evm(
     )
     if meets_claim:
         verdict = (
-            f"EVM 已达标（Claim 要求 < {claim_threshold:g}%，当前 {evm:.2f}%）。"
-            "主因是设计噪声（AWGN），不是故障。"
+            f"EVM meets the claim (< {claim_threshold:g}%; current value: {evm:.2f}%). "
+            "The primary contributor is the designed AWGN, not a fault."
         )
         sugg: List[dict] = [{
-            "knob": "chan.noise_voltage", "dir": "↑(可选压测)",
-            "say_novice": "已经达标了，不用改。如果想看它变差，可以把杂音调大试试。",
-            "say_student": "可选：增大 chan.noise_voltage 做鲁棒性压测。",
+            "knob": "chan.noise_voltage", "dir": "↑ (optional stress test)",
+            "say_novice": "The target is already met. No change is needed; increase the noise only if you want to observe degradation.",
+            "say_student": "Optional: increase chan.noise_voltage for a robustness stress test.",
         }]
         return verdict, sugg, True
     if evm < _EVM_GOOD:
-        verdict = "EVM 正常,链路质量优秀。"
+        verdict = "EVM is normal and link quality is excellent."
         sugg = [{
-            "knob": "chan.noise_voltage", "dir": "↑(压测)",
-            "say_novice": "信号很干净;如果想看它变差,可以把杂音调大试试。",
-            "say_student": "可增大 chan.noise_voltage 做鲁棒性压测。",
+            "knob": "chan.noise_voltage", "dir": "↑ (stress test)",
+            "say_novice": "The signal is clean; increase the noise only if you want to observe degradation.",
+            "say_student": "Increase chan.noise_voltage for a robustness stress test.",
         }]
     elif evm < _EVM_USABLE:
         verdict = (
-            "EVM 处于设计噪声下的正常范围，主因是 AWGN 设计点，不是故障。"
+            "EVM is within the normal range for the designed noise level. The primary contributor is the AWGN design point, not a fault."
         )
         sugg = [{
-            "knob": "chan.noise_voltage", "dir": "↓(可选)",
-            "say_novice": "这不是故障。如果想更干净，可以把杂音再调小一点。",
-            "say_student": "可选：减小 chan.noise_voltage 进一步压低 EVM。",
+            "knob": "chan.noise_voltage", "dir": "↓ (optional)",
+            "say_novice": "This is not a fault. Reduce the noise if you want an even cleaner signal.",
+            "say_student": "Optional: reduce chan.noise_voltage to lower EVM further.",
         }]
     else:
-        verdict = "EVM 偏高,判决容易出错,需排查噪声/频偏/同步。"
+        verdict = "EVM is high; symbol decisions may fail. Inspect noise, frequency offset, and synchronization."
         sugg = [{
             "knob": "chan.noise_voltage", "dir": "↓",
-            "say_novice": "信号有点乱,先把杂音调小很多再看。",
-            "say_student": "先大幅降低 chan.noise_voltage 确认是否为噪声主导。",
+            "say_novice": "The signal is distorted. Reduce the noise substantially and check again.",
+            "say_student": "Reduce chan.noise_voltage substantially to determine whether noise is dominant.",
         }, {
             "knob": "chan.freq_offset", "dir": "→0",
-            "say_novice": "如果信号点在转圈,把\"频率偏移\"设回 0。",
-            "say_student": "若星座旋转,说明有频偏,应置 freq_offset=0 或加载波恢复。",
+            "say_novice": "If the signal points rotate, set the frequency offset back to 0.",
+            "say_student": "A rotating constellation indicates frequency offset; set freq_offset=0 or add carrier recovery.",
         }]
     return verdict, sugg, False
 

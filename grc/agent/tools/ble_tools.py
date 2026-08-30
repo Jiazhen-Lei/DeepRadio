@@ -111,19 +111,24 @@ def _reference_dewhiten(data: bytes, channel: int) -> bytes:
 
 
 def _advertiser_address(local_name: str) -> bytes:
-    address = bytearray(hashlib.sha256(local_name.encode("utf-8")).digest()[:6])
+    # A local name is optional in a valid advertising payload.  It is only a
+    # deterministic seed here so repeated offline builds remain reproducible.
+    seed = local_name or "deepradio-unnamed-advertiser"
+    address = bytearray(hashlib.sha256(seed.encode("utf-8")).digest()[:6])
     address[-1] = (address[-1] & 0x3F) | 0xC0  # static random address
     return bytes(address)
 
 
 def _packet(local_name: str, channel: int) -> Dict[str, Any]:
     encoded = local_name.encode("utf-8")
-    if not encoded or len(encoded) > 26:
-        raise ValueError("BLE Complete Local Name 必须为 1~26 个 UTF-8 字节")
+    if len(encoded) > 26:
+        raise ValueError("BLE Complete Local Name cannot exceed 26 UTF-8 bytes")
     if channel not in ADV_FREQUENCIES:
-        raise ValueError("BLE Advertising channel 必须是 37、38 或 39")
+        raise ValueError("BLE advertising channel must be 37, 38, or 39")
     adv_address = _advertiser_address(local_name)
-    adv_data = bytes((2, 0x01, 0x06, len(encoded) + 1, 0x09)) + encoded
+    adv_data = bytes((2, 0x01, 0x06))
+    if encoded:
+        adv_data += bytes((len(encoded) + 1, 0x09)) + encoded
     payload = adv_address + adv_data
     header = bytes((0x42, len(payload)))  # ADV_NONCONN_IND + TxAdd=random
     pdu = header + payload
@@ -164,8 +169,9 @@ def _leave_hardware_sink_unarmed(ctx: ToolContext, block_id: str) -> None:
 @tool(
     name="build_ble_advertising_pdu",
     description=(
-        "DeepRadio protocol tool: build a BLE ADV_NONCONN_IND PDU with Complete "
-        "Local Name. Not a GNU Radio block; call this tool instead of synthesizing bits."
+        "DeepRadio protocol tool: build a BLE ADV_NONCONN_IND PDU. Complete "
+        "Local Name is optional. Not a GNU Radio block; call this tool instead "
+        "of synthesizing bits."
     ),
     parameters={
         "type": "object",
@@ -173,7 +179,7 @@ def _leave_hardware_sink_unarmed(ctx: ToolContext, block_id: str) -> None:
             "local_name": {"type": "string"},
             "channel": {"type": "integer"},
         },
-        "required": ["local_name"],
+        "required": [],
     },
     group="ble",
     origin="deepradio_protocol",
@@ -181,7 +187,7 @@ def _leave_hardware_sink_unarmed(ctx: ToolContext, block_id: str) -> None:
     effect_level="ARTIFACT_WRITE",
 )
 def build_ble_advertising_pdu(
-    ctx: ToolContext, local_name: str, channel: int = 37
+    ctx: ToolContext, local_name: str = "", channel: int = 37
 ) -> Dict[str, Any]:
     packet = _packet(local_name, int(channel))
     out_dir = _out_dir(ctx)
@@ -223,7 +229,7 @@ def build_ble_advertising_pdu(
 
 def _gaussian_taps(samples_per_symbol: int, bt: float = 0.5, span: int = 4) -> np.ndarray:
     if samples_per_symbol < 2 or bt <= 0:
-        raise ValueError("samples_per_symbol 和 BT 必须为正")
+        raise ValueError("samples_per_symbol and BT must be positive")
     # Gaussian impulse response, with time expressed in symbol periods.
     # A larger BT has a wider frequency response and therefore a narrower
     # time-domain impulse response.
@@ -250,7 +256,7 @@ def _gaussian_taps(samples_per_symbol: int, bt: float = 0.5, span: int = 4) -> n
             "modulation_index": {"type": "number"},
             "digital_amplitude": {"type": "number"},
         },
-        "required": ["local_name"],
+        "required": [],
     },
     group="ble",
     origin="deepradio_protocol",
@@ -259,7 +265,7 @@ def _gaussian_taps(samples_per_symbol: int, bt: float = 0.5, span: int = 4) -> n
 )
 def generate_ble_1m_waveform(
     ctx: ToolContext,
-    local_name: str,
+    local_name: str = "",
     channel: int = 37,
     sample_rate: float = 2_000_000.0,
     interval_ms: float = 100.0,
@@ -270,15 +276,15 @@ def generate_ble_1m_waveform(
     sample_rate = float(sample_rate)
     samples_per_symbol = int(round(sample_rate / 1_000_000.0))
     if samples_per_symbol < 2 or abs(samples_per_symbol * 1_000_000.0 - sample_rate) > 1:
-        return {"ok": False, "error": "BLE 1M sample_rate 必须是 1 MHz 的整数倍且至少 2 MHz"}
+        return {"ok": False, "error": "BLE 1M sample_rate must be an integer multiple of 1 MHz and at least 2 MHz"}
     if not 20.0 <= float(interval_ms) <= 10_240.0:
-        return {"ok": False, "error": "advertising interval 必须位于 20~10240 ms"}
+        return {"ok": False, "error": "Advertising interval must be between 20 and 10240 ms"}
     if not 0.3 <= float(bt) <= 0.7:
-        return {"ok": False, "error": "BLE GFSK BT 必须位于 0.3~0.7"}
+        return {"ok": False, "error": "BLE GFSK BT must be between 0.3 and 0.7"}
     if not 0.45 <= float(modulation_index) <= 0.55:
-        return {"ok": False, "error": "BLE 1M modulation_index 必须位于 0.45~0.55"}
+        return {"ok": False, "error": "BLE 1M modulation_index must be between 0.45 and 0.55"}
     if not 0.0 < float(digital_amplitude) <= 0.8:
-        return {"ok": False, "error": "digital_amplitude 必须位于 (0, 0.8]"}
+        return {"ok": False, "error": "digital_amplitude must be in (0, 0.8]"}
     packet = _packet(local_name, int(channel))
     symbols = 2.0 * np.asarray(_bits_lsb(packet["air_packet"]), dtype=np.float64) - 1.0
     nrz = np.repeat(symbols, samples_per_symbol)
@@ -318,19 +324,20 @@ def generate_ble_1m_waveform(
     name="verify_ble_packet_bits",
     description=(
         "DeepRadio protocol tool: verify the offline BLE advertising packet, "
-        "CRC, whitening round-trip, and local name. Not a GNU Radio block."
+        "CRC and whitening round-trip. When requested, also verify the local "
+        "name. Not a GNU Radio block."
     ),
     parameters={
         "type": "object",
         "properties": {"local_name": {"type": "string"}, "channel": {"type": "integer"}},
-        "required": ["local_name"],
+        "required": [],
     },
     group="ble",
     origin="deepradio_protocol",
     runtime="deepradio",
 )
 def verify_ble_packet_bits(
-    ctx: ToolContext, local_name: str, channel: int = 37
+    ctx: ToolContext, local_name: str = "", channel: int = 37
 ) -> Dict[str, Any]:
     channel = int(channel)
     current = ctx.extra.get("ble_packet") or {}
@@ -342,11 +349,13 @@ def verify_ble_packet_bits(
         except (OSError, TypeError):
             air_packet = b""
     parsed = _parse_advertising_air_packet(air_packet, channel)
-    expected_name = local_name.encode("utf-8")
-    name_ok = parsed.get("local_name_bytes") == expected_name
     waveform_check = _verify_waveform_loopback(ctx, air_packet)
     checks = dict(parsed.get("checks") or {})
-    checks["local_name_matches_request"] = bool(name_ok)
+    if local_name:
+        expected_name = local_name.encode("utf-8")
+        checks["local_name_matches_request"] = (
+            parsed.get("local_name_bytes") == expected_name
+        )
     checks.update(waveform_check.get("checks") or {})
     verified = bool(checks and all(checks.values()))
     result = {
@@ -504,13 +513,13 @@ def build_ble_uhd_tx_flowgraph(
     device_args = device_args_for("b210", device_args)
     path = Path(waveform_path).resolve()
     if not path.is_file():
-        return {"ok": False, "error": "BLE waveform 文件不存在"}
+        return {"ok": False, "error": "BLE waveform file does not exist"}
     if int(channel) not in ADV_FREQUENCIES:
-        return {"ok": False, "error": "仅支持 BLE Advertising channel 37/38/39"}
+        return {"ok": False, "error": "Only BLE advertising channels 37, 38, and 39 are supported"}
     if not 0.0 <= float(gain) <= 10.0:
-        return {"ok": False, "error": "首期安全策略限制 TX gain 为 0~10 dB"}
+        return {"ok": False, "error": "The initial safety policy limits TX gain to 0–10 dB"}
     if not 1.0 <= float(duration_seconds) <= 60.0:
-        return {"ok": False, "error": "TX duration_seconds 必须位于 1~60 秒"}
+        return {"ok": False, "error": "TX duration_seconds must be between 1 and 60 seconds"}
     steps = []
 
     def invoke(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -612,13 +621,13 @@ def build_ble_pluto_tx_flowgraph(
 ) -> Dict[str, Any]:
     path = Path(waveform_path).resolve()
     if not path.is_file():
-        return {"ok": False, "error": "BLE waveform 文件不存在"}
+        return {"ok": False, "error": "BLE waveform file does not exist"}
     if int(channel) not in ADV_FREQUENCIES:
-        return {"ok": False, "error": "仅支持 BLE Advertising channel 37/38/39"}
+        return {"ok": False, "error": "Only BLE advertising channels 37, 38, and 39 are supported"}
     if not 10.0 <= float(attenuation) <= 80.0:
-        return {"ok": False, "error": "Pluto TX attenuation 首期限制为 10~80 dB"}
+        return {"ok": False, "error": "The initial safety policy limits Pluto TX attenuation to 10–80 dB"}
     if not 1.0 <= float(duration_seconds) <= 60.0:
-        return {"ok": False, "error": "TX duration_seconds 必须位于 1~60 秒"}
+        return {"ok": False, "error": "TX duration_seconds must be between 1 and 60 seconds"}
     steps = []
 
     def invoke(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -669,7 +678,7 @@ def build_ble_pluto_tx_flowgraph(
         return {
             "ok": False,
             "valid": False,
-            "error": added.get("error") or "当前环境没有 iio_pluto_sink",
+            "error": added.get("error") or "iio_pluto_sink is unavailable in the current environment",
             "steps": steps,
             "not_started": True,
         }

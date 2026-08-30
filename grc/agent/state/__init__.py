@@ -21,7 +21,12 @@ from .shared_state import (
     current_measurement_id,
 )
 from .snapshot import create_snapshot, restore_snapshot
-from .intent_state import INTENT_STATUSES, SharedIntent
+from .intent_state import (
+    INTENT_STATUSES,
+    RadioSpecification,
+    SharedIntent,
+    SpecificationField,
+)
 
 __all__ = [
     "ALLOW",
@@ -41,6 +46,8 @@ __all__ = [
     "ResultEnvelope",
     "SharedState",
     "SharedIntent",
+    "RadioSpecification",
+    "SpecificationField",
     "INTENT_STATUSES",
     "TaskCard",
     "RuntimeState",

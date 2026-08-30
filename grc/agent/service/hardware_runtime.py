@@ -34,7 +34,7 @@ class HardwareRuntime:
             if existing and existing["process"].poll() is not None:
                 self._reap_locked(session_id)
             if session_id in self._processes:
-                return {"ok": False, "error": "该 session 已有硬件 Flowgraph 在运行"}
+                return {"ok": False, "error": "A hardware flowgraph is already running in this session"}
             command = [interpreter, "-u", program] if interpreter else [program]
             try:
                 process = subprocess.Popen(
@@ -50,7 +50,7 @@ class HardwareRuntime:
                     "ok": False,
                     "running": False,
                     "ready": False,
-                    "error": f"硬件 Flowgraph 进程创建失败: {exc}",
+                    "error": f"Failed to create the hardware flowgraph process: {exc}",
                     "program": program,
                     "interpreter": interpreter,
                 }
@@ -195,7 +195,7 @@ class HardwareRuntime:
                 "run_id": record.get("run_id"),
                 "ready": True,
                 "pid": process.pid,
-                "error": "硬件 Flowgraph 未能进入终止状态",
+                "error": "The hardware flowgraph did not reach a terminated state",
             }
         self._processes.pop(session_id, None)
         reader = record.get("reader")

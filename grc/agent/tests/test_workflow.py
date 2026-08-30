@@ -1675,13 +1675,13 @@ class IntentAlignmentContractTest(unittest.TestCase):
         first = self.alignment.consume_text("我要用硬件发射一段ble信号")
         self.assertTrue(first.pending)
         self.assertEqual(self.state.intent.interaction["field"], "hardware")
-        self.respond(value="pluto")
-        self.assertEqual(self.state.intent.interaction["field"], "local_name")
-        self.respond(custom_value="deepradio")
-        self.assertEqual(self.state.intent.interaction["field"], "duration_seconds")
-        self.respond(value=30.0)
-        self.assertEqual(self.state.intent.interaction["field"], "success_conditions")
-        self.respond(custom_value="LightBlue 观察到 deepradio")
+        self.assertEqual(
+            self.state.intent.interaction["fields"],
+            ["hardware", "duration_seconds", "success_conditions"],
+        )
+        self.alignment.consume_text(
+            "硬件用 PlutoSDR，最多20秒，成功条件是独立接收端观察到目标信号"
+        )
         self.assertEqual(
             self.state.intent.interaction["kind"], "intent_confirmation"
         )
@@ -1689,11 +1689,12 @@ class IntentAlignmentContractTest(unittest.TestCase):
         self.assertFalse(final.pending)
         self.assertEqual(self.state.intent.status, "confirmed")
         self.assertEqual(final.intent.slots["hardware"], "pluto")
-        self.assertEqual(final.intent.slots["local_name"], "deepradio")
-        self.assertEqual(final.intent.slots["max_duration_seconds"], 30.0)
+        self.assertNotIn("local_name", final.intent.slots)
+        self.assertEqual(final.intent.slots["direction"], "tx")
+        self.assertEqual(final.intent.slots["max_duration_seconds"], 20.0)
         self.assertEqual(
             final.intent.slots["success_conditions"],
-            ["LightBlue 观察到 deepradio"],
+            ["独立接收端观察到目标信号"],
         )
         self.assertTrue(self.state.intent.semantic_hash)
 
@@ -1726,7 +1727,7 @@ class IntentAlignmentContractTest(unittest.TestCase):
             self.state.intent.parameter_sources["duration_seconds"], "user_choice"
         )
 
-    def test_radio_specification_exposes_default_and_edit_choices(self):
+    def test_radio_specification_is_read_only_and_exposes_suggestions(self):
         self.alignment.consume_text("我要用硬件发射一段ble信号")
         digest = self.state.spec_digest()
         rows = {item["key"]: item for item in digest["radio_specification"]}
@@ -1735,8 +1736,145 @@ class IntentAlignmentContractTest(unittest.TestCase):
         self.assertEqual(duration["source"], "safety_default")
         self.assertTrue(duration["needs_confirmation"])
         self.assertTrue(duration["choices"])
-        self.assertTrue(rows["modulation"]["editable"])
+        self.assertFalse(rows["modulation"]["editable"])
+        self.assertTrue(rows["modulation"]["locked"])
         self.assertEqual(rows["modulation"]["display_value"], "GFSK")
+
+    def test_optional_ble_name_only_appears_when_user_mentions_it(self):
+        self.alignment.consume_text("我要用硬件发射一段 BLE 信号")
+        unnamed = {
+            item["key"] for item in self.state.spec_digest()["radio_specification"]
+        }
+        self.assertNotIn("local_name", unnamed)
+
+        other_state = SharedState(session_id="named-intent")
+        other = IntentAlignmentCoordinator(self.engine, other_state)
+        other.consume_text(
+            "我要用硬件发射 BLE，local name 为 research-demo"
+        )
+        named_rows = {
+            item["key"]: item for item in other_state.spec_digest()["radio_specification"]
+        }
+        self.assertEqual(named_rows["local_name"]["requirement"], "mentioned")
+        self.assertEqual(named_rows["local_name"]["value"], "research-demo")
+
+    def test_partial_natural_reply_only_reasks_unanswered_required_fields(self):
+        self.alignment.consume_text("我要用硬件发射一段 BLE 信号")
+        self.alignment.consume_text("硬件用 PlutoSDR")
+        self.assertEqual(
+            self.state.intent.missing_fields,
+            ["duration_seconds", "success_conditions"],
+        )
+        self.assertEqual(
+            self.state.intent.interaction["fields"],
+            ["duration_seconds", "success_conditions"],
+        )
+
+    def test_optional_catalog_and_teaching_do_not_confirm_or_mutate_values(self):
+        self.alignment.consume_text("我要用硬件发射一段 BLE 信号")
+        self.alignment.consume_text(
+            "硬件用 PlutoSDR，最多20秒，成功条件是独立接收端观察到目标信号"
+        )
+        revision = self.state.intent.revision
+        parameters = dict(self.state.intent.parameters)
+        catalog = self.alignment.consume_text("有哪些可选字段")
+        self.assertIn("Advertising name", catalog.message)
+        teaching = self.alignment.consume_text("介绍这些参数")
+        self.assertIn("只是解释", teaching.message)
+        self.assertEqual(self.state.intent.status, "awaiting_confirmation")
+        self.assertEqual(self.state.intent.revision, revision)
+        self.assertEqual(self.state.intent.parameters, parameters)
+
+        self.alignment.consume_text("local name 改为 research-demo")
+        self.assertEqual(
+            self.state.intent.parameters["local_name"], "research-demo"
+        )
+        added = next(
+            item for item in self.state.intent.specification.fields
+            if item.key == "local_name"
+        )
+        self.assertEqual(added.requirement, "optional_added")
+        self.assertEqual(self.state.intent.status, "awaiting_confirmation")
+
+    def test_radio_specification_export_matches_canonical_intent_revision(self):
+        self.alignment.consume_text("我要用硬件发射一段 BLE 信号")
+        state_path = Path(self.temp.name) / "state.json"
+        self.state.save(str(state_path))
+        exported = json.loads(
+            (Path(self.temp.name) / "radio_specification.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(exported["intent_id"], self.state.intent.intent_id)
+        self.assertEqual(exported["revision"], self.state.intent.revision)
+        self.assertEqual(exported["semantic_hash"], self.state.intent.semantic_hash)
+        self.assertEqual(
+            exported["specification"], self.state.intent.specification.to_dict()
+        )
+
+    def test_protocol_profiles_are_composed_without_task_sentence_branches(self):
+        from grc.agent.knowledge.spec_requirements import resolve_specification
+
+        common = {
+            "task_type": "HARDWARE_CONFIGURE",
+            "capabilities": ["protocol", "hardware_runtime", "deploy"],
+            "slot_sources": {
+                "hardware": "user", "direction": "user",
+                "protocol": "user", "duration_seconds": "user",
+                "success_conditions": "user",
+            },
+            "missing_fields": [], "validation_errors": [],
+        }
+        ble = resolve_specification(
+            **common,
+            slots={
+                "hardware": "pluto", "direction": "tx", "protocol": "ble",
+                "operation": "deploy",
+                "duration_seconds": 10, "success_conditions": ["observe"],
+            },
+        )
+        wifi = resolve_specification(
+            **common,
+            slots={
+                "hardware": "b210", "direction": "tx", "protocol": "wifi",
+                "operation": "deploy",
+                "wifi_role": "beacon", "duration_seconds": 10,
+                "success_conditions": ["observe"],
+            },
+        )
+        generic = resolve_specification(
+            task_type="END_TO_END_SIM", capabilities=["build_signal"],
+            slots={"modulation": "bpsk"}, slot_sources={"modulation": "user"},
+            missing_fields=[], validation_errors=[],
+        )
+        self.assertIn("protocol_ble", ble.profile_refs)
+        self.assertIn("protocol_wifi", wifi.profile_refs)
+        self.assertNotIn("protocol_ble", generic.profile_refs)
+        self.assertIn("local_name", [item["field"] for item in ble.optional_prompts])
+        self.assertIn("ssid", [item["field"] for item in wifi.optional_prompts])
+        self.assertNotIn("ssid", [item["field"] for item in generic.optional_prompts])
+
+    def test_physical_tx_questions_only_apply_to_actual_deploy(self):
+        deploy_state = SharedState(session_id="generic-deploy")
+        deploy = IntentAlignmentCoordinator(self.engine, deploy_state)
+        deploy.consume_text(
+            "用 B210 发射 BPSK 信号，载频 915 MHz，采样率 2 Msps"
+        )
+        self.assertEqual(
+            deploy_state.intent.missing_fields,
+            ["duration_seconds", "success_conditions"],
+        )
+        self.assertIn("physical_tx", deploy_state.intent.specification.profile_refs)
+
+        configure_state = SharedState(session_id="generic-configure")
+        configure = IntentAlignmentCoordinator(self.engine, configure_state)
+        configure.consume_text(
+            "给 Pluto 配好发射流图，载频 915 MHz，采样率 2 Msps，先不要发射"
+        )
+        self.assertEqual(configure_state.intent.missing_fields, [])
+        self.assertNotIn(
+            "physical_tx", configure_state.intent.specification.profile_refs
+        )
 
     def test_task_card_receives_shared_intent_snapshot(self):
         outcome = self.alignment.consume_text("构建 BPSK 过 AWGN 并测 EVM")

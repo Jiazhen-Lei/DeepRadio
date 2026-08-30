@@ -47,7 +47,7 @@ def _grc_number(value: float) -> str:
 def _run(command: list[str], timeout: float = 15.0) -> Dict[str, Any]:
     executable = shutil.which(command[0])
     if not executable:
-        return {"ok": False, "error": f"命令不可用: {command[0]}"}
+        return {"ok": False, "error": f"Command unavailable: {command[0]}"}
     try:
         completed = subprocess.run(
             [executable, *command[1:]],
@@ -58,7 +58,7 @@ def _run(command: list[str], timeout: float = 15.0) -> Dict[str, Any]:
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
-        return {"ok": False, "error": "硬件命令超时", "output": str(exc.stdout or "")}
+        return {"ok": False, "error": "Hardware command timed out", "output": str(exc.stdout or "")}
     return {
         "ok": completed.returncode == 0,
         "return_code": completed.returncode,
@@ -148,7 +148,7 @@ def _resolve_gnuradio_python(device_type: str = "") -> Dict[str, Any]:
             return {"ok": True, "interpreter": executable, "required": required}
     return {
         "ok": False,
-        "error": "没有找到可导入 GNU Radio 硬件模块的 Python 解释器",
+        "error": "No Python interpreter capable of importing GNU Radio hardware modules was found",
         "required": required,
         "checked": checked,
     }
@@ -279,12 +279,12 @@ def _persist_hardware_report(
 def _compile_grc(path: str) -> Dict[str, Any]:
     """Compile a saved GRC in a temporary directory without running it."""
     if not shutil.which("grcc"):
-        return {"ok": False, "error": "命令不可用: grcc", "compiled": False}
+        return {"ok": False, "error": "Command unavailable: grcc", "compiled": False}
     try:
         with tempfile.TemporaryDirectory(prefix="deepradio-grcc-") as build_dir:
             result = _run(["grcc", "-o", build_dir, path], timeout=30.0)
     except OSError as exc:
-        return {"ok": False, "error": f"无法创建临时编译目录: {exc}", "compiled": False}
+        return {"ok": False, "error": f"Unable to create a temporary compilation directory: {exc}", "compiled": False}
     result["compiled"] = bool(result.get("ok"))
     return result
 
@@ -316,7 +316,7 @@ def discover_devices(
     command = profile.command(probe=False, identity=device_args) if profile else []
     if not command:
         return {"ok": False, "read_only": True, "device_found": False,
-                "error": f"不支持的硬件发现类型: {device_type or '(empty)'}"}
+                "error": f"Unsupported hardware discovery type: {device_type or '(empty)'}"}
     result = _run(command)
     result["read_only"] = True
     result["device_type"] = device_type
@@ -366,12 +366,12 @@ def probe_device(
             "ok": False,
             "read_only": True,
             "device_probed": False,
-            "error": "IIO probe 需要 discover 返回的明确 device_identity",
+            "error": "IIO probing requires the exact device_identity returned by discovery",
         }
     command = profile.command(probe=True, identity=device_args) if profile else []
     if not command:
         return {"ok": False, "read_only": True, "device_probed": False,
-                "error": f"不支持的硬件探测类型: {device_type or '(empty)'}"}
+                "error": f"Unsupported hardware probe type: {device_type or '(empty)'}"}
     result = _run(command, timeout=20.0)
     result["read_only"] = True
     result["device_type"] = device_type
@@ -430,20 +430,20 @@ def arm_hardware_flowgraph(
             "ok": False,
             "armed": False,
             "requires_system_enable": True,
-            "error": "RF 运行功能未启用，拒绝生成 armed 流图",
+            "error": "RF runtime is disabled; refusing to generate an armed flowgraph",
         }
     if _is_ble_deploy(ctx) and not _completion_satisfied(ctx, "ble_packet_valid"):
-        return {"ok": False, "armed": False, "error": "离线协议校验尚未通过"}
+        return {"ok": False, "armed": False, "error": "Offline protocol verification has not passed"}
     if not _completion_satisfied(ctx, "device_probed"):
-        return {"ok": False, "armed": False, "error": "硬件 discover/probe 尚未通过"}
+        return {"ok": False, "armed": False, "error": "Hardware discovery and probing have not passed"}
     if not _rf_approved(ctx):
-        return {"ok": False, "armed": False, "error": "缺少 RF_RUN 用户授权"}
+        return {"ok": False, "armed": False, "error": "RF_RUN user authorization is missing"}
     source = _resolve_work_path(ctx, grc_path)
     out_dir = Path(ctx.out_dir or "").resolve()
     if not source.is_file() or out_dir not in source.parents:
-        return {"ok": False, "armed": False, "error": "只允许武装当前 session 的流图"}
+        return {"ok": False, "armed": False, "error": "Only the current session's flowgraph may be armed"}
     if ctx.flow_graph is None:
-        return {"ok": False, "armed": False, "error": "当前 session 没有已加载流图"}
+        return {"ok": False, "armed": False, "error": "The current session has no loaded flowgraph"}
     sink_keys = {
         "uhd_usrp_sink", "iio_pluto_sink", "iio_fmcomms2_sink_fc32",
         "osmosdr_sink", "limesdr_sink",
@@ -453,7 +453,7 @@ def arm_hardware_flowgraph(
         if str(getattr(block, "key", "")) in sink_keys
     ]
     if not sinks:
-        return {"ok": False, "armed": False, "error": "流图中没有受支持的硬件 TX Sink"}
+        return {"ok": False, "armed": False, "error": "The flowgraph has no supported hardware TX sink"}
     prior_states = [block.state for block in sinks]
     preview_blocks = [
         block for block in ctx.flow_graph.blocks
@@ -473,7 +473,7 @@ def arm_hardware_flowgraph(
         for block, state in zip(preview_blocks, preview_prior_states):
             block.state = state
         ctx.flow_graph.rewrite()
-        return {"ok": False, "armed": False, "error": "启用 TX Sink 后流图校验失败"}
+        return {"ok": False, "armed": False, "error": "Flowgraph validation failed after enabling the TX sink"}
     armed_path = source.with_name(f"{source.stem}.armed.grc")
     try:
         ctx.platform.save_flow_graph(str(armed_path), ctx.flow_graph)
@@ -483,7 +483,7 @@ def arm_hardware_flowgraph(
         for block, state in zip(preview_blocks, preview_prior_states):
             block.state = state
         ctx.flow_graph.rewrite()
-        return {"ok": False, "armed": False, "error": f"武装流图保存失败: {exc}"}
+        return {"ok": False, "armed": False, "error": f"Failed to save the armed flowgraph: {exc}"}
     compiled = _compile_grc(str(armed_path))
     if not compiled.get("compiled"):
         for block, state in zip(sinks, prior_states):
@@ -498,7 +498,7 @@ def arm_hardware_flowgraph(
         return {
             "ok": False,
             "armed": False,
-            "error": "武装流图未通过 grcc 编译",
+            "error": "The armed flowgraph did not compile with grcc",
             "compile": compiled,
         }
     state = ctx.extra.get("state")
@@ -568,30 +568,30 @@ def start_flowgraph(
             "ok": False,
             "enabled": False,
             "requires_confirmation": True,
-            "error": "真实 RF 默认关闭；仅在完成安全检查后显式设置 GRC_AGENT_ENABLE_RF=1",
+            "error": "Physical RF is disabled by default; explicitly set GRC_AGENT_ENABLE_RF=1 only after completing safety checks",
         }
     if not _rf_approved(ctx):
-        return {"ok": False, "requires_confirmation": True, "error": "缺少 RF_RUN 用户授权"}
+        return {"ok": False, "requires_confirmation": True, "error": "RF_RUN user authorization is missing"}
     if _is_ble_deploy(ctx) and not _completion_satisfied(ctx, "ble_packet_valid"):
-        return {"ok": False, "error": "离线协议校验尚未通过，拒绝启动 RF"}
+        return {"ok": False, "error": "Offline protocol verification has not passed; refusing to start RF"}
     if not _completion_satisfied(ctx, "device_probed"):
-        return {"ok": False, "error": "硬件 discover/probe 尚未通过，拒绝启动 RF"}
+        return {"ok": False, "error": "Hardware discovery and probing have not passed; refusing to start RF"}
     if _tx_requires_arming(ctx) and not _rf_armed(ctx, grc_path):
-        return {"ok": False, "error": "流图尚未由受控流程武装，拒绝启动 RF"}
+        return {"ok": False, "error": "The flowgraph has not been armed by the controlled workflow; refusing to start RF"}
     source = _resolve_work_path(ctx, grc_path)
     out_dir = Path(ctx.out_dir or "").resolve()
     if not source.is_file() or out_dir not in source.parents:
-        return {"ok": False, "error": "只允许执行当前 session 输出目录中的 .grc"}
+        return {"ok": False, "error": "Only .grc files in the current session output directory may be executed"}
     if source.suffix != ".grc":
-        return {"ok": False, "error": "硬件运行目标必须是 .grc"}
+        return {"ok": False, "error": "The hardware runtime target must be a .grc file"}
     build_dir = out_dir / "hardware_runtime"
     build_dir.mkdir(parents=True, exist_ok=True)
     compiled = _run(["grcc", "-o", str(build_dir), str(source)], timeout=30.0)
     if not compiled.get("ok"):
-        return {"ok": False, "error": "grcc 生成失败", "detail": compiled}
+        return {"ok": False, "error": "grcc generation failed", "detail": compiled}
     candidates = sorted(build_dir.glob("*.py"), key=lambda item: item.stat().st_mtime, reverse=True)
     if not candidates:
-        return {"ok": False, "error": "grcc 未生成 Python 程序"}
+        return {"ok": False, "error": "grcc did not generate a Python program"}
     candidates[0].chmod(candidates[0].stat().st_mode | 0o100)
     state = ctx.extra.get("state")
     project = getattr(state, "project", None)
@@ -820,12 +820,12 @@ def build_sdr_tx_flowgraph(
     freq = float(center_freq)
     rate = float(sample_rate)
     if freq <= 0 or rate <= 0:
-        return {"ok": False, "error": "中心频率和采样率必须为正数"}
+        return {"ok": False, "error": "Center frequency and sample rate must be positive"}
     candidates = _sdr_tx_sink_candidates(device_type, freq, rate)
     if not candidates:
         return {
             "ok": False,
-            "error": f"没有覆盖 {device_type or 'SDR'} 发射 endpoint 的确定性骨架",
+            "error": f"No deterministic structure covers the {device_type or 'SDR'} transmit endpoint",
         }
     steps: list[Dict[str, Any]] = []
 
@@ -860,7 +860,7 @@ def build_sdr_tx_flowgraph(
                 "waveform": "analog.GR_COS_WAVE",
                 "freq": "1000",
                 "amp": "0.3",
-                "comment": "未指定调制：预览用 1 kHz 测试音",
+                "comment": "No modulation specified: using a 1 kHz test tone for preview",
             },
         },
     )
@@ -877,7 +877,7 @@ def build_sdr_tx_flowgraph(
             "params": {
                 "type": "complex",
                 "samples_per_second": "samp_rate",
-                "comment": "仅限速，避免预览空转；不是错误",
+                "comment": "Rate limiting only, to prevent an unbounded preview loop; this is not an error",
             },
         },
     )
@@ -888,7 +888,7 @@ def build_sdr_tx_flowgraph(
             "id": "preview_sink",
             "params": {
                 "type": "complex",
-                "comment": "安全预览：采样丢弃，不接天线。灰色硬件端未 arm，不会发射。",
+                "comment": "Safe preview: samples are discarded and no antenna is connected. The grey hardware endpoint is unarmed and will not transmit.",
             },
         },
     )
@@ -897,7 +897,7 @@ def build_sdr_tx_flowgraph(
     dst_port = 0
     for sink_key, sink_id, params, dst_port in candidates:
         params = dict(params)
-        params["comment"] = "未授权射频，保持禁用。灰色=未 arm 的硬件端，不会发射。"
+        params["comment"] = "Unauthorized RF; remains disabled. Grey means the hardware endpoint is unarmed and will not transmit."
         added = invoke("add_block", {"key": sink_key, "id": sink_id, "params": params})
         if added.get("ok"):
             break
@@ -905,7 +905,7 @@ def build_sdr_tx_flowgraph(
         return {
             "ok": False,
             "valid": False,
-            "error": added.get("error") or f"当前环境没有 {device_type} 发射 sink",
+            "error": added.get("error") or f"No {device_type} transmit sink is available in the current environment",
             "steps": steps,
             "not_started": True,
             "armed": False,
@@ -918,7 +918,7 @@ def build_sdr_tx_flowgraph(
         return {
             "ok": False,
             "valid": False,
-            "error": connected.get("error") or "无法连接基带源与 SDR sink",
+            "error": connected.get("error") or "Unable to connect the baseband source to the SDR sink",
             "steps": steps,
             "hardware": hardware,
             "sink_key": sink_key,
@@ -941,7 +941,7 @@ def build_sdr_tx_flowgraph(
         if intended_validation.get("valid")
         and preview_src.get("ok")
         and preview_sink.get("ok")
-        else {"ok": False, "valid": False, "errors": ["安全预览支路创建失败"]}
+        else {"ok": False, "valid": False, "errors": ["Failed to create the safe-preview branch"]}
     )
     rendered = (
         invoke("render_grc", {})
@@ -951,7 +951,7 @@ def build_sdr_tx_flowgraph(
     compiled = (
         _compile_grc(str(rendered.get("path") or ""))
         if rendered.get("ok") and rendered.get("path")
-        else {"ok": False, "compiled": False, "error": "流图尚未保存"}
+        else {"ok": False, "compiled": False, "error": "The flowgraph has not been saved"}
     )
     final_valid = bool(
         preview_validation.get("valid") and compiled.get("compiled")
@@ -985,7 +985,7 @@ def build_sdr_tx_flowgraph(
         "grc_path": rendered.get("path"),
         "steps": steps,
         "errors": preview_validation.get("errors", [])
-        or ([] if compiled.get("compiled") else [compiled.get("error") or "grcc 编译失败"]),
+        or ([] if compiled.get("compiled") else [compiled.get("error") or "grcc compilation failed"]),
         "intended_topology_valid": bool(intended_validation.get("valid")),
         "preview_topology_valid": bool(preview_validation.get("valid")),
         "compiled": bool(compiled.get("compiled")),
@@ -1047,11 +1047,11 @@ def build_usrp_rx_spectrum_flowgraph(
     rate = float(sample_rate)
     rx_gain = float(gain)
     if freq <= 0 or rate <= 0:
-        return {"ok": False, "error": "中心频率和采样率必须为正数"}
+        return {"ok": False, "error": "Center frequency and sample rate must be positive"}
     if not 70e6 <= freq <= 6e9:
-        return {"ok": False, "error": "中心频率超出 B210 能力范围"}
+        return {"ok": False, "error": "Center frequency is outside the B210 capability range"}
     if not 0.0 <= rx_gain <= 76.0:
-        return {"ok": False, "error": "RX gain 必须在 0~76 dB"}
+        return {"ok": False, "error": "RX gain must be between 0 and 76 dB"}
     steps = []
 
     def invoke(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1181,16 +1181,16 @@ def build_sdr_rx_spectrum_flowgraph(
     hardware = normalize_hardware(device_type)
     profile = resolve_hardware_profile(hardware)
     if profile is None:
-        return {"ok": False, "error": f"未知 SDR 类型: {device_type}"}
+        return {"ok": False, "error": f"Unknown SDR type: {device_type}"}
     freq = float(center_freq)
     rate = float(sample_rate)
     if freq <= 0 or rate <= 0:
-        return {"ok": False, "error": "中心频率和采样率必须为正数"}
+        return {"ok": False, "error": "Center frequency and sample rate must be positive"}
     low, high = profile.frequency_range
     if not low <= freq <= high:
         return {
             "ok": False,
-            "error": f"中心频率超出 {profile.label} 的声明能力范围",
+            "error": f"Center frequency is outside the declared capability range of {profile.label}",
         }
     if profile.driver_family == "uhd":
         result = build_usrp_rx_spectrum_flowgraph(
@@ -1211,7 +1211,7 @@ def build_sdr_rx_spectrum_flowgraph(
     if profile.driver_family != "iio":
         return {
             "ok": False,
-            "error": f"{profile.label} 尚无接收频谱 builder",
+            "error": f"No receive-spectrum builder is available for {profile.label}",
         }
 
     steps: list[Dict[str, Any]] = []

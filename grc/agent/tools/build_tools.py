@@ -29,7 +29,7 @@ def init_flow_graph(
     ctx: ToolContext, flowgraph_id: str, generate_options: str = "no_gui"
 ):
     if ctx.platform is None:
-        return {"ok": False, "error": "缺少 platform"}
+        return {"ok": False, "error": "Platform is missing"}
     flow_graph = ctx.platform.make_flow_graph()
     env.configure_options(
         flow_graph, "python", generate_options, flowgraph_id=flowgraph_id
@@ -64,11 +64,11 @@ def add_block(
     ctx: ToolContext, key: str, id: str, params: Optional[dict] = None
 ):
     if id in ctx.blocks:
-        return {"ok": False, "error": f"块 id 已存在: {id}"}
+        return {"ok": False, "error": f"Block ID already exists: {id}"}
     flow_graph = ctx.ensure_flow_graph()
     block = flow_graph.new_block(key)
     if block is None:
-        return {"ok": False, "error": f"块不存在: {key}"}
+        return {"ok": False, "error": f"Block does not exist: {key}"}
     block.params["id"].set_value(id)
     unknown = []
     for name, value in (params or {}).items():
@@ -84,7 +84,7 @@ def add_block(
     ctx.blocks[id] = block
     result = {"ok": True, "id": id, "key": key}
     if unknown:
-        result["warning"] = f"忽略未知参数: {unknown}"
+        result["warning"] = f"Ignored unknown parameters: {unknown}"
     return result
 
 
@@ -110,13 +110,13 @@ def set_param(ctx: ToolContext, id: str, name: str, value):
     if block is None:
         return {
             "ok": False,
-            "error": f"块 id 不存在: {id}",
+            "error": f"Block ID does not exist: {id}",
             "known": list(ctx.blocks),
         }
     if name not in block.params:
         return {
             "ok": False,
-            "error": f"块 {id} 无参数 {name}",
+            "error": f"Block {id} has no parameter named {name}",
             "available": list(block.params),
         }
     block.params[name].set_value(str(value))
@@ -150,13 +150,13 @@ def connect(
 ):
     flow_graph = ctx.flow_graph
     if flow_graph is None:
-        return {"ok": False, "error": "流图尚未创建"}
+        return {"ok": False, "error": "The flowgraph has not been created"}
     source = ctx.blocks.get(src_id)
     destination = ctx.blocks.get(dst_id)
     if source is None or destination is None:
         return {
             "ok": False,
-            "error": "src/dst id 不存在",
+            "error": "The source or destination ID does not exist",
             "known": list(ctx.blocks),
         }
     flow_graph.rewrite()
@@ -166,7 +166,7 @@ def connect(
     except IndexError as exc:
         return {
             "ok": False,
-            "error": f"端口序号越界: {exc}",
+            "error": f"Port index out of range: {exc}",
             "src_sources": len(source.sources),
             "dst_sinks": len(destination.sinks),
         }
@@ -174,7 +174,7 @@ def connect(
         flow_graph.connect(source_endpoint, destination_endpoint)
         flow_graph.rewrite()
     except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "error": f"连接失败: {exc}"}
+        return {"ok": False, "error": f"Connection failed: {exc}"}
     return {
         "ok": True,
         "connection": f"{src_id}[{src_port}] -> {dst_id}[{dst_port}]",
@@ -196,7 +196,7 @@ def connect(
 def render_grc(ctx: ToolContext, path: str = ""):
     flow_graph = ctx.flow_graph
     if flow_graph is None:
-        return {"ok": False, "error": "流图尚未创建"}
+        return {"ok": False, "error": "The flowgraph has not been created"}
     flow_graph.rewrite()
     if not path:
         flowgraph_id = flow_graph.get_option("id") or "flow_graph"
@@ -206,7 +206,7 @@ def render_grc(ctx: ToolContext, path: str = ""):
     try:
         ctx.platform.save_flow_graph(path, flow_graph)
     except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "error": f"存盘失败: {exc}"}
+        return {"ok": False, "error": f"Failed to save the flowgraph: {exc}"}
     return {"ok": True, "path": path}
 
 
@@ -221,7 +221,7 @@ def render_grc(ctx: ToolContext, path: str = ""):
 def inspect_flowgraph(ctx: ToolContext):
     flow_graph = ctx.flow_graph
     if flow_graph is None:
-        return {"ok": False, "error": "当前 session 没有已加载的流图"}
+        return {"ok": False, "error": "The current session has no loaded flowgraph"}
     flow_graph.rewrite()
     blocks = []
     for block in flow_graph.blocks:

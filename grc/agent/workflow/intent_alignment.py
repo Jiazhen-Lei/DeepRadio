@@ -1,8 +1,8 @@
 """Alignment Gate before Workflow instantiation.
 
 This module deliberately does not execute stages.  It turns an underspecified
-request into a versioned SharedIntent, requests one answer at a time, and only
-hands a confirmed WorkflowIntent to the existing WorkflowEngine.
+request into a versioned SharedIntent, asks for all currently blocking fields,
+and only hands a confirmed WorkflowIntent to the existing WorkflowEngine.
 """
 
 from __future__ import annotations
@@ -13,7 +13,13 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 
-from ..knowledge.spec_requirements import missing_required_fields, question_for
+from ..knowledge.spec_requirements import (
+    combined_question,
+    missing_profile_fields,
+    missing_required_fields,
+    question_for,
+    resolve_specification,
+)
 from ..state import SharedIntent
 from .planning import project_intent_ir
 from .schema import WorkflowIntent
@@ -57,8 +63,18 @@ class IntentAlignmentCoordinator:
                     return self._confirm()
                 if normalized in _REVISE:
                     return self._request_revision()
+                if normalized in {
+                    "可选字段", "有哪些可选字段", "还能添加什么字段",
+                    "optional fields", "what optional fields are available",
+                }:
+                    return self._describe_optional_fields()
+                if any(word in normalized for word in (
+                    "介绍这些参数", "解释这些参数", "参数教学",
+                    "explain these parameters", "teach me these parameters",
+                )):
+                    return self._teach_specification()
                 return self._merge_free_text(text)
-            return self._answer_field(text, source="user_text")
+            return self._answer_fields(text, source="user_text")
         return self._start(text)
 
     def consume_response(self, response: Dict[str, Any]) -> AlignmentOutcome:
@@ -67,13 +83,13 @@ class IntentAlignmentCoordinator:
         if not interaction or str(response.get("interaction_id") or "") != str(
             interaction.get("interaction_id") or ""
         ):
-            return AlignmentOutcome(True, message="意图交互已变化，请刷新后重试。")
+            return AlignmentOutcome(True, message="The intent interaction has changed. Refresh and try again.")
         try:
             base_revision = int(response.get("base_intent_revision") or 0)
         except (TypeError, ValueError):
             base_revision = 0
         if base_revision != shared.revision:
-            return AlignmentOutcome(True, message="意图版本已变化，请按最新问题回答。")
+            return AlignmentOutcome(True, message="The intent revision has changed. Answer the latest question.")
         if interaction.get("kind") == "intent_confirmation":
             decision = str(response.get("decision") or "")
             if decision == "approved":
@@ -87,20 +103,24 @@ class IntentAlignmentCoordinator:
         )
 
     def consume_updates(self, response: Dict[str, Any]) -> AlignmentOutcome:
-        """Apply one Radio Specification table submission atomically."""
+        """Apply a legacy structured client update through the canonical writer.
+
+        The GTK main path uses natural language.  This remains for resumed
+        sessions and non-GUI API clients; it never writes exported JSON.
+        """
         shared = self.state.intent
         interaction = dict(shared.interaction or {})
         interaction_id = str(response.get("interaction_id") or "")
         if interaction and interaction_id != str(interaction.get("interaction_id") or ""):
-            return AlignmentOutcome(True, message="意图交互已变化，请刷新后重试。")
+            return AlignmentOutcome(True, message="The intent interaction has changed. Refresh and try again.")
         if str(response.get("intent_id") or shared.intent_id) != shared.intent_id:
-            return AlignmentOutcome(True, message="意图已变化，请按最新规格修改。")
+            return AlignmentOutcome(True, message="The intent has changed. Revise the latest specification.")
         try:
             base_revision = int(response.get("base_intent_revision") or 0)
         except (TypeError, ValueError):
             base_revision = 0
         if base_revision != shared.revision:
-            return AlignmentOutcome(True, message="意图版本已变化，请按最新规格修改。")
+            return AlignmentOutcome(True, message="The intent revision has changed. Revise the latest specification.")
         updates = dict(response.get("updates") or {})
         if not updates:
             if interaction.get("kind") == "intent_confirmation":
@@ -144,7 +164,7 @@ class IntentAlignmentCoordinator:
         shared.record_patch(
             changed_fields=changed,
             scope="intent_only",
-            source="radio_specification_table",
+            source="structured_specification_update",
             note="{} -> {}".format(before, shared.parameters),
         )
         self.event_sink(
@@ -212,19 +232,93 @@ class IntentAlignmentCoordinator:
         self.event_sink("intent_draft_created", self._event_payload())
         return self._evaluate(intent, had_user_questions=False)
 
-    def _answer_field(self, text: str, *, source: str) -> AlignmentOutcome:
+    def _answer_fields(self, text: str, *, source: str) -> AlignmentOutcome:
+        """Merge every reliably extracted answer from one natural-language turn."""
         interaction = dict(self.state.intent.interaction or {})
+        fields = list(interaction.get("fields") or [])
         field = str(interaction.get("field") or "")
-        if not field:
+        if field and field not in fields:
+            fields.insert(0, field)
+        if not fields:
             return self._merge_free_text(text)
-        parsed = self.engine.classify(text, self.state).slots.get(field)
-        value = parsed if parsed not in (None, "", []) else self._coerce(field, text)
-        return self._apply_field(field, value, source=source)
+        update = self.engine.classify(text, self.state)
+        update = self.engine._reconcile_intent(update, text, self.state)
+        shared = self.state.intent
+        changed = []
+        before = dict(shared.parameters or {})
+        explicit_sources = {"user", "llm", "user_text", "user_choice", "user_revision"}
+        # A reply to a concrete missing-field question must not accidentally
+        # reinterpret the already-established task.  For example, "an
+        # independent receiver observes the signal" is a success condition,
+        # not a request to turn a TX workflow into RX.  These identity fields
+        # may still be supplied when they are themselves being requested.
+        stable_identity_fields = {"protocol", "direction", "operation", "hardware"}
+        for key, value in dict(update.slots or {}).items():
+            if value in (None, "", []):
+                continue
+            if (
+                key in stable_identity_fields
+                and key not in fields
+                and shared.parameters.get(key) not in (None, "", [])
+            ):
+                continue
+            value_source = str(update.slot_sources.get(key) or "")
+            # Protocol defaults may accompany an explicitly named protocol;
+            # retain them as defaults, but never claim the user supplied them.
+            accepted_default = bool(
+                update.slots.get("protocol")
+                and update.slot_sources.get("protocol") in explicit_sources
+                and value_source in {"protocol_default", "derived"}
+            )
+            if value_source not in explicit_sources and not accepted_default:
+                continue
+            if shared.parameters.get(key) == value:
+                # Confirming a proposed/default value is still a semantic
+                # change: the value stays equal, but its authority becomes
+                # the user's explicit decision.
+                if (
+                    value_source in explicit_sources
+                    and shared.parameter_sources.get(key) not in explicit_sources
+                ):
+                    shared.parameter_sources[key] = source
+                    changed.append(key)
+                continue
+            shared.parameters[key] = value
+            shared.parameter_sources[key] = (
+                source if value_source in explicit_sources else value_source
+            )
+            changed.append(key)
+        if not changed and len(fields) == 1:
+            value = self._coerce(fields[0], text)
+            if value not in (None, "", []):
+                shared.parameters[fields[0]] = value
+                shared.parameter_sources[fields[0]] = source
+                changed.append(fields[0])
+        if not changed:
+            return AlignmentOutcome(
+                True,
+                message=(combined_question(fields) or "No usable parameter was recognized. Please rephrase your answer."),
+            )
+        shared.raw_text = (shared.raw_text + "\n" + str(text or "")).strip()
+        shared.revision += 1
+        shared.record_patch(
+            changed_fields=changed,
+            scope="intent_only",
+            source=source,
+            note="{} -> {}".format(before, shared.parameters),
+        )
+        self.event_sink(
+            "interaction_answered",
+            {**self._event_payload(), "fields": changed, "source": source},
+        )
+        return self._evaluate(
+            self._to_workflow_intent(shared), had_user_questions=True
+        )
 
     def _apply_field(self, field: str, value: Any, *, source: str) -> AlignmentOutcome:
         shared = self.state.intent
         if not field or value in (None, "", []):
-            return AlignmentOutcome(True, message=f"{field or '该字段'} 不能为空。")
+            return AlignmentOutcome(True, message=f"{field or 'This field'} cannot be empty.")
         before = shared.parameters.get(field)
         shared.parameters[field] = value
         shared.parameter_sources[field] = source
@@ -266,7 +360,8 @@ class IntentAlignmentCoordinator:
             changed.append(key)
         if not changed:
             return self._request_revision(
-                "请直接说明要改的参数，例如“设备改为 PlutoSDR”或“名称改为 demo”。"
+                "State the parameter and its new value directly, for example, "
+                "'change the device to PlutoSDR' or 'change the name to demo'."
             )
         shared.raw_text = (shared.raw_text + "\n" + str(text or "")).strip()
         shared.revision += 1
@@ -286,6 +381,12 @@ class IntentAlignmentCoordinator:
                 capabilities=intent.capabilities, slots=intent.slots,
                 slot_sources=intent.slot_sources,
             )
+            + missing_profile_fields(
+                task_type=intent.task_type,
+                capabilities=intent.capabilities,
+                slots=intent.slots,
+                slot_sources=intent.slot_sources,
+            )
         ))
         intent.validation_errors = self.engine._validate_slots(intent.slots)
         project_intent_ir(intent)
@@ -299,7 +400,7 @@ class IntentAlignmentCoordinator:
                 field = "modulation"
             return self._ask(field, validation_error=intent.validation_errors[0])
         if intent.missing_slots:
-            return self._ask(intent.missing_slots[0])
+            return self._ask_missing(intent.missing_slots)
         if had_user_questions or bool(shared.patch_history):
             return self._ask_confirmation()
         shared.status = "confirmed"
@@ -310,28 +411,51 @@ class IntentAlignmentCoordinator:
         return AlignmentOutcome(False, intent=self._to_workflow_intent(shared))
 
     def _ask(self, field: str, *, validation_error: str = "") -> AlignmentOutcome:
+        return self._ask_missing([field], validation_error=validation_error)
+
+    def _ask_missing(
+        self, fields: list[str], *, validation_error: str = ""
+    ) -> AlignmentOutcome:
         shared = self.state.intent
-        question = question_for(field)
+        fields = list(dict.fromkeys(str(item) for item in fields if item))
+        question = question_for(fields[0]) if fields else question_for("goal")
+        prompt = combined_question(fields) or str(question["prompt"])
         interaction = {
             "action": "intent_alignment",
             "kind": "ask_user_question",
             "purpose": "intent_alignment",
             "interaction_id": f"interaction-{uuid.uuid4().hex[:10]}",
             "base_intent_revision": shared.revision,
-            "field": field,
-            "prompt": question["prompt"],
-            "reason": question["prompt"],
-            "choices": list(question.get("choices") or []),
-            "allow_custom": bool(question.get("allow_custom", True)),
+            "field": fields[0] if fields else "",
+            "fields": fields,
+            "questions": [question_for(field) for field in fields],
+            "prompt": prompt,
+            "reason": prompt,
+            # Choices are retained only as suggestions for API compatibility;
+            # the GUI main path answers through natural language.
+            "choices": [],
+            "allow_custom": True,
             "validation_error": validation_error,
             "can_confirm": True,
             "approved": False,
         }
         shared.status = "awaiting_input"
         shared.interaction = interaction
+        shared.specification.blocking_questions = [
+            {
+                "field": field,
+                "prompt": str(question_for(field).get("prompt") or ""),
+                "suggestions": [
+                    str(item.get("label") or item.get("value") or "")
+                    for item in question_for(field).get("choices") or []
+                    if isinstance(item, dict)
+                ],
+            }
+            for field in fields
+        ]
         shared.refresh_hash()
         self.event_sink("interaction_requested", {**self._event_payload(), **interaction})
-        return AlignmentOutcome(True, message=question["prompt"])
+        return AlignmentOutcome(True, message=prompt)
 
     def _ask_confirmation(self) -> AlignmentOutcome:
         shared = self.state.intent
@@ -342,12 +466,15 @@ class IntentAlignmentCoordinator:
             "purpose": "intent_confirmation",
             "interaction_id": f"interaction-{uuid.uuid4().hex[:10]}",
             "base_intent_revision": shared.revision,
-            "prompt": "请确认对齐后的意图；确认后才建立 Workflow。",
-            "reason": "请确认对齐后的意图；确认后才建立 Workflow。",
+            "prompt": (
+                "Confirm the aligned intent before the workflow is created. "
+                "You can also state a field to revise or add, or ask to explain these parameters."
+            ),
+            "reason": "Confirm, continue revising, add optional fields, or request parameter guidance.",
             "summary": summary,
             "choices": [
-                {"id": "approved", "label": "确认并建立 Workflow", "value": "approved"},
-                {"id": "revise", "label": "继续修改", "value": "revise"}
+                {"id": "approved", "label": "Confirm and Create Workflow", "value": "approved"},
+                {"id": "revise", "label": "Continue Revising", "value": "revise"}
             ],
             "allow_custom": False,
             "can_confirm": True,
@@ -359,7 +486,29 @@ class IntentAlignmentCoordinator:
         self.event_sink("interaction_requested", {**self._event_payload(), **interaction})
         return AlignmentOutcome(True, message=interaction["prompt"] + "\n" + summary)
 
-    def _request_revision(self, message: str = "请说明需要修改的字段和值。") -> AlignmentOutcome:
+    def _describe_optional_fields(self) -> AlignmentOutcome:
+        optional = list(self.state.intent.specification.optional_prompts or [])
+        if not optional:
+            return AlignmentOutcome(True, message="The current profile has no additional recommended fields. You can confirm it now.")
+        labels = ", ".join(
+            str(item.get("label") or item.get("field") or "") for item in optional
+        )
+        return AlignmentOutcome(
+            True,
+            message="Optional fields include: {}. State the field and value to add, or reply 'confirm'.".format(labels),
+        )
+
+    def _teach_specification(self) -> AlignmentOutcome:
+        fields = list(self.state.intent.specification.fields or [])
+        lines = ["Current Radio Specification parameter guide:"]
+        for item in fields:
+            meta = question_for(item.key)
+            teaching = str(meta.get("teaching") or meta.get("prompt") or item.reason)
+            lines.append("- {}: {}".format(item.label or item.key, teaching))
+        lines.append("This explanation does not confirm any parameters. Continue revising or reply 'confirm'.")
+        return AlignmentOutcome(True, message="\n".join(lines))
+
+    def _request_revision(self, message: str = "State the field and value you want to revise.") -> AlignmentOutcome:
         shared = self.state.intent
         shared.status = "awaiting_confirmation"
         shared.interaction = {
@@ -409,6 +558,16 @@ class IntentAlignmentCoordinator:
             "entities": dict(intent.entities),
             "context": dict(intent.context),
         }
+        shared.specification = resolve_specification(
+            task_type=intent.task_type,
+            capabilities=intent.capabilities,
+            slots=intent.slots,
+            slot_sources=intent.slot_sources,
+            missing_fields=intent.missing_slots,
+            validation_errors=intent.validation_errors,
+            goals=intent.goals,
+            raw_text=shared.raw_text,
+        )
         shared.refresh_hash()
 
     @staticmethod
@@ -467,7 +626,7 @@ class IntentAlignmentCoordinator:
                 "duration_seconds", "operation", "signal_source_scope",
             }
         ]
-        return "意图: {}；{}".format(shared.task_type or "未分类", "，".join(visible))
+        return "Intent: {}; {}".format(shared.task_type or "Unclassified", ", ".join(visible))
 
     @staticmethod
     def _coerce(field: str, value: Any) -> Any:

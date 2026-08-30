@@ -70,6 +70,11 @@ def state_path(session_id: str) -> str:
     return os.path.join(session_root(session_id), "state.json")
 
 
+def radio_specification_path(session_id: str) -> str:
+    """Read-only materialized projection written alongside SharedState."""
+    return os.path.join(session_root(session_id), "radio_specification.json")
+
+
 def workflow_path(session_id: str) -> str:
     return os.path.join(session_root(session_id), "workflow.yaml")
 
@@ -533,6 +538,12 @@ def recent_events(session_id: str, limit: int = 40) -> List[Dict[str, Any]]:
                 "attempt": record.get("attempt") if record.get("attempt") is not None else payload.get("attempt"),
                 "actor": _event_actor(payload),
                 "mode": payload.get("mode") or payload.get("executor") or "",
+                "outcome": payload.get("outcome") or "",
+                "cause": payload.get("cause") or payload.get("reason") or "",
+                "affected_stages": list(
+                    payload.get("affected_stages") or payload.get("stages") or []
+                ),
+                "decision": payload.get("decision") or "",
                 "ok": (
                     (payload.get("result") or {}).get("ok")
                     if isinstance(payload.get("result"), dict)

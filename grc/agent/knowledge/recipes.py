@@ -71,10 +71,10 @@ def _common_vars(samp_rate: str = "1000000", sps: str = "4"):
 # ---------------------------------------------------------------------------
 _RECIPE_BPSK_AWGN = Recipe(
     name="bpsk_awgn",
-    title="BPSK 基带 + AWGN 信道",
+    title="BPSK Baseband + AWGN Channel",
     difficulty="T2",
-    summary="随机比特 -> BPSK 星座调制(RRC 成形)-> 加性高斯白噪声 -> 采集 IQ,"
-            "适合观察星座/EVM 随噪声退化。",
+    summary="Random bits -> BPSK constellation modulation (RRC shaping) -> additive white Gaussian noise -> IQ capture; "
+            "suited to observing constellation and EVM degradation with noise.",
     blocks=[
         *_common_vars(),
         ("variable_constellation", "bpsk_const", {
@@ -98,10 +98,10 @@ _RECIPE_BPSK_AWGN = Recipe(
         ("src", "mod"), ("mod", "chan"), ("chan", "head"), ("head", "sink"),
     ],
     knobs={
-        "chan.noise_voltage": "噪声强度;越大星座越散、EVM 越高。建议 0.01~0.5",
-        "mod.excess_bw": "RRC 滚降系数;越大带宽越宽、码间串扰越小。建议 0.2~0.5",
-        "sps.value": "每符号样本数;影响过采样与眼图张开度。建议 2~8",
-        "chan.freq_offset": "归一化频偏;非零会让星座旋转。诊断载波恢复用",
+        "chan.noise_voltage": "Noise strength; higher values spread the constellation and increase EVM. Suggested: 0.01–0.5",
+        "mod.excess_bw": "RRC roll-off; higher values widen bandwidth and reduce inter-symbol interference. Suggested: 0.2–0.5",
+        "sps.value": "Samples per symbol; affects oversampling and eye opening. Suggested: 2–8",
+        "chan.freq_offset": "Normalized frequency offset; nonzero values rotate the constellation. Useful for carrier-recovery diagnosis",
     },
     metrics=["evm", "constellation", "spectrum"],
     keywords=["bpsk", "awgn", "星座", "噪声", "调制", "误差", "evm", "基带"],
@@ -114,10 +114,10 @@ _RECIPE_BPSK_AWGN = Recipe(
 # ---------------------------------------------------------------------------
 _RECIPE_QPSK_AWGN = Recipe(
     name="qpsk_awgn",
-    title="QPSK 基带 + AWGN 信道",
+    title="QPSK Baseband + AWGN Channel",
     difficulty="T2",
-    summary="随机比特 -> QPSK 星座调制 -> AWGN -> 采集 IQ。每符号 2 bit,"
-            "同噪声下比 BPSK 更易出错,适合对比星座/EVM。",
+    summary="Random bits -> QPSK constellation modulation -> AWGN -> IQ capture. With two bits per symbol, "
+            "it is more error-prone than BPSK at the same noise level and supports constellation/EVM comparison.",
     blocks=[
         *_common_vars(),
         ("variable_constellation", "qpsk_const", {"type": "qpsk"}),
@@ -138,9 +138,9 @@ _RECIPE_QPSK_AWGN = Recipe(
         ("src", "mod"), ("mod", "chan"), ("chan", "head"), ("head", "sink"),
     ],
     knobs={
-        "chan.noise_voltage": "噪声强度;QPSK 判决边界更密,对噪声更敏感。建议 0.01~0.3",
-        "mod.excess_bw": "RRC 滚降系数。建议 0.2~0.5",
-        "chan.freq_offset": "归一化频偏;QPSK 星座会整体旋转 45°的整数倍",
+        "chan.noise_voltage": "Noise strength; QPSK decision boundaries are denser and more noise-sensitive. Suggested: 0.01–0.3",
+        "mod.excess_bw": "RRC roll-off. Suggested: 0.2–0.5",
+        "chan.freq_offset": "Normalized frequency offset; the QPSK constellation rotates in integer multiples of 45°",
     },
     metrics=["evm", "constellation", "spectrum"],
     keywords=["qpsk", "四相", "awgn", "星座", "噪声", "evm"],
@@ -163,7 +163,7 @@ def _tx_only_recipe(
         name=name,
         title=title,
         difficulty="T2",
-        summary=f"随机比特 -> {constellation.upper()} 星座调制 -> 采集 IQ，不含信道。",
+        summary=f"Random bits -> {constellation.upper()} constellation modulation -> IQ capture, without a channel model.",
         blocks=[
             *_common_vars(),
             ("variable_constellation", const_id, {"type": constellation}),
@@ -193,8 +193,8 @@ def _tx_only_recipe(
         ],
         connections=[("src", "mod"), ("mod", "head"), ("head", "sink")],
         knobs={
-            "mod.excess_bw": "RRC 滚降系数。建议 0.2~0.5",
-            "sps.value": "每符号样本数。建议 2~8",
+            "mod.excess_bw": "RRC roll-off. Suggested: 0.2–0.5",
+            "sps.value": "Samples per symbol. Suggested: 2–8",
         },
         metrics=[],
         keywords=keywords,
@@ -205,14 +205,14 @@ def _tx_only_recipe(
 
 _RECIPE_BPSK_TX = _tx_only_recipe(
     "bpsk_tx",
-    "BPSK 发射（无信道）",
+    "BPSK Transmitter (No Channel)",
     "bpsk",
     "2",
     ["bpsk", "发射机", "transmitter", "tx", "发射链"],
 )
 _RECIPE_QPSK_TX = _tx_only_recipe(
     "qpsk_tx",
-    "QPSK 发射（无信道）",
+    "QPSK Transmitter (No Channel)",
     "qpsk",
     "4",
     ["qpsk", "四相", "发射机", "transmitter", "tx", "发射链"],
@@ -223,9 +223,9 @@ _RECIPE_QPSK_TX = _tx_only_recipe(
 # ---------------------------------------------------------------------------
 _RECIPE_RX_BPSK_AWGN = Recipe(
     name="rx_bpsk_awgn",
-    title="BPSK AWGN 接收机",
+    title="BPSK AWGN Receiver",
     difficulty="T2",
-    summary="自包含 BPSK 激励与 AWGN 信道，经星座接收机完成载波跟踪和判决。",
+    summary="Self-contained BPSK stimulus and AWGN channel with carrier tracking and symbol decisions through a constellation receiver.",
     blocks=[
         *_common_vars(),
         ("variable_constellation", "bpsk_const", {
@@ -307,9 +307,9 @@ _RECIPE_RX_BPSK_AWGN = Recipe(
         ("head", "sink"),
     ],
     knobs={
-        "rx.loop_bw": "载波环路带宽；跟踪速度与噪声抑制折中。",
-        "chan.noise_voltage": "接收机输入噪声强度。",
-        "chan.freq_offset": "用于验证接收机载波跟踪范围。",
+        "rx.loop_bw": "Carrier-loop bandwidth; trades tracking speed against noise suppression.",
+        "chan.noise_voltage": "Receiver input-noise strength.",
+        "chan.freq_offset": "Used to verify the receiver's carrier-tracking range.",
     },
     metrics=["ber"],
     keywords=[
@@ -328,10 +328,10 @@ _RECIPE_RX_BPSK_AWGN = Recipe(
 # ---------------------------------------------------------------------------
 _RECIPE_TONE_NOISE = Recipe(
     name="tone_noise",
-    title="单音信号 + 噪声(入门)",
+    title="Tone + Noise (Introductory)",
     difficulty="T1",
-    summary="一个复正弦音叠加高斯噪声 -> 采集 IQ,用于最直观地演示"
-            "\"信号 + 噪声\"与频谱,门槛最低。",
+    summary="A complex sinusoidal tone plus Gaussian noise -> IQ capture, providing an accessible demonstration "
+            "of signal, noise, and spectrum.",
     blocks=[
         *_common_vars(),
         ("analog_sig_source_x", "sig",
@@ -350,8 +350,8 @@ _RECIPE_TONE_NOISE = Recipe(
         ("add", "head"), ("head", "sink"),
     ],
     knobs={
-        "noise.amplitude": "噪声幅度;越大频谱本底越高。建议 0.05~0.5",
-        "sig.freq": "单音频率(Hz);决定频谱峰位置",
+        "noise.amplitude": "Noise amplitude; higher values raise the spectral floor. Suggested: 0.05–0.5",
+        "sig.freq": "Tone frequency (Hz); determines the spectrum-peak position",
     },
     metrics=["spectrum", "constellation"],
     keywords=["正弦", "单音", "tone", "噪声", "频谱", "入门", "sine", "信号加噪"],
@@ -364,10 +364,10 @@ _RECIPE_TONE_NOISE = Recipe(
 # ---------------------------------------------------------------------------
 _RECIPE_OFDM = Recipe(
     name="ofdm_awgn",
-    title="OFDM 发射 + AWGN(进阶,占位)",
+    title="OFDM Transmitter + AWGN (Advanced Placeholder)",
     difficulty="T3",
-    summary="随机字节 -> OFDM 发射(FFT 64, CP 16)-> AWGN -> 采集 IQ。"
-            "预留骨架:多载波抗多径,适合看 PAPR/子载波频谱。",
+    summary="Random bytes -> OFDM transmitter (FFT 64, CP 16) -> AWGN -> IQ capture. "
+            "Placeholder structure for multicarrier multipath resistance and PAPR/subcarrier-spectrum observation.",
     blocks=[
         *_common_vars(samp_rate="1000000"),
         ("analog_random_source_x", "src",
@@ -387,9 +387,9 @@ _RECIPE_OFDM = Recipe(
         ("src", "ofdm"), ("ofdm", "chan"), ("chan", "head"), ("head", "sink"),
     ],
     knobs={
-        "ofdm.fft_len": "子载波数;越大频率分辨率越高、PAPR 风险越大。常见 64/128",
-        "ofdm.cp_len": "循环前缀长度;抗多径能力 vs 开销权衡。常取 fft_len/4",
-        "chan.noise_voltage": "噪声强度。建议 0.01~0.1",
+        "ofdm.fft_len": "Subcarrier count; larger values improve frequency resolution and increase PAPR risk. Common values: 64/128",
+        "ofdm.cp_len": "Cyclic-prefix length; trades multipath tolerance against overhead. Often fft_len/4",
+        "chan.noise_voltage": "Noise strength. Suggested: 0.01–0.1",
     },
     metrics=["spectrum", "constellation"],
     keywords=["ofdm", "多载波", "子载波", "fft", "循环前缀", "cp", "papr"],

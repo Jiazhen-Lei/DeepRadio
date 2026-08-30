@@ -23,9 +23,8 @@ _DTYPE_BY_SINK_TYPE = {
 
 #: 无样本时给模型的可执行提示,避免它去猜产物路径或反复重跑。
 _NO_SAMPLE_HINT = (
-    "probe 读到 0 个样本。probe 文件路径必须来自流图里 file sink 的 file 参数,"
-    "不要按 probe_id 猜文件名;推荐直接调用 design_flowgraph(simulate=True) 走"
-    "完整链路。"
+    "The probe returned 0 samples. The probe path must come from the flowgraph file sink's file parameter; "
+    "do not infer a filename from probe_id. Prefer design_flowgraph(simulate=True) for the complete path."
 )
 
 
@@ -66,7 +65,7 @@ def _require_samples(ctx: ToolContext, probe_id: str = ""):
     """取出可用的复数样本;不可用时返回 (None, 错误 dict)。"""
     res = ctx.last_sim
     if res is None or not res.ok:
-        return None, {"ok": False, "error": "尚无成功的仿真结果,请先 run_simulation"}
+        return None, {"ok": False, "error": "No successful simulation result is available; run run_simulation first"}
     arr = res._pick_complex(probe_id or None)
     if arr is None:
         probe = res.data.get(probe_id) if probe_id else None
@@ -79,14 +78,14 @@ def _require_samples(ctx: ToolContext, probe_id: str = ""):
             return None, {
                 "ok": False,
                 "error": (
-                    f"probe '{probe_id or 'sink'}' 是 {dtype or '整数'} 比特/字节,"
-                    "不能按 IQ 计算 EVM 或频谱。请改用 kind=ber,或换复数 IQ sink。"
+                    f"Probe '{probe_id or 'sink'}' contains {dtype or 'integer'} bits/bytes and cannot be treated as IQ for EVM or spectrum. "
+                    "Use kind=ber or a complex IQ sink."
                 ),
             }
-        return None, {"ok": False, "error": "找不到复数 probe 数据",
+        return None, {"ok": False, "error": "No complex probe data was found",
                       "hint": _NO_SAMPLE_HINT}
     if int(getattr(arr, "size", 0)) == 0:
-        return None, {"ok": False, "error": "probe 无样本(0 采样)",
+        return None, {"ok": False, "error": "The probe contains no samples (0 samples)",
                       "hint": _NO_SAMPLE_HINT}
     return arr, None
 
@@ -123,7 +122,7 @@ def _pick_integer_bits(res, probe_id: str = ""):
 def run_simulation(ctx: ToolContext, probes: dict = None, timeout: float = 30.0):
     fg = ctx.flow_graph
     if fg is None:
-        return {"ok": False, "error": "流图尚未创建"}
+        return {"ok": False, "error": "The flowgraph has not been created"}
     # 把 [path, dtype] 规整成 (path, dtype) 元组
     norm = None
     if probes:
@@ -142,7 +141,7 @@ def run_simulation(ctx: ToolContext, probes: dict = None, timeout: float = 30.0)
                           out_dir=ctx.out_dir, timeout=timeout)
     ctx.last_sim = result
     if not result.ok:
-        return {"ok": False, "error": result.error or "仿真失败",
+        return {"ok": False, "error": result.error or "Simulation failed",
                 "stderr": result.stderr, "summary": result.summary}
     sizes = {pid: int(getattr(arr, "size", 0))
              for pid, arr in result.data.items()}
@@ -181,7 +180,7 @@ def read_metric(ctx: ToolContext, kind: str, probe_id: str = "",
     import numpy as np
     res = ctx.last_sim
     if res is None or not res.ok:
-        return {"ok": False, "error": "尚无成功的仿真结果,请先 run_simulation"}
+        return {"ok": False, "error": "No successful simulation result is available; run run_simulation first"}
     kind = (kind or "").lower().strip()
     if kind in ("spectrum", "psd"):
         kind = "spectrum_peak"
@@ -224,8 +223,8 @@ def read_metric(ctx: ToolContext, kind: str, probe_id: str = "",
                     "ok": False,
                     "kind": "ber",
                     "error": (
-                        "probe 是比特/字节,算 BER 还需要 tx_bits_probe "
-                        "(已知发送比特)。不要对 byte sink 计算 EVM。"
+                        "The probe contains bits/bytes; BER calculation also requires tx_bits_probe "
+                        "(known transmitted bits). Do not calculate EVM from a byte sink."
                     ),
                     "n_bits": int(getattr(bits, "size", 0)),
                 }
@@ -249,7 +248,7 @@ def read_metric(ctx: ToolContext, kind: str, probe_id: str = "",
         tx = res.data.get(tx_bits_probe)
         if tx is None:
             return {"ok": False,
-                    "error": "算 ber 需要已知发送比特(tx_bits_probe)"}
+                    "error": "BER calculation requires known transmitted bits (tx_bits_probe)"}
         report = simulate.ber_report(np.asarray(tx), rx_bits)
         if not report.get("valid"):
             return {"ok": False, "kind": "ber", **report}
@@ -266,7 +265,7 @@ def read_metric(ctx: ToolContext, kind: str, probe_id: str = "",
         n = min(len(iq), max(32, int(fft_size)))
         if n < 32 or float(samp_rate) <= 0:
             return {"ok": False, "kind": "spectrum_peak",
-                    "error": "频谱测量需要有效样本和正采样率"}
+                    "error": "Spectrum measurement requires valid samples and a positive sample rate"}
         report = simulate.spectrum_peak_report(iq, samp_rate, fft_size)
         res.metrics["spectrum_peak"] = report["frequency_hz"]
         res.metrics["spectrum_peak_report"] = report
@@ -278,7 +277,7 @@ def read_metric(ctx: ToolContext, kind: str, probe_id: str = "",
                     algorithm={"samp_rate": samp_rate, "fft_size": fft_size},
                 )}
 
-    return {"ok": False, "error": f"未知指标: {kind}"}
+    return {"ok": False, "error": f"Unknown metric: {kind}"}
 
 
 @tool(
@@ -307,7 +306,7 @@ def plot_constellation(ctx: ToolContext, probe_id: str = "",
         out, probe_id=probe_id or None, sps=sps, modulation=modulation,
     )
     if p is None:
-        return {"ok": False, "error": "无可用复数数据"}
+        return {"ok": False, "error": "No usable complex data is available"}
     return {"ok": True, "path": p,
             "measurement_id": attach_measurement(
                 ctx, metric="constellation", artifact=p,
@@ -339,7 +338,7 @@ def plot_spectrum(ctx: ToolContext, probe_id: str = "",
     out = path or os.path.join(res.out_dir or ".", "spectrum.png")
     p = res.plot_spectrum(out, probe_id=probe_id or None, samp_rate=samp_rate)
     if p is None:
-        return {"ok": False, "error": "无可用复数数据"}
+        return {"ok": False, "error": "No usable complex data is available"}
     return {"ok": True, "path": p,
             "measurement_id": attach_measurement(
                 ctx, metric="spectrum", artifact=p,
@@ -370,7 +369,7 @@ def plot_eye(ctx: ToolContext, probe_id: str = "", sps: int = 4, path: str = "")
     out = path or os.path.join(res.out_dir or ".", "eye.png")
     p = res.plot_eye(out, probe_id=probe_id or None, sps=sps)
     if p is None:
-        return {"ok": False, "error": "数据不足以画眼图"}
+        return {"ok": False, "error": "There is not enough data to plot an eye diagram"}
     return {"ok": True, "path": p,
             "measurement_id": attach_measurement(
                 ctx, metric="eye", artifact=p,

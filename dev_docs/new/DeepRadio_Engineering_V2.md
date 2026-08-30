@@ -1,107 +1,243 @@
 # DeepRadio 工程方案 V2
 
-> 更新日期：2026-08-29<br>
+> 更新日期：2026-08-30<br>
 > 当前证据：`local/agent_sessions/0827/V3/`、`local/output/0827/V3/`、`local/agent_sessions/0828/V2/plutoble/`、`local/output/0828/V2/plutoble/` 与当前工作区代码<br>
 > 状态口径：实验已暴露但尚未由修改后全量回归证明关闭的问题，统一视为活动问题或待回归问题。<br>
 > 约束：不替换现有框架，不引入第二套编排器，不把系统改成纯 LLM 执行。
 
 ---
 
-## UI 目标对齐与实施记录（2026-08-29）
+## 自适应 Radio Specification 与常驻 Workflow Monitor 方案（2026-08-29）
 
-### 结论
+### 实施状态（2026-08-30）
 
-目标界面以 `local/docs/jensen/273b186c647dde8b1425086f7f4724be.png` 和 `local/docs/jensen/deepradio-task-walkthrough-plan.md` 为准。此前方案只做到方向一致，尚未完全对齐：已有 SharedIntent、选择题和 Workflow Inspector，但 Radio Specification 仍是单行摘要，诊断结果没有形成可视步骤，Claims/日志/内部 ID 混在默认面板，而且旧工程的 BLE 配置会污染新诊断任务的规格视图。
+本节 P0～P2 已按不替换现有 WorkflowEngine 的方式实现。主要落点为：
 
-本轮修订后采用以下界面结构：
+- `grc/agent/knowledge/specs/profiles.json` 与 `spec_requirements.py`：组合 general、TX/RX、BLE、Wi-Fi、diagnose profile，分离 required、mentioned、optional 和 derived。
+- `intent_state.py`、`shared_state.py`：Radio Specification 已纳入 SharedIntent 权威状态，并原子投影为 session 下的 `radio_specification.json`。
+- `intent_alignment.py`：支持一轮多字段自然语言补齐、部分回答后继续追问、默认值显式确认、可选字段介绍和最终 confirm。
+- `AgentPanel.py`：对话中只读、可折叠、分组与分色的 Radio Specification；旧 ComboBox/Entry 写规格入口已删除。
+- `ClaimsPanel.py` 与 `workflow_presenter.py`：底部常驻 Workflow Monitor，Stage 纵向 stepper 内嵌 Claim，并显示最近正向/回退跳转。
+- `adapter.py`：增加只读 progress channel，只推送意图 revision、Stage、checkpoint 和 Workflow 状态事件，不把 tool/routing log 涌入 UI；GUI 可实时刷新，但不获得推进状态机的写权。
+- BLE Local/Advertising Name 已改为真正的可选字段；未指定名称也能构建、生成和校验合法广播，空口验收回退为通用“观察到目标信号”。
 
-```text
-真实 GRC Canvas（左）        DeepRadio 对话与交互卡片（右）
-                              ├── Radio Specification 可编辑表格
-                              ├── Workflow Stage 框图
-                              └── Diagnosis 步骤卡（仅诊断时出现）
-──────────────────────────────────────────────────────────
-右下角紧凑区：Task/Stage + Runtime controls + Claim summary
-```
+自动回归结果：GNU Radio `gnuradio` conda 环境下 agent tests `195 passed, 1 skipped`（HIL 条件跳过），GUI tests `17 passed`。GNU Radio 会在 `/var/tmp` 创建双映射缓冲区，因此全量仿真回归必须在允许该路径的环境运行；本次已在非沙箱模式通过。
 
-这仍是 GNU Radio Companion 内嵌界面，不改成 Web dashboard，也不把图中的 BLE 六格故事板写成固定流水线。Phase 由当前 state/checkpoint 推导；不同任务可跳过或回退阶段。
+### 改造前问题与根因（已关闭）
 
-### 默认保留、条件展示与隐藏字段
+本节取代此前“在 Radio Specification 表格内用下拉框一次性填写”和“Workflow 只作为对话卡片显示”的 UI 方案。目标仍以 `local/docs/jensen/273b186c647dde8b1425086f7f4724be.png` 与 `local/docs/jensen/deepradio-task-walkthrough-plan.md` 为信息架构参考，但图中的 PlutoSDR BLE 只是一个 state-dependent workflow instance，不能反向成为所有任务的固定模板。
 
-| 层 | 默认展示 | 条件展示 | 仅保留的审计数据 |
+以下是本轮改造针对的历史问题及根因，其处置结果以上方“实施状态”为准。
+
+| 问题 | 直接原因 | 架构根因 | 影响 |
 |---|---|---|---|
-| 意图 | 对话中的当前任务与等待原因 | 规格是否已对齐 | intent id/revision/hash、capabilities、原始 IntentIR 仅落 session，不进入用户界面 |
-| Radio Specification | 在对话内显示 Goal、协议/调制、Device、Channel/Carrier、Sample rate、时长、Success condition、字段来源 | 每个可编辑字段提供候选项与自定义填写；可一次提交整个表格 | 全量 slots、规则命中过程只落 session |
-| Workflow | 对话内以 Stage 框图显示 Passed/Failed/Current | 成功条件；验收条件数量只通过 tooltip 解释 | attempt、completion 明细、workflow id 仅落 session，不展示 |
-| Diagnosis | 对话内显示用户请求的检查维度、Passed/Failed/Unknown、短证据、修复建议 | 只有诊断任务出现；物理连接必须是 Unknown/人工证据，不能伪造 Passed | 原始 report JSON、厂商 CLI 全输出只落 session |
-| Claims | 右下角只显示 Failed/Stale/Not tested/Passed 摘要 | 用户主动展开时显示简短断言 | 完整 Evidence JSON、measurement id 不默认展示 |
-| Runtime | 右下角显示 RF 状态、run id、剩余时长、Stop/Emergency Stop | 授权或运行时出现 | PID、return code、原始 `U/O` 日志只落 session，不展示 |
+| BLE 规格总出现 Advertising name 等字段 | `SharedState.spec_digest()` 根据 `protocol == ble` 硬编码展示 Channel、Advertising name 等行 | “展示字段”“必填字段”“协议可选字段”没有独立模型，示例字段进入了通用投影 | 无关字段污染任务，扩展 Wi-Fi/通用信号时会继续堆条件分支 |
+| 必填和可选字段混在一起 | `requirements.json` 只有少量 required rule，UI 又把已有默认值和 choices 全部当作可编辑项 | 缺少 required/mentioned/optional/derived 四类字段语义 | 用户不知道哪些信息阻塞 Workflow，默认值也可能被误当成用户决定 |
+| 交互像填写配置表，不像和 Agent 协作 | GUI 的 ComboBox/Entry 直接提交 `specification_update` | 意图补齐同时由 GUI 控件和 Alignment Coordinator 驱动，存在两套交互入口 | 不利于研究自然语言渐进对齐，也无法检验 LLM 对补充文本的理解 |
+| Radio Specification 没有稳定文件身份 | `RadioSpec`、`SharedIntent.parameters` 与 GUI digest 存在重叠 | 规格只是 SharedIntent 的投影，但尚未显式定义唯一真值源和持久化契约 | 修改、回退、跨 Agent 共享时容易产生两个版本 |
+| Workflow 到任务结束后才明显出现 | 对话卡只在完整 `AgentReply` 返回时刷新；后台 Stage 执行期间没有 progress event | UI 订阅的是“回复完成”，不是“Workflow 状态变化” | 用户看不到实时运行、跳转、失败回退和等待确认 |
+| Stage 框图不容易理解跳转 | 窄侧栏内使用 `FlowBox` 平铺 Stage，仅靠图标表达状态 | 展示模型缺少 transition/current/previous/retry/back-edge 语义 | 回退和重试看起来像静态列表 |
+| 对话文字不能可靠随宽度换行 | `_FlowLabel` 只约束普通气泡；规格卡、Grid、badge、Stage label 使用普通 `Gtk.Label`，部分控件会撑大自然宽度；已分配宽度还可能残留旧值 | 缺少统一的 responsive label/card 组件 | 缩窄侧栏后出现截断、横向撑宽或不重新排版 |
 
-字段来源必须区分 `User`、`Protocol Default`、`Safety Default`、`Derived`、`Canvas` 和 `Unresolved`。默认值可以帮助补全规格，但安全时长和任务成功条件不能静默冒充用户决定。
+### 1. Radio Specification 字段选择规则
 
-### 数据与展示边界
+规格默认只展示两类字段：
 
-保持主链不变：
+1. **Required fields**：完成当前请求的下一项可执行产物或物理操作所必需的字段。
+2. **Mentioned fields**：用户文本明确提到的字段，即使它不是必填字段，也必须回显，防止系统忽略用户约束。
 
-```text
-GUI → ServiceAgent → WorkflowEngine → StageExecutor
-    → deterministic handler / LLM subagent → Completion → SharedState
-```
-
-新增纯展示投影：
+Optional fields 不默认占据表格；用户通过自然语言提出、点击“可选字段”提示，或者要求教学介绍后才加入。Derived fields 仅在其对建图、验证或执行有实际影响时展示，并标记来源，不把所有协议常量都塞进规格表。
 
 ```text
-SharedState + Workflow digest
-        ↓
-workflow_presenter（无 GTK、可单测）
-        ↓
-Phase / Specification / Diagnosis / Claims / Runtime ViewModel
-        ↓
-AgentPanel 对话卡 + ClaimsPanel 紧凑运行/证据区
+visible_fields = required_fields
+               ∪ user_mentioned_fields
+               ∪ user_added_optional_fields
+               ∪ execution_relevant_derived_fields
 ```
 
-GTK 不再自行解释底层 JSON。Subagent 也不能直接写 UI；它只能返回 ResultEnvelope/工具事实，由 host 投影到 SharedState，再生成 ViewModel。
+字段应包含以下元数据，而不能只保存 key/value：
 
-### 同步修复的底层问题
+```json
+{
+  "key": "carrier_frequency",
+  "value": 2402000000.0,
+  "requirement": "required",
+  "source": "protocol_default",
+  "locked": true,
+  "confirmed": false,
+  "reason": "BLE advertising channel 37 determines the carrier",
+  "depends_on": ["protocol", "advertising_channels"]
+}
+```
 
-1. `SharedState.spec_digest()` 以当前 `SharedIntent.parameters` 为规格真值，并携带 `parameter_sources` 与 `radio_specification` 行；存在活动意图时不从旧 `project.config` 补入无关协议、Local Name 或设备。
-2. BLE 物理部署的 Alignment Gate 除硬件和 Local Name 外，还要求用户显式确认最大时长与成功证据；Carrier、Channel 和 Sample rate 可保留协议默认并显示来源。
-3. 诊断按 `diagnosis_dimensions` 或用户文本中的领域维度生成 scope。纯硬件诊断不会因为画布上恰好打开旧 BLE 工程就进入 EVM 离线诊断。
-4. 硬件诊断与信号诊断分别使用 `hardware_diagnosis_report` 和 `signal_diagnosis_report`，禁止同名产物互相覆盖。
-5. 最新诊断以 `intent_id + intent_revision` 绑定保存；GUI 只展示与当前意图版本一致的 findings。Unknown 是合法诊断结论但会显示 warning，不会被渲染成 Passed。
-6. Claim 写入时绑定 `intent_id + intent_revision`。项目修改/重验仍可复用项目级 Claim，但纯硬件诊断等新 scope 的默认视图不会混入旧 BLE/仿真断言；完整历史仍保存在 SharedState。
-7. Runtime 卡新增可执行的 `Stop` 与 `Emergency Stop`；命令直接进入 host control plane，停止后撤销 RF grant，不依赖 LLM，也不推进或伪造 Workflow 完成状态。
+- `requirement`：`required | mentioned | optional_added | derived`。
+- `source`：`user | protocol_default | safety_default | derived | canvas | unresolved`。
+- `locked` 只表示不能在表格中直接编辑，不表示永远不可改变。用户仍可在对话中修改上游要求；例如修改 BLE Channel 后重新推导 Carrier。
+- Required 字段如果使用普通协议默认值，可以展示建议；涉及设备身份、物理 RF 授权、安全时长和成功证据的值不得静默确认。
+- Local/Advertising name 仅在用户提到名称、选择 BLE advertising payload，或成功条件要求接收端按名称观察时出现；它不是所有 BLE 发射任务的必填项。
 
-### 修改落点
+### 2. 对话式渐进对齐协议
 
-| 文件 | 修改职责 |
-|---|---|
-| `grc/gui/workflow_presenter.py` | 新增纯 ViewModel：Phase、Radio Specification、Diagnosis、Claims、Runtime |
-| `grc/gui/ClaimsPanel.py` | 精简为运行控制与 Claim 摘要；移除用户可见的内部 Workflow dump、PID 和原始日志 |
-| `grc/gui/AgentPanel.py` | 在对话流中渲染可编辑规格表、Workflow Stage 框图和 Diagnosis 卡；移除输入框上方重复状态字 |
-| `grc/agent/state/shared_state.py` | 当前意图优先的规格投影；增加版本绑定的 DiagnosisSnapshot |
-| `grc/agent/state/claim_store.py` | Claim 绑定意图版本；支持当前意图视图与完整历史两种投影 |
-| `grc/agent/knowledge/specs/requirements.json` | 声明式补充有界 RF 时长和成功证据要求 |
-| `grc/agent/knowledge/spec_requirements.py` | 识别“值存在但仍是未确认安全默认”的字段 |
-| `grc/agent/workflow/intent_alignment.py` | 处理结构化答案与来源；支持一次提交完整 Radio Specification，并对更新后的意图重新确认 |
-| `grc/agent/service/stage_handlers.py` | 诊断 scope 路由、报告角色分离、Unknown quality |
-| `grc/agent/service/adapter.py` | 将当前 intent revision 对应的 diagnosis 放入 workflow digest；处理 Stop/Emergency Stop host command |
+Radio Specification 是**只读的当前解释投影**，不再在表格单元格中放 ComboBox/Entry。所有修改通过自然语言进入同一个 Alignment Coordinator，避免 GUI 与 Agent 各写一套状态。
 
-### 验收口径
+```text
+用户 text1
+  ↓ LLM 提取用户明确字段与候选任务方向
+TemplateResolver 组合模板并计算 required_fields
+  ↓
+显示折叠式 Radio Specification（已有值 + Unresolved 必填项）
+  ↓
+ask_user_question：一次询问本轮全部缺失必填项，并给建议与理由
+  ↓
+用户 text2
+  ↓ LLM 做增量字段提取；Host 做类型、依赖和硬件能力校验
+仍缺字段 ──是──→ 更新表格并继续追问剩余字段
+  │否
+  ↓
+显示完整 Radio Specification
+  ↓
+confirm：确认 / 继续修改 / 添加可选字段 / 介绍这些参数
+  ↓确认
+建立 Workflow
+```
 
-- 输入“我要用硬件发射一段 BLE 信号”时，先显示带未决项和来源的完整 Radio Specification，再逐项/成组补齐，不得只显示当前一个问题。
-- 对齐完成前不建立可执行 Workflow；用户修改任意规格后，卡片与 intent revision 同步更新。
-- 只读 PlutoSDR/B210 接入诊断只展示请求的驱动、发现、身份、probe、runtime、物理连接等步骤，不得自动插入 EVM。
-- 新任务不得显示上一任务的 Radio Specification、Claims 或 RF grant；诊断快照必须匹配当前 intent revision。
-- 画布被用户修改后，project version 增长，相关 Claims 变 Stale，并返回验证；重新 Passed 必须有新版本证据。
-- RF proposal 和 RF authorization 是两个 checkpoint；运行卡必须提供有界时长、Stop/Emergency Stop，并把 task success 与 runtime quality 分开。
-- 默认界面不出现 workflow hash、attempt/completion 明细、PID 和 `UUU`；这些信息保存在 session/state 中供离线审计，不在 GUI 保留旧 Developer Inspector。
+`ask_user_question` 可以在一条消息中询问多个缺失字段，但回复解析必须允许用户只回答其中一部分。每轮只合并能可靠识别的字段，未回答字段继续保留 `Unresolved`，不得为了尽快建立 Workflow 而猜测用户答案。
 
-以上实现对齐的是目标图的信息架构和交互机制，不承诺每个像素与生成图一致；最终论文截图仍需在真实 GRC 中按 `(a)`～`(f)` 六个状态逐帧人工验收。
+Open Questions 分两类：
 
-自动验证结果（`gnuradio` Conda 环境）：agent tests `187 passed, 1 skipped`（跳过项为预期 HIL 条件），GUI tests `16 passed`；新增测试覆盖规格字段来源/未决项、Radio Specification 表格的一次性批量对齐、诊断卡 scope、模糊 BLE 对齐、新意图不继承旧 BLE 工程字段、Claim 的 intent 视图隔离，以及 GUI Emergency Stop 撤销 RF grant。GTK 像素布局、真实画布编辑回流与六帧论文截图仍属于人工 GUI 验收，不以 headless 单测替代。
+- `blocking_questions`：缺失 required 字段或验证冲突；未解决时不能建立 Workflow。
+- `optional_prompts`：是否添加可选字段、是否需要参数教学；不影响规格完整性，在最终 confirm 中提供入口，不新增 Workflow 阻塞状态。
 
-## 0. 2026-08-29 增量：问题分析与当前实现
+教学模式只解释字段含义、推荐范围和取舍，不替用户确认字段，也不能将 Claim 或 Completion 改成 Passed。
+
+### 3. Template 设计：组合模板，不复制固定任务表
+
+不建议维护“BLE 发射完整模板”“Wi-Fi 发射完整模板”两份互相独立的大表。应采用声明式组合：
+
+```text
+General base
+  + operation overlay（generate / simulate / transmit / receive / diagnose）
+  + direction overlay（TX / RX / transceiver）
+  + protocol overlay（BLE / Wi-Fi / generic digital / ...）
+  + hardware overlay（PlutoSDR / B210 / file / simulation）
+  + user-mentioned optional fields
+```
+
+TemplateResolver 的输入是 `IntentIR.requested_operations`、capabilities、direction、protocol、hardware、desired artifacts、success criteria，而不是七类 Task 标签或某句测试文本。LLM 负责从开放文本提取候选值；确定性 resolver 负责必填计算、默认来源、字段依赖和合法性验证。
+
+首批 profile 范围：
+
+| Profile | 典型 Required | 条件 Required / Optional 示例 |
+|---|---|---|
+| 通用流图生成 | goal、source/signal type、requested output | modulation、channel model、visualization、duration 按请求加入 |
+| 通用硬件 TX | hardware、center frequency、sample rate、signal definition、bounded duration、success condition | gain/attenuation、bandwidth、antenna/path、payload |
+| 通用硬件 RX | hardware、center frequency、sample rate、expected signal 或 observation goal、capture bound | bandwidth、demodulation、output sink、trigger |
+| BLE TX | BLE role/operation、PHY 所需 waveform 参数；物理发射时叠加通用 TX 字段 | advertising channels；payload fields；local name 只在名称相关请求中加入 |
+| Wi-Fi TX | Wi-Fi role、standard/band or channel、bandwidth；物理发射时叠加通用 TX 字段 | SSID 只对 beacon/AP 等相关帧加入；MCS、GI、payload 可选或按目标必填 |
+| Diagnose | diagnosis target、requested dimensions、available artifact/device context | 期望设备身份、错误日志、物理连接证据按诊断维度加入 |
+
+新增协议应增加 protocol profile、builder/validator 与测试向量，不修改 Alignment Coordinator 的主循环。新增硬件应增加 HardwareProfile，不复制协议模板。
+
+### 4. 与 SharedIntent 的持久化关系
+
+Radio Specification 与 SharedIntent **应合并为一个领域真值源，但保留不同视图职责**：SharedIntent 表达用户目标和约束，Radio Specification 是其中通信参数部分的结构化对象。不能再让 `RadioSpec`、`SharedIntent.parameters` 和 GUI 表格成为三个可独立修改的数据源。
+
+建议在 `SharedIntent` 中增加版本化 `specification` 对象，包含 fields、template/profile refs、blocking questions、optional prompts、validation 和 patch history。唯一写者仍是 Host `IntentAlignmentCoordinator`；main agent、subagent、skill 和 GUI 只读取快照或提交 patch proposal。
+
+持久化采用双层但单一写源：
+
+- 权威状态：`local/agent_sessions/<session_id>/state.json` 中的 `shared_intent.specification`。
+- 人类可读投影：每次 revision 后原子生成 `local/agent_sessions/<session_id>/radio_specification.json`。
+- `radio_specification.json` 带 `intent_id`、`revision`、`semantic_hash`，只作为导出/审计产物，禁止 GUI 或 Agent 直接写回。
+
+这样既满足“一直有文件记录、随对话更新”，又避免双写漂移。用户在 Workflow 建立后修改规格时，继续使用现有 `revision.py` 做影响分析：只使依赖该字段的 Stage/Artifact/Claim 失效；涉及 RF 参数或硬件的变更必须停止运行、撤销授权并重新确认。
+
+### 5. 折叠式 Radio Specification UI
+
+Radio Specification 保留在对话中，每次 revision 替换当前 live card，不重复堆积。默认展开状态取决于当前阶段：
+
+- 有 blocking question：自动展开。
+- 等待最终确认：自动展开。
+- Workflow 已建立：默认折叠，标题显示 `Radio Specification · confirmed · rev N`。
+- 规格被用户修改或校验失败：重新展开。
+
+展开内容为只读表格，按 `Required`、`Mentioned/Added` 分组，Optional catalog 不直接铺满。卡片底部只显示 Open Questions；DeepRadio 随后在对话中询问用户可以“确认、继续修改、添加可选字段或介绍这些参数”。这四项是 LLM 需要识别的回复意图，不是另一组下拉框或必选按钮，最终由同一个 coordinator 生成结构化 interaction event，不能直接修改 JSON。
+
+### 6. Workflow 与 Claims 合并为常驻 Workflow Monitor
+
+对话区不再承担主要 Workflow 可视化。底部保留一个常驻、可折叠的 `Workflow Monitor`，将执行状态和 Claims 合并，避免“Workflow 一套状态、Claims 又一套状态”的重复认知负担。
+
+折叠态始终显示：
+
+```text
+Task · 当前 Stage i/n · Running/Waiting/Failed/Passed · 关键 Claim 状态
+```
+
+展开态使用适合窄面板的**纵向 stepper**，而不是横向 FlowBox：
+
+```text
+✓ Build flowgraph          Passed
+│  Claim: structure valid  Passed
+↓
+▶ Verify waveform          Running
+│  Claim: BLE PHY valid    Checking
+↓
+○ Configure hardware       Pending
+↩ 最近跳转：Verify → Build（修复后重新验证）
+```
+
+规则：
+
+- Stage 是一级导航；与该 Stage 直接相关的 Claim/Evidence 摘要嵌在 Stage 下。
+- Failed、Stale、Not tested 优先展示；完整 Evidence JSON 继续只落 session 或按需展开。
+- `current_stage` 使用明显高亮；Passed/Failed/Pending/Waiting 使用稳定颜色与图标。
+- 正向跳转显示连接箭头；retry/back transition 显示最近一次 `from → to + reason`，不把动态状态机伪装成固定线性流水线。
+- Runtime 的 Stop/Emergency Stop 保留在同一 Monitor，但 task result 与 runtime quality 分开。
+
+当前 UI 只在 `AgentReply` 完成后刷新，所以应增加 progress channel，而不是等待整个任务返回。最小改动是在现有 ServiceAgent/driver 中注入 `progress_sink(event, workflow_digest)`：每次 Stage started/completed/failed、checkpoint created/resolved、state revision changed 后发事件；GUI 用 `GLib.idle_add` 更新 ViewModel。它是观察接口，不改变 WorkflowEngine 的状态迁移，也不允许 GUI 直接推进 Stage。轮询仅作为断线后的兜底。
+
+### 7. 对话宽度与自动换行修复
+
+统一建立 responsive widget，而不是只修普通聊天气泡：
+
+1. 普通消息、规格字段值、来源标签、Open Questions、Stage/Claim 文本统一使用 `_WrappingLabel` 工厂，并标记可重新约束的 role。
+2. `_on_chat_size_allocate` 将 viewport 的实际 content width 减去卡片 margin 后下发给所有 live cards；取消残留的固定 `width_chars`/旧 `size_request`。
+3. Radio Specification 从三列 `Gtk.Grid` 改为响应式 `Gtk.ListBox`：宽屏时 label/value/source 同行，窄屏时 source 换到 value 下方。移除会撑宽表格的 ComboBox。
+4. Workflow 使用纵向 stepper；Stage label 设置 `WORD_CHAR` 换行和 `xalign=0`。
+5. 路径、设备 identity 等长字符串插入安全的断行机会或中部省略；内部 hash 不进入用户 UI。
+
+### 8. 修改落点与顺序
+
+| 顺序 | 文件/模块 | 修改职责 |
+|---|---|---|
+| P0-1 | `grc/agent/knowledge/specs/` | 将单一 requirements 文件拆成字段注册表、通用/operation/protocol/hardware profile；声明 required 条件、依赖、默认来源和教学说明 |
+| P0-2 | `grc/agent/knowledge/spec_requirements.py` | 实现 TemplateResolver，输出 required/mentioned/optional/derived 和 validation，不依赖 Task 文案 |
+| P0-3 | `grc/agent/state/intent_state.py`、`shared_state.py` | 把 Radio Specification 作为 SharedIntent 的版本化子对象；删除硬编码 BLE 行；原子导出只读 `radio_specification.json` |
+| P0-4 | `grc/agent/workflow/intent_alignment.py` | 支持多字段自然语言增量补齐、成组 blocking question、可重复追问和最终 confirm；移除 GUI 表格直接写值的主路径 |
+| P1-1 | `grc/gui/workflow_presenter.py` | 增加 read-only specification、open questions、transition、stage-bound claim 的纯 ViewModel |
+| P1-2 | `grc/gui/AgentPanel.py` | 折叠式只读规格卡、自然语言交互、统一 wrapping widget；移除规格 ComboBox/Entry |
+| P1-3 | `grc/gui/ClaimsPanel.py` | 改为常驻可折叠 Workflow Monitor，纵向 Stage stepper 内嵌 Claim；保留 Runtime controls |
+| P1-4 | `grc/agent/service/adapter.py` / workflow driver | 增加只读 progress sink，在 Stage/checkpoint/revision 事件后推送 digest |
+| P2 | tests | Template 组合、缺失字段循环、规格持久化、revision 失效、实时事件顺序、不同宽度 GTK layout 与人工截图验收 |
+
+不新增第二套状态机，不让 LLM 决定安全门是否通过，不把 BLE/Wi-Fi 示例文本写进分类器，也不允许 GUI、subagent 或 skill 直接编辑 `state.json`/`radio_specification.json`。
+
+### 9. 验收场景
+
+1. 通用 BPSK 仿真不出现 Device、Advertising name 或 BLE Channel；用户提到 roll-off 时，即使它是 optional 也必须回显。
+2. “用硬件发射 BLE”只展示当前必填字段与已提及字段；Local name 在未被请求、未被成功条件依赖时不出现。
+3. 用户第一轮只给出部分字段时，表格显示全部已知值和剩余 required；第二轮只回答一部分时，只追问剩余项；没有完整规格时不得建立 Workflow。
+4. 用户选择“介绍这些参数”只获得解释，不改变 confirmed/source/Claim。
+5. BLE、Wi-Fi、通用 TX/RX 由 profile 组合得到不同字段集合；增加新 protocol profile 不修改 alignment 主循环。
+6. 每次规格变化同时增加 SharedIntent revision，并能在 session 中读取同 revision/hash 的 `radio_specification.json`；直接修改导出文件不会改变运行状态。
+7. Workflow Monitor 在 Stage 开始时即更新，不等待任务结束；失败回退能显示最近跳转原因，Claim 与 project/intent revision 一致。
+8. 将侧栏宽度分别调整为 260、340、480 px，普通对话、规格行、Open Questions、Stage/Claim 均自动换行，不出现水平滚动或内容遮挡。
+
+本节改造后的自动回归基线已更新为 agent tests `195 passed, 1 skipped`和 GUI tests `17 passed`。实机宽度 260/340/480 px 的视觉换行、失败回退动画以及运行中 Stop/Emergency Stop 仍属于人工 GUI/HIL 验收，不应由无头单元测试代替。
+
+## 0. 已实现的工程基础（历史问题与处置）
+
+本节记录当前方案所依赖的既有能力。表中“根因”描述的是改造前的历史问题，不代表它们仍全部处于未修复状态；本轮新增待实施项以文档最前面的 P0～P2 为准。
 
 ### 0.1 工程问题分析
 

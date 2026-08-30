@@ -68,43 +68,43 @@ _TASK_TYPES = frozenset(
     }
 )
 _TASK_LABELS = {
-    "END_TO_END_SIM": "端到端仿真",
-    "TX_BUILD": "构建发射链路",
-    "RX_BUILD": "构建接收链路",
-    "DIAGNOSE": "诊断工程",
-    "MODIFY_PROJECT": "修改已有工程",
-    "OBSERVE": "观测工程",
-    "HARDWARE_CONFIGURE": "配置 SDR",
+    "END_TO_END_SIM": "End-to-End Simulation",
+    "TX_BUILD": "Build Transmit Chain",
+    "RX_BUILD": "Build Receive Chain",
+    "DIAGNOSE": "Diagnose Project",
+    "MODIFY_PROJECT": "Modify Existing Project",
+    "OBSERVE": "Observe Project",
+    "HARDWARE_CONFIGURE": "Configure SDR",
 }
 _STAGE_LABELS = {
-    "spec_alignment": "规格对齐",
-    "rx_spec_alignment": "接收规格对齐",
-    "build_and_verify": "构建与验证",
-    "tx_build_and_validate": "发射机构建与校验",
-    "rx_build_and_verify": "接收机构建与验证",
-    "inspect_and_diagnose": "检查与诊断",
-    "repair_confirmation": "修复确认",
-    "repair_and_verify": "修复与重验",
-    "inspect_and_plan": "检查与规划",
-    "change_confirmation": "变更确认",
-    "apply_and_verify": "应用与重验",
-    "inspect_and_measure": "检查与测量",
-    "hardware_precheck": "硬件预检",
-    "hardware_confirmation": "硬件确认",
-    "configure_and_check": "配置与检查",
-    "protocol_spec_alignment": "BLE 规格对齐",
-    "build_ble_advertiser": "构建 BLE 广播",
-    "offline_protocol_verify": "BLE 离线协议校验",
-    "discover_and_probe_device": "发现并探测所选 SDR",
-    "rf_plan_confirmation": "RF 计划确认",
-    "configure_device": "配置设备参数",
-    "transmit_bounded": "有限时长发射",
-    "over_air_verification": "LightBlue 空口验收",
-    "stop_and_finalize": "停止并完成审计",
-    "discover_and_probe_hardware": "发现并探测硬件",
-    "run_bounded": "有限时长运行",
-    "runtime_observation": "运行结果确认",
-    "stop_runtime": "停止硬件运行",
+    "spec_alignment": "Specification Alignment",
+    "rx_spec_alignment": "Receiver Specification Alignment",
+    "build_and_verify": "Build and Verify",
+    "tx_build_and_validate": "Build and Validate Transmitter",
+    "rx_build_and_verify": "Build and Verify Receiver",
+    "inspect_and_diagnose": "Inspect and Diagnose",
+    "repair_confirmation": "Repair Confirmation",
+    "repair_and_verify": "Repair and Reverify",
+    "inspect_and_plan": "Inspect and Plan",
+    "change_confirmation": "Change Confirmation",
+    "apply_and_verify": "Apply and Reverify",
+    "inspect_and_measure": "Inspect and Measure",
+    "hardware_precheck": "Hardware Precheck",
+    "hardware_confirmation": "Hardware Confirmation",
+    "configure_and_check": "Configure and Check",
+    "protocol_spec_alignment": "BLE Specification Alignment",
+    "build_ble_advertiser": "Build BLE Advertiser",
+    "offline_protocol_verify": "Offline BLE Protocol Verification",
+    "discover_and_probe_device": "Discover and Probe Selected SDR",
+    "rf_plan_confirmation": "RF Plan Confirmation",
+    "configure_device": "Configure Device Parameters",
+    "transmit_bounded": "Bounded Transmission",
+    "over_air_verification": "LightBlue Over-the-Air Verification",
+    "stop_and_finalize": "Stop and Finalize Audit",
+    "discover_and_probe_hardware": "Discover and Probe Hardware",
+    "run_bounded": "Bounded Runtime",
+    "runtime_observation": "Runtime Result Confirmation",
+    "stop_runtime": "Stop Hardware Runtime",
 }
 
 _ALIGNMENT_STAGES = frozenset(
@@ -299,7 +299,7 @@ class WorkflowEngine:
             data = json.load(handle)
         candidates = data.get("task_candidates")
         if data.get("schema_version") != 1 or not isinstance(candidates, dict):
-            raise ValueError("不支持的 Task Catalog")
+            raise ValueError("Unsupported Task Catalog")
         for task_type, candidate in candidates.items():
             stage_sets = [list(candidate.get("stages") or [])]
             if candidate.get("deploy_stages"):
@@ -314,22 +314,22 @@ class WorkflowEngine:
     def _validate_catalog_stages(task_type: str, stages: list[Dict[str, Any]]) -> None:
         ids = [str(stage.get("id") or "") for stage in stages]
         if not task_type or not stages or any(not stage_id for stage_id in ids):
-            raise ValueError(f"Task {task_type!r} 缺少有效 Stage")
+            raise ValueError(f"Task {task_type!r} has no valid stage")
         if len(ids) != len(set(ids)):
-            raise ValueError(f"Task {task_type} Stage id 重复")
+            raise ValueError(f"Task {task_type} contains duplicate stage IDs")
         for stage in stages:
             unknown_agents = set(stage.get("recommended_agents") or []) - _KNOWN_AGENTS
             unknown_completion = set(stage.get("completion") or []) - KNOWN_COMPLETIONS
             if unknown_agents:
-                raise ValueError(f"Task {task_type} 使用未知 Subagent: {sorted(unknown_agents)}")
+                raise ValueError(f"Task {task_type} uses unknown subagents: {sorted(unknown_agents)}")
             if unknown_completion:
                 raise ValueError(
-                    f"Task {task_type} 使用未知 completion: {sorted(unknown_completion)}"
+                    f"Task {task_type} uses unknown completion conditions: {sorted(unknown_completion)}"
                 )
             for target in (stage.get("on") or {}).values():
                 if target not in ids and target not in _TERMINAL_TARGETS:
                     raise ValueError(
-                        f"Task {task_type} Stage {stage.get('id')} 转移目标不存在: {target}"
+                        f"Task {task_type} stage {stage.get('id')} has an unknown transition target: {target}"
                     )
 
     def _load(self) -> Optional[Workflow]:
@@ -662,7 +662,8 @@ class WorkflowEngine:
             if "duration_seconds" in slots:
                 slot_sources["duration_seconds"] = (
                     "user" if re.search(
-                        r"(?:运行|持续|时长|发射|duration)\s*[:=为]?\s*"
+                        r"(?:运行|持续|时长|发射|duration|最多|最长|不超过)\s*"
+                        r"(?:改为|改成|换成|设为|设置为|[:=为])?\s*"
                         r"\d+(?:\.\d+)?\s*(?:秒|s|sec(?:onds?)?)",
                         low,
                     ) else "safety_default"
@@ -682,6 +683,12 @@ class WorkflowEngine:
                 slot_sources["advertising_channels"] = "derived"
             if re.search(r"(?:采样率|sample rate)", low):
                 slot_sources["sample_rate"] = "user"
+        elif slots.get("protocol") == "wifi":
+            for key in ("wifi_role", "modulation"):
+                if key in slots:
+                    slot_sources[key] = "derived"
+            if re.search(r"(?:ssid|网络名称|热点名称)", low) and slots.get("ssid"):
+                slot_sources["ssid"] = "user"
         context = {
             "current_project": {
                 "grc_path": str(getattr(getattr(shared_state, "project", None), "grc_path", "") or ""),
@@ -893,7 +900,8 @@ class WorkflowEngine:
         if _DEVICE_ACCESS_FORBIDDEN.search(text or ""):
             slots["hardware_access"] = "forbidden"
         duration = re.search(
-            r"(?:运行|持续|时长|发射|duration)\s*[:=为]?\s*"
+            r"(?:运行|持续|时长|发射|duration|最多|最长|不超过)\s*"
+            r"(?:改为|改成|换成|设为|设置为|[:=为])?\s*"
             r"(\d+(?:\.\d+)?)\s*(?:秒|s|sec(?:onds?)?)",
             low,
         )
@@ -910,6 +918,9 @@ class WorkflowEngine:
                     "operation": "deploy" if any(
                         word in low for word in ("发射", "部署", "transmit", "deploy")
                     ) else "configure",
+                    "direction": "tx" if any(
+                        word in low for word in ("发射", "部署", "transmit", "deploy")
+                    ) else slots.get("direction", ""),
                     "modulation": "gfsk",
                     "advertising_channels": [37],
                     "carrier_frequency": 2_402_000_000.0,
@@ -919,8 +930,36 @@ class WorkflowEngine:
                     "tx_gain": 0.0,
                 }
             )
+        elif any(marker in low for marker in ("wi-fi", "wifi", "802.11")):
+            slots["protocol"] = "wifi"
+            if any(word in low for word in ("发射", "发送", "transmit", " tx")):
+                slots["direction"] = "tx"
+                slots["operation"] = (
+                    "deploy"
+                    if any(word in low for word in ("部署", "运行", "发射", "transmit"))
+                    else "configure"
+                )
+            elif any(word in low for word in ("接收", "receive", " rx")):
+                slots["direction"] = "rx"
+            if any(word in low for word in ("beacon", "ssid", "热点", "ap帧", "ap 帧")):
+                slots["wifi_role"] = "beacon"
+            elif slots.get("direction") == "tx":
+                slots["wifi_role"] = "frame_tx"
+            elif slots.get("direction") == "rx":
+                slots["wifi_role"] = "frame_rx"
+            slots.setdefault("modulation", "ofdm")
+            ssid = re.search(
+                r"(?:ssid|网络名称|热点名称)\s*"
+                r"(?:改为|改成|换成|设为|设置为|为|=|:|：)?\s*"
+                r"([A-Za-z0-9_-]{1,32})",
+                text,
+                flags=re.IGNORECASE,
+            )
+            if ssid:
+                slots["ssid"] = ssid.group(1)
         name = re.search(
-            r"(?:local\s*name|localname|本地名称|设备名称)\s*(?:为|=|:)?\s*"
+            r"(?:local\s*name|localname|本地名称|设备名称)\s*"
+            r"(?:改为|改成|换成|设为|设置为|为|=|:|：)?\s*"
             r"([A-Za-z0-9_-]{1,26})",
             text,
             flags=re.IGNORECASE,
@@ -946,10 +985,10 @@ class WorkflowEngine:
             slots["target_project"] = target_project.group(1)
         units = {"g": 1e9, "m": 1e6, "k": 1e3, "": 1.0}
         patterns = {
-            "carrier_frequency": r"(?:中心频率|载频|carrier(?: frequency)?)\s*[:=为]?\s*(\d+(?:\.\d+)?)\s*([gmk]?)hz",
-            "sample_rate": r"(?:采样率|sample rate)\s*[:=为]?\s*(\d+(?:\.\d+)?)\s*([gmk]?)s?(?:ps|hz)",
-            "bandwidth": r"(?:带宽|bandwidth)\s*[:=为]?\s*(\d+(?:\.\d+)?)\s*([gmk]?)hz",
-            "symbol_rate": r"(?:符号率|symbol rate)\s*[:=为]?\s*(\d+(?:\.\d+)?)\s*([gmk]?)(?:baud|sym/s)",
+            "carrier_frequency": r"(?:中心频率|载频|carrier(?: frequency)?)\s*(?:改为|改成|换成|设为|设置为|[:=为])?\s*(\d+(?:\.\d+)?)\s*([gmk]?)hz",
+            "sample_rate": r"(?:采样率|sample rate)\s*(?:改为|改成|换成|设为|设置为|[:=为])?\s*(\d+(?:\.\d+)?)\s*([gmk]?)s?(?:ps|hz)",
+            "bandwidth": r"(?:带宽|bandwidth)\s*(?:改为|改成|换成|设为|设置为|[:=为])?\s*(\d+(?:\.\d+)?)\s*([gmk]?)hz",
+            "symbol_rate": r"(?:符号率|symbol rate)\s*(?:改为|改成|换成|设为|设置为|[:=为])?\s*(\d+(?:\.\d+)?)\s*([gmk]?)(?:baud|sym/s)",
         }
         for key, pattern in patterns.items():
             match = re.search(pattern, low, flags=re.IGNORECASE)
@@ -992,6 +1031,22 @@ class WorkflowEngine:
         )
         if device:
             slots["hardware"] = device
+        explicit_hardware_tx = bool(
+            device
+            and any(
+                word in low
+                for word in ("发射", "开始发送", "transmit", "start tx")
+            )
+            and slots.get("direction") != "rx"
+        )
+        if explicit_hardware_tx:
+            slots["direction"] = "tx"
+        if (
+            explicit_hardware_tx
+            and slots.get("deploy_permission") not in {"pending", "forbidden"}
+        ):
+            slots["operation"] = "deploy"
+            slots["deploy_permission"] = "requested"
         switch = re.search(
             r"(?:改成|换成|改为|change\s+(?:it\s+)?to|switch\s+(?:it\s+)?to)\s*"
             r"([a-z0-9_]+)",
@@ -1066,9 +1121,6 @@ class WorkflowEngine:
             for key in ("hardware", "carrier_frequency", "sample_rate"):
                 if not slots.get(key):
                     missing.append(key)
-            if slots.get("operation") == "deploy" and slots.get("protocol") == "ble":
-                if not slots.get("local_name"):
-                    missing.append("local_name")
         return missing
 
     @staticmethod
@@ -1109,10 +1161,10 @@ class WorkflowEngine:
     def instantiate(self, intent: WorkflowIntent, shared_state: Any) -> Workflow:
         candidate = self.catalog["task_candidates"].get(intent.task_type)
         if not candidate:
-            raise ValueError(f"未知 Task Type: {intent.task_type}")
+            raise ValueError(f"Unknown task type: {intent.task_type}")
         stages = self._compose_stages(intent, candidate)
         if not stages:
-            raise ValueError(f"Task {intent.task_type} 没有可执行 Stage")
+            raise ValueError(f"Task {intent.task_type} has no executable stage")
         from .llm_planner import propose_plan
 
         proposal = propose_plan(
@@ -1271,7 +1323,7 @@ class WorkflowEngine:
 
         stages = [stage for group in groups for stage in group]
         if len({stage.id for stage in stages}) != len(stages):
-            raise ValueError("能力组合产生重复 Stage id")
+            raise ValueError("The capability composition produced duplicate stage IDs")
 
         forbidden = set(intent.context.get("forbidden_capabilities") or [])
         if "modify_project" in forbidden:
@@ -1347,11 +1399,11 @@ class WorkflowEngine:
 
     def accept_result(self, result: Any) -> bool:
         if not self.workflow:
-            raise ValueError("没有活动 Workflow")
+            raise ValueError("There is no active workflow")
         data = result if isinstance(result, dict) else vars(result)
         stage = self.current_stage()
         if not stage:
-            raise ValueError("没有 current_stage")
+            raise ValueError("There is no current stage")
         stale = (
             str(data.get("workflow_id") or self.workflow.workflow_id) != self.workflow.workflow_id
             or str(data.get("stage_id") or stage.id) != stage.id
@@ -1469,7 +1521,7 @@ class WorkflowEngine:
         """Pause the current autonomous Stage for a Policy/user decision."""
         stage = self.current_stage()
         if not stage:
-            raise ValueError("没有 current_stage")
+            raise ValueError("There is no current stage")
         checkpoint = Checkpoint(
             id=f"cp-{uuid.uuid4().hex[:8]}",
             purpose=self._checkpoint_purpose(stage),
@@ -1496,11 +1548,11 @@ class WorkflowEngine:
     def resolve_checkpoint(self, decision: str) -> None:
         stage = self.current_stage()
         if not stage or not stage.checkpoint or stage.execution_status != "waiting":
-            raise ValueError("当前没有待决 Checkpoint")
+            raise ValueError("There is no pending checkpoint")
         if stage.checkpoint.blocker:
             raise ValueError(
                 stage.checkpoint.blocker.get("message")
-                or "当前系统能力不足，不能接受该确认"
+                or "The required system capability is unavailable, so this confirmation cannot be accepted"
             )
         normalized = "approved" if decision == "approved" else "rejected"
         stage.checkpoint.decision_status = normalized
@@ -1728,12 +1780,12 @@ class WorkflowEngine:
         if wait_kind == "capability" and stage and stage.checkpoint:
             waiting_reason = str(
                 stage.checkpoint.blocker.get("message")
-                or "当前系统能力不足。"
+                or "The required system capability is unavailable."
             )
         elif wait_kind == "approval" and stage and stage.checkpoint:
             waiting_reason = stage.checkpoint.reason
         elif wait_kind == "input":
-            waiting_reason = "待补充或修正：{}".format(
+            waiting_reason = "Provide or correct: {}".format(
                 ", ".join(
                     list(self.workflow.intent.missing_slots)
                     + list(self.workflow.intent.validation_errors)
@@ -1742,12 +1794,12 @@ class WorkflowEngine:
         elif wait_kind == "denied":
             waiting_reason = str(
                 ((stage.result if stage else {}) or {}).get("note")
-                or "改图被拒绝，工程保持不变。"
+                or "The flowgraph change was rejected; the project remains unchanged."
             )
         elif wait_kind == "recovery":
             waiting_reason = str(
                 ((stage.result if stage else {}) or {}).get("note")
-                or "当前 Stage 未满足完成条件，请重试、调整方案或取消。"
+                or "The current stage did not meet its completion conditions. Retry, revise the plan, or cancel."
             )
         visible_stages = visible_plan_horizon(
             self.workflow.stages, self.workflow.current_stage
@@ -2161,7 +2213,7 @@ class WorkflowEngine:
         if not self.workflow.stage(target):
             self._restore_stage_from_catalog(target)
         if not self.workflow.stage(target):
-            raise ValueError(f"Stage 转移目标不存在: {target}")
+            raise ValueError(f"Stage transition target does not exist: {target}")
         self.workflow.current_stage = target
         next_stage = self.current_stage()
         if next_stage.execution_status in ("completed", "errored"):

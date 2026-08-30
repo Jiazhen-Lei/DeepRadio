@@ -2,28 +2,28 @@
   "schema_version": 1,
   "task_candidates": {
     "END_TO_END_SIM": {
-      "description": "构建端到端通信系统并完成仿真验证",
+      "description": "Build an end-to-end communication system and complete simulation verification",
       "stages": [
         {"id": "spec_alignment", "interaction": "conditional_checkpoint", "recommended_agents": ["spec_agent"], "completion": ["required_slots_complete"], "on": {"approved": "build_and_verify", "rejected": "cancelled"}},
         {"id": "build_and_verify", "interaction": "autonomous", "recommended_agents": ["radio_design_agent", "flowgraph_agent", "verification_agent", "diagnosis_agent"], "completion": ["flowgraph_saved", "structural_validation_completed", "measurement_completed", "affected_claims_evaluated"], "depends_on": ["spec.architecture", "project.flowgraph", "success_conditions"], "max_attempts": 2, "on": {"passed": "completed", "failed_with_improvement": "build_and_verify", "failed_without_improvement": "waiting_user", "errored": "stop"}}
       ]
     },
     "TX_BUILD": {
-      "description": "构建发射链路并完成结构校验",
+      "description": "Build a transmit chain and complete structural validation",
       "stages": [
         {"id": "spec_alignment", "interaction": "conditional_checkpoint", "recommended_agents": ["spec_agent"], "completion": ["required_slots_complete"], "on": {"approved": "tx_build_and_validate", "rejected": "cancelled"}},
         {"id": "tx_build_and_validate", "interaction": "autonomous", "recommended_agents": ["radio_design_agent", "flowgraph_agent", "verification_agent"], "completion": ["flowgraph_saved", "structural_validation_completed"], "max_attempts": 2, "on": {"passed": "completed", "failed_with_improvement": "tx_build_and_validate", "failed_without_improvement": "waiting_user", "errored": "stop"}}
       ]
     },
     "RX_BUILD": {
-      "description": "构建接收链路并验证接收质量",
+      "description": "Build a receive chain and verify reception quality",
       "stages": [
         {"id": "rx_spec_alignment", "interaction": "conditional_checkpoint", "recommended_agents": ["spec_agent"], "completion": ["required_slots_complete"], "on": {"approved": "rx_build_and_verify", "rejected": "cancelled"}},
         {"id": "rx_build_and_verify", "interaction": "autonomous", "recommended_agents": ["radio_design_agent", "flowgraph_agent", "verification_agent", "diagnosis_agent"], "completion": ["flowgraph_saved", "structural_validation_completed", "receive_quality_evaluated"], "max_attempts": 2, "on": {"passed": "completed", "failed_with_improvement": "rx_build_and_verify", "failed_without_improvement": "waiting_user", "errored": "stop"}}
       ]
     },
     "DIAGNOSE": {
-      "description": "检查当前工程并基于 Evidence 诊断",
+      "description": "Inspect the current project and diagnose it using evidence",
       "stages": [
         {"id": "inspect_and_diagnose", "interaction": "autonomous", "recommended_agents": ["verification_agent", "diagnosis_agent"], "completion": ["diagnosis_created"], "on": {"passed": "completed", "failed": "repair_confirmation", "errored": "stop"}},
         {"id": "repair_confirmation", "interaction": "conditional_checkpoint", "recommended_agents": ["diagnosis_agent"], "completion": ["repair_decision_recorded"], "on": {"approved": "repair_and_verify", "rejected": "completed"}},
@@ -31,7 +31,7 @@
       ]
     },
     "MODIFY_PROJECT": {
-      "description": "修改已有 GNU Radio 工程",
+      "description": "Modify an existing GNU Radio project",
       "stages": [
         {"id": "inspect_and_plan", "interaction": "autonomous", "recommended_agents": ["spec_agent", "flowgraph_agent"], "completion": ["change_plan_created"], "on": {"passed": "change_confirmation", "failed": "change_confirmation", "failed_without_improvement": "change_confirmation", "errored": "stop"}},
         {"id": "change_confirmation", "interaction": "conditional_checkpoint", "when": {"any": ["modulation_change", "recipe_change", "multi_block_change", "hardware_change"]}, "recommended_agents": ["flowgraph_agent"], "completion": ["change_decision_recorded"], "on": {"approved": "apply_and_verify", "rejected": "cancelled", "not_required": "apply_and_verify"}},
@@ -39,13 +39,13 @@
       ]
     },
     "OBSERVE": {
-      "description": "观察当前工程结构、信号和指标",
+      "description": "Observe the current project structure, signal, and metrics",
       "stages": [
         {"id": "inspect_and_measure", "interaction": "autonomous", "recommended_agents": ["flowgraph_agent", "verification_agent"], "completion": ["measurement_completed"], "on": {"passed": "completed", "failed": "waiting_user", "errored": "stop"}}
       ]
     },
     "HARDWARE_CONFIGURE": {
-      "description": "规划或配置 SDR 系统",
+      "description": "Plan or configure an SDR system",
       "stages": [
         {"id": "hardware_precheck", "interaction": "autonomous", "recommended_agents": ["hardware_agent"], "completion": ["hardware_precheck_completed"], "on": {"passed": "hardware_confirmation", "failed": "waiting_user", "errored": "stop"}},
         {"id": "hardware_confirmation", "interaction": "checkpoint", "recommended_agents": ["hardware_agent"], "completion": ["hardware_decision_recorded"], "on": {"approved": "configure_and_check", "rejected": "cancelled"}},

@@ -45,7 +45,7 @@ def run_deterministic_stage(
     handler = _HANDLERS.get(stage_id)
     if handler is None:
         return self._fold(
-            ctx, f"Stage {stage_id} 没有可安全自动执行的确定性修改。",
+            ctx, f"Stage {stage_id} has no deterministic change that can be executed safely.",
             source="deterministic-stage", ok=False,
         )
     return handler(self, ctx, user_text, recipe, simulate)
@@ -86,7 +86,7 @@ def _recipe_graph_patch(from_recipe: str, to_recipe: str) -> dict:
     def connection_key(item: Any) -> tuple[str, int, str, int]:
         values = tuple(item or ())
         if len(values) < 2:
-            raise ValueError("recipe connection 至少需要 src_id 和 dst_id")
+            raise ValueError("A recipe connection requires at least src_id and dst_id")
         if len(values) >= 4:
             return (
                 str(values[0]), int(values[2]),
@@ -194,7 +194,7 @@ def _handle_apply(self, ctx, user_text, recipe, simulate) -> AgentReply:
                 self._state.project.config["modulation"] = modulation
         return self._fold(
             ctx,
-            result.get("error") or "已应用 GraphPatch 并完成重验。",
+            result.get("error") or "Applied the GraphPatch and completed revalidation.",
             source="deterministic-stage",
             ok=bool(result.get("ok")) and bool(validation.get("valid")),
         )
@@ -212,7 +212,7 @@ def _handle_apply(self, ctx, user_text, recipe, simulate) -> AgentReply:
     )
     if not change:
         return self._fold(
-            ctx, "无法从修改请求中确定 block.parameter 和新值。",
+            ctx, "Unable to determine the block.parameter target and new value from the change request.",
             source="deterministic-stage", ok=False,
         )
     result = registry.call("apply_grc_diff", {
@@ -229,7 +229,7 @@ def _handle_apply(self, ctx, user_text, recipe, simulate) -> AgentReply:
     return self._fold(
         ctx,
         result.get("error") or (
-            f"已修改 {change.group(1)}.{change.group(2)}，完成重验。"
+            f"Changed {change.group(1)}.{change.group(2)} and completed revalidation."
         ),
         source="deterministic-stage",
         ok=bool(result.get("ok")) and bool(validation.get("valid")),
@@ -254,20 +254,20 @@ def _handle_inspect_plan(self, ctx, user_text, recipe, simulate) -> AgentReply:
                 json.dump(patch, handle, ensure_ascii=False, indent=2, sort_keys=True)
             ctx.extra.setdefault("artifacts", {})["change_plan"] = plan_path
             note = (
-                f"已检查当前工程（{current or '未命名'}）并生成 GraphPatch："
-                f"{len(patch['operations'])} 项原位修改；确认前画布不变。"
+                f"Inspected the current project ({current or 'Untitled'}) and generated a GraphPatch with "
+                f"{len(patch['operations'])} in-place change(s); the canvas remains unchanged until confirmation."
             )
         else:
             slots["rebuild_required"] = True
-            slots["rebuild_reason"] = "当前与目标结构无法生成受约束的语义差异"
+            slots["rebuild_reason"] = "A constrained semantic diff cannot be generated between the current and target structures"
             note = (
-                "已检查当前工程，但无法形成可验证的原位 GraphPatch。"
-                "若继续，将明确按重建路径处理。"
+                "The current project was inspected, but a verifiable in-place GraphPatch could not be formed. "
+                "Continuing will explicitly use the rebuild path."
             )
     elif result.get("ok"):
-        note = "已检查当前工程并形成变更计划；确认后才会应用并重验。"
+        note = "The current project was inspected and a change plan was created. It will be applied and revalidated only after confirmation."
     else:
-        note = result.get("error", "工程检查失败")
+        note = result.get("error", "Project inspection failed")
     return self._fold(
         ctx, note, source="deterministic-stage", ok=bool(result.get("ok"))
     )
@@ -288,9 +288,9 @@ def _handle_hardware_precheck(self, ctx, user_text, recipe, simulate) -> AgentRe
     result = registry.call("hardware_preflight", {"device_type": hardware}, ctx)
     self._record_tool_result(ctx, "hardware_preflight", result)
     missing = list(result.get("missing") or [])
-    note = result.get("note") or "硬件预检完成。"
+    note = result.get("note") or "Hardware precheck completed."
     if missing:
-        note = "硬件预检尚缺：{}。{}".format(", ".join(missing), note)
+        note = "Hardware precheck is still missing: {}. {}".format(", ".join(missing), note)
     return self._fold(
         ctx, note, source="deterministic-stage", ok=bool(result.get("ok")),
     )
@@ -314,7 +314,7 @@ def _handle_configure_and_check(self, ctx, user_text, recipe, simulate) -> Agent
     self._record_tool_result(ctx, "hardware_preflight", preflight)
     return self._fold(
         ctx,
-        result.get("error") or "SDR 参数已记录；真实硬件操作保持禁用。",
+        result.get("error") or "SDR parameters were recorded; physical hardware operations remain disabled.",
         source="deterministic-stage",
         ok=bool(result.get("ok")) and bool(preflight.get("ok")),
     )
@@ -347,8 +347,8 @@ def _handle_build_ble(self, ctx, user_text, recipe, simulate) -> AgentReply:
     if profile is None or not profile.ble_tx_builder:
         return self._fold(
             ctx,
-            f"所选硬件 {hardware or '(empty)'} 暂无 BLE TX builder；"
-            "已停止，未替换成其他 SDR。",
+            f"No BLE TX builder is available for the selected hardware ({hardware or '(empty)'}). "
+            "Execution stopped without substituting another SDR.",
             source="deterministic-stage",
             ok=False,
         )
@@ -363,7 +363,7 @@ def _handle_build_ble(self, ctx, user_text, recipe, simulate) -> AgentReply:
         }
         built = registry.call("build_ble_pluto_tx_flowgraph", build_args, ctx)
         builder = "build_ble_pluto_tx_flowgraph"
-        sink_note = "PlutoSDR TX 流图已生成；尚未启动 RF。"
+        sink_note = "the PlutoSDR TX flowgraph was generated; RF has not started."
     elif profile.ble_tx_builder == "build_ble_uhd_tx_flowgraph":
         build_args = {
             "waveform_path": waveform.get("path") or "",
@@ -377,11 +377,11 @@ def _handle_build_ble(self, ctx, user_text, recipe, simulate) -> AgentReply:
         }
         built = registry.call("build_ble_uhd_tx_flowgraph", build_args, ctx)
         builder = "build_ble_uhd_tx_flowgraph"
-        sink_note = "B210 TX 流图已生成；尚未启动 RF。"
+        sink_note = "the B210 TX flowgraph was generated; RF has not started."
     else:
         return self._fold(
             ctx,
-            f"HardwareProfile {profile.key} 的 BLE builder 未实现。",
+            f"The BLE builder for HardwareProfile {profile.key} is not implemented.",
             source="deterministic-stage",
             ok=False,
         )
@@ -405,7 +405,7 @@ def _handle_build_ble(self, ctx, user_text, recipe, simulate) -> AgentReply:
         })
     return self._fold(
         ctx,
-        built.get("error") or f"BLE 广播 PDU、离线波形和{sink_note}",
+        built.get("error") or f"The BLE advertising PDU and offline waveform were generated, and {sink_note}",
         source="deterministic-stage",
         ok=bool(pdu.get("ok") and waveform.get("ok") and built.get("ok")),
     )
@@ -429,7 +429,7 @@ def _handle_offline_protocol(self, ctx, user_text, recipe, simulate) -> AgentRep
     profile = resolve_hardware_profile(hardware)
     sink = profile.label if profile else hardware or "SDR"
     return self._fold(
-        ctx, f"BLE PDU/CRC/whitening 与 {sink} TX 流图离线校验完成。",
+        ctx, f"Offline BLE PDU/CRC/whitening and {sink} TX flowgraph verification completed.",
         source="deterministic-stage",
         ok=bool(verified.get("valid") and validation.get("valid")),
     )
@@ -450,7 +450,7 @@ def _discover_and_probe(
     profile = resolve_hardware_profile(hardware)
     if profile is None:
         return self._fold(
-            ctx, f"不支持的 SDR 类型: {hardware or '(empty)'}。",
+            ctx, f"Unsupported SDR type: {hardware or '(empty)' }.",
             source="deterministic-stage", ok=False,
         )
     args = {"device_type": hardware}
@@ -477,14 +477,14 @@ def _discover_and_probe(
         _bind_preview_identity(self, ctx, str(observed.get("identity") or ""))
     label = profile.label
     if not discovered.get("device_found"):
-        note = discovered.get("error") or f"未发现可用 {label}。"
+        note = discovered.get("error") or f"No available {label} was discovered."
     elif not discovered.get("device_identity"):
-        note = f"已发现 {label}，但未能提取可用于精确探测的设备标识。"
+        note = f"{label} was discovered, but no device identity suitable for precise probing could be extracted."
     elif not probed.get("device_probed"):
         note = (
             probed.get("error")
-            or f"已发现 {label} {discovered.get('device_identity')}，"
-            "但精确 probe 未通过验收。"
+            or f"{label} {discovered.get('device_identity')} was discovered, "
+            "but precise probing did not pass acceptance."
         )
     else:
         note = success_note.format(label=label)
@@ -497,14 +497,14 @@ def _discover_and_probe(
 def _handle_probe_device(self, ctx, user_text, recipe, simulate) -> AgentReply:
     return _discover_and_probe(
         self, ctx, default_hardware="b210", with_timestamp=False,
-        success_note="{label} 只读发现与 probe 完成；尚未打开 TX stream。",
+        success_note="Read-only discovery and probing completed for {label}; the TX stream has not been opened.",
     )
 
 
 def _handle_probe_hardware(self, ctx, user_text, recipe, simulate) -> AgentReply:
     return _discover_and_probe(
         self, ctx, default_hardware="", with_timestamp=True,
-        success_note="{label} 只读发现与探测完成；尚未启动 Flowgraph。",
+        success_note="Read-only discovery and probing completed for {label}; the flowgraph has not started.",
     )
 
 
@@ -557,9 +557,9 @@ def _handle_configure_device(self, ctx, user_text, recipe, simulate) -> AgentRep
         ctx,
         result.get("error") or armed.get("error")
         or (
-            f"{label} 发射配置已记录并完成受控武装，等待启动。"
+            f"The {label} transmit configuration was recorded and safely armed; waiting to start."
             if tx_runtime
-            else f"{label} 接收配置已记录，等待有限时长运行。"
+            else f"The {label} receive configuration was recorded; waiting for a bounded runtime."
         ),
         source="deterministic-stage",
         ok=ok,
@@ -582,18 +582,21 @@ def _start_bounded(self, ctx: ToolContext, *, tx: bool) -> AgentReply:
     result = registry.call("start_flowgraph", start_args, ctx)
     self._record_tool_result(ctx, "start_flowgraph", result, start_args)
     if tx:
+        target = (
+            f"Check for advertising name {slots.get('local_name')} before the deadline."
+            if slots.get("local_name")
+            else "Check the target signal with an independent receiver before the deadline."
+        )
         note = (
-            f"受控发射已启动（最大时长 {duration:g} 秒；"
-            "OTA 确认或取消后会提前停止）。"
-            f" run_id={result.get('run_id')} pid={result.get('pid')}。"
-            f"请在截止前检查广播名称 {slots.get('local_name') or '(未指定)'}。"
-            "进程由 Workflow 管理，无需在 GRC 中点击运行。"
+            f"Bounded transmission started (maximum duration: {duration:g} seconds; "
+            "OTA confirmation or cancellation stops it early). "
+            + target
+            + "The process is managed by the workflow; you do not need to click Run in GRC."
         )
     else:
         note = (
-            f"受控运行已启动（最大时长 {duration:g} 秒）。"
-            f" run_id={result.get('run_id')} pid={result.get('pid')}。"
-            "无需在 GRC 中点击运行。"
+            f"Bounded runtime started (maximum duration: {duration:g} seconds). "
+            "You do not need to click Run in GRC."
         )
     return self._fold(
         ctx, result.get("error") or note, source="deterministic-stage",
@@ -625,9 +628,9 @@ def _stop_runtime(self, ctx: ToolContext, *, require_ota: bool) -> AgentReply:
             ota.get("run_id") and ota.get("run_id") == stopped.get("run_id")
         )
         note = (
-            "发射已停止，LightBlue 空口观察已记录。"
+            "Transmission stopped and the independent receiver's over-the-air observation was recorded."
             if observed else
-            "发射已停止，但用户未在 LightBlue 中观察到目标广播。"
+            "Transmission stopped, but the user did not observe the target signal on an independent receiver."
         )
         ok = bool(
             stopped.get("ok")
@@ -637,7 +640,7 @@ def _stop_runtime(self, ctx: ToolContext, *, require_ota: bool) -> AgentReply:
             and same_run
         )
     else:
-        note = "硬件 Flowgraph 已停止，运行状态与用户观察结果已记录。"
+        note = "The hardware flowgraph was stopped; runtime status and user observations were recorded."
         ok = bool(
             stopped.get("ok")
             and not stopped.get("running")
@@ -664,7 +667,7 @@ def _handle_repair(self, ctx, user_text, recipe, simulate) -> AgentReply:
     )
     if not changes:
         return self._fold(
-            ctx, "没有可确定执行的修复参数，请先补充修改目标。",
+            ctx, "No deterministic repair parameters are available. Provide the repair target first.",
             source="deterministic-stage", ok=False,
         )
     change = changes[0]
@@ -680,7 +683,7 @@ def _handle_repair(self, ctx, user_text, recipe, simulate) -> AgentReply:
     if result.get("path"):
         ctx.extra.setdefault("artifacts", {})["grc_path"] = result["path"]
     return self._fold(
-        ctx, result.get("error") or "已应用最小修复并完成重验。",
+        ctx, result.get("error") or "The minimum repair was applied and revalidated.",
         source="deterministic-stage",
         ok=bool(result.get("ok")) and bool(validation.get("valid")),
     )
@@ -761,8 +764,8 @@ def inspect_measure_stage(
             summary = dict(hardware_report.get("summary") or {})
             reply = self._fold(
                 ctx,
-                "硬件诊断完成：pass={pass_count}，fail={fail_count}，"
-                "unknown={unknown_count}；unknown 项需要外部或人工证据。".format(
+                "Hardware diagnosis completed: pass={pass_count}, fail={fail_count}, "
+                "unknown={unknown_count}. Unknown findings require external or human evidence.".format(
                     pass_count=summary.get("pass", 0),
                     fail_count=summary.get("fail", 0),
                     unknown_count=summary.get("unknown", 0),
@@ -786,7 +789,7 @@ def inspect_measure_stage(
     self._record_tool_result(ctx, "validate", validation)
     if not inspected.get("ok") or not validation.get("ok"):
         return self._fold(
-            ctx, inspected.get("error") or validation.get("error") or "工程检查失败",
+            ctx, inspected.get("error") or validation.get("error") or "Project inspection failed",
             source="deterministic-stage", ok=False,
         )
     if not validation.get("valid"):
@@ -795,7 +798,7 @@ def inspect_measure_stage(
         )
         self._record_tool_result(ctx, "explain_error", explained)
         return self._fold(
-            ctx, "结构校验未通过，已给出具体错误与修复建议。",
+            ctx, "Structural validation did not pass; specific errors and repair suggestions were provided.",
             source="deterministic-stage", ok=False,
         )
     if workflow:
@@ -830,7 +833,7 @@ def inspect_measure_stage(
     self._record_tool_result(ctx, "simulate", simulated)
     if not simulated.get("ok"):
         return self._fold(
-            ctx, simulated.get("error") or "仿真失败",
+            ctx, simulated.get("error") or "Simulation failed",
             source="deterministic-stage", ok=False,
         )
     slots = workflow.intent.slots if workflow else {}
@@ -840,8 +843,8 @@ def inspect_measure_stage(
     if source_scope == "live_device":
         return self._fold(
             ctx,
-            "实时设备观察必须经设备身份探测和受控 RX runtime；"
-            "不会用当前工程的离线仿真替代。",
+            "Live device observation requires device identity probing and a controlled RX runtime; "
+            "offline simulation of the current project will not be substituted.",
             source="deterministic-stage",
             ok=False,
         )
@@ -940,8 +943,9 @@ def inspect_measure_stage(
             "sps": sps,
         }, ctx)
         self._record_tool_result(ctx, "debug_by_metric", diagnosis)
+        verdict = str(diagnosis.get("verdict") or "").lower()
         issue = (
-            "偏高" in str(diagnosis.get("verdict") or "")
+            any(marker in verdict for marker in ("偏高", "high", "elevated"))
             and not diagnosis.get("meets_claim")
         )
         forbidden = set(
@@ -953,7 +957,7 @@ def inspect_measure_stage(
         )
         reply = self._fold(
             ctx,
-            diagnosis.get("narrative") or diagnosis.get("error") or "诊断完成。",
+            diagnosis.get("narrative") or diagnosis.get("error") or "Diagnosis completed.",
             source="deterministic-stage",
             ok=bool(diagnosis.get("ok")) if readonly else (
                 not issue and bool(diagnosis.get("ok"))
@@ -972,15 +976,15 @@ def inspect_measure_stage(
             if proposed:
                 reply.pending = {
                     "action": "workflow_checkpoint",
-                    "reason": "对照实验指出主要因素，确认后才修改原工程",
+                    "reason": "The controlled experiment identified the primary factor; the original project will be modified only after confirmation",
                     "approved": False,
                     "proposed_changes": [proposed],
                 }
         return reply
-    summary = "工程检查与测量完成。"
+    summary = "Project inspection and measurement completed."
     peak = metrics.get("spectrum_peak_report")
     if isinstance(peak, dict) and peak.get("valid"):
-        summary += " 主峰 {:.3f} Hz，幅度 {:.2f} dBFS（FFT {}，{} 窗）。".format(
+        summary += " Peak at {:.3f} Hz with amplitude {:.2f} dBFS (FFT {}, {} window).".format(
             float(peak.get("frequency_hz") or 0.0),
             float(peak.get("magnitude_dbfs") or 0.0),
             int(peak.get("fft_size") or 0),

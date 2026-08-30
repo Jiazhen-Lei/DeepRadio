@@ -220,6 +220,22 @@ class SharedState:
         with open(tmp, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, indent=2)
         os.replace(tmp, path)
+        if self.intent.intent_id:
+            specification_path = os.path.join(parent, "radio_specification.json")
+            specification_payload = {
+                "schema_version": 1,
+                "intent_id": self.intent.intent_id,
+                "revision": self.intent.revision,
+                "status": self.intent.status,
+                "semantic_hash": self.intent.semantic_hash,
+                "specification": self.intent.specification.to_dict(),
+            }
+            specification_tmp = f"{specification_path}.tmp"
+            with open(specification_tmp, "w", encoding="utf-8") as handle:
+                json.dump(
+                    specification_payload, handle, ensure_ascii=False, indent=2
+                )
+            os.replace(specification_tmp, specification_path)
         return path
 
     @classmethod
@@ -338,56 +354,50 @@ class SharedState:
             "intent_status": shared.status if active_intent else "idle",
             "parameter_sources": sources,
         }
-        missing = set(digest["open_questions"])
-        rows = []
+        specification = shared.specification
+        if active_intent and not specification.fields:
+            from ..knowledge.spec_requirements import resolve_specification
 
-        def add_row(key: str, label: str, raw: Any, raw_source: str,
-                    display: str = "") -> None:
+            specification = resolve_specification(
+                task_type=shared.task_type,
+                capabilities=shared.capabilities,
+                slots=parameters,
+                slot_sources=sources,
+                missing_fields=shared.missing_fields,
+                validation_errors=shared.validation_errors,
+                goals=shared.goals,
+                raw_text=shared.raw_text,
+            )
+            shared.specification = specification
+        rows = []
+        for item in specification.fields:
             from ..knowledge.spec_requirements import question_for
 
-            unresolved = raw in (None, "", [])
-            needs_confirmation = key in missing and not unresolved
-            interaction = question_for(key)
+            unresolved = item.value in (None, "", []) or item.source == "unresolved"
+            question = question_for(item.key)
             rows.append({
-                "key": key,
-                "label": label,
-                "value": raw,
-                "display_value": "" if unresolved else (display or str(raw)),
-                "source": raw_source,
+                "key": item.key,
+                "label": item.label or item.key,
+                "value": item.value,
+                "display_value": "" if unresolved else _display_spec_value(
+                    item.key, item.value
+                ),
+                "source": item.source,
                 "unresolved": unresolved,
-                "needs_confirmation": needs_confirmation,
-                "editable": key != "goal",
-                "choices": list(interaction.get("choices") or []),
-                "allow_custom": bool(interaction.get("allow_custom", True)),
+                "needs_confirmation": item.requirement == "required" and not item.confirmed,
+                "editable": False,
+                "locked": True,
+                "confirmed": bool(item.confirmed),
+                "requirement": item.requirement,
+                "reason": item.reason,
+                "depends_on": list(item.depends_on),
+                "choices": list(question.get("choices") or []),
+                "allow_custom": bool(question.get("allow_custom", True)),
             })
-
-        goal_text = "；".join(str(item) for item in goals if item)
-        add_row("goal", "Goal", goal_text, "user" if shared.raw_text else "system")
-        if hardware or "hardware" in missing:
-            add_row("hardware", "Device", hardware, source("hardware"), _hardware_label(hardware))
-        if protocol or "protocol" in missing:
-            add_row("protocol", "Protocol", protocol, source("protocol"), protocol.upper())
-        if digest["modulation"] or "modulation" in missing:
-            add_row("modulation", "Modulation", digest["modulation"], source("modulation"), digest["modulation"].upper())
-        if protocol.lower() == "ble" or ble_channel not in (None, ""):
-            channels = value("advertising_channels") or (
-                [ble_channel] if ble_channel not in (None, "") else []
-            )
-            add_row("advertising_channels", "Channel", channels, source("advertising_channels", "carrier_frequency"), f"CH{ble_channel}" if ble_channel not in (None, "") else "")
-        elif digest["channel"] or "channel" in missing:
-            add_row("channel", "Channel", digest["channel"], source("channel"), digest["channel"].upper())
-        if carrier is not None or "carrier_frequency" in missing:
-            add_row("carrier_frequency", "Carrier", carrier, source("carrier_frequency"), _format_hz(carrier))
-        if digest["sample_rate"] is not None or "sample_rate" in missing:
-            add_row("sample_rate", "Sample rate", digest["sample_rate"], source("sample_rate"), _format_rate(digest["sample_rate"]))
-        if duration not in (None, "") or missing.intersection({"duration_seconds", "max_duration_seconds"}):
-            add_row("duration_seconds", "Maximum duration", duration, source("max_duration_seconds", "duration_seconds"), f"{duration:g} s" if isinstance(duration, (int, float)) else str(duration))
-        success_text = "；".join(str(item) for item in success_conditions if item)
-        if success_text or "success_conditions" in missing:
-            add_row("success_conditions", "Success condition", success_text, source("success_conditions"))
-        if protocol.lower() == "ble" and (local_name or "local_name" in missing):
-            add_row("local_name", "Advertising name", local_name, source("local_name"))
         digest["radio_specification"] = rows
+        digest["specification_profiles"] = list(specification.profile_refs)
+        digest["blocking_questions"] = list(specification.blocking_questions)
+        digest["optional_prompts"] = list(specification.optional_prompts)
         digest["summary"] = _spec_summary_line(digest)
         if protocol.lower() == "ble" and duration not in ("", None):
             digest["duration_note"] = (
@@ -396,6 +406,25 @@ class SharedState:
                 else f"最大时长 {duration} 秒；OTA 确认或取消后会提前停止"
             )
         return digest
+
+
+def _display_spec_value(key: str, value: Any) -> str:
+    if key == "hardware":
+        return _hardware_label(str(value or ""))
+    if key in {"carrier_frequency", "bandwidth"}:
+        return _format_hz(value)
+    if key == "sample_rate":
+        return _format_rate(value)
+    if key in {"duration_seconds", "max_duration_seconds", "capture_duration"}:
+        return f"{value:g} s" if isinstance(value, (int, float)) else str(value)
+    if key == "advertising_channels":
+        values = value if isinstance(value, list) else [value]
+        return ", ".join(f"CH{item}" for item in values)
+    if isinstance(value, list):
+        return "；".join(str(item) for item in value)
+    if key in {"protocol", "modulation", "channel"}:
+        return str(value or "").upper()
+    return str(value)
 
 
 def _format_hz(value: Any) -> str:
@@ -481,14 +510,14 @@ def _spec_summary_line(digest: Dict[str, Any]) -> str:
         rate = _format_rate(digest.get("sample_rate"))
         if rate:
             parts.append(rate)
-        parts.append("RF armed" if digest.get("rf_armed") else "sink 未 arm")
+        parts.append("RF armed" if digest.get("rf_armed") else "sink unarmed")
         return " · ".join(part for part in parts if part)
     parts = [
         str(digest.get("modulation") or "").upper(),
         str(digest.get("channel") or "").upper(),
         recipe,
     ]
-    return " → ".join(item for item in parts if item) or "尚未提取"
+    return " → ".join(item for item in parts if item) or "Not extracted"
 
 
 def _from_dict(data: Dict[str, Any]) -> SharedState:

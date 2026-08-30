@@ -99,12 +99,16 @@ def specification_view(
             "choices": list(item.get("choices") or []),
             "allow_custom": bool(item.get("allow_custom", True)),
             "raw_value": item.get("value"),
+            "requirement": str(item.get("requirement") or "mentioned"),
+            "locked": bool(item.get("locked", True)),
+            "confirmed": bool(item.get("confirmed")),
+            "reason": str(item.get("reason") or ""),
         })
     if not rows:
-        summary = str(spec.get("summary") or "尚未提取")
+        summary = str(spec.get("summary") or "Not extracted")
         rows = [{
             "key": "summary", "label": "Summary", "value": summary,
-            "source": "System", "unresolved": summary == "尚未提取",
+            "source": "System", "unresolved": summary == "Not extracted",
         }]
     unresolved = [
         item["key"] for item in rows
@@ -119,6 +123,11 @@ def specification_view(
         "rows": rows,
         "aligned": not unresolved and intent_status == "confirmed",
         "unresolved": unresolved,
+        "status": intent_status or "draft",
+        "revision": int(spec.get("intent_revision") or 0),
+        "profiles": list(spec.get("specification_profiles") or []),
+        "blocking_questions": list(spec.get("blocking_questions") or []),
+        "optional_prompts": list(spec.get("optional_prompts") or []),
     }
 
 
@@ -161,11 +170,12 @@ def diagnosis_view(workflow: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def workflow_view(
-    workflow: Dict[str, Any], spec: Dict[str, Any]
+    workflow: Dict[str, Any], spec: Dict[str, Any], claim_rows: Iterable[Dict[str, Any]]
 ) -> Dict[str, Any]:
     """Project execution state without exposing control-plane bookkeeping."""
     current = str(workflow.get("current_stage") or "")
     stages = []
+    unmatched_claims = [dict(item) for item in claim_rows or []]
     for item in workflow.get("stages") or []:
         if not isinstance(item, dict):
             continue
@@ -176,14 +186,22 @@ def workflow_view(
             status = "failed"
         elif outcome == "passed":
             status = "passed"
+        stage_id = str(item.get("id") or "")
+        stage_claims = [
+            claim for claim in unmatched_claims
+            if str(claim.get("producer") or "") == stage_id
+        ]
+        unmatched_claims = [claim for claim in unmatched_claims if claim not in stage_claims]
         stages.append({
-            "id": str(item.get("id") or ""),
+            "id": stage_id,
             "label": str(item.get("label") or item.get("id") or "Stage"),
             "status": status,
             "current": str(item.get("id") or "") == current,
             # Count means independent acceptance predicates, never executions.
             "acceptance_count": len(item.get("completion") or []),
+            "claims": stage_claims,
         })
+    transition = _latest_transition(workflow, stages)
     return {
         "visible": bool(stages),
         "title": str(
@@ -191,6 +209,39 @@ def workflow_view(
         ),
         "stages": stages,
         "success_conditions": list(spec.get("success_conditions") or []),
+        "transition": transition,
+        "task_claims": unmatched_claims,
+        "execution_status": str(workflow.get("execution_status") or "idle"),
+        "outcome": str(workflow.get("outcome") or ""),
+        "stage_index": int(workflow.get("stage_index") or 0),
+        "stage_total": int(workflow.get("stage_total") or len(stages)),
+    }
+
+
+def _latest_transition(
+    workflow: Dict[str, Any], stages: List[Dict[str, Any]]
+) -> Dict[str, str]:
+    index = {item["id"]: position for position, item in enumerate(stages)}
+    activations = [
+        item for item in workflow.get("timeline") or []
+        if item.get("event") in {"stage_started", "stage_invalidated"}
+        and item.get("stage_id")
+    ]
+    if len(activations) < 2:
+        return {}
+    previous = str(activations[-2].get("stage_id") or "")
+    current = str(activations[-1].get("stage_id") or "")
+    if not previous or not current or previous == current:
+        return {}
+    backward = index.get(current, 0) <= index.get(previous, 0)
+    return {
+        "from": previous,
+        "to": current,
+        "kind": "back" if backward else "forward",
+        "reason": str(
+            activations[-1].get("cause")
+            or ("Revalidation or recovery" if backward else "Previous stage completed")
+        ),
     }
 
 
@@ -229,6 +280,7 @@ def claims_view(
             "status": _STATUS_LABELS.get(status.lower(), status),
             "version": int(claim.get("project_version") or project_version),
             "evidence_grade": str(latest.get("evidence_grade") or ""),
+            "producer": str(claim.get("producer") or ""),
         })
     priority = {"Failed": 0, "Inconclusive": 1, "Stale": 2, "Not tested": 3, "Passed": 4}
     rows.sort(key=lambda item: priority.get(item["status"], 5))
@@ -256,11 +308,12 @@ def present(
     *, spec: Dict[str, Any], workflow: Dict[str, Any], claims: Iterable[Dict[str, Any]]
 ) -> Dict[str, Any]:
     """Create the complete default inspector view model."""
+    claim_projection = claims_view(claims, workflow)
     return {
         "phase": phase_view(workflow),
         "specification": specification_view(spec, workflow),
-        "workflow": workflow_view(workflow, spec),
+        "workflow": workflow_view(workflow, spec, claim_projection.get("rows") or []),
         "diagnosis": diagnosis_view(workflow),
-        "claims": claims_view(claims, workflow),
+        "claims": claim_projection,
         "runtime": runtime_view(workflow),
     }

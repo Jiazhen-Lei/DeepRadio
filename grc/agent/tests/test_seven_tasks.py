@@ -222,6 +222,20 @@ class SevenTaskServiceAgentTest(unittest.TestCase):
         self.assertIsNotNone(match, f"missing claim {claim_id}")
         return match
 
+    def test_progress_listener_receives_read_only_stage_snapshots(self):
+        agent = self.agent("seven-progress")
+        snapshots = []
+        listener = snapshots.append
+        agent.subscribe_progress(listener)
+        agent.step("构建 BPSK 过 AWGN 并测 EVM")
+        agent.unsubscribe_progress(listener)
+        events = [item.get("event") for item in snapshots]
+        self.assertIn("stage_started", events)
+        self.assertNotIn("intent_llm_started", events)
+        self.assertNotIn("tool_called", events)
+        self.assertTrue(all(isinstance(item.get("workflow_digest"), dict) for item in snapshots))
+        self.assertTrue(all(isinstance(item.get("spec_digest"), dict) for item in snapshots))
+
     def _open_copied_project(self, session_id: str, source: ServiceAgent) -> ServiceAgent:
         src = Path(source._state.project.grc_path)
         self.assertTrue(src.is_file())
@@ -241,7 +255,7 @@ class SevenTaskServiceAgentTest(unittest.TestCase):
         agent._tool_ctx = None
         return agent
 
-    def test_vague_ble_uses_structured_alignment_before_workflow(self):
+    def test_vague_ble_uses_natural_alignment_before_workflow(self):
         agent = self.agent("seven-vague-ble")
         first = agent.step("我要用硬件发射一段 BLE 信号")
         self.assertEqual(first.stage, "ALIGN")
@@ -256,18 +270,15 @@ class SevenTaskServiceAgentTest(unittest.TestCase):
                 **values,
             })
 
-        second = answer(first, value="pluto")
-        self.assertEqual(second.pending.get("field"), "local_name")
-        third = answer(second, custom_value="alignment-demo")
-        self.assertEqual(third.pending.get("field"), "duration_seconds")
-        fourth = answer(third, value=30.0)
-        self.assertEqual(fourth.pending.get("field"), "success_conditions")
-        fifth = answer(fourth, custom_value="LightBlue 观察到 alignment-demo")
-        self.assertEqual(fifth.pending.get("kind"), "intent_confirmation")
-        reply = answer(fifth, decision="approved")
+        second = agent.step(
+            "硬件用 PlutoSDR，最多30秒，成功条件是独立接收端观察到目标信号"
+        )
+        self.assertEqual(second.pending.get("kind"), "intent_confirmation")
+        reply = answer(second, decision="approved")
         self.assertIsNotNone(agent._workflow.workflow)
         self.assertEqual(agent._state.intent.status, "confirmed")
-        self.assertEqual(agent._workflow.workflow.intent.slots["local_name"], "alignment-demo")
+        self.assertNotIn("local_name", agent._workflow.workflow.intent.slots)
+        self.assertEqual(agent._workflow.workflow.intent.slots["direction"], "tx")
         self.assertNotIn("start_flowgraph", self._events("seven-vague-ble"))
 
     def test_vague_ble_accepts_one_radio_specification_table(self):

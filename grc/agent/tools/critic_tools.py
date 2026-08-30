@@ -52,13 +52,13 @@ def _enable_disabled_rf(ctx: ToolContext):
 
 @tool(
     name="validate_flowgraph",
-    description="校验当前流图是否合法(类型一致/端口连通等),返回是否通过与错误列表。",
+    description="Validate the current flowgraph (type consistency, port connectivity, and related checks) and return errors.",
     parameters={
         "type": "object",
         "properties": {
             "arm_disabled_rf": {
                 "type": "boolean",
-                "description": "临时启用已 disable 的 RF 端点再校验拓扑，不改变存盘状态",
+                "description": "Temporarily enable disabled RF endpoints for topology validation without changing saved state",
             },
         },
     },
@@ -67,7 +67,7 @@ def _enable_disabled_rf(ctx: ToolContext):
 def validate_flowgraph(ctx: ToolContext, arm_disabled_rf: bool = False):
     fg = ctx.flow_graph
     if fg is None:
-        return {"ok": False, "error": "流图尚未创建"}
+        return {"ok": False, "error": "The flowgraph has not been created"}
     restored = _enable_disabled_rf(ctx) if arm_disabled_rf else []
     try:
         valid, msgs = _collect_errors(fg)
@@ -80,25 +80,25 @@ def validate_flowgraph(ctx: ToolContext, arm_disabled_rf: bool = False):
 
 #: 常见错误模式 -> 可读解释与修复建议(供 explain_error 快速匹配)
 _ERROR_HINTS = (
-    ("type", "端口数据类型不一致:检查相连块的 type 参数(complex/float/byte)是否一致。"),
-    ("port", "端口连接问题:确认源块有输出口、目标块有输入口,且端口序号未越界。"),
-    ("not connected", "存在未连接的端口:每个块的输入/输出应被正确连线。"),
-    ("throttle", "缺少限速:纯软件仿真链路通常需要 blocks_throttle2、blocks_throttle 或 blocks_head 限速。"),
-    ("param", "参数取值非法:检查该参数是否引用了未定义的变量或类型不匹配。"),
-    ("id", "块 id 重复或非法:每个块 id 必须唯一且为合法标识符。"),
+    ("type", "Port data types do not match: verify that connected blocks use matching type parameters (complex/float/byte)."),
+    ("port", "Port connection problem: verify source outputs, destination inputs, and port indices."),
+    ("not connected", "An unconnected port exists: connect every required block input and output correctly."),
+    ("throttle", "Rate limiting is missing: software-only simulation chains typically need blocks_throttle2, blocks_throttle, or blocks_head."),
+    ("param", "Invalid parameter value: check for undefined variables or type mismatches."),
+    ("id", "A block ID is duplicate or invalid: each block ID must be unique and syntactically valid."),
 )
 
 
 @tool(
     name="explain_error",
-    description="把流图校验的原始报错整理成可读的原因与修复建议。",
+    description="Convert raw flowgraph validation errors into readable causes and repair suggestions.",
     parameters={
         "type": "object",
         "properties": {
             "errors": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "可选,错误文本列表;不传则自动重新校验当前流图取错误。",
+                "description": "Optional error list; when omitted, rerun flowgraph validation to collect errors.",
             },
         },
     },
@@ -108,12 +108,12 @@ def explain_error(ctx: ToolContext, errors: list = None):
     if errors is None:
         fg = ctx.flow_graph
         if fg is None:
-            return {"ok": False, "error": "流图尚未创建且未提供 errors"}
+            return {"ok": False, "error": "The flowgraph has not been created and no errors were provided"}
         _valid, errors = _collect_errors(fg)
     explained = []
     for err in errors or []:
         low = err.lower()
         hint = next((h for kw, h in _ERROR_HINTS if kw in low),
-                    "请对照块文档检查参数与连接。")
+                    "Check parameters and connections against the block documentation.")
         explained.append({"error": err, "hint": hint})
     return {"ok": True, "count": len(explained), "explanations": explained}

@@ -42,7 +42,7 @@ def stage_display_label(
 ) -> str:
     """Human stage name. Config confirm is not an RF authorization."""
     if str(stage_id or "") == "rf_plan_confirmation":
-        return "RF 计划确认" if is_rf_grant_effect(requested_effect) else "配置确认"
+        return "RF Plan Confirmation" if is_rf_grant_effect(requested_effect) else "Configuration Confirmation"
     return default_label or str(stage_id or "")
 
 
@@ -86,10 +86,10 @@ def system_capability_blocker(effect: Any) -> CapabilityBlocker | None:
         code="SYSTEM_CAPABILITY_MISSING",
         capability="rf_runtime",
         requested_effect=requested.name,
-        message="当前 GUI 进程未启用 RF 运行能力，不能接受本次执行授权。",
+        message="RF runtime capability is not enabled in the current GUI process, so this execution authorization cannot be accepted.",
         remediation=(
-            "关闭 GRC，设置 GRC_AGENT_ENABLE_RF=1 后重新启动；"
-            "会话恢复后再确认。"
+            "Close GRC, set GRC_AGENT_ENABLE_RF=1, and restart. "
+            "Confirm again after the session is restored."
         ),
         retryable=False,
         requires_restart=True,
@@ -219,4 +219,3 @@ def project_intent_ir(intent: Any) -> None:
         marker = f"stop_at:{terminal}"
         if marker not in getattr(intent, "stop_conditions", []):
             intent.stop_conditions.append(marker)
-

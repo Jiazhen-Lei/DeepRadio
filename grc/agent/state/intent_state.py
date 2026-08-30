@@ -23,6 +23,67 @@ def semantic_hash(payload: Dict[str, Any]) -> str:
 
 
 @dataclass
+class SpecificationField:
+    """One user-visible radio parameter with requirement and provenance."""
+
+    key: str
+    value: Any = None
+    label: str = ""
+    requirement: str = "mentioned"
+    source: str = "unresolved"
+    locked: bool = True
+    confirmed: bool = False
+    reason: str = ""
+    depends_on: List[str] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "SpecificationField":
+        return cls(
+            key=str(data.get("key") or ""),
+            value=data.get("value"),
+            label=str(data.get("label") or data.get("key") or ""),
+            requirement=str(data.get("requirement") or "mentioned"),
+            source=str(data.get("source") or "unresolved"),
+            locked=bool(data.get("locked", True)),
+            confirmed=bool(data.get("confirmed")),
+            reason=str(data.get("reason") or ""),
+            depends_on=list(data.get("depends_on") or []),
+        )
+
+
+@dataclass
+class RadioSpecification:
+    """Versioned specification embedded in SharedIntent.
+
+    It is the canonical communication-parameter view.  The GUI and exported
+    ``radio_specification.json`` are projections and never independent writers.
+    """
+
+    profile_refs: List[str] = field(default_factory=list)
+    fields: List[SpecificationField] = field(default_factory=list)
+    blocking_questions: List[Dict[str, Any]] = field(default_factory=list)
+    optional_prompts: List[Dict[str, Any]] = field(default_factory=list)
+    validation_errors: List[str] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "RadioSpecification":
+        return cls(
+            profile_refs=list(data.get("profile_refs") or []),
+            fields=[
+                SpecificationField.from_dict(item)
+                for item in data.get("fields") or []
+                if isinstance(item, dict) and item.get("key")
+            ],
+            blocking_questions=list(data.get("blocking_questions") or []),
+            optional_prompts=list(data.get("optional_prompts") or []),
+            validation_errors=list(data.get("validation_errors") or []),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class SharedIntent:
     """Canonical intent contract.
 
@@ -47,6 +108,7 @@ class SharedIntent:
     validation_errors: List[str] = field(default_factory=list)
     interaction: Dict[str, Any] = field(default_factory=dict)
     intent_ir: Dict[str, Any] = field(default_factory=dict)
+    specification: RadioSpecification = field(default_factory=RadioSpecification)
     semantic_hash: str = ""
     confirmed_at: float = 0.0
     patch_history: List[Dict[str, Any]] = field(default_factory=list)
@@ -66,6 +128,7 @@ class SharedIntent:
             "constraints": dict(self.constraints),
             "success_criteria": list(self.success_criteria),
             "intent_ir": dict(self.intent_ir),
+            "specification": self.specification.to_dict(),
         }
 
     def refresh_hash(self) -> str:
@@ -98,6 +161,9 @@ class SharedIntent:
             validation_errors=list(data.get("validation_errors") or []),
             interaction=dict(data.get("interaction") or {}),
             intent_ir=dict(data.get("intent_ir") or {}),
+            specification=RadioSpecification.from_dict(
+                dict(data.get("specification") or {})
+            ),
             semantic_hash=str(data.get("semantic_hash") or ""),
             confirmed_at=float(data.get("confirmed_at", 0.0) or 0.0),
             patch_history=list(data.get("patch_history") or []),

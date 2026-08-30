@@ -54,6 +54,22 @@ class BleDeployContractTest(unittest.TestCase):
         self.assertGreater(Path(waveform["path"]).stat().st_size, 0)
         self.assertTrue(verified["valid"])
 
+    def test_ble_packet_without_optional_local_name_is_valid(self):
+        packet = registry.call(
+            "build_ble_advertising_pdu", {"channel": 38}, self.ctx
+        )
+        waveform = registry.call(
+            "generate_ble_1m_waveform", {"channel": 38}, self.ctx
+        )
+        verified = registry.call(
+            "verify_ble_packet_bits", {"channel": 38}, self.ctx
+        )
+        self.assertTrue(packet["ok"])
+        self.assertEqual(packet["local_name"], "")
+        self.assertTrue(waveform["ok"])
+        self.assertTrue(verified["valid"], verified)
+        self.assertNotIn("local_name_matches_request", verified["checks"])
+
     def test_ble_uhd_flowgraph_is_valid_but_not_started(self):
         waveform = registry.call(
             "generate_ble_1m_waveform", {"local_name": "deepradio"}, self.ctx

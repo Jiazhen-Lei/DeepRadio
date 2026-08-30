@@ -40,7 +40,7 @@ def design_link(ctx, profile=None, intent: str = "",
     if ctx.extra.get("mutation_forbidden"):
         return {
             "ok": False,
-            "error": "本轮禁止改图（用户要求只诊断/先不要修改）",
+            "error": "Flowgraph changes are forbidden in this turn because the user requested diagnosis only or asked not to modify it yet",
             "policy": "DENY",
         }
 
@@ -63,7 +63,7 @@ def design_link(ctx, profile=None, intent: str = "",
                 "ok": False,
                 "recipe": rc.name,
                 "valid": False,
-                "error": "PolicyGateway 拒绝修改已锁定的 modulation",
+                "error": "PolicyGateway rejected a change to the locked modulation",
                 "policy": "DENY",
             }
         current_recipe = str(state.project.config.get("recipe") or "")
@@ -90,7 +90,7 @@ def design_link(ctx, profile=None, intent: str = "",
         )
         if pending and pending.get("approved"):
             if ctx.platform is None:
-                return {"ok": False, "error": "缺少 platform,无法建图"}
+                return {"ok": False, "error": "Platform is missing; the flowgraph cannot be built"}
             approved_pending = dict(pending)
             state.coordination.pending_confirmations.remove(pending)
             decision = ALLOW
@@ -138,7 +138,7 @@ def design_link(ctx, profile=None, intent: str = "",
                 )
             return {
                 "ok": False,
-                "error": f"PolicyGateway 拒绝建图: {decision}",
+                "error": f"PolicyGateway rejected flowgraph construction: {decision}",
                 "policy": decision,
                 "recipe": rc.name,
                 "from_recipe": current_recipe,
@@ -151,7 +151,7 @@ def design_link(ctx, profile=None, intent: str = "",
             create_snapshot(state, snapshots_dir, state_path)
 
     if ctx.platform is None:
-        return {"ok": False, "error": "缺少 platform,无法建图"}
+        return {"ok": False, "error": "Platform is missing; the flowgraph cannot be built"}
 
     steps: List[dict] = []
 
@@ -164,7 +164,7 @@ def design_link(ctx, profile=None, intent: str = "",
     # 1) 新建空流图(no_gui 便于无头仿真)
     r = _c("init_flow_graph", flowgraph_id=fid, generate_options="no_gui")
     if not r.get("ok"):
-        return {"ok": False, "error": f"init 失败: {r.get('error')}",
+        return {"ok": False, "error": f"Initialization failed: {r.get('error')}",
                 "steps": steps}
 
     # 2) probe 落盘路径：.grc 里写相对文件名，仿真读回仍用绝对路径。
@@ -221,7 +221,7 @@ def design_link(ctx, profile=None, intent: str = "",
             artifacts["grc_path"] = rr["path"]
             render_ok = True
         else:
-            render_error = str(rr.get("error") or "render_grc 失败")
+            render_error = str(rr.get("error") or "render_grc failed")
 
     # 7) 可选仿真 + 取指标 + 画图
     if simulate and valid:

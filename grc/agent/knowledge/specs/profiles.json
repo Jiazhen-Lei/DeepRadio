@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "profiles": [
+    {
+      "id": "general",
+      "always": true,
+      "optional": [
+        "bandwidth",
+        "payload",
+        "success_conditions"
+      ]
+    },
+    {
+      "id": "build_tx",
+      "when_any_capability": ["build_tx", "build_signal"],
+      "optional": [
+        "modulation",
+        "sample_rate",
+        "bandwidth",
+        "payload"
+      ]
+    },
+    {
+      "id": "build_rx",
+      "when_any_capability": ["build_rx", "realtime_observe"],
+      "optional": [
+        "expected_signal",
+        "bandwidth",
+        "capture_duration",
+        "requested_metrics"
+      ]
+    },
+    {
+      "id": "physical_tx",
+      "when_any_capability": ["deploy", "hardware_runtime"],
+      "when_slots": {"direction": "tx", "operation": "deploy"},
+      "required": [
+        "hardware",
+        "carrier_frequency",
+        "sample_rate",
+        "duration_seconds",
+        "success_conditions"
+      ],
+      "require_explicit_sources": [
+        "duration_seconds",
+        "success_conditions"
+      ],
+      "optional": [
+        "bandwidth",
+        "tx_gain",
+        "tx_attenuation",
+        "payload"
+      ]
+    },
+    {
+      "id": "physical_rx",
+      "when_any_capability": ["hardware_runtime", "realtime_observe"],
+      "when_slots": {"direction": "rx"},
+      "required": [
+        "hardware",
+        "carrier_frequency",
+        "sample_rate"
+      ],
+      "optional": [
+        "bandwidth",
+        "capture_duration",
+        "expected_signal",
+        "requested_metrics"
+      ]
+    },
+    {
+      "id": "protocol_ble",
+      "when_slots": {"protocol": "ble"},
+      "optional": [
+        "ble_mode",
+        "advertising_channels",
+        "local_name",
+        "payload"
+      ],
+      "derived_display": [
+        "modulation",
+        "carrier_frequency",
+        "sample_rate"
+      ]
+    },
+    {
+      "id": "protocol_wifi",
+      "when_slots": {"protocol": "wifi"},
+      "required": ["wifi_role"],
+      "optional": [
+        "wifi_standard",
+        "wifi_channel",
+        "bandwidth",
+        "ssid",
+        "modulation",
+        "payload"
+      ],
+      "derived_display": ["carrier_frequency", "sample_rate"]
+    },
+    {
+      "id": "diagnose",
+      "when_any_capability": ["diagnose"],
+      "optional": [
+        "diagnosis_target",
+        "diagnosis_dimensions",
+        "hardware",
+        "expected_signal"
+      ]
+    }
+  ]
+}

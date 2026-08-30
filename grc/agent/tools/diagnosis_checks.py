@@ -78,7 +78,7 @@ def run_diagnosis_checks(
             "intent",
             "pass" if profile else "fail",
             {"requested": requested, "normalized": normalize_hardware(requested)},
-            remediation="请选择受支持的 HardwareProfile 或新增声明式 profile。" if not profile else "",
+            remediation="Select a supported HardwareProfile or add a declarative profile." if not profile else "",
         ))
 
     if include("environment"):
@@ -91,7 +91,7 @@ def run_diagnosis_checks(
             "environment",
             "pass" if executable else "fail",
             {"driver_family": profile.driver_family if profile else "", "executable": executable},
-            remediation="在 GNU Radio 环境安装对应 UHD/IIO/厂商驱动并确认命令位于 PATH。" if not executable else "",
+            remediation="Install the corresponding UHD, IIO, or vendor driver in the GNU Radio environment and ensure its command is on PATH." if not executable else "",
         ))
 
     discovery: Dict[str, Any] = {}
@@ -110,7 +110,7 @@ def run_diagnosis_checks(
                 "health": discovery.get("health") or {},
                 "report_path": discovery.get("report_path") or "",
             },
-            remediation=str(discovery.get("error") or "检查 USB/网络、电源、权限与厂商驱动。") if not found else "",
+            remediation=str(discovery.get("error") or "Check USB/network connectivity, power, permissions, and vendor drivers.") if not found else "",
         ))
         identity = str(discovery.get("device_identity") or "")
         identity_match = bool(
@@ -121,7 +121,7 @@ def run_diagnosis_checks(
             "device",
             "pass" if identity_match else "fail",
             {"requested_type": profile.key, "observed_type": discovery.get("device_type")},
-            remediation="不要把同一驱动家族中的另一台设备当作用户指定型号；重新选择或重新发现。" if not identity_match else "",
+            remediation="Do not treat another device in the same driver family as the requested model; select again or rerun discovery." if not identity_match else "",
         ))
         if found:
             probe = probe_device(ctx, device_type=profile.key, device_args=identity)
@@ -135,7 +135,7 @@ def run_diagnosis_checks(
                 "health": probe.get("health") or {},
                 "report_path": probe.get("report_path") or "",
             },
-            remediation=str(probe.get("error") or "按 discovery 返回的明确 identity 重试 probe。") if not probed else "",
+            remediation=str(probe.get("error") or "Retry probing with the exact identity returned by discovery.") if not probed else "",
         ))
     elif include("device"):
         findings.append(_finding(
@@ -143,7 +143,7 @@ def run_diagnosis_checks(
             "device",
             "unknown",
             {"requested_type": requested, "live_probe": live_probe},
-            remediation="启用只读 discover/probe 后才能判断设备接入。",
+            remediation="Enable read-only discovery and probing before determining whether the device is connected.",
             evidence_grade="not_observed",
         ))
 
@@ -160,7 +160,7 @@ def run_diagnosis_checks(
             "parameters",
             "unknown" if in_range is None else "pass" if in_range else "fail",
             {"frequency": frequency, "supported_range": list(profile.frequency_range)},
-            remediation="补充合法中心频率，且必须位于设备能力范围内。" if in_range is not True else "",
+            remediation="Provide a valid center frequency within the device's supported range." if in_range is not True else "",
             evidence_grade="intent_validated" if frequency is not None else "not_observed",
         ))
 
@@ -172,7 +172,7 @@ def run_diagnosis_checks(
             "project",
             "pass" if path and os.path.isfile(path) else "unknown",
             {"grc_path": path},
-            remediation="若问题涉及流图，请先打开或生成 .grc；纯硬件接入诊断不要求流图。" if not path else "",
+            remediation="If the issue involves a flowgraph, open or generate a .grc project first; hardware-connectivity diagnosis alone does not require one." if not path else "",
             evidence_grade="filesystem_verified" if path else "not_observed",
         ))
 
@@ -189,7 +189,7 @@ def run_diagnosis_checks(
                 "return_code": runtime.get("return_code"),
                 "log_path": runtime.get("log_path") or "",
             },
-            remediation="读取 runtime.log 与 return_code；不要用“已生成流图”替代“运行成功”。" if runtime_status in {"crashed", "failed"} else "",
+            remediation="Inspect runtime.log and return_code; do not substitute 'flowgraph generated' for 'runtime succeeded'." if runtime_status in {"crashed", "failed"} else "",
             evidence_grade="runtime_observed" if runtime else "not_observed",
         ))
 
@@ -199,9 +199,9 @@ def run_diagnosis_checks(
             "rf_path",
             "unknown",
             {
-                "reason": "主机 discover/probe 不能证明天线、衰减器、收发端口或线缆连接正确"
+                "reason": "Host discovery and probing cannot prove that antennas, attenuators, RF ports, or cables are connected correctly"
             },
-            remediation="由人工检查端口/天线/衰减器，或增加有线回环、功率计、频谱仪/独立 sniffer 证据。",
+            remediation="Inspect ports, antennas, and attenuators manually, or add evidence from a wired loopback, power meter, spectrum analyzer, or independent sniffer.",
             evidence_grade="requires_external_evidence",
             requires_human=True,
         ))

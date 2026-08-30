@@ -105,7 +105,7 @@ def _measure(ctx: ToolContext, metric: str, args: Dict[str, Any]) -> Dict[str, A
 
     fg = getattr(ctx, "flow_graph", None)
     if fg is None:
-        return {"ok": False, "error": "流图尚未创建"}
+        return {"ok": False, "error": "The flowgraph has not been created"}
     simulated = simulate.run(
         fg,
         ctx.platform,
@@ -116,7 +116,7 @@ def _measure(ctx: ToolContext, metric: str, args: Dict[str, Any]) -> Dict[str, A
     )
     ctx.last_sim = simulated
     if not simulated.ok:
-        return {"ok": False, "error": simulated.error or "仿真失败"}
+        return {"ok": False, "error": simulated.error or "Simulation failed"}
     from . import registry
 
     payload = dict(args)
@@ -125,7 +125,7 @@ def _measure(ctx: ToolContext, metric: str, args: Dict[str, Any]) -> Dict[str, A
     if not measured.get("ok") or measured.get("value") is None:
         return {
             "ok": False,
-            "error": measured.get("error") or "指标不可读",
+            "error": measured.get("error") or "The metric could not be read",
         }
     return measured
 

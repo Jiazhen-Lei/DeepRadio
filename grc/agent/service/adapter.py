@@ -57,6 +57,27 @@ _HOST_CONTROLLED_STAGES = frozenset({
     "stop_runtime",
 })
 
+# User-facing observation channel: omit routing/tool bookkeeping so a fast
+# deterministic stage does not flood GTK with log-like redraws.
+_PROGRESS_EVENTS = frozenset({
+    "intent_draft_created",
+    "interaction_requested",
+    "intent_confirmed",
+    "intent_patch_proposed",
+    "intent_patch_applied",
+    "workflow_created",
+    "workflow_recovered",
+    "workflow_completed",
+    "workflow_cancelled",
+    "stage_started",
+    "stage_completed",
+    "stage_errored",
+    "stage_invalidated",
+    "stage_skipped",
+    "checkpoint_opened",
+    "checkpoint_resolved",
+})
+
 
 def _flowgraph_semantic_hash(path: str) -> str:
     """Hash functional GRC content while ignoring canvas-only formatting."""
@@ -161,6 +182,7 @@ class ServiceAgent:
     def __init__(self, session_id: Optional[str] = None,
                  profile: Any = None, platform: Any = None):
         self.session_id = session_id or f"gui-{uuid.uuid4().hex[:8]}"
+        self._progress_listeners = []
         _store.ensure_run_metadata(self.session_id)
         # 统一用 memory.profile.UserProfile(创新 B);GUI 通过 ctx.profile 驱动。
         self.profile = profile if isinstance(profile, UserProfile) \
@@ -196,6 +218,15 @@ class ServiceAgent:
         # GUI 兼容层:agent.ctx.{tool_ctx.out_dir, adaptive, profile}
         self.ctx = _CtxShim(self)
         self._spec_workflow_id = None
+
+    def subscribe_progress(self, callback: Any) -> None:
+        """Observe read-only workflow snapshots without gaining control authority."""
+        if callable(callback) and callback not in self._progress_listeners:
+            self._progress_listeners.append(callback)
+
+    def unsubscribe_progress(self, callback: Any) -> None:
+        if callback in self._progress_listeners:
+            self._progress_listeners.remove(callback)
 
     # ---- 上下文装配 --------------------------------------------------
     def _make_ctx(self) -> ToolContext:
@@ -488,7 +519,7 @@ class ServiceAgent:
                     if name.startswith("v")
                 )
         if not snaps:
-            return {"ok": False, "error": "没有可回滚的快照"}
+            return {"ok": False, "error": "There is no snapshot to restore"}
         target = snaps[-1]
         try:
             restored = restore_snapshot(
@@ -586,8 +617,8 @@ class ServiceAgent:
         if getattr(self._state, "_load_failed", False):
             backup = getattr(self._state, "_corrupt_backup", "")
             return self._error_reply(
-                "会话 SharedState 已损坏，已停止写入以保护原数据。"
-                f"备份: {backup or '创建失败'}"
+                "The session SharedState is corrupted. Writes were stopped to protect the original data. "
+                f"Backup: {backup or 'creation failed'}"
             )
         if consume_turn:
             _store.append_session_event(
@@ -606,7 +637,7 @@ class ServiceAgent:
                     self._state.save(_store.state_path(self.session_id))
                 except Exception as exc:  # noqa: BLE001
                     logger.exception("Intent alignment 失败")
-                    return self._error_reply(f"意图对齐失败: {exc}")
+                    return self._error_reply(f"Intent alignment failed: {exc}")
                 if aligned.pending or aligned.intent is None:
                     return self._alignment_waiting_reply(aligned.message)
                 try:
@@ -615,7 +646,7 @@ class ServiceAgent:
                     )
                 except Exception as exc:  # noqa: BLE001
                     logger.exception("Workflow instantiate 失败")
-                    return self._error_reply(f"Workflow 建立失败: {exc}")
+                    return self._error_reply(f"Workflow creation failed: {exc}")
             else:
                 workflow = None
             intent_before_turn = dict(self._state.intent.parameters or {})
@@ -625,7 +656,7 @@ class ServiceAgent:
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Workflow consume_turn 失败")
-                return self._error_reply(f"Workflow 状态错误: {exc}")
+                return self._error_reply(f"Workflow state error: {exc}")
             if active and workflow is not None:
                 impact = analyze_intent_patch(
                     intent_before_turn,
@@ -675,7 +706,7 @@ class ServiceAgent:
         else:
             workflow = self._workflow.workflow
             if workflow is None:
-                return self._error_reply("没有活动 Workflow")
+                return self._error_reply("There is no active workflow")
         self._sync_workflow_intent_to_state()
         stage_text = user_text or workflow.intent.raw_text
         design_text = str(workflow.intent.raw_text or "") or stage_text
@@ -712,7 +743,7 @@ class ServiceAgent:
             return self._workflow_waiting_reply()
         stage = self._workflow.start_stage()
         if stage is None:
-            return self._error_reply("Workflow 没有可执行 Stage")
+            return self._error_reply("The workflow has no executable stage")
         if stage.execution_status == "waiting":
             try:
                 self._state.save(_store.state_path(self.session_id))
@@ -748,7 +779,7 @@ class ServiceAgent:
                 self._state.save(_store.state_path(self.session_id))
                 self._workflow.finish("cancelled")
                 reply = AgentReply(
-                    text="已取消待执行的工程修改。",
+                    text="The pending project change was cancelled.",
                     stage="CANCELLED",
                     claims=ClaimStore(self._state).summary(),
                     spec_digest=self._state.spec_digest(),
@@ -794,7 +825,7 @@ class ServiceAgent:
                     except OSError as exc:
                         logger.warning("SharedState 落盘失败: %s", exc)
                     reply = AgentReply(
-                        text="当前已经是 {}，无需换配方。".format(already),
+                        text="The current project already uses {}; no recipe change is needed.".format(already),
                         stage="DELIVER",
                         claims=ClaimStore(self._state).summary(),
                         spec_digest=self._state.spec_digest(),
@@ -895,7 +926,7 @@ class ServiceAgent:
             if recovered is not None:
                 return recovered
             return self._error_reply(
-                f"编排出错: {type(exc).__name__}: {exc}"
+                f"Orchestration error: {type(exc).__name__}: {exc}"
             )
 
     def _prefer_host_stage(self, stage: Any, recipe: str) -> bool:
@@ -965,7 +996,7 @@ class ServiceAgent:
         reply.needs_confirmation = False
         reply.text = (
             (reply.text + "\n") if reply.text else ""
-        ) + "自动 Stage 推进达到安全上限，已停止并保留当前状态。"
+        ) + "Automatic stage advancement reached its safety limit. Execution stopped and the current state was preserved."
         return reply
 
     @staticmethod
@@ -1004,14 +1035,14 @@ class ServiceAgent:
                 self._state.save(_store.state_path(self.session_id))
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Radio Specification 更新失败")
-                return self._error_reply(f"规格更新失败: {exc}")
+                return self._error_reply(f"Specification update failed: {exc}")
             if aligned.pending or aligned.intent is None:
                 return self._alignment_waiting_reply(aligned.message)
             try:
                 self._workflow.instantiate(aligned.intent, self._state)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Workflow instantiate 失败")
-                return self._error_reply(f"Workflow 建立失败: {exc}")
+                return self._error_reply(f"Workflow creation failed: {exc}")
             reply = self._step_once(
                 "", recipe="", simulate=True, consume_turn=False
             )
@@ -1022,14 +1053,14 @@ class ServiceAgent:
                 self._state.save(_store.state_path(self.session_id))
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Structured intent interaction 失败")
-                return self._error_reply(f"意图交互失败: {exc}")
+                return self._error_reply(f"Intent interaction failed: {exc}")
             if aligned.pending or aligned.intent is None:
                 return self._alignment_waiting_reply(aligned.message)
             try:
                 self._workflow.instantiate(aligned.intent, self._state)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Workflow instantiate 失败")
-                return self._error_reply(f"Workflow 建立失败: {exc}")
+                return self._error_reply(f"Workflow creation failed: {exc}")
             reply = self._step_once(
                 "", recipe="", simulate=True, consume_turn=False
             )
@@ -1043,18 +1074,18 @@ class ServiceAgent:
         if action == "cancel_workflow":
             return self._cancel_waiting_workflow()
         if action != "checkpoint_decision":
-            return self._error_reply(f"未知 GUI command: {action or '(empty)'}")
+            return self._error_reply(f"Unknown GUI command: {action or '(empty)'}")
         stage = self._workflow.current_stage()
         checkpoint = stage.checkpoint if stage else None
         checkpoint_id = str(command.get("checkpoint_id") or "")
         if not checkpoint or checkpoint.id != checkpoint_id:
-            return self._error_reply("Checkpoint 已变化，请刷新后重试。")
+            return self._error_reply("The checkpoint has changed. Refresh and try again.")
         if checkpoint.blocker:
             reply = self._workflow_waiting_reply()
             reply.stage = "WAITING"
             reply.needs_confirmation = False
             reply.text = "{}{}".format(
-                checkpoint.blocker.get("message") or "当前系统能力不足。",
+                checkpoint.blocker.get("message") or "The required system capability is unavailable.",
                 (
                     "\n" + str(checkpoint.blocker.get("remediation") or "")
                     if checkpoint.blocker.get("remediation") else ""
@@ -1063,7 +1094,7 @@ class ServiceAgent:
             return reply
         decision = str(command.get("decision") or "")
         if decision not in ("approved", "rejected"):
-            return self._error_reply("Checkpoint decision 必须是 approved/rejected。")
+            return self._error_reply("The checkpoint decision must be approved or rejected.")
         _store.append_session_event(
             self.session_id,
             "checkpoint_command_received",
@@ -1086,7 +1117,7 @@ class ServiceAgent:
             effect = str(checkpoint.requested_effect or "READ")
             if is_rf_grant_effect(effect) and checkpoint.purpose != "rf_authorization":
                 return self._error_reply(
-                    "只有 rf_authorization Checkpoint 可以授予 RF_RUN。"
+                    "Only an RF authorization checkpoint can grant RF_RUN."
                 )
             if effect not in self._state.runtime.granted_effects:
                 self._state.runtime.granted_effects.append(effect)
@@ -1159,16 +1190,16 @@ class ServiceAgent:
                     reply = self._workflow_waiting_reply()
                     reply.stage = "CRITIC"
                     reply.text = (
-                        "当前受控发射进程不在有效运行窗口内，不能记录空口通过。"
-                        "请先检查运行错误并重新执行有限时长发射。"
+                        "The bounded transmission is not within a valid runtime window, so over-the-air verification cannot pass. "
+                        "Inspect runtime errors and run the bounded transmission again."
                     )
                     return reply
                 if decision == "approved" and observed_name != expected_name:
                     reply = self._workflow_waiting_reply()
                     reply.stage = "CRITIC"
                     reply.text = (
-                        f"空口观察名称与目标不一致：期望 {expected_name or '(空)'}，"
-                        f"收到 {observed_name or '(未填写)'}。"
+                        f"The observed over-the-air name does not match the target: expected {expected_name or '(empty)'}, "
+                        f"received {observed_name or '(not provided)'}."
                     )
                     return reply
                 attached = _store.attach_evidence(
@@ -1233,7 +1264,7 @@ class ServiceAgent:
             if self._workflow.workflow.outcome == "cancelled":
                 return self._workflow_cancelled_reply()
             return AgentReply(
-                text="当前 Workflow 已结束。",
+                text="The current workflow has already ended.",
                 stage="DELIVER",
                 done=True,
                 claims=ClaimStore(self._state).summary(),
@@ -1254,13 +1285,13 @@ class ServiceAgent:
             or stage is None
             or workflow.execution_status != "waiting"
         ):
-            return self._error_reply("当前没有可重试的 Stage。")
+            return self._error_reply("There is no stage available to retry.")
         blocker = dict(self._state.runtime.blocker or {})
         if blocker and not blocker.get("retryable", False):
             reply = self._workflow_waiting_reply()
             reply.needs_confirmation = False
             reply.text = "{}{}".format(
-                blocker.get("message") or "当前阻塞不可直接重试。",
+                blocker.get("message") or "The current blocker cannot be retried directly.",
                 "\n" + str(blocker.get("remediation") or "")
                 if blocker.get("remediation") else "",
             )
@@ -1275,7 +1306,7 @@ class ServiceAgent:
 
     def _cancel_waiting_workflow(self) -> AgentReply:
         if self._workflow.workflow is None:
-            return self._error_reply("没有活动 Workflow。")
+            return self._error_reply("There is no active workflow.")
         self._workflow.finish("cancelled")
         return self._workflow_cancelled_reply()
 
@@ -1285,7 +1316,7 @@ class ServiceAgent:
             "over_air_verification", "runtime_observation", "transmit_bounded",
             "run_bounded",
         ):
-            return self._error_reply("当前 Stage 不能受控重试发射。")
+            return self._error_reply("The current stage cannot retry a bounded transmission.")
         from ..tools import registry
 
         ctx = self._make_ctx()
@@ -1307,10 +1338,9 @@ class ServiceAgent:
             ctx,
             result.get("error")
             or (
-                f"已受控重试发射（最大时长 {max_duration:g} 秒；"
-                "OTA 确认或取消后会提前停止）。"
-                f" run_id={result.get('run_id')} pid={result.get('pid')}。"
-                "无需在 GRC 中点击运行。"
+                f"Bounded transmission retry started (maximum duration: {max_duration:g} seconds; "
+                "OTA confirmation or cancellation stops it early). "
+                "You do not need to click Run in GRC."
             ),
             source="deterministic-stage",
             ok=bool(result.get("running") and result.get("ready")),
@@ -1337,8 +1367,7 @@ class ServiceAgent:
         self._state.save(_store.state_path(self.session_id))
         reply = self._fold(
             ctx,
-            ("已执行紧急停止。" if emergency else "已停止当前运行。")
-            + (f" run_id={result.get('run_id')}" if result.get("run_id") else ""),
+            ("Emergency stop completed." if emergency else "The current runtime was stopped."),
             source="host-runtime-control",
             ok=bool(result.get("ok", True)),
         )
@@ -1374,7 +1403,7 @@ class ServiceAgent:
                     "messages": [
                         {
                             "role": "user",
-                            "content": f"{user_text}\n\n当前 Stage TaskCard：{task_json}",
+                            "content": f"{user_text}\n\nCurrent Stage TaskCard: {task_json}\n\nReturn all user-facing narrative in English.",
                         }
                     ]
                 },
@@ -1388,8 +1417,8 @@ class ServiceAgent:
                     {"limit": config["recursion_limit"]})
                 done = bool(ctx.extra.get("artifacts", {}).get("grc_path")) or bool(
                     self._state.project.grc_path)
-                note = ("编排步数达到上限,已中止后续探索。"
-                        if done else "编排步数达到上限,尚未产出可用流图。")
+                note = ("The orchestration step limit was reached; further exploration was stopped."
+                        if done else "The orchestration step limit was reached before a usable flowgraph was produced.")
                 return self._fold(ctx, note, source="deepagents-truncated",
                                   ok=done)
             recovered = self._recover_partial_stage(ctx, exc)
@@ -1423,9 +1452,9 @@ class ServiceAgent:
             return None
         has_grc = bool(artifacts.get("grc_path"))
         note = (
-            "编排超时，已保留已产出的流图。"
+            "Orchestration timed out; the generated flowgraph was preserved."
             if timeout and has_grc
-            else "编排中断（{}）。".format(type(exc).__name__)
+            else "Orchestration was interrupted ({}).".format(type(exc).__name__)
         )
         return self._fold(
             ctx, note, source="deepagents-partial", ok=has_grc
@@ -1553,10 +1582,10 @@ class ServiceAgent:
             and "recipe" not in result
             and str(result.get("policy") or "").upper() != "DENY"
         ):
-            err = result.get("error", "建图环境不可用")
+            err = result.get("error", "Flowgraph build environment unavailable")
             _store.append_session_event(self.session_id, "env_error",
                                         {"error": err})
-            return self._error_reply(f"建图环境不可用: {err}")
+            return self._error_reply(f"Flowgraph build environment unavailable: {err}")
 
         # 把 design_link 结果并入 ctx,复用统一折叠
         _merge(ctx.extra.setdefault("artifacts", {}),
@@ -1630,10 +1659,10 @@ class ServiceAgent:
         validation = self._validate_loaded(ctx)
         self._record_tool_result(ctx, "validate_flowgraph", validation)
         note = result.get("error") or (
-            "已生成所选 SDR 的实时接收频谱流图（QT GUI Frequency Sink）。"
-            "尚未启动 RF；实时频谱会在 GNU Radio QT 窗口中显示，而不是对话里的 PNG。"
+            "Generated a live receive-spectrum flowgraph for the selected SDR (QT GUI Frequency Sink). "
+            "RF has not started; the live spectrum will appear in a GNU Radio QT window, not as a PNG in the conversation."
             if result.get("ok")
-            else "无法生成 B210 接收频谱流图。"
+            else "Unable to generate the B210 receive-spectrum flowgraph."
         )
         return self._fold(
             ctx, note, source="deterministic-stage",
@@ -1648,7 +1677,7 @@ class ServiceAgent:
         if str(slots.get("direction") or "") == "rx":
             return self._fold(
                 ctx,
-                "当前没有可证明覆盖该接收硬件 endpoint 的确定性模板，已停止等待补充。",
+                "No deterministic template can currently provide verified coverage for this receive-hardware endpoint. Execution stopped for more information.",
                 source="deterministic-stage",
                 ok=False,
             )
@@ -1722,19 +1751,19 @@ class ServiceAgent:
     @staticmethod
     def _tx_preview_note(slots: Dict[str, Any], *, reused: bool) -> str:
         tone = (
-            "未指定调制时用 1 kHz 低幅度测试音占位基带。"
+            "A low-amplitude 1 kHz test tone is used as placeholder baseband when no modulation is specified."
             if not slots.get("modulation") else ""
         )
-        grey = "灰色硬件 sink 表示未授权射频、保持禁用；亮的 Null Sink 是预览路径，不会发射。"
+        grey = "The grey hardware sink indicates unauthorized RF and remains disabled; the active Null Sink is a preview path and does not transmit."
         if reused:
-            head = "复用已保存的安全预览流图（sink 保持禁用）。"
+            head = "Reusing the saved safe-preview flowgraph (sink remains disabled)."
         else:
-            head = "已生成未 arm 的 SDR 发射流图（sink 保持禁用）。"
+            head = "Generated an unarmed SDR transmit flowgraph (sink remains disabled)."
         if slots.get("operation") == "deploy":
-            tail = "确认射频后才会 arm 并启动。"
+            tail = "It will be armed and started only after RF authorization."
         else:
-            tail = "保存配置后停在确认，不会自动开机。"
-        return f"{head}{grey}{tone}{tail}"
+            tail = "The workflow stops for confirmation after saving the configuration and will not start automatically."
+        return f"{head} {grey} {tone} {tail}".strip()
 
     def _validate_loaded(self, ctx: ToolContext) -> Dict[str, Any]:
         from ..tools import registry
@@ -1787,7 +1816,7 @@ class ServiceAgent:
         ):
             pending = unresolved_pending or dict(reply.pending or {})
             checkpoint = self._workflow.wait_for_checkpoint(
-                str(pending.get("reason") or pending.get("action") or "等待用户确认"),
+                str(pending.get("reason") or pending.get("action") or "Waiting for user confirmation"),
                 action=str(pending.get("action") or "workflow_checkpoint"),
                 payload_ref=str(pending.get("id") or ""),
             )
@@ -1863,12 +1892,12 @@ class ServiceAgent:
                 reply.stage = "CRITIC"
                 reply.needs_confirmation = False
                 if missing_completion:
-                    reply.text = "{}\n尚未满足 Stage 完成条件：{}。".format(
+                    reply.text = "{}\nStage completion conditions not met: {}.".format(
                         reply.text, ", ".join(missing_completion)
                     ).strip()
                 failure_codes = list(envelope.acceptance.get("failure_codes") or [])
                 if failure_codes:
-                    reply.text = "{}\nStage 验收失败：{}。".format(
+                    reply.text = "{}\nStage acceptance failed: {}.".format(
                         reply.text, ", ".join(failure_codes)
                     ).strip()
             result = vars(envelope)
@@ -1971,9 +2000,9 @@ class ServiceAgent:
                         capability_blocker.get("message")
                         or current.checkpoint.reason
                         or (
-                            "确认设备身份、射频参数和有限运行时长"
+                            "Confirm the device identity, RF parameters, and bounded runtime"
                             if is_rf_grant_effect(current.checkpoint.requested_effect)
-                            else "确认设备身份与射频参数；确认后不启动射频"
+                            else "Confirm the device identity and RF parameters; confirmation will not start RF"
                         )
                     ),
                     "requested_effect": current.checkpoint.requested_effect,
@@ -2132,9 +2161,19 @@ class ServiceAgent:
         details["evidence_complete"] = bool(artifact)
         evidence_grade = "attached_capture" if artifact else "human_statement"
         details["evidence_grade"] = evidence_grade
+        requested_name = str(slots.get("local_name") or "")
+        claim_id = (
+            "ota_ble_local_name_observed"
+            if requested_name else "ota_target_signal_observed"
+        )
+        statement = (
+            "External receiver observed the requested BLE Complete Local Name"
+            if requested_name
+            else "External receiver observed the requested signal"
+        )
         self._record_claim(
-            "ota_ble_local_name_observed",
-            "External receiver observed the requested BLE Complete Local Name",
+            claim_id,
+            statement,
             "hardware",
             source,
             details,
@@ -2180,14 +2219,14 @@ class ServiceAgent:
             interaction = dict(shared_intent.interaction or {})
             digest.update({
                 "task_type": shared_intent.task_type or "INTENT_ALIGNMENT",
-                "task_label": "意图对齐",
+                "task_label": "Intent Alignment",
                 "execution_status": "waiting",
                 "current_stage": "intent_alignment",
-                "stage_label": "意图识别与参数对齐",
+                "stage_label": "Intent Recognition and Parameter Alignment",
                 "stage_index": 0,
                 "stage_total": 0,
                 "wait_kind": "input",
-                "waiting_reason": interaction.get("prompt") or "等待补充意图",
+                "waiting_reason": interaction.get("prompt") or "Waiting for additional intent information",
                 "interaction_request": interaction,
                 "needs_confirmation": True,
                 "can_confirm": True,
@@ -2245,7 +2284,7 @@ class ServiceAgent:
             self._state.save(_store.state_path(self.session_id))
         except OSError as exc:
             logger.warning("意图等待态 SharedState 落盘失败: %s", exc)
-        text = str(message or interaction.get("prompt") or "请补充意图信息。")
+        text = str(message or interaction.get("prompt") or "Please provide the missing intent information.")
         return AgentReply(
             text=text,
             stage="ALIGN",
@@ -2278,26 +2317,26 @@ class ServiceAgent:
         )
         if missing:
             labels = {
-                "modulation": "请说明调制方式（如 BPSK、QPSK 或 OFDM）。",
-                "current_project": "当前没有可供检查的工程，请先构建或打开一个 .grc。",
-                "hardware": "请说明 SDR 设备类型（如 USRP B210）。",
-                "carrier_frequency": "请说明中心频率（如 2.4 GHz）。",
-                "sample_rate": "请说明采样率（如 1 MHz）。",
-                "local_name": "请说明要广播的 BLE Complete Local Name。",
-                "ebn0_db": "请说明 BER 仿真的 Eb/N0（例如 8 dB）。",
+                "modulation": "Specify the modulation scheme, such as BPSK, QPSK, or OFDM.",
+                "current_project": "There is no project to inspect. Build or open a .grc project first.",
+                "hardware": "Specify the SDR device type, such as USRP B210.",
+                "carrier_frequency": "Specify the center frequency, such as 2.4 GHz.",
+                "sample_rate": "Specify the sample rate, such as 1 MHz.",
+                "local_name": "Specify the BLE Complete Local Name to advertise.",
+                "ebn0_db": "Specify the Eb/N0 for the BER simulation, such as 8 dB.",
             }
-            text = "\n".join(labels.get(item, f"请补充 {item}。") for item in missing)
+            text = "\n".join(labels.get(item, f"Please provide {item}.") for item in missing)
             pending = {}
         elif validation_errors:
             labels = {
-                "carrier_frequency_invalid": "中心频率格式或数值无效，请重新说明。",
-                "carrier_frequency_out_of_device_range": "中心频率超出所选设备能力范围，请重新说明。",
-                "sample_rate_invalid": "采样率必须为正数，请重新说明。",
-                "bandwidth_invalid": "带宽必须为正数，请重新说明。",
-                "symbol_rate_invalid": "符号率必须为正数，请重新说明。",
+                "carrier_frequency_invalid": "The center-frequency format or value is invalid. Specify it again.",
+                "carrier_frequency_out_of_device_range": "The center frequency is outside the selected device's supported range. Specify it again.",
+                "sample_rate_invalid": "The sample rate must be positive.",
+                "bandwidth_invalid": "The bandwidth must be positive.",
+                "symbol_rate_invalid": "The symbol rate must be positive.",
             }
             text = "\n".join(
-                labels.get(item, f"参数校验失败：{item}。")
+                labels.get(item, f"Parameter validation failed: {item}.")
                 for item in validation_errors
             )
             pending = {}
@@ -2305,7 +2344,7 @@ class ServiceAgent:
             blocker = dict(stage.checkpoint.blocker)
             pending = {
                 "action": "capability_blocker",
-                "reason": blocker.get("message") or "当前系统能力不足。",
+                "reason": blocker.get("message") or "The required system capability is unavailable.",
                 "blocker": blocker,
                 "can_confirm": False,
                 "can_retry": bool(blocker.get("retryable", False)),
@@ -2347,18 +2386,18 @@ class ServiceAgent:
                 or ""
             )
             text = (
-                "请仅在 LightBlue 中实际看到目标 Complete Local Name 后点击“已看到目标名称”。"
-                "可附加上传截图；确认后受控进程会提前停止。"
+                "Click 'Target Signal Observed' only after an independent receiver has actually observed the target signal. "
+                "You may attach a screenshot; confirmation stops the bounded process early."
                 if stage.id == "over_air_verification"
                 else (
-                    "当前 Stage 等待你的确认；确认后继续，取消则保留现有工程。"
-                    "批准后将由 Workflow 自动启动发射，无需在 GRC 中点击运行。"
+                    "The current stage is waiting for your confirmation. Confirm to continue, or cancel to keep the existing project. "
+                    "After approval, the workflow starts transmission automatically; you do not need to click Run in GRC."
                     if rf_grant
-                    else "当前已停在决策边界。确认后不启动射频。"
-                    "若要发射，请明确授权运行。"
+                    else "The workflow is paused at a decision boundary. Confirmation does not start RF. "
+                    "Explicit runtime authorization is required to transmit."
                 )
                 if stage.id == "rf_plan_confirmation"
-                else "当前 Stage 等待你的确认；确认后继续，取消则保留现有工程。"
+                else "The current stage is waiting for your confirmation. Confirm to continue, or cancel to keep the existing project."
             )
             if stage.id == "rf_plan_confirmation":
                 slots = intent.slots if intent else {}
@@ -2386,8 +2425,8 @@ class ServiceAgent:
         else:
             pending = {}
             text = (
-                "当前 Stage 未满足完成条件。请补充信息、调整方案，或明确要求重试；"
-                "这不是批准型 Checkpoint。"
+                "The current stage did not meet its completion conditions. Provide more information, revise the plan, "
+                "or explicitly request a retry. This is not an approval checkpoint."
             )
         return AgentReply(
             text=text,
@@ -2408,7 +2447,7 @@ class ServiceAgent:
 
     def _workflow_cancelled_reply(self) -> AgentReply:
         return AgentReply(
-            text="已取消当前 Workflow，现有工程保持不变。",
+            text="The current workflow was cancelled; the existing project remains unchanged.",
             stage="CANCELLED",
             done=True,
             claims=ClaimStore(self._state).summary(),
@@ -2574,13 +2613,13 @@ class ServiceAgent:
             result.get("from_recipe")
             or pending.get("from_recipe")
             or self._state.project.config.get("recipe")
-            or "当前工程"
+            or "Current Project"
         )
         to_recipe = result.get("recipe") or pending.get("recipe") or ""
         text = (
-            f"将把当前工程从「{from_recipe}」换成「{to_recipe}」。"
-            "确认后才会重建流图；现有 Claim 将在新版本上失效并重验。"
-            "画布保持不变，直到你确认。"
+            f"The current project will change from '{from_recipe}' to '{to_recipe}'. "
+            "The flowgraph will be rebuilt only after confirmation; existing claims will become stale and be revalidated against the new version. "
+            "The canvas remains unchanged until you confirm."
         )
         reply = AgentReply(
             text=text,
@@ -2612,6 +2651,25 @@ class ServiceAgent:
         data = dict(payload or {})
         data.setdefault("profile_level", getattr(self.profile, "level", "student"))
         _store.append_session_event(self.session_id, event, data)
+        if not self._progress_listeners or event not in _PROGRESS_EVENTS:
+            return
+        try:
+            snapshot = {
+                "event": str(event or "state_changed"),
+                "event_payload": data,
+                "workflow_digest": self._digest_with_timeline(),
+                "spec_digest": self._state.spec_digest(),
+                "claims": ClaimStore(self._state).summary(),
+                "pending": dict(self._state.intent.interaction or {}),
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("生成 Workflow progress snapshot 失败: %s", exc)
+            return
+        for callback in list(self._progress_listeners):
+            try:
+                callback(snapshot)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Workflow progress listener 失败: %s", exc)
 
     def _workflow_event_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         data = dict(payload or {})
@@ -2660,16 +2718,16 @@ class ServiceAgent:
             metrics = dict(ctx.extra.get("metrics") or {})
             source_scope = str(metrics.get("signal_source_scope") or "")
             source_labels = {
-                "generated_fixture": "测量来源：自包含生成测试夹具（不是当前空口）。",
-                "current_project_offline": "测量来源：当前工程离线仿真（不是实时接收）。",
-                "live_device": "测量来源：已绑定的实时硬件接收路径。",
+                "generated_fixture": "Measurement source: self-contained generated fixture (not the current over-the-air signal).",
+                "current_project_offline": "Measurement source: offline simulation of the current project (not live reception).",
+                "live_device": "Measurement source: the bound live hardware receive path.",
             }
             if source_labels.get(source_scope):
                 parts.append(source_labels[source_scope])
             ber = metrics.get("ber_report")
             if isinstance(ber, dict) and ber.get("valid"):
                 parts.append(
-                    "BER={}（{}/{} bit；95% 单侧上界={}；{}）。".format(
+                    "BER={} ({}/{} bits; 95% one-sided upper bound={}; {}).".format(
                         ber.get("value"), ber.get("bit_errors"),
                         ber.get("compared_bits"),
                         ber.get("confidence_upper_bound"),
@@ -2699,27 +2757,27 @@ class ServiceAgent:
                 not_started = True
         parts = []
         if passed:
-            parts.append("已完成工具：" + "、".join(dict.fromkeys(passed)) + "。")
+            parts.append("Completed tools: " + ", ".join(dict.fromkeys(passed)) + ".")
         if failed:
-            parts.append("未通过工具：" + "、".join(dict.fromkeys(failed)) + "。")
+            parts.append("Failed tools: " + ", ".join(dict.fromkeys(failed)) + ".")
         artifacts = [
             os.path.basename(value)
             for value in (ctx.extra.get("artifacts") or {}).values()
             if isinstance(value, str) and value
         ]
         if artifacts:
-            parts.append("已记录产物：" + "、".join(dict.fromkeys(artifacts)) + "。")
+            parts.append("Recorded artifacts: " + ", ".join(dict.fromkeys(artifacts)) + ".")
         if not_started:
-            parts.append("流图尚未启动，不能据此声称 RF 或空口验收成功。")
-        return "".join(parts) or "当前 Stage 已结束，详细事实见工具结果。"
+            parts.append("The flowgraph has not started, so this cannot support a claim of successful RF or over-the-air verification.")
+        return " ".join(parts) or "The current stage has ended; see the tool results for detailed facts."
 
     @staticmethod
     def _fallback_text(data: dict) -> str:
-        recipe = data.get("recipe") or "所选配方"
+        recipe = data.get("recipe") or "selected recipe"
         metrics = data.get("metrics") or {}
-        parts = [f"已按「{recipe}」建图并校验。"]
+        parts = [f"Built and validated the flowgraph using '{recipe}'."]
         if metrics.get("evm_pct") is not None:
-            parts.append(f"仿真 EVM ≈ {metrics['evm_pct']:.2f}%。")
+            parts.append(f" Simulated EVM ≈ {metrics['evm_pct']:.2f}%.")
         return "".join(parts)
 
 

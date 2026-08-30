@@ -83,7 +83,7 @@ class WorkflowPresenterTest(unittest.TestCase):
         self.assertIn("配置 SDR", self.panel._activity_label.text)
         self.assertIn("有限时长发射 6/8", self.panel._activity_label.text)
         self.assertIn("等待批准", self.panel._activity_label.text)
-        self.assertIn("run_id=run-test123", self.panel._runtime_label.text)
+        self.assertNotIn("run_id=", self.panel._runtime_label.text)
         self.assertIn("剩余 12.5s", self.panel._runtime_label.text)
         self.assertNotIn("pid=", self.panel._runtime_label.text)
         self.assertNotIn("UUU", self.panel._runtime_label.text)
@@ -237,7 +237,7 @@ class WorkflowPresenterTest(unittest.TestCase):
             "purpose": "ota_observation",
             "approved": False,
         })
-        self.assertEqual(self.panel._confirm_btn.label, "已看到目标名称")
+        self.assertEqual(self.panel._confirm_btn.label, "已观察到目标信号")
         self.assertEqual(self.panel._cancel_btn.label, "未看到")
         self.assertTrue(self.panel._evidence_btn.visible)
         self.assertTrue(self.panel._evidence_btn.sensitive)
@@ -305,6 +305,43 @@ class WorkflowPresenterTest(unittest.TestCase):
         self.assertEqual(rows["carrier_frequency"]["source"], "Protocol Default")
         self.assertEqual(rows["success_conditions"]["value"], "?")
         self.assertFalse(view["specification"]["aligned"])
+
+    def test_workflow_monitor_binds_claims_and_exposes_latest_transition(self):
+        view = present(
+            spec={"success_conditions": ["接收端观察到信号"]},
+            workflow={
+                "task_type": "HARDWARE_CONFIGURE",
+                "task_label": "配置并运行 SDR",
+                "current_stage": "verify",
+                "stage_index": 2,
+                "stage_total": 3,
+                "execution_status": "running",
+                "timeline": [
+                    {"event": "stage_started", "stage_id": "build"},
+                    {
+                        "event": "stage_invalidated", "stage_id": "verify",
+                        "cause": "规格 revision 使验证结果过期",
+                    },
+                ],
+                "stages": [
+                    {"id": "build", "label": "Build", "execution_status": "completed", "outcome": "passed"},
+                    {"id": "verify", "label": "Verify", "execution_status": "running"},
+                    {"id": "run", "label": "Run", "execution_status": "pending"},
+                ],
+            },
+            claims=[{
+                "statement": "PHY valid", "status": "Passed",
+                "producer": "verify", "layer": "protocol",
+            }],
+        )
+        monitor = view["workflow"]
+        self.assertTrue(monitor["visible"])
+        verify = next(item for item in monitor["stages"] if item["id"] == "verify")
+        self.assertTrue(verify["current"])
+        self.assertEqual(verify["claims"][0]["statement"], "PHY valid")
+        self.assertEqual(monitor["transition"]["from"], "build")
+        self.assertEqual(monitor["transition"]["to"], "verify")
+        self.assertIn("revision", monitor["transition"]["reason"])
 
     def test_diagnosis_card_only_uses_scoped_findings(self):
         view = present(
