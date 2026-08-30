@@ -2581,6 +2581,24 @@ _CAPABILITIES = frozenset(
         "hardware_runtime",
     }
 )
+_SLOT_ALIASES = {
+    "device": "hardware",
+    "sdr": "hardware",
+    "radio": "hardware",
+}
+
+# Structured slot keys eligible for evidence-backed rule-seed fallback in
+# _merge when the LLM extraction omits them.  Free-text keys (local_name,
+# payload) and safety keys (operation/deploy_permission/duration) are
+# intentionally excluded.  Keep in sync with the canonical-key rule in
+# _PROMPT and the alias table in knowledge/spec_requirements.py.
+_SEED_FALLBACK_KEYS = frozenset({
+    "hardware", "protocol", "direction", "modulation",
+    "carrier_frequency", "sample_rate", "bandwidth",
+    "ble_mode", "advertising_channels",
+})
+
+
 _PROMPT = """你是 DeepRadio 的 Intent 语义解析器。只输出一个 JSON 对象。
 字段:
 - goals / requested_operations / desired_artifacts / evidence_requirements
@@ -2604,6 +2622,7 @@ _PROMPT = """你是 DeepRadio 的 Intent 语义解析器。只输出一个 JSON 
 - 不得因为载频像 2.4 GHz 就判定 BLE，除非用户说了 ble/蓝牙/广播。
 - "transmit chain" / "transmit-only" means direction=tx; "receive chain" means direction=rx.
 - slots must include every parameter explicitly stated in the current user text.
+- slots 只能用规范键名: hardware(设备型号, 如 plutosdr/b210/hackrf), protocol, direction, modulation, carrier_frequency, sample_rate, bandwidth, duration_seconds, local_name, ble_mode, advertising_channels, payload, success_conditions。设备型号必须写在 hardware 键下, 禁止用 device/sdr/radio 等同义键。
 - deterministic_context.preserved_slots 里 slot_sources 为 safety_default/safe_preview_default/current_project 的是确定性安全与工程事实，不得改写；其余 preserved 值若与用户原文冲突，以你从原文的提取为准。
 - 不得把 safety_default 时长改写成用户约束；用户没写时长就不要填 duration。prepare/配置确认不要写 30 秒。
 - 不要发明 local_name。
@@ -2769,13 +2788,51 @@ def _merge(rules: WorkflowIntent, parsed: dict[str, Any]) -> WorkflowIntent:
     locked = {
         "safety_default", "safe_preview_default", "current_project",
     }
-    for key, value in dict(parsed.get("slots") or {}).items():
+    llm_slots = dict(parsed.get("slots") or {})
+    # Normalize common synonyms onto canonical keys so a `device` answer
+    # lands in `hardware` instead of forking into duplicate spec rows.
+    for _alias, _canonical in _SLOT_ALIASES.items():
+        if _alias not in llm_slots:
+            continue
+        _alias_value = llm_slots.pop(_alias)
+        if _alias_value in (None, "", []):
+            continue
+        if llm_slots.get(_canonical) in (None, "", []):
+            llm_slots[_canonical] = _alias_value
+    for key, value in llm_slots.items():
         if value in (None, "", []):
             continue
         if sources.get(key) in locked:
             continue
         slots[key] = value
         sources[key] = "llm"
+    # Seed fallback with literal evidence: when the LLM extraction omits a
+    # descriptive parameter whose rule-layer seed value literally occurs in
+    # the user's own text, keep it instead of re-asking the user for a fact
+    # she already stated.  The LLM still wins on every key it returned.
+    # Free-text keys (local_name/payload) and safety-sensitive keys
+    # (operation/deploy_permission/duration) never fall back, so regex
+    # guesses without textual support still die with the V4 contract.
+    text_lower = (rules.raw_text or "").lower()
+    text_compact = re.sub(r"[\s\-_]+", "", text_lower)
+    for key in _SEED_FALLBACK_KEYS:
+        if slots.get(key) not in (None, "", []):
+            continue
+        seed_value = rules.slots.get(key)
+        if seed_value in (None, "", []):
+            continue
+        seed_text = str(seed_value).strip().lower()
+        if not seed_text:
+            continue
+        if (
+            seed_text not in text_lower
+            and re.sub(r"[\s\-_]+", "", seed_text) not in text_compact
+        ):
+            continue
+        slots[key] = seed_value
+        sources.setdefault(
+            key, rules.slot_sources.get(key) or "rules"
+        )
     requested_operations = _string_list(
         parsed.get("requested_operations"), []
     )

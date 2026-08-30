@@ -79,6 +79,11 @@ _PROFILES = (
 )
 
 
+def iter_profiles():
+    """Read-only access to all hardware profiles (cross-family discovery)."""
+    return _PROFILES
+
+
 def resolve_hardware_profile(value: str) -> Optional[HardwareProfile]:
     normalized = (value or "").strip().lower()
     if not normalized:

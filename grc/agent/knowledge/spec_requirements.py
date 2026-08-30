@@ -23,6 +23,15 @@ _DEFAULT_SOURCES = frozenset({
     "safe_preview_default", "derived", "rules", "",
 })
 
+# Slot-key synonyms merged onto canonical keys before rendering so the card
+# never shows two rows for the same fact (e.g. `device` + `hardware`).  Keep
+# in sync with workflow/engine.py::_SLOT_ALIASES.
+_SLOT_ALIAS_CANON = {
+    "device": "hardware",
+    "sdr": "hardware",
+    "radio": "hardware",
+}
+
 
 @lru_cache(maxsize=1)
 def load_requirements() -> Dict[str, Any]:
@@ -115,6 +124,19 @@ def resolve_specification(
     caps = set(capabilities or [])
     values = dict(slots or {})
     sources = dict(slot_sources or {})
+    # Merge slot synonyms onto canonical keys before any required/mentioned
+    # computation: one fact must render as one field with one source.
+    for alias, canonical in _SLOT_ALIAS_CANON.items():
+        if alias not in values:
+            continue
+        alias_value = values.pop(alias)
+        alias_source = sources.pop(alias, "")
+        if values.get(canonical) in (None, "", []) and alias_value not in (
+            None, "", [],
+        ):
+            values[canonical] = alias_value
+            if canonical not in sources:
+                sources[canonical] = alias_source
     missing = list(dict.fromkeys(str(item) for item in missing_fields or [] if item))
     active_profiles = []
     profile_required: List[str] = []

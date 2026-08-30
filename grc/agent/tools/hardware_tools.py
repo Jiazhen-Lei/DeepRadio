@@ -22,6 +22,7 @@ from typing import Any, Dict
 from ..service.hardware_runtime import RUNTIME
 from .hardware_profiles import (
     device_args_for,
+    iter_profiles,
     normalize_hardware,
     output_indicates_device,
     output_indicates_successful_probe,
@@ -294,6 +295,40 @@ def _device_command(device_type: str, *, probe: bool) -> list[str]:
     return profile.command(probe=probe) if profile else []
 
 
+def _scan_other_families(skip_family: str) -> list[Dict[str, Any]]:
+    """Read-only cross-family scan for when the expected SDR is absent.
+
+    Runs each other driver family's discovery command (``iio_info -S usb``,
+    ``hackrf_info``, ...) so a PlutoSDR is still visible when the caller
+    expected a UHD device, and vice versa.  Never opens an RF stream.
+    """
+    found: list[Dict[str, Any]] = []
+    seen_families: set[str] = set()
+    if skip_family:
+        seen_families.add(skip_family)
+    for profile in iter_profiles():
+        if profile.driver_family in seen_families:
+            continue
+        seen_families.add(profile.driver_family)
+        command = profile.command(probe=False)
+        if not command:
+            continue
+        try:
+            result = _run(command, timeout=10.0)
+        except Exception:  # noqa: BLE001 - diagnostic scan must not raise
+            continue
+        output = str(result.get("output") or "")
+        if not (result.get("ok") and output_indicates_device(profile, output)):
+            continue
+        found.append({
+            "device_type": profile.key,
+            "device_label": profile.label,
+            "driver_family": profile.driver_family,
+            "device_identity": parse_device_identity(profile, output),
+        })
+    return found
+
+
 @tool(
     name="discover_devices",
     description=(
@@ -315,9 +350,12 @@ def discover_devices(
     profile = resolve_hardware_profile(device_type)
     command = profile.command(probe=False, identity=device_args) if profile else []
     if not command:
-        return {"ok": False, "read_only": True, "device_found": False,
-                "error": f"Unsupported hardware discovery type: {device_type or '(empty)'}"}
-    result = _run(command)
+        result = {
+            "ok": False, "return_code": 1, "output": "",
+            "error": f"Unsupported hardware discovery type: {device_type or '(empty)'}",
+        }
+    else:
+        result = _run(command)
     result["read_only"] = True
     result["device_type"] = device_type
     output = str(result.get("output") or "")
@@ -330,6 +368,31 @@ def discover_devices(
         result["driver_family"] = profile.driver_family
         result["device_identity"] = parse_device_identity(profile, output)
     result["observed_at"] = time.time()
+    # Cross-family fallback: when the expected radio is missing, scan the
+    # other driver families read-only so a physically present PlutoSDR is
+    # still reported even if the caller probed for a UHD device (or vice
+    # versa), instead of blindly re-running the same failing command.
+    if not result["device_found"]:
+        alternates = _scan_other_families(
+            profile.driver_family if profile else ""
+        )
+        if alternates:
+            result["devices"] = alternates
+            expected = (
+                profile.label if profile else (device_type or "an SDR")
+            )
+            found_desc = ", ".join(
+                "{}{}".format(
+                    item.get("device_label") or item.get("device_type"),
+                    " ({})".format(item["device_identity"])
+                    if item.get("device_identity") else "",
+                )
+                for item in alternates
+            )
+            result["mismatch_hint"] = (
+                f"Expected {expected} but discovered: {found_desc}. "
+                "Confirm the device selection or the physical connection."
+            )
     result["health"] = _probe_health(
         output, identity_ok=bool(result.get("device_found"))
     )

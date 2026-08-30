@@ -1506,6 +1506,89 @@ class IntentLlmTest(unittest.TestCase):
             completed = complete_intent(rules, rules.raw_text, SharedState())
         self.assertTrue(completed.context["turn_semantics"]["read_only"])
 
+    def test_llm_device_alias_merges_onto_hardware(self):
+        """A `device` slot answer must land in canonical `hardware`.
+
+        (V5 regression: the intent LLM answered with a `device` key; the
+        spec then rendered duplicate Device rows and re-asked the user.)
+        """
+        rules = WorkflowIntent(
+            raw_text="I want to use plutosdr to transmit ble signal.",
+            task_type="HARDWARE_CONFIGURE",
+            confidence=0.95,
+            capabilities=["build_tx", "protocol", "hardware_configure"],
+            slots={"hardware": "pluto"},
+            slot_sources={"hardware": "rules"},
+        )
+        payload = {
+            "task_type": "HARDWARE_CONFIGURE",
+            "confidence": 0.97,
+            "capabilities": ["build_tx", "protocol", "hardware_configure"],
+            "slots": {
+                "device": "plutosdr",
+                "protocol": "ble",
+                "direction": "tx",
+            },
+        }
+        with mock.patch("grc.agent.llm.is_configured", return_value=True), mock.patch(
+            "grc.agent.llm.chat", return_value=json.dumps(payload)
+        ):
+            completed = complete_intent(rules, rules.raw_text, SharedState())
+        self.assertEqual(completed.slots.get("hardware"), "plutosdr")
+        self.assertEqual(completed.slot_sources.get("hardware"), "llm")
+        self.assertNotIn("device", completed.slots)
+
+    def test_seed_hardware_survives_llm_omission_with_literal_evidence(self):
+        """Stated-in-text hardware must survive an LLM extraction omission."""
+        rules = WorkflowIntent(
+            raw_text="I want to use plutosdr to transmit ble signal.",
+            task_type="HARDWARE_CONFIGURE",
+            confidence=0.95,
+            capabilities=["build_tx", "protocol", "hardware_configure"],
+            slots={"hardware": "pluto", "protocol": "ble"},
+            slot_sources={"hardware": "rules", "protocol": "rules"},
+        )
+        payload = {
+            "task_type": "HARDWARE_CONFIGURE",
+            "confidence": 0.9,
+            "capabilities": ["build_tx", "protocol", "hardware_configure"],
+            "slots": {"direction": "tx"},
+        }
+        with mock.patch("grc.agent.llm.is_configured", return_value=True), mock.patch(
+            "grc.agent.llm.chat", return_value=json.dumps(payload)
+        ):
+            completed = complete_intent(rules, rules.raw_text, SharedState())
+        self.assertEqual(completed.slots.get("hardware"), "pluto")
+        self.assertEqual(completed.slot_sources.get("hardware"), "rules")
+        self.assertEqual(completed.slots.get("protocol"), "ble")
+        engine = WorkflowEngine(tempfile.mktemp(suffix=".json"))
+        missing = engine._missing_slots(
+            "HARDWARE_CONFIGURE", completed.slots, SharedState(),
+            completed.capabilities,
+        )
+        self.assertNotIn("hardware", missing)
+
+    def test_llm_answer_still_wins_over_seed_fallback(self):
+        rules = WorkflowIntent(
+            raw_text="use the b210 instead of plutosdr please",
+            task_type="HARDWARE_CONFIGURE",
+            confidence=0.95,
+            slots={"hardware": "pluto"},
+            slot_sources={"hardware": "rules"},
+        )
+        payload = {
+            "task_type": "HARDWARE_CONFIGURE",
+            "confidence": 0.9,
+            "capabilities": ["build_tx"],
+            "slots": {"hardware": "b210"},
+        }
+        with mock.patch("grc.agent.llm.is_configured", return_value=True), mock.patch(
+            "grc.agent.llm.chat", return_value=json.dumps(payload)
+        ):
+            completed = complete_intent(rules, rules.raw_text, SharedState())
+        self.assertEqual(completed.slots.get("hardware"), "b210")
+        self.assertEqual(completed.slot_sources.get("hardware"), "llm")
+
     def test_llm_does_not_override_safety_bounds(self):
         rules = WorkflowIntent(
             raw_text="发射 10 秒",
@@ -2427,6 +2510,40 @@ class IntentAlignmentContractTest(unittest.TestCase):
         self.assertEqual(
             exported["specification"], self.state.intent.specification.to_dict()
         )
+
+    def test_specification_merges_device_alias_into_single_hardware_row(self):
+        """`device` + `hardware` slots must render as one Device field.
+
+        (V5 regression: the spec card showed two Device rows — one required
+        from user_text, one mentioned from the LLM's `device` key.)
+        """
+        from grc.agent.knowledge.spec_requirements import resolve_specification
+
+        spec = resolve_specification(
+            task_type="HARDWARE_CONFIGURE",
+            capabilities=["build_tx", "protocol", "hardware_configure"],
+            slots={
+                "hardware": "plutosdr",
+                "device": "plutosdr",
+                "protocol": "ble",
+                "direction": "tx",
+            },
+            slot_sources={
+                "hardware": "user_text",
+                "device": "llm",
+                "protocol": "llm",
+                "direction": "llm",
+            },
+            missing_fields=[],
+            validation_errors=[],
+        )
+        field_keys = [field.key for field in spec.fields]
+        device_rows = [key for key in field_keys if key in ("device", "hardware")]
+        self.assertEqual(device_rows, ["hardware"])
+        hardware_field = next(
+            field for field in spec.fields if field.key == "hardware"
+        )
+        self.assertEqual(hardware_field.value, "plutosdr")
 
     def test_protocol_profiles_are_composed_without_task_sentence_branches(self):
         from grc.agent.knowledge.spec_requirements import resolve_specification

@@ -783,6 +783,11 @@ class FriendlyFailureAndRetryContractTest(unittest.TestCase):
         self.assertEqual(
             called.call_args_list[0].args[0], "discover_devices"
         )
+        # V5 contract: the intent's hardware choice must be forwarded to
+        # discovery — the tool's "b210" default must never mask it.
+        self.assertEqual(
+            called.call_args_list[0].args[1].get("device_type"), "pluto"
+        )
         self.assertEqual(reply.stage, "WAITING")
         self.assertIn("No SDR was detected", reply.text)
         self.assertEqual(
@@ -791,6 +796,70 @@ class FriendlyFailureAndRetryContractTest(unittest.TestCase):
         self.assertEqual(
             agent._workflow.workflow.execution_status, "waiting"
         )
+
+    def test_repeated_hardware_failure_escalates_to_llm_diagnosis(self):
+        """After two consecutive misses the retry note gains an LLM diagnosis.
+
+        (V5 regression: three identical blind UHD retries while a PlutoSDR
+        sat on USB; nothing ever explained the contradiction.)
+        """
+        agent = self._waiting_agent("retry-diagnose")
+        discovery = {
+            "ok": True,
+            "device_found": False,
+            "devices": [],
+            "command": ["uhd_find_devices"],
+            "output": "No UHD Devices Found",
+            "device_type": "pluto",
+            "driver_family": "iio",
+            "mismatch_hint": (
+                "Expected PlutoSDR but discovered: USRP B210. "
+                "Confirm the device selection or the physical connection."
+            ),
+        }
+        fake_chat = mock.Mock(
+            return_value=(
+                '{"cause": "探测命令用了 UHD 后端, 而期望设备是 IIO 家族的 PlutoSDR", '
+                '"suggestion": "运行 iio_info -S usb 确认 PlutoSDR 枚举"}'
+            )
+        )
+        with mock.patch(
+            "grc.agent.tools.registry.call", return_value=discovery
+        ), mock.patch(
+            "grc.agent.llm.is_configured", return_value=True
+        ), mock.patch(
+            "grc.agent.llm.chat", new=fake_chat
+        ):
+            reply1 = agent.step_command({"action": "retry_stage"})
+            reply2 = agent.step_command({"action": "retry_stage"})
+        self.assertIn("Confirm the device selection", reply1.text)
+        self.assertNotIn("Diagnosis:", reply1.text)
+        self.assertIn("Diagnosis:", reply2.text)
+        self.assertIn("iio_info", reply2.text)
+        fake_chat.assert_called_once()
+
+    def test_successful_recheck_resets_failure_counter(self):
+        agent = self._waiting_agent("retry-reset")
+        workflow = agent._workflow.workflow
+        workflow.intent.context = {"hw_retry_failures": 3}
+        with mock.patch(
+            "grc.agent.tools.registry.call",
+            side_effect=[
+                {
+                    "ok": True,
+                    "device_found": True,
+                    "device_type": "pluto",
+                    "device_label": "PlutoSDR",
+                    "device_identity": "usb:test.pluto",
+                },
+                {"ok": True, "device_probed": True},
+            ],
+        ):
+            note = agent._refresh_hardware_for_retry()
+        self.assertEqual(
+            workflow.intent.context.get("hw_retry_failures"), 0
+        )
+        self.assertIn("detected and probed", note)
 
     def test_retry_probe_evidence_survives_into_next_stage_context(self):
         agent = self._waiting_agent("retry-with-device")
@@ -1032,6 +1101,86 @@ class UsrpRxSpectrumContractTest(unittest.TestCase):
         self.assertEqual(reply.workflow_digest["wait_kind"], "recovery")
         self.assertTrue(reply.workflow_digest.get("timeline"))
         self.assertNotIn('"start_flowgraph"', event_text)
+
+
+class CrossFamilyDiscoveryTest(unittest.TestCase):
+    """V5 contract: a missed expected radio must surface a present one."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.ctx = ToolContext(
+            platform=env.make_platform(), out_dir=str(self.root)
+        )
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    @staticmethod
+    def _fake_run(command, timeout=15.0):
+        cmd = " ".join(command)
+        if "iio_info" in cmd:
+            return {
+                "ok": True,
+                "return_code": 0,
+                "output": (
+                    "IIO context created with usb backend.\n"
+                    "Backend description string: 0456:b673 "
+                    "(Analog Devices Inc. PlutoSDR)\n"
+                    "IIO context has 1 device: ad9361 "
+                    "[usb:2.4.5, serial=104473]"
+                ),
+                "command": command,
+            }
+        return {
+            "ok": True,
+            "return_code": 0,
+            "output": "No UHD Devices Found",
+            "command": command,
+        }
+
+    def test_b210_miss_reports_a_present_pluto(self):
+        from grc.agent.tools import hardware_tools
+
+        with mock.patch.object(
+            hardware_tools, "_run", side_effect=self._fake_run
+        ):
+            result = hardware_tools.discover_devices(
+                self.ctx, device_type="b210"
+            )
+        self.assertFalse(result["device_found"])
+        devices = result.get("devices") or []
+        self.assertTrue(devices, result)
+        self.assertEqual(devices[0]["device_type"], "pluto")
+        self.assertIn("usb:2.4.5", devices[0].get("device_identity") or "")
+        hint = str(result.get("mismatch_hint") or "")
+        self.assertIn("PlutoSDR", hint)
+        self.assertIn("Confirm the device selection", hint)
+
+    def test_hit_on_expected_family_skips_cross_scan(self):
+        from grc.agent.tools import hardware_tools
+
+        calls: list[list[str]] = []
+
+        def fake_run(command, timeout=15.0):
+            calls.append(list(command))
+            return {
+                "ok": True,
+                "return_code": 0,
+                "output": "ad9361 pluto device [usb:1.2.3]",
+                "command": command,
+            }
+
+        with mock.patch.object(
+            hardware_tools, "_run", side_effect=fake_run
+        ):
+            result = hardware_tools.discover_devices(
+                self.ctx, device_type="pluto"
+            )
+        self.assertTrue(result["device_found"])
+        self.assertNotIn("devices", result)
+        self.assertNotIn("mismatch_hint", result)
+        self.assertEqual(len(calls), 1, calls)
 
 
 class B210HilGateTest(unittest.TestCase):

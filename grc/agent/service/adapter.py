@@ -1473,13 +1473,18 @@ class ServiceAgent:
         from ..tools import registry
 
         ctx = self._tool_ctx or self._make_ctx()
-        discovery = registry.call("discover_devices", {}, ctx)
-        self._record_tool_result(ctx, "discover_devices", discovery, {})
+        slots = dict(workflow.intent.slots or {})
+        # Pass the intent's hardware choice into discovery: the tool default
+        # ("b210") must never override what the user actually selected.
+        discovery_args = {"device_type": slots.get("hardware") or "sdr"}
+        discovery = registry.call("discover_devices", discovery_args, ctx)
+        self._record_tool_result(
+            ctx, "discover_devices", discovery, discovery_args
+        )
         devices = list(discovery.get("devices") or [])
         found = bool(discovery.get("device_found") or devices)
         identity = ""
         if found:
-            slots = dict(workflow.intent.slots or {})
             probe_args = {"device_type": slots.get("hardware") or "sdr"}
             if devices:
                 first = devices[0] if isinstance(devices[0], dict) else {}
@@ -1517,17 +1522,80 @@ class ServiceAgent:
         except Exception as exc:  # noqa: BLE001
             logger.debug("retry 预检查结果投影失败,忽略: %s", exc)
         if not found:
-            return (
+            if workflow.intent.context is None:
+                workflow.intent.context = {}
+            context = workflow.intent.context
+            failures = int(context.get("hw_retry_failures") or 0) + 1
+            context["hw_retry_failures"] = failures
+            base = (
                 "SDR_NOT_FOUND:No SDR was detected just now. "
                 "Connect the device (and wait for it to enumerate), then press "
                 "Retry — I will re-check it automatically."
             )
+            mismatch = str(discovery.get("mismatch_hint") or "").strip()
+            if mismatch:
+                base = "SDR_NOT_FOUND:" + mismatch
+            # After repeated blind failures escalate to an advisory LLM
+            # diagnosis: only the model can relate "expected IIO device, UHD
+            # probe kept failing" style contradictions into a cause.
+            if failures >= 2:
+                diagnosis = self._diagnose_hardware_mismatch(
+                    str(slots.get("hardware") or ""), discovery,
+                )
+                if diagnosis:
+                    base = "{}\n{}".format(base, diagnosis)
+            return base
+        if workflow.intent.context is not None:
+            workflow.intent.context["hw_retry_failures"] = 0
         device = str(discovery.get("device_type") or "")
         if devices and isinstance(devices[0], dict):
             device = str(devices[0].get("device_type") or device)
         return "Re-checked the SDR before retrying: {} {} detected and probed.".format(
             device or "SDR", identity,
         ).replace("  ", " ")
+
+    def _diagnose_hardware_mismatch(
+        self, expected: str, discovery: Dict[str, Any]
+    ) -> str:
+        """Advisory LLM diagnosis when hardware detection keeps failing.
+
+        Returns a short ``Diagnosis: ...`` line, or an empty string when the
+        LLM is unavailable or returns malformed output.  Purely advisory: it
+        must never block or alter the deterministic retry loop.
+        """
+        try:
+            from ..llm import chat, is_configured, parse_json_object
+        except Exception:  # noqa: BLE001
+            return ""
+        if not is_configured():
+            return ""
+        evidence = {
+            "expected_hardware": expected,
+            "discovery_command": discovery.get("command") or [],
+            "discovery_output": str(discovery.get("output") or "")[:800],
+            "device_type_used": discovery.get("device_type") or "",
+            "driver_family": discovery.get("driver_family") or "",
+            "devices_seen": discovery.get("devices") or [],
+            "mismatch_hint": discovery.get("mismatch_hint") or "",
+        }
+        prompt = (
+            "你是 DeepRadio 的硬件诊断助手。用户期望的 SDR 一直没有被探测命令发现。"
+            "根据证据判断最可能的原因, 并给出一条用户可立即执行的建议。"
+            '只输出 JSON: {"cause": "...", "suggestion": "..."}。'
+            "证据: " + json.dumps(evidence, ensure_ascii=False)
+        )
+        try:
+            content = chat([{"role": "user", "content": prompt}])
+            parsed = parse_json_object(content)
+            cause = str(parsed.get("cause") or "").strip()
+            suggestion = str(parsed.get("suggestion") or "").strip()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("硬件诊断 LLM 失败,忽略: %s", exc)
+            return ""
+        parts = [part for part in (cause, suggestion) if part]
+        if not parts:
+            return ""
+        return "Diagnosis: " + " | ".join(parts)
 
     def _cancel_waiting_workflow(self) -> AgentReply:
         if self._workflow.workflow is None:
