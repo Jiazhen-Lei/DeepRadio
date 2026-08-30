@@ -375,11 +375,11 @@ class SevenTaskServiceAgentTest(unittest.TestCase):
         self.assertEqual(hashlib.sha256(built_grc.read_bytes()).hexdigest(), built_hash)
         self.assertTrue(diagnosed.text)
         self.assertNotIn("eye_png", diagnosed.artifacts or {})
-        self.assertNotIn("偏高", diagnosed.text or "")
+        self.assertNotIn("EVM is high", diagnosed.text or "")
         self.assertTrue(
-            "达标" in (diagnosed.text or "")
-            or "设计噪声" in (diagnosed.text or "")
-            or "不是故障" in (diagnosed.text or "")
+            "EVM is normal" in (diagnosed.text or "")
+            or "link quality is excellent" in (diagnosed.text or "")
+            or "not a fault" in (diagnosed.text or "")
         )
 
         observed = agent.step(
@@ -402,7 +402,7 @@ class SevenTaskServiceAgentTest(unittest.TestCase):
         self.assertIsNotNone(peak.get("frequency_hz"))
         self.assertIsNotNone(peak.get("magnitude_dbfs"))
         self.assertGreaterEqual(float(peak.get("sample_rate") or 0), 1e3)
-        self.assertIn("主峰", observed.text or "")
+        self.assertIn("Peak at", observed.text or "")
         self.assertIn("Hz", observed.text or "")
         self._claim(observed.claims, "spectrum_peak_measured")
 
@@ -619,7 +619,7 @@ class SevenTaskServiceAgentTest(unittest.TestCase):
         peak = (observed.artifacts.get("metrics") or {}).get("spectrum_peak_report") or {}
         self.assertTrue(peak.get("valid"))
         self.assertGreaterEqual(float(peak.get("sample_rate") or 0), 1e3)
-        self.assertIn("主峰", observed.text or "")
+        self.assertIn("Peak at", observed.text or "")
         self.assertIn("Hz", observed.text or "")
         self.assertIn("dBFS", observed.text or "")
         self._claim(observed.claims, "spectrum_peak_measured")
@@ -705,7 +705,7 @@ class SevenTaskServiceAgentTest(unittest.TestCase):
         self.assertFalse(reply.workflow_digest.get("blocker"))
         self.assertEqual(reply.pending.get("requested_effect"), "DEVICE_READ")
         self.assertIsNone(reply.pending.get("max_duration_seconds"))
-        self.assertEqual(reply.workflow_digest.get("stage_label"), "配置确认")
+        self.assertEqual(reply.workflow_digest.get("stage_label"), "Configuration Confirmation")
         self.assertEqual((reply.pending.get("device") or {}).get("identity"), "usb:test.pluto")
         self.assertEqual(reply.pending.get("center_frequency"), 2_402_000_000.0)
         self.assertEqual(reply.pending.get("sample_rate"), 2_000_000.0)
@@ -758,7 +758,7 @@ class SevenTaskServiceAgentTest(unittest.TestCase):
             "max_duration_seconds",
             agent._state.project.config.get("rf_plan") or {},
         )
-        self.assertEqual(finished.workflow_digest.get("stage_label"), "配置确认")
+        self.assertEqual(finished.workflow_digest.get("stage_label"), "Configuration Confirmation")
 
     def test_failed_sdr_tx_builder_does_not_fallback_to_baseband(self):
         from grc.agent.tools import registry

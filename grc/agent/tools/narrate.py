@@ -27,9 +27,7 @@ def _level(profile) -> str:
 # ---------------------------------------------------------------------------
 # design_link 的解说
 # ---------------------------------------------------------------------------
-_NO_GUI_NOTE = (
-    "Constellation and spectrum plots are session artifacts; the canvas is a headless simulation chain (File Sink), not a QT GUI."
-)
+_OFFLINE_NOTE = "No hardware was accessed and no RF transmission was started."
 
 
 def narrate_design(recipe, result: Dict[str, Any], profile) -> str:
@@ -41,33 +39,33 @@ def narrate_design(recipe, result: Dict[str, Any], profile) -> str:
 
     if not ok:
         errs = result.get("errors", [])
-        head = f"The '{title}' chain did not pass validation after it was built. "
+        head = f"⚠️ The '{title}' chain was created, but validation found an issue. "
         if lvl == "novice":
             return head + "Let's inspect the connections one step at a time."
         return head + f"Key errors: {_fmt_errors(errs)}"
 
     if lvl == "novice":
-        s = (f"I built a '{title}' signal chain with {nb} blocks "
-             f"and verified that it can run correctly. ")
+        s = (f"✅ Your '{title}' signal chain is ready. I checked all {nb} blocks "
+             f"and the chain passed validation. ")
         if evm is not None:
             s += (f"Its EVM signal-quality score is {evm:.1f}%; "
                   f"a smaller number means a cleaner signal. ")
         s += "You can ask me to increase the noise next and see how the plots change."
-        return s + " " + _NO_GUI_NOTE
+        return s + " " + _OFFLINE_NOTE
 
     if lvl == "expert":
-        s = f"Generated '{title}' ({recipe.difficulty}), {nb} blocks; validation passed."
+        s = f"✅ Generated '{title}' ({recipe.difficulty}), {nb} blocks; validation passed."
         if evm is not None:
             s += f" EVM={evm:.2f}%."
         knob_keys = ", ".join(list(recipe.knobs)[:3])
         s += f" Adjustable parameters: {knob_keys}."
-        return s + " " + _NO_GUI_NOTE
+        return s + " " + _OFFLINE_NOTE
 
     # student
-    s = f"Built the '{title}' chain and passed validation."
+    s = f"✅ Your '{title}' chain is ready and passed validation."
     if evm is not None:
         s += f" EVM is {evm:.2f}%."
-    return s + " " + _NO_GUI_NOTE
+    return s + " " + _OFFLINE_NOTE
 
 
 # ---------------------------------------------------------------------------

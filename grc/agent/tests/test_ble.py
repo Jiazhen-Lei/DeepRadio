@@ -192,7 +192,7 @@ class BleDeployContractTest(unittest.TestCase):
             )
             self.assertEqual(reply.workflow_digest["current_stage"],
                              "build_ble_advertiser")
-            self.assertIn("暂无 BLE TX builder", reply.text)
+            self.assertIn("No BLE TX builder", reply.text)
             self.assertFalse(reply.needs_confirmation)
             self.assertFalse(any(
                 item.name == "build_ble_uhd_tx_flowgraph"

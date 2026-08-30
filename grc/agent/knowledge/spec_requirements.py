@@ -170,15 +170,9 @@ def resolve_specification(
             source in _EXPLICIT_SOURCES
             or (key not in missing and source not in {"safety_default", "safe_preview_default"})
         )
-        reason = (
-            "Required to build or execute the current request"
-            if requirement == "required"
-            else "Added by the user during intent alignment"
-            if requirement == "optional_added"
-            else "Explicitly mentioned by the user"
-            if requirement == "mentioned"
-            else "Derived from the active protocol or hardware profile and affects execution"
-        )
+        # Per-row explanatory sentences were removed from the user-facing card;
+        # the requirement/source tags carry the same information compactly.
+        reason = ""
         fields.append(SpecificationField(
             key=key,
             value=value,
@@ -239,13 +233,15 @@ def combined_question(fields: Iterable[str]) -> str:
     questions = [_question_payload(str(field)) for field in fields if field]
     if not questions:
         return ""
-    lines = [f"{len(questions)} required item(s) are still missing before the workflow can be created:"]
+    noun = "detail" if len(questions) == 1 else "details"
+    lines = [f"🧭 I need {len(questions)} more {noun} before I create the workflow:"]
     for index, item in enumerate(questions, 1):
-        line = f"{index}. {item['prompt']}"
+        label = str(question_for(item["field"]).get("label") or item["field"])
+        line = f"{index}. {label}: {item['prompt']}"
         if item["suggestions"]:
-            line += " Suggestions: " + ", ".join(item["suggestions"][:4])
+            line += " Suggested: " + ", ".join(item["suggestions"][:4])
         lines.append(line)
-    lines.append("Reply in natural language. Any unanswered fields will remain open for the next turn.")
+    lines.append("Reply in one natural-language message; I will keep only unanswered items open.")
     return "\n".join(lines)
 
 

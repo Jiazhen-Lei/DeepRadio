@@ -227,7 +227,7 @@ class V3HardwareWorkflowRegressionTest(unittest.TestCase):
                     },
                 })
             self.assertEqual(reply.stage, "CRITIC")
-            self.assertIn("不在有效运行窗口", reply.text)
+            self.assertIn("not within a valid runtime window", reply.text)
             self.assertEqual(stage.execution_status, "waiting")
 
     def test_unarmed_tx_preview_is_valid_and_compiles(self) -> None:
@@ -256,10 +256,10 @@ class V3HardwareWorkflowRegressionTest(unittest.TestCase):
         self.assertEqual(getattr(sink, "state", None), "disabled")
         text = Path(built["grc_path"]).read_text(encoding="utf-8")
         self.assertTrue("blocks_throttle2" in text or "blocks_throttle" in text)
-        self.assertIn("未授权射频", self.ctx.blocks["sdr_sink"].comment)
+        self.assertIn("Unauthorized RF", self.ctx.blocks["sdr_sink"].comment)
         self.assertIn("1 kHz", self.ctx.blocks["src"].comment)
-        self.assertIn("仅限速", self.ctx.blocks["preview_throttle"].comment)
-        self.assertIn("预览", self.ctx.blocks["preview_sink"].comment)
+        self.assertIn("Rate limiting only", self.ctx.blocks["preview_throttle"].comment)
+        self.assertIn("Safe preview", self.ctx.blocks["preview_sink"].comment)
         self.assertEqual(
             getattr(self.ctx.blocks.get("preview_throttle"), "state", None),
             "enabled",
@@ -538,7 +538,7 @@ class V6FollowupContractTest(unittest.TestCase):
         digest = state.spec_digest()
         self.assertIn("PlutoSDR", digest["summary"])
         self.assertIn("2.402 GHz", digest["summary"])
-        self.assertIn("sink 未 arm", digest["summary"])
+        self.assertIn("sink unarmed", digest["summary"])
         self.assertNotIn("? → ? → ?", digest["summary"])
 
     def test_configure_sdr_uses_configuration_mode(self):
@@ -701,7 +701,7 @@ class V6FollowupContractTest(unittest.TestCase):
         self.assertNotIn('"event": "subagent_invoked"', events)
         self.assertIn("BLE 1M", reply.spec_digest.get("summary") or "")
         self.assertIn("loveu", reply.spec_digest.get("summary") or "")
-        self.assertIn("✓ BLE PDU generated", reply.text or "")
+        self.assertIn("BLE PDU generated", reply.text or "")
 
     def test_gui_emergency_stop_command_revokes_rf_grant(self):
         from grc.agent.service.adapter import ServiceAgent
@@ -720,13 +720,132 @@ class V6FollowupContractTest(unittest.TestCase):
             reply = agent.step_command({"action": "emergency_stop"})
         called.assert_called_once_with("emergency_stop", {}, mock.ANY)
         self.assertEqual(reply.stage, "RUNTIME")
-        self.assertIn("紧急停止", reply.text)
+        self.assertIn("Emergency stop", reply.text)
         self.assertNotIn("RF_RUN", agent._state.runtime.granted_effects)
 
 
 # --- test_tool_origin_and_profiles.py ---
 
 """Contracts for tool origin labels and HardwareProfile device args."""
+
+
+class FriendlyFailureAndRetryContractTest(unittest.TestCase):
+    """V4 GUI contracts: friendly failure text and hardware-aware retry."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self._old_cwd = os.getcwd()
+        os.chdir(self.temp.name)
+
+    def tearDown(self):
+        os.chdir(self._old_cwd)
+        self.temp.cleanup()
+
+    def test_friendly_stage_failure_hides_internal_codes(self):
+        from grc.agent.service.adapter import _friendly_stage_failure
+
+        text = _friendly_stage_failure(
+            ["hardware_endpoint_present"],
+            ["REPLY_STATUS_REJECTED", "MISSING_COMPLETION:flowgraph_saved"],
+        )
+        self.assertNotIn("MISSING_COMPLETION", text)
+        self.assertNotIn("REPLY_STATUS_REJECTED", text)
+        self.assertNotIn("hardware_endpoint_present", text)
+        self.assertIn("did not finish", text)
+        self.assertIn("SDR hardware output", text)
+        self.assertIn("retry", text.lower())
+        self.assertIn("diagnose", text.lower())
+
+    def _waiting_agent(self, session_id):
+        from grc.agent.service.adapter import ServiceAgent
+
+        with mock.patch(
+            "grc.agent.service.orchestrator.build_agent", return_value=None
+        ):
+            agent = ServiceAgent(session_id=session_id)
+            agent.step(
+                "为 PlutoSDR 配置 2.402 GHz、2 Msps 的发射流图，"
+                "保存配置并停在发射确认。"
+            )
+        return agent
+
+    def test_retry_reports_missing_device_and_does_not_rerun(self):
+        agent = self._waiting_agent("retry-no-device")
+        workflow = agent._workflow.workflow
+        self.assertEqual(workflow.execution_status, "waiting")
+        stage_before = agent._workflow.current_stage()
+        with mock.patch(
+            "grc.agent.tools.registry.call",
+            return_value={"ok": True, "device_found": False, "devices": []},
+        ) as called:
+            reply = agent.step_command({"action": "retry_stage"})
+        self.assertEqual(
+            called.call_args_list[0].args[0], "discover_devices"
+        )
+        self.assertEqual(reply.stage, "WAITING")
+        self.assertIn("No SDR was detected", reply.text)
+        self.assertEqual(
+            agent._workflow.current_stage().id, stage_before.id
+        )
+        self.assertEqual(
+            agent._workflow.workflow.execution_status, "waiting"
+        )
+
+    def test_retry_probe_evidence_survives_into_next_stage_context(self):
+        agent = self._waiting_agent("retry-with-device")
+
+        def side_effect(name, args, ctx):
+            if name == "discover_devices":
+                return {
+                    "ok": True,
+                    "device_found": True,
+                    "device_type": "pluto",
+                    "devices": [
+                        {"device_type": "pluto", "device_identity": "usb:0"}
+                    ],
+                }
+            if name == "probe_device":
+                return {
+                    "ok": True,
+                    "device_probed": True,
+                    "device_type": "pluto",
+                    "device_identity": "usb:0",
+                }
+            return {"ok": True}
+
+        with mock.patch(
+            "grc.agent.tools.registry.call", side_effect=side_effect
+        ):
+            note = agent._refresh_hardware_for_retry()
+        self.assertIn("Re-checked the SDR", note)
+        self.assertIn("usb:0", note)
+        self.assertTrue(agent._retry_preflight_events)
+        kinds = {
+            item.get("kind") for item in agent._retry_preflight_events
+        }
+        self.assertIn("discover_devices", kinds)
+        self.assertIn("probe_device", kinds)
+        # The next stage context must inherit the fresh evidence.
+        ctx = agent._make_ctx()
+        event_kinds = {item.get("kind") for item in ctx.extra["events"]}
+        self.assertIn("probe_device", event_kinds)
+        self.assertEqual(agent._retry_preflight_events, [])
+
+    def test_inspect_plan_without_patch_is_honest(self):
+        """V4 regression: no false 'change plan was created' claim."""
+        from grc.agent.service.stage_handlers import _handle_inspect_plan
+
+        agent = self._waiting_agent("inspect-honest")
+        ctx = agent._make_ctx()
+        with mock.patch(
+            "grc.agent.tools.registry.call",
+            return_value={"ok": True, "path": "/tmp/current.grc"},
+        ):
+            reply = _handle_inspect_plan(agent, ctx, "", "", True)
+        self.assertNotIn("change plan was created", reply.text)
+        self.assertIn("could not derive a concrete change plan", reply.text)
+        self.assertIn("nothing was modified", reply.text)
 
 
 import unittest
@@ -1013,6 +1132,49 @@ class HardwareRuntimeContractTest(unittest.TestCase):
         self.assertEqual(quality["underrun_count"], 3)
         self.assertEqual(quality["overrun_count"], 2)
         self.assertTrue(quality["stream_quality_warning"])
+
+    def test_windows_python_script_uses_current_interpreter(self):
+        process = mock.Mock()
+        process.pid = 123
+        process.stdout = None
+        process.poll.return_value = None
+        windows_os = mock.Mock(wraps=os)
+        windows_os.name = "nt"
+        with mock.patch(
+            "grc.agent.service.hardware_runtime.os", windows_os
+        ), mock.patch(
+            "grc.agent.service.hardware_runtime.subprocess.Popen",
+            return_value=process,
+        ) as popen:
+            result = self.runtime.start("windows-script", "radio.py", 30)
+        timer = self.runtime._processes["windows-script"].get("timer")
+        if timer:
+            timer.cancel()
+        self.runtime._processes.pop("windows-script", None)
+        self.assertEqual(result["interpreter"], sys.executable)
+        command = popen.call_args.args[0]
+        self.assertEqual(command[:2], [sys.executable, "-u"])
+        self.assertFalse(popen.call_args.kwargs["start_new_session"])
+
+    def test_windows_termination_uses_process_methods(self):
+        process = mock.Mock()
+        windows_os = mock.Mock(wraps=os)
+        windows_os.name = "nt"
+        with mock.patch("grc.agent.service.hardware_runtime.os", windows_os):
+            HardwareRuntime._terminate_process(process, emergency=False)
+            process.terminate.assert_called_once_with()
+            HardwareRuntime._terminate_process(process, emergency=True)
+            process.kill.assert_called_once_with()
+
+    def test_relocatable_paths_use_forward_slashes(self):
+        windows_path = mock.Mock(wraps=os.path)
+        windows_path.relpath.return_value = r"final\evidence\capture.png"
+        windows_os = mock.Mock(wraps=os)
+        windows_os.sep = "\\"
+        windows_os.path = windows_path
+        with mock.patch.object(session_store, "os", windows_os):
+            relative = session_store._posix_relpath("target", "root")
+        self.assertEqual(relative, "final/evidence/capture.png")
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

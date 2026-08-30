@@ -683,7 +683,7 @@ def to_relpath(root: str, path: str) -> str:
     if abs_path == abs_root:
         return "."
     if abs_path.startswith(prefix):
-        return os.path.relpath(abs_path, abs_root)
+        return os.path.relpath(abs_path, abs_root).replace(os.sep, "/")
     return path
 
 

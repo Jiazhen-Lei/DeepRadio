@@ -184,6 +184,51 @@ def looks_like_task_dump(text: str) -> bool:
     return len(stripped) > 240
 
 
+_EVM_THRESHOLD_RE = re.compile(
+    r"(?:evm)\s*(?:要|需|必须|应)?\s*(?:小于|低于|<|≤)\s*(\d+(?:\.\d+)?)\s*%?"
+)
+
+
+def ensure_success_condition_claims(
+    state, conditions: List[str], *, keep_verbatim: bool = True
+) -> List[str]:
+    """Register success conditions and derive evaluable Claims from EVM thresholds.
+
+    Shared by the legacy ``commit_intent`` tool path and the workflow
+    intent-sync path so "EVM < x%" always maps to an ``evm_lt_x`` sim-layer
+    claim regardless of which path produced the intent. Non-EVM conditions
+    are recorded verbatim when *keep_verbatim* is set.
+    """
+    claim_ids: List[str] = []
+    for raw in conditions or []:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        match = _EVM_THRESHOLD_RE.search(text.lower())
+        if match:
+            threshold = float(match.group(1))
+            condition = f"EVM < {threshold:g}%"
+        else:
+            if not keep_verbatim:
+                continue
+            condition = text
+        if condition not in state.spec.success_conditions:
+            state.spec.success_conditions.append(condition)
+        if not match:
+            continue
+        claim_id = f"evm_lt_{threshold:g}".replace(".", "_")
+        ClaimStore(state).upsert(
+            Claim(
+                id=claim_id,
+                statement=condition,
+                layer="sim",
+                project_version=state.project.flowgraph_version,
+            )
+        )
+        claim_ids.append(claim_id)
+    return claim_ids
+
+
 def commit_intent(ctx: ToolContext, text: str) -> Dict[str, Any]:
     """Deterministically extract the minimum traceable radio specification."""
     state = _state(ctx)
@@ -241,26 +286,7 @@ def commit_intent(ctx: ToolContext, text: str) -> Dict[str, Any]:
             for d in proposed
         ]
 
-    match = re.search(
-        r"(?:evm)\s*(?:要|需|必须|应)?\s*(?:小于|低于|<|≤)\s*(\d+(?:\.\d+)?)\s*%?",
-        lowered,
-    )
-    claim_ids: List[str] = []
-    if match:
-        threshold = float(match.group(1))
-        condition = f"EVM < {threshold:g}%"
-        if condition not in state.spec.success_conditions:
-            state.spec.success_conditions.append(condition)
-        claim_id = f"evm_lt_{threshold:g}".replace(".", "_")
-        ClaimStore(state).upsert(
-            Claim(
-                id=claim_id,
-                statement=condition,
-                layer="sim",
-                project_version=state.project.flowgraph_version,
-            )
-        )
-        claim_ids.append(claim_id)
+    claim_ids = ensure_success_condition_claims(state, [lowered], keep_verbatim=False)
     state.spec.open_questions = []
     if not (modulation or known_modulation):
         state.spec.open_questions.append("使用哪种调制方式？")

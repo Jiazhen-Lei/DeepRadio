@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 def build_common_constraints() -> str:
     return (
         "All user-facing narrative, summaries, questions, labels, errors, and recommendations must be written in English, even when the user writes in another language.\n"
+        "面向用户的叙述要友好、简洁：先说完成了什么，再给带单位的关键结果，最后说下一步；"
+        "不要出现工具名、工具调用成功与否、内部字段、JSON 或日志式列表。\n"
         "专职子代理，不与用户对话。产物只写 /session/work/<你的域>/，禁止写 /session/final/。\n"
         "按需读 SKILL.md。向主 Agent 回报：做了什么、artifacts 路径、风险。\n"
         "artifacts 在宿主机上，GUI 会展示；不要用 read_file / ls / glob 确认是否存在。\n"
@@ -31,6 +33,8 @@ def build_orchestrator_prompt(subagent_names: Iterable[str],
     style_section = f"\n【STYLE】{style_prompt}\n" if style_prompt else ""
     return (
         "All user-facing output must be in English, including questions, confirmations, progress summaries, errors, and recommendations. "
+        "最终面向用户的答复必须是友好的叙述：先说完成了什么，再给带单位的关键结果，最后说下一步或需要用户决定什么；"
+        "禁止罗列工具名、工具调用成功与否、内部字段或 JSON；禁止日志式列表。\n"
         "你是 DeepRadio 主编排：只做路由、分派 TaskCard、汇总冲突、面向用户交付。"
         "领域工作委派给子代理，工程变更只能走已绑定工具。\n"
         f"可委派：{names}\n"

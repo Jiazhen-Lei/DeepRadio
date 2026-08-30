@@ -9,10 +9,16 @@ import os
 import re
 import time
 import uuid
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Mapping, Optional
 
-from .completion import KNOWN_COMPLETIONS
+from .completion import (
+    EXTERNAL_PRECONDITION_COMPLETIONS,
+    KNOWN_COMPLETIONS,
+    external_waiting_note,
+)
 from .plan_compiler import (
+    PlanCoverageError,
+    _PROTECTED_TAIL_IDS,
     compact_invocations,
     compact_workflow_payload,
     compile_stages,
@@ -31,13 +37,26 @@ from .planning import (
     stage_plan_item,
     stops_at_boundary,
     system_capability_blocker,
-    visible_plan_horizon,
 )
 from .schema import Checkpoint, Stage, Workflow, WorkflowIntent
 from ..tools.hardware_profiles import resolve_hardware_profile
 from ..tools.state_tools import is_read_only_request
 
 logger = logging.getLogger(__name__)
+
+
+def _atomic_replace(src: str, dst: str, *, retries: int = 5) -> None:
+    """Replace a state file, tolerating short Windows file-lock races."""
+    delay = 0.02
+    for attempt in range(max(1, int(retries))):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == max(1, int(retries)) - 1:
+                raise
+            time.sleep(delay)
+            delay *= 1.6
 
 
 _TERMINALS = {"completed", "errored"}
@@ -465,8 +484,15 @@ class WorkflowEngine:
         )
 
     def _turn_relation(self, text: str, shared_state: Any) -> str:
+        # Understanding user input is the LLM's job exclusively.  Production
+        # never re-interprets a turn with keyword rules; the deterministic
+        # branch below only serves the unit-test bypass.
         low = (text or "").lower().strip()
         current = self.current_stage()
+        relation = self._turn_relation_llm(text)
+        if relation is not None:
+            return relation
+        # Deterministic fallback: only reached by the unit-test bypass.
         if any(hint in low for hint in ("终止任务", "取消任务", "cancel task")):
             return "cancel"
         if current and current.execution_status == "waiting" and current.checkpoint:
@@ -476,10 +502,6 @@ class WorkflowEngine:
         if self._is_explicit_new_task(low):
             return "new_task"
         if current and current.execution_status == "waiting" and current.checkpoint:
-            # A checkpoint pauses the current workflow; it does not capture all
-            # subsequent user turns.  A clearly classified request for another
-            # capability must be allowed to supersede it (for example, moving
-            # from diagnosis to a read-only observation).
             classified = self.classify(text, shared_state)
             if self._is_strong_task_switch(classified):
                 return "new_task"
@@ -502,6 +524,125 @@ class WorkflowEngine:
         if self.workflow.execution_status == "waiting":
             return "feedback"
         return "adjustment"
+
+    _RELATION_PROMPT = """你是 DeepRadio 的会话关系判定器。当前有一个活动工作流,用户发来了新一轮输入。
+只输出一个 JSON 对象:
+{"relation":"...","reason":"...","turn_semantics":{"read_only":false,"confirmation_decision":"none","recipe_switch_target":""}}
+relation 只能取:
+- new_task: 一个明确的新目标(与当前工作流不同的能力/方向/工件)
+- adjustment: 对当前任务参数的补充或修改(例如指定 local name、频率、时长、设备型号)
+- answer: 回答当前工作流正在等待的问题
+- feedback: 对等待/失败的反馈(重试、继续、启动、请求诊断)
+- approval: 批准当前确认点(如"确认"、"同意"、"可以发射")
+- rejection: 拒绝当前确认点(如"不行"、"拒绝"、"不要发射")
+- cancel: 取消当前任务
+规则:
+- 补充参数和修改参数都是 adjustment,绝不是 new_task。例如 "the local name must be X" 是对当前发射任务的参数补充。
+- 只有用户明确提出与当前工作流不同的新目标才是 new_task。
+- current_workflow 只是背景;不要因为文本里提到协议名或设备名就判定 new_task。
+- 当前没有确认点(stage_status 不是 waiting 或没有 checkpoint)时,不要输出 approval/rejection。
+- read_only 仅在用户明确要求只读、只诊断、不要修改时为 true。
+- confirmation_decision 只能为 approved/rejected/none，并与 relation 保持一致。
+- recipe_switch_target 只在用户明确要求切换现有工程配方时填写给定的 canonical recipe id；否则为空。
+- 拿不准时优先 adjustment。
+"""
+
+    def _turn_relation_llm(self, text: str) -> Optional[str]:
+        """Classify the turn relation with the LLM as the only authority.
+
+        Returns ``None`` only when the deterministic unit-test bypass is
+        active.  Any production configuration or request failure raises
+        ``SemanticUnderstandingError`` — the turn is never silently
+        re-interpreted by keyword rules.
+        """
+        from ..llm import (
+            SemanticUnderstandingError,
+            chat,
+            get_config,
+            intent_test_bypass_enabled,
+            is_configured,
+        )
+
+        if not is_configured():
+            if intent_test_bypass_enabled():
+                return None
+            self._event("turn_relation_llm_failed", {"reason": "not_configured"})
+            raise SemanticUnderstandingError(
+                "The language model is not configured, so your message was not "
+                "interpreted. Check the model connection and send it again."
+            )
+        stage = self.current_stage()
+        workflow = self.workflow
+        payload = {
+            "text": str(text or ""),
+            "allowed_recipe_ids": _known_recipe_ids(),
+            "current_workflow": {
+                "task_type": getattr(workflow, "task_type", "") if workflow else "",
+                "task_label": _TASK_LABELS.get(
+                    getattr(workflow, "task_type", ""), ""
+                ) if workflow else "",
+                "capabilities": list(
+                    getattr(getattr(workflow, "intent", None), "capabilities", None)
+                    or []
+                ) if workflow else [],
+                "current_stage": getattr(stage, "id", "") if stage else "",
+                "stage_status": getattr(stage, "execution_status", "") if stage else "",
+                "missing_slots": list(
+                    getattr(getattr(workflow, "intent", None), "missing_slots", None)
+                    or []
+                ) if workflow else [],
+            },
+        }
+        emit_payload = {
+            "text_hash": hashlib.sha256(
+                str(text or "").encode("utf-8")
+            ).hexdigest(),
+        }
+        self._event("turn_relation_llm_started", emit_payload)
+        started_at = time.perf_counter()
+        try:
+            content = chat(
+                [
+                    {"role": "system", "content": self._RELATION_PROMPT},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ]
+            )
+            from ..llm import parse_json_object
+
+            parsed = parse_json_object(content)
+            relation = str(parsed.get("relation") or "")
+            allowed = {
+                "new_task", "adjustment", "answer", "feedback",
+                "approval", "rejection", "cancel",
+            }
+            if relation not in allowed:
+                raise ValueError(f"invalid relation: {relation!r}")
+            semantics = _normalize_turn_semantics(parsed)
+            semantics["relation"] = relation
+            if relation == "approval":
+                semantics["confirmation_decision"] = "approved"
+            elif relation in {"rejection", "cancel"}:
+                semantics["confirmation_decision"] = "rejected"
+        except Exception as exc:  # noqa: BLE001
+            self._event("turn_relation_llm_failed", {
+                **emit_payload,
+                "reason": "request_failed",
+                "error_type": type(exc).__name__,
+                "latency_ms": round((time.perf_counter() - started_at) * 1000, 3),
+            })
+            raise SemanticUnderstandingError(
+                "The language model could not classify your message, so it was "
+                "not interpreted. Nothing was changed; check the model "
+                "connection and send it again."
+            ) from exc
+        self._event("turn_relation_llm_succeeded", {
+            **emit_payload,
+            "relation": relation,
+            "latency_ms": round((time.perf_counter() - started_at) * 1000, 3),
+        })
+        if self.workflow is not None:
+            self.workflow.intent.context["turn_semantics"] = semantics
+        return relation
 
     @staticmethod
     def _is_explicit_new_task(low: str) -> bool:
@@ -530,7 +671,9 @@ class WorkflowEngine:
         )
 
     def _merge_turn_slots(self, text: str, shared_state: Any) -> None:
-        update = self.classify(text, shared_state)
+        update = self._reconcile_intent(
+            self.classify(text, shared_state), text, shared_state
+        )
         updates = {
             key: value
             for key, value in update.slots.items()
@@ -541,12 +684,15 @@ class WorkflowEngine:
             "ebn0_db" in missing_before
             and updates.get("ebn0_db") is None
         ):
-            parsed = _parse_ebn0_db(text, allow_bare_answer=True)
-            if parsed is not None:
-                updates["ebn0_db"] = parsed
+            from ..llm import intent_test_bypass_enabled
+
+            if intent_test_bypass_enabled():
+                parsed = _parse_ebn0_db(text, allow_bare_answer=True)
+                if parsed is not None:
+                    updates["ebn0_db"] = parsed
         self.workflow.intent.slots.update(updates)
         self.workflow.intent.slot_sources.update(
-            {key: "user" for key in updates}
+            {key: "llm" for key in updates}
         )
         # Capabilities describe the instantiated plan and stay stable during
         # ordinary feedback.  A material capability change is a replan/new
@@ -618,8 +764,10 @@ class WorkflowEngine:
             or getattr(getattr(shared_state, "project", None), "config", {}).get("recipe")
         )
         slots = self._parse_slots(text)
+        # Regex parsing only generates candidates.  It must not masquerade as
+        # semantic authority or prevent the LLM from correcting ambiguity.
         slot_sources = {
-            key: "user" for key, value in slots.items() if value not in (None, "", [])
+            key: "rules" for key, value in slots.items() if value not in (None, "", [])
         }
         self._inherit_tx_preview_slots(text, slots, slot_sources, shared_state)
         capabilities = self._detect_capabilities(text, slots, has_project)
@@ -777,7 +925,17 @@ class WorkflowEngine:
             shared_state,
             event_sink=self._event,
         )
-        if "diagnose" in intent.capabilities and is_read_only_request(text):
+        semantics = dict((intent.context or {}).get("turn_semantics") or {})
+        semantic_read_only = semantics.get("read_only") is True
+        if not semantics:
+            # Preserve deterministic unit-test fixtures without letting this
+            # vocabulary become a production fallback.
+            from ..llm import intent_test_bypass_enabled
+
+            semantic_read_only = bool(
+                intent_test_bypass_enabled() and is_read_only_request(text)
+            )
+        if "diagnose" in intent.capabilities and semantic_read_only:
             forbidden = set(intent.context.get("forbidden_capabilities") or [])
             forbidden.add("modify_project")
             intent.context["forbidden_capabilities"] = sorted(forbidden)
@@ -1158,6 +1316,70 @@ class WorkflowEngine:
                     errors.append(f"{key}_invalid")
         return errors
 
+    @staticmethod
+    def _blocking_unbound_actions(unbound_actions: list[str]) -> set[str]:
+        """Unbound device/RF-grade planner actions must block execution."""
+        blocking: set[str] = set()
+        for action in unbound_actions:
+            name = str(action or "")
+            if name in _PROTECTED_TAIL_IDS:
+                blocking.add(name)
+                continue
+            try:
+                from ..tools import registry
+
+                spec = registry.get(name)
+            except Exception:  # noqa: BLE001
+                spec = None
+            if spec is None:
+                continue
+            effect = str(getattr(spec, "effect_level", "") or "")
+            if effect in {"DEVICE_CONFIG", "RF_RUN"}:
+                blocking.add(name)
+        return blocking
+
+    def _archive_superseded_workflow(self) -> list[dict[str, Any]]:
+        """Keep a superseded workflow visible as a Previous Attempt.
+
+        Called whenever a new workflow replaces an active (non-terminal) one.
+        The archive is a compact summary — the monitor shows what was running
+        and how far it got, without resurrecting its execution authority.
+        """
+        existing = self.workflow
+        if existing is None or existing.execution_status in _TERMINALS:
+            # Terminal workflows are history already; only a superseded
+            # active workflow becomes a Previous Attempt.
+            return list(getattr(existing, "previous_attempts", None) or []) if existing else []
+        summary = {
+            "workflow_id": existing.workflow_id,
+            "task_type": existing.task_type,
+            "task_label": _TASK_LABELS.get(existing.task_type, existing.task_type),
+            "execution_status": existing.execution_status,
+            "outcome": existing.outcome,
+            "current_stage": existing.current_stage,
+            "stage_label": _STAGE_LABELS.get(
+                existing.current_stage, existing.current_stage
+            ),
+            "stages": [
+                {
+                    "id": stage.id,
+                    "label": _STAGE_LABELS.get(stage.id, stage.id),
+                    "status": stage.execution_status,
+                    "outcome": stage.outcome,
+                }
+                for stage in existing.stages
+            ],
+            "superseded_at": time.time(),
+        }
+        chain = list(getattr(existing, "previous_attempts", None) or [])
+        chain.append(summary)
+        self._event("workflow_archived", {
+            "workflow_id": existing.workflow_id,
+            "task_type": existing.task_type,
+            "stage_count": len(existing.stages),
+        })
+        return chain[-5:]
+
     def instantiate(self, intent: WorkflowIntent, shared_state: Any) -> Workflow:
         candidate = self.catalog["task_candidates"].get(intent.task_type)
         if not candidate:
@@ -1173,9 +1395,25 @@ class WorkflowEngine:
             catalog=self.catalog,
             event_sink=self._event,
         )
-        stages, _nodes, rejected = compile_stages(
+        stages, _nodes, rejected, unbound_actions = compile_stages(
             intent, stages, catalog=self.catalog, proposal=proposal
         )
+        if unbound_actions:
+            # Plan Coverage Validator: a planner action that no stage can
+            # serve must never be silently dropped.  Device/RF-grade actions
+            # block execution; informational ones are recorded for audit.
+            blocking = self._blocking_unbound_actions(unbound_actions)
+            self._event("plan_actions_unbound", {
+                "workflow_id": self.workflow.workflow_id if self.workflow else "",
+                "unbound_actions": list(unbound_actions),
+                "blocking": sorted(blocking),
+            })
+            if blocking:
+                raise PlanCoverageError(
+                    "The plan was rejected because required actions could not "
+                    "be compiled into any stage: {}. Restate the goal or "
+                    "remove these actions.".format(", ".join(sorted(blocking)))
+                )
         horizon, deferred = split_at_decision_boundary(stages)
         version = int(getattr(getattr(shared_state, "project", None), "flowgraph_version", 0))
         runtime = getattr(shared_state, "runtime", None)
@@ -1187,6 +1425,7 @@ class WorkflowEngine:
         deferred_items = [stage_plan_item(item) for item in deferred]
         shared_intent_ref = dict((intent.context or {}).get("shared_intent") or {})
         shared_intent_id = str(shared_intent_ref.get("intent_id") or "")
+        previous_attempts = self._archive_superseded_workflow()
         self.workflow = Workflow(
             workflow_id=(
                 "wf-" + shared_intent_id.removeprefix("intent-")
@@ -1200,6 +1439,7 @@ class WorkflowEngine:
             base_project_version=version,
             current_stage=horizon[0].id,
             catalog_version=int(self.catalog.get("schema_version", 1)),
+            previous_attempts=previous_attempts,
         )
         if rejected:
             self._event("plan_actions_rejected", {"actions": rejected})
@@ -1426,6 +1666,46 @@ class WorkflowEngine:
         quality = str(data.get("quality") or "clean")
         if quality not in ("clean", "warning", "failed"):
             quality = "failed"
+        if missing_completion and all(
+            name in EXTERNAL_PRECONDITION_COMPLETIONS
+            for name in missing_completion
+        ):
+            # Missing external preconditions (no SDR connected, endpoint not
+            # armed yet, device mismatch) are not execution failures.  Park
+            # the stage as waiting so the user can fix the condition and
+            # retry, instead of being shown a hard "failed" verdict.
+            stage.result = {
+                key: data.get(key)
+                for key in (
+                    "note",
+                    "artifacts",
+                    "produced_claims",
+                    "proposed_changes",
+                    "completion",
+                    "invocations",
+                    "acceptance",
+                    "quality",
+                    "evidence_grade",
+                )
+                if data.get(key)
+            }
+            stage.result["quality"] = quality
+            stage.result["missing_completion"] = missing_completion
+            stage.result["note"] = str(
+                data.get("note")
+                or external_waiting_note(missing_completion)
+            )
+            stage.execution_status = "waiting"
+            stage.outcome = "inconclusive"
+            self.workflow.execution_status = "waiting"
+            self._event("stage_waiting_external", {
+                "stage_id": stage.id,
+                "attempt": stage.attempt,
+                "missing_completion": missing_completion,
+                "note": stage.result["note"],
+            })
+            self.save()
+            return True
         if missing_completion:
             outcome = "failed"
         stage.result = {
@@ -1745,7 +2025,7 @@ class WorkflowEngine:
         tmp = f"{self.path}.tmp"
         with open(tmp, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, indent=2)
-        os.replace(tmp, self.path)
+        _atomic_replace(tmp, self.path)
         return self.path
 
     def digest(self) -> Dict[str, Any]:
@@ -1801,9 +2081,30 @@ class WorkflowEngine:
                 ((stage.result if stage else {}) or {}).get("note")
                 or "The current stage did not meet its completion conditions. Retry, revise the plan, or cancel."
             )
-        visible_stages = visible_plan_horizon(
-            self.workflow.stages, self.workflow.current_stage
-        )
+        # The monitor always shows the whole plan: completed, current, and
+        # upcoming (including deferred) stages.  Hiding the horizon made the
+        # workflow look like it "lost" stages after each decision boundary.
+        visible_stages = list(self.workflow.stages)
+        deferred_stages = [
+            {
+                "id": str(item.get("id") or ""),
+                "label": stage_display_label(
+                    str(item.get("id") or ""),
+                    str(item.get("label") or item.get("id") or ""),
+                    "",
+                ),
+                "execution_status": "deferred",
+                "outcome": "",
+                "attempt": 0,
+                "max_attempts": int(item.get("max_attempts") or 0),
+                "completion": list(item.get("completion") or []),
+                "completion_result": {},
+                "quality": "clean",
+                "unbound_predicates": list(item.get("unbound_predicates") or []),
+            }
+            for item in (self.workflow.deferred_plan or [])
+            if isinstance(item, Mapping)
+        ]
         blocker = dict(stage.checkpoint.blocker) if (
             stage and stage.checkpoint and stage.checkpoint.blocker
         ) else {}
@@ -1826,7 +2127,7 @@ class WorkflowEngine:
                 ),
             ),
             "stage_index": index,
-            "stage_total": len(visible_stages),
+            "stage_total": len(visible_stages) + len(deferred_stages),
             "all_stage_total": len(self.workflow.stages) + len(
                 self.workflow.deferred_plan or []
             ),
@@ -1892,6 +2193,7 @@ class WorkflowEngine:
                 "entities": dict(self.workflow.intent.entities),
             },
             "compiled_plan": list(self.workflow.compiled_plan or []),
+            "previous_attempts": list(self.workflow.previous_attempts or []),
             "revision": self.workflow.revision,
             "base_project_version": self.workflow.base_project_version,
             "capabilities": list(self.workflow.intent.capabilities),
@@ -1932,7 +2234,7 @@ class WorkflowEngine:
                     "unbound_predicates": list(item.unbound_predicates),
                 }
                 for item in visible_stages
-            ],
+            ] + deferred_stages,
         }
 
     @staticmethod
@@ -2279,7 +2581,7 @@ _CAPABILITIES = frozenset(
         "hardware_runtime",
     }
 )
-_PROMPT = """你是 DeepRadio 的 Intent 校正器。只输出一个 JSON 对象。
+_PROMPT = """你是 DeepRadio 的 Intent 语义解析器。只输出一个 JSON 对象。
 字段:
 - goals / requested_operations / desired_artifacts / evidence_requirements
 - constraints / decision_boundaries / stop_conditions
@@ -2287,9 +2589,11 @@ _PROMPT = """你是 DeepRadio 的 Intent 校正器。只输出一个 JSON 对象
 - capabilities: 只能用给定集合
 - forbidden_capabilities: 用户明确不要的能力
 - slots: 文本里明确出现的参数
+- turn_semantics: {read_only, confirmation_decision, recipe_switch_target}
 - confidence: 0~1
 规则:
-- 规则 Intent 只是初值。按用户目标校正，不要套固定任务模板。
+- 独立根据用户原文识别目标，不要套固定任务模板。
+- deterministic_context 只含协议/安全默认值和当前工程事实，不是意图分类结果。
 - 否定、只仿真、不要硬件/射频 优先于关键词。
 - 目标是现在发射/运行/部署: operation=deploy，不要加 stop_at_decision_boundary。
 - 已有未 arm 的硬件预览图时，「现在发射/运行 N 秒」是新一轮 deploy，复用当前工程参数，不要重建，也不要当成配置确认。
@@ -2298,9 +2602,14 @@ _PROMPT = """你是 DeepRadio 的 Intent 校正器。只输出一个 JSON 对象
 - 配置/保存发射流图不是 TX_BUILD，也不是已经授权 RF_RUN。
 - 不得把实时硬件观察改写成离线仿真。
 - 不得因为载频像 2.4 GHz 就判定 BLE，除非用户说了 ble/蓝牙/广播。
-- slot_sources=user 或 current_project 的字段不得覆盖。
+- "transmit chain" / "transmit-only" means direction=tx; "receive chain" means direction=rx.
+- slots must include every parameter explicitly stated in the current user text.
+- deterministic_context.preserved_slots 里 slot_sources 为 safety_default/safe_preview_default/current_project 的是确定性安全与工程事实，不得改写；其余 preserved 值若与用户原文冲突，以你从原文的提取为准。
 - 不得把 safety_default 时长改写成用户约束；用户没写时长就不要填 duration。prepare/配置确认不要写 30 秒。
 - 不要发明 local_name。
+- read_only 仅在用户明确要求只读、只诊断或不要修改时为 true；false 不能授予写权限。
+- confirmation_decision 只能是 approved/rejected/none。
+- recipe_switch_target 仅在用户明确要求切换现有工程配方时填写 allowed_recipe_ids 中的 canonical id。
 """
 
 
@@ -2311,41 +2620,61 @@ def complete_intent(
     *,
     event_sink: Optional[Callable[[str, Dict[str, Any]], None]] = None,
 ) -> WorkflowIntent:
-    """Merge rules Intent with an optional LLM patch (may drop forbidden capabilities)."""
+    """Use the LLM as semantic authority and merge its structured result.
+
+    Rules provide candidates and deterministic safety constraints only.  A
+    production request never silently falls back to them when the LLM fails.
+    """
     emit = event_sink or (lambda _event, _payload: None)
     try:
-        from ..llm import chat, get_config, is_configured
+        from ..llm import (
+            SemanticUnderstandingError,
+            chat,
+            get_config,
+            intent_test_bypass_enabled,
+            is_configured,
+        )
     except Exception as exc:  # noqa: BLE001
-        emit("intent_llm_fallback", {
+        emit("intent_llm_failed", {
             "reason": "llm_import_unavailable",
             "error_type": type(exc).__name__,
         })
-        return rules_intent
+        raise RuntimeError("The semantic understanding service could not be loaded.") from exc
     if not is_configured():
-        emit("intent_llm_fallback", {"reason": "not_configured"})
-        return rules_intent
+        if intent_test_bypass_enabled():
+            emit("intent_llm_test_bypass", {"reason": "test_runner"})
+            for key, source in list(rules_intent.slot_sources.items()):
+                if source == "rules":
+                    rules_intent.slot_sources[key] = "user"
+            return rules_intent
+        emit("intent_llm_failed", {"reason": "not_configured"})
+        raise SemanticUnderstandingError(
+            "The language model is not configured. Your request was not interpreted."
+        )
+    deterministic_sources = {
+        "safety_default", "safe_preview_default", "current_project",
+    }
+    preserved_slots = {
+        key: value for key, value in rules_intent.slots.items()
+        if rules_intent.slot_sources.get(key) in deterministic_sources
+    }
+    preserved_sources = {
+        key: value for key, value in rules_intent.slot_sources.items()
+        if value in deterministic_sources
+    }
     payload = {
         "text": text,
-        "rules_intent": {
-            "task_type": rules_intent.task_type,
-            "confidence": rules_intent.confidence,
-            "slots": rules_intent.slots,
-            "missing_slots": rules_intent.missing_slots,
-            "capabilities": rules_intent.capabilities,
+        "deterministic_context": {
+            "preserved_slots": preserved_slots,
+            "slot_sources": preserved_sources,
             "forbidden_capabilities": list(
                 (rules_intent.context or {}).get("forbidden_capabilities") or []
             ),
-            "slot_sources": rules_intent.slot_sources,
-            "goals": rules_intent.goals,
-            "requested_operations": rules_intent.requested_operations,
-            "desired_artifacts": rules_intent.desired_artifacts,
-            "evidence_requirements": rules_intent.evidence_requirements,
-            "constraints": rules_intent.constraints,
-            "decision_boundaries": rules_intent.decision_boundaries,
-            "stop_conditions": rules_intent.stop_conditions,
+            "current_project": dict((rules_intent.context or {}).get("current_project") or {}),
         },
         "allowed_task_types": sorted(_TASK_TYPES),
         "allowed_capabilities": sorted(_CAPABILITIES),
+        "allowed_recipe_ids": _known_recipe_ids(),
         "has_project": bool(
             getattr(getattr(shared_state, "project", None), "grc_path", "")
         ),
@@ -2373,16 +2702,25 @@ def complete_intent(
         from ..llm import parse_json_object
 
         parsed = parse_json_object(content)
+        if not isinstance(parsed.get("slots"), dict):
+            raise ValueError("Intent LLM response is missing the slots object")
+        if not isinstance(parsed.get("capabilities"), list):
+            raise ValueError("Intent LLM response is missing the capabilities list")
+        if str(parsed.get("task_type") or "") not in _TASK_TYPES:
+            raise ValueError("Intent LLM response has an invalid task_type")
     except Exception as exc:  # noqa: BLE001
-        logger.info("Intent LLM 补全失败，沿用规则分类: %s", exc)
-        emit("intent_llm_fallback", {
+        logger.warning("Intent LLM failed; refusing rule-only interpretation: %s", exc)
+        emit("intent_llm_failed", {
             "reason": "request_failed",
             "model": model,
             "request_hash": request_hash,
             "latency_ms": round((time.perf_counter() - started_at) * 1000, 3),
             "error_type": type(exc).__name__,
         })
-        return rules_intent
+        raise SemanticUnderstandingError(
+            "The language model did not complete semantic understanding. "
+            "Your request was not replaced by a rule-based guess."
+        ) from exc
     merged = _merge(rules_intent, parsed)
     project_intent_ir(merged)
     emit("intent_llm_succeeded", {
@@ -2397,37 +2735,39 @@ def complete_intent(
 
 
 def _merge(rules: WorkflowIntent, parsed: dict[str, Any]) -> WorkflowIntent:
-    task_type = str(parsed.get("task_type") or rules.task_type)
+    task_type = str(parsed.get("task_type") or "")
     if task_type not in _TASK_TYPES:
-        task_type = rules.task_type
+        task_type = "END_TO_END_SIM"
     forbidden = {
         name for name in list(parsed.get("forbidden_capabilities") or [])
         + list((rules.context or {}).get("forbidden_capabilities") or [])
         if name in _CAPABILITIES
     }
-    checkpoint_prepare = (
-        rules.slots.get("operation") == "prepare"
-        and rules.slots.get("deploy_permission") == "pending"
-    )
-    if checkpoint_prepare:
-        # Reaching a TX checkpoint requires read-only preflight/probe.  It is
-        # deferred runtime authority, not an instruction to skip the gates.
-        forbidden.discard("hardware_runtime")
     raw_caps = parsed.get("capabilities")
-    if isinstance(raw_caps, list) and raw_caps:
-        capabilities = [name for name in raw_caps if name in _CAPABILITIES]
-    else:
-        capabilities = list(rules.capabilities)
+    capabilities = [name for name in raw_caps if name in _CAPABILITIES]
     capabilities = [name for name in capabilities if name not in forbidden]
-    if checkpoint_prepare:
-        for name in ("hardware_configure", "hardware_runtime"):
-            if name in rules.capabilities and name not in capabilities:
-                capabilities.append(name)
-    slots = dict(rules.slots)
-    sources = dict(rules.slot_sources)
+    # Production never promotes regex/keyword candidates to user facts.  Only
+    # host-owned safety defaults and current-project facts survive before the
+    # LLM extraction is applied.
+    deterministic_sources = {
+        "safety_default", "safe_preview_default", "current_project",
+    }
+    slots = {
+        key: value for key, value in rules.slots.items()
+        if rules.slot_sources.get(key) in deterministic_sources
+    }
+    sources = {
+        key: value for key, value in rules.slot_sources.items()
+        if value in deterministic_sources
+    }
+    # Only deterministic safety bounds and current-project facts are locked.
+    # Values the regex layer labelled "user"/"derived"/"protocol_default" are
+    # still guesses about the user's text; the LLM extraction of that same
+    # text is the authoritative reading and must win on conflict.  This keeps
+    # the shared intent and the workflow intent in one transaction instead of
+    # two disagreeing projections.
     locked = {
-        "user", "safety_default", "protocol_default", "derived",
-        "safe_preview_default", "current_project",
+        "safety_default", "safe_preview_default", "current_project",
     }
     for key, value in dict(parsed.get("slots") or {}).items():
         if value in (None, "", []):
@@ -2436,14 +2776,34 @@ def _merge(rules: WorkflowIntent, parsed: dict[str, Any]) -> WorkflowIntent:
             continue
         slots[key] = value
         sources[key] = "llm"
+    requested_operations = _string_list(
+        parsed.get("requested_operations"), []
+    )
+    _apply_semantic_defaults(
+        slots,
+        sources,
+        capabilities,
+        context=dict(rules.context or {}),
+        requested_operations=requested_operations,
+    )
+    checkpoint_prepare = (
+        slots.get("operation") == "prepare"
+        and slots.get("deploy_permission") == "pending"
+    )
+    if checkpoint_prepare:
+        forbidden.discard("hardware_runtime")
+        for name in ("hardware_configure", "hardware_runtime"):
+            if name not in capabilities:
+                capabilities.append(name)
     try:
-        confidence = float(parsed.get("confidence", rules.confidence))
+        confidence = float(parsed.get("confidence", 0.0))
     except (TypeError, ValueError):
-        confidence = rules.confidence
-    confidence = min(1.0, max(rules.confidence, confidence, 0.0))
+        confidence = 0.0
+    confidence = min(1.0, max(confidence, 0.0))
     context = dict(rules.context)
     if forbidden:
         context["forbidden_capabilities"] = sorted(forbidden)
+    context["turn_semantics"] = _normalize_turn_semantics(parsed)
     return WorkflowIntent(
         raw_text=rules.raw_text,
         turn_relation=rules.turn_relation,
@@ -2455,36 +2815,135 @@ def _merge(rules: WorkflowIntent, parsed: dict[str, Any]) -> WorkflowIntent:
         slot_sources=sources,
         context=context,
         validation_errors=list(rules.validation_errors),
-        goals=_string_list(parsed.get("goals"), rules.goals),
-        requested_operations=_string_list(
-            parsed.get("requested_operations"), rules.requested_operations
-        ),
+        goals=_string_list(parsed.get("goals"), []),
+        requested_operations=requested_operations,
         desired_artifacts=_string_list(
-            parsed.get("desired_artifacts"), rules.desired_artifacts
+            parsed.get("desired_artifacts"), []
         ),
         evidence_requirements=_string_list(
-            parsed.get("evidence_requirements"), rules.evidence_requirements
+            parsed.get("evidence_requirements"), []
         ),
         constraints=(
-            dict(parsed.get("constraints") or rules.constraints)
-            if isinstance(parsed.get("constraints") or rules.constraints, dict)
-            else dict(rules.constraints)
+            dict(parsed.get("constraints") or {})
+            if isinstance(parsed.get("constraints"), dict)
+            else {}
         ),
         forbidden_effects=_string_list(
-            parsed.get("forbidden_effects"), rules.forbidden_effects
+            parsed.get("forbidden_effects"), []
         ),
         decision_boundaries=_string_list(
-            parsed.get("decision_boundaries"), rules.decision_boundaries
+            parsed.get("decision_boundaries"), []
         ),
         stop_conditions=_string_list(
-            parsed.get("stop_conditions"), rules.stop_conditions
+            parsed.get("stop_conditions"), []
         ),
+        # Entities are re-derived from the merged slots by project_intent_ir.
+        # Falling back to rules.entities here leaked stale regex guesses (for
+        # example local_name="of") next to the LLM's corrected parameter.
         entities=(
-            dict(parsed.get("entities") or rules.entities)
-            if isinstance(parsed.get("entities") or rules.entities, dict)
-            else dict(rules.entities)
+            dict(parsed.get("entities") or {})
+            if isinstance(parsed.get("entities"), dict)
+            else {}
         ),
     )
+
+
+def _known_recipe_ids() -> list[str]:
+    try:
+        from ..knowledge import recipes
+
+        return sorted(str(name) for name in recipes.RECIPES)
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _normalize_turn_semantics(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    raw = payload.get("turn_semantics")
+    data = dict(raw) if isinstance(raw, Mapping) else {}
+    decision = str(
+        data.get("confirmation_decision")
+        or payload.get("confirmation_decision")
+        or "none"
+    ).lower()
+    if decision not in {"approved", "rejected", "none"}:
+        decision = "none"
+    target = str(
+        data.get("recipe_switch_target")
+        or payload.get("recipe_switch_target")
+        or ""
+    ).strip()
+    if target not in _known_recipe_ids():
+        target = ""
+    read_only = data.get("read_only", payload.get("read_only"))
+    return {
+        "read_only": read_only is True,
+        "confirmation_decision": decision,
+        "recipe_switch_target": target,
+    }
+
+
+def _apply_semantic_defaults(
+    slots: Dict[str, Any],
+    sources: Dict[str, str],
+    capabilities: list[str],
+    *,
+    context: Dict[str, Any],
+    requested_operations: list[str],
+) -> None:
+    """Derive protocol/safety facts only after the LLM established semantics."""
+    operations = {str(item).lower() for item in requested_operations or []}
+    if "deploy" in capabilities or "deploy" in operations:
+        slots.setdefault("operation", "deploy")
+        sources.setdefault("operation", "derived")
+    operation = str(slots.get("operation") or "").lower()
+    current = dict(context.get("current_project") or {})
+    if operation in {"deploy", "prepare"}:
+        for key in (
+            "hardware", "direction", "carrier_frequency", "sample_rate",
+            "bandwidth", "tx_gain", "tx_attenuation",
+        ):
+            value = current.get(key)
+            if slots.get(key) in (None, "", []) and value not in (None, "", []):
+                slots[key] = value
+                sources[key] = "current_project"
+    protocol = str(slots.get("protocol") or "").lower()
+    if protocol == "ble":
+        defaults = {
+            "ble_mode": "advertising",
+            "modulation": "gfsk",
+            "advertising_channels": [37],
+            "carrier_frequency": 2_402_000_000.0,
+            "sample_rate": 2_000_000.0,
+        }
+        for key, value in defaults.items():
+            if slots.get(key) in (None, "", []):
+                slots[key] = value
+                sources[key] = "protocol_default"
+    hardware = str(slots.get("hardware") or "").lower()
+    if hardware and operation in {"deploy", "prepare"}:
+        for capability in ("hardware_configure", "hardware_runtime"):
+            if capability not in capabilities:
+                capabilities.append(capability)
+    if protocol and "protocol" not in capabilities:
+        capabilities.append("protocol")
+    if operation == "deploy" and "deploy" not in capabilities:
+        capabilities.append("deploy")
+    if operation == "prepare":
+        slots.setdefault("deploy_permission", "pending")
+        sources.setdefault("deploy_permission", "derived")
+    if operation == "deploy":
+        slots.setdefault("deploy_permission", "requested")
+        sources.setdefault("deploy_permission", "derived")
+        slots.setdefault("duration_seconds", 30.0)
+        slots.setdefault("max_duration_seconds", slots["duration_seconds"])
+        sources.setdefault("duration_seconds", "safety_default")
+        sources.setdefault("max_duration_seconds", "safety_default")
+    if slots.get("sample_rate") not in (None, "", []):
+        slots.setdefault("bandwidth", slots["sample_rate"])
+        sources.setdefault("bandwidth", "derived")
+    if hardware in {"pluto", "plutosdr", "adalm-pluto"}:
+        slots.setdefault("tx_attenuation", 30.0)
+        sources.setdefault("tx_attenuation", "safety_default")
 
 
 def _string_list(value: Any, fallback: list[str]) -> list[str]:

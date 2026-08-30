@@ -202,6 +202,8 @@ class Workflow:
     decisions: List[Dict[str, Any]] = field(default_factory=list)
     deferred_plan: List[Dict[str, Any]] = field(default_factory=list)
     compiled_plan: List[Dict[str, Any]] = field(default_factory=list)
+    #: Summaries of superseded workflows, kept visible as Previous Attempts.
+    previous_attempts: List[Dict[str, Any]] = field(default_factory=list)
 
     def validate(self) -> None:
         if not self.workflow_id or not self.task_type:
@@ -248,6 +250,7 @@ class Workflow:
             decisions=list(data.get("decisions") or []),
             deferred_plan=list(data.get("deferred_plan") or []),
             compiled_plan=list(data.get("compiled_plan") or []),
+            previous_attempts=list(data.get("previous_attempts") or []),
         )
         item.validate()
         return item

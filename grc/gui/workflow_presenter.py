@@ -11,6 +11,28 @@ from __future__ import annotations
 from typing import Any, Dict, Iterable, List
 
 
+_LAYER_LABELS = {
+    "sim": "Simulation",
+    "structure": "Flowgraph check",
+    "hardware": "Hardware",
+    "protocol": "Protocol",
+    "waveform": "Waveform",
+    "radio": "Radio design",
+    "link": "Link",
+    "measurement": "Measurement",
+    "ota": "Over-the-air",
+    "": "General",
+}
+
+
+def layer_label(layer: Any) -> str:
+    """Map internal claim layer ids to user-facing category names."""
+    raw = str(layer or "").strip().lower()
+    if raw in _LAYER_LABELS:
+        return _LAYER_LABELS[raw]
+    return raw.replace("_", " ").title() or "General"
+
+
 _SOURCE_LABELS = {
     "user": "User",
     "user_choice": "User",
@@ -100,9 +122,13 @@ def specification_view(
             "allow_custom": bool(item.get("allow_custom", True)),
             "raw_value": item.get("value"),
             "requirement": str(item.get("requirement") or "mentioned"),
+            "group": (
+                "Required"
+                if str(item.get("requirement") or "") == "required"
+                else "Added"
+            ),
             "locked": bool(item.get("locked", True)),
             "confirmed": bool(item.get("confirmed")),
-            "reason": str(item.get("reason") or ""),
         })
     if not rows:
         summary = str(spec.get("summary") or "Not extracted")
@@ -118,6 +144,18 @@ def specification_view(
         (workflow.get("shared_intent") or {}).get("status")
         or spec.get("intent_status") or ""
     )
+    blocking_questions = [
+        str(item.get("prompt") or item.get("field") or "").strip()
+        for item in spec.get("blocking_questions") or []
+        if isinstance(item, dict)
+        and str(item.get("prompt") or item.get("field") or "").strip()
+    ]
+    if len(blocking_questions) == 1:
+        open_question = "Open question: " + blocking_questions[0]
+    elif blocking_questions:
+        open_question = "Open questions: " + " · ".join(blocking_questions)
+    else:
+        open_question = ""
     return {
         "title": "Radio Specification",
         "rows": rows,
@@ -127,6 +165,7 @@ def specification_view(
         "revision": int(spec.get("intent_revision") or 0),
         "profiles": list(spec.get("specification_profiles") or []),
         "blocking_questions": list(spec.get("blocking_questions") or []),
+        "open_question": open_question,
         "optional_prompts": list(spec.get("optional_prompts") or []),
     }
 
@@ -186,6 +225,9 @@ def workflow_view(
             status = "failed"
         elif outcome == "passed":
             status = "passed"
+        elif outcome == "inconclusive" or execution == "deferred":
+            # Parked on an external precondition / not yet scheduled.
+            status = "waiting" if outcome == "inconclusive" else "deferred"
         stage_id = str(item.get("id") or "")
         stage_claims = [
             claim for claim in unmatched_claims
@@ -202,12 +244,24 @@ def workflow_view(
             "claims": stage_claims,
         })
     transition = _latest_transition(workflow, stages)
+    previous_workflows = []
+    for item in workflow.get("previous_attempts") or []:
+        if not isinstance(item, dict):
+            continue
+        previous_workflows.append({
+            "task_label": str(item.get("task_label") or item.get("task_type") or ""),
+            "outcome": str(item.get("outcome") or ""),
+            "status": str(item.get("execution_status") or ""),
+            "stage_label": str(item.get("stage_label") or ""),
+            "stage_count": len(item.get("stages") or []),
+        })
     return {
         "visible": bool(stages),
         "title": str(
             workflow.get("task_label") or workflow.get("task_type") or "Workflow"
         ),
         "stages": stages,
+        "previous_workflows": previous_workflows,
         "success_conditions": list(spec.get("success_conditions") or []),
         "transition": transition,
         "task_claims": unmatched_claims,
@@ -277,6 +331,7 @@ def claims_view(
         rows.append({
             "statement": str(claim.get("statement") or ""),
             "layer": str(claim.get("layer") or ""),
+            "layer_label": layer_label(claim.get("layer")),
             "status": _STATUS_LABELS.get(status.lower(), status),
             "version": int(claim.get("project_version") or project_version),
             "evidence_grade": str(latest.get("evidence_grade") or ""),

@@ -101,8 +101,9 @@ class PlanCompilerContractTest(unittest.TestCase):
                 "completion": ["metrics_recorded"],
             })
         ]
-        compiled, nodes, rejected = compile_stages(object(), stages)
+        compiled, nodes, rejected, unbound = compile_stages(object(), stages)
         self.assertFalse(rejected)
+        self.assertEqual(unbound, [])
         self.assertEqual(stages[0].objective, "inspect_and_measure")
         self.assertEqual(nodes[0].produces, ["metrics_recorded"])
 
@@ -143,11 +144,11 @@ class PlanCompilerContractTest(unittest.TestCase):
         self.assertTrue(is_rf_grant_effect("RF_RUN"))
         self.assertEqual(
             stage_display_label("rf_plan_confirmation", "RF 计划确认", "DEVICE_READ"),
-            "配置确认",
+            "Configuration Confirmation",
         )
         self.assertEqual(
             stage_display_label("rf_plan_confirmation", "RF 计划确认", "RF_RUN"),
-            "RF 计划确认",
+            "RF Plan Confirmation",
         )
 
     def test_prepare_does_not_get_safety_duration(self):

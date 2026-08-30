@@ -9,7 +9,65 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 from gi.repository import Gdk, GObject, Gtk, Pango
 
-from .workflow_presenter import present
+from .chat_markup import escape_pango
+from .workflow_presenter import layer_label, present
+
+_escape = escape_pango
+
+
+#: Stage visual styles: completed stages fade to a small muted line, the
+#: current stage is emphasized with a bigger bold label on tinted background,
+#: upcoming stages stay quiet gray.  ``scale`` is a font-point delta.
+_STAGE_STYLES = {
+    "passed": {
+        "marker": "✓", "marker_color": "#2E9E5B", "text": "#5E6C7E",
+        "background": None, "scale": -2, "bold": False,
+    },
+    "failed": {
+        "marker": "✕", "marker_color": "#C43E3E", "text": "#8A2A2A",
+        "background": "#FDECEC", "scale": 0, "bold": True,
+    },
+    "running": {
+        "marker": "▶", "marker_color": "#1B62D6", "text": "#1F2933",
+        "background": "#E8F0FE", "scale": 1, "bold": True,
+    },
+    "waiting": {
+        "marker": "▶", "marker_color": "#C45B08", "text": "#3D3419",
+        "background": "#FFF4E5", "scale": 1, "bold": True,
+    },
+    "pending": {
+        "marker": "○", "marker_color": "#98A2B3", "text": "#98A2B3",
+        "background": None, "scale": -1, "bold": False,
+    },
+}
+_STAGE_STYLES["error"] = _STAGE_STYLES["failed"]
+_STAGE_STYLES["errored"] = _STAGE_STYLES["failed"]
+_STAGE_STYLES["invalidated"] = _STAGE_STYLES["pending"]
+# Deferred (planned but not yet scheduled) stages stay visible as quiet
+# upcoming steps instead of disappearing from the monitor.
+_STAGE_STYLES["deferred"] = dict(_STAGE_STYLES["pending"])
+
+#: Current-stage status word shown beside the label.
+_STAGE_STATUS_WORDS = {
+    "running": "Running…",
+    "waiting": "Waiting for you",
+    "failed": "Failed",
+    "error": "Failed",
+    "errored": "Failed",
+    "invalidated": "Outdated",
+}
+
+#: Claim status colors for the compact evidence lines under a stage.
+_CLAIM_STATUS_STYLES = {
+    "Passed": ("✓", "#2E9E5B"),
+    "Failed": ("✕", "#C43E3E"),
+    "Inconclusive": ("?", "#C45B08"),
+    "Stale": ("○", "#98A2B3"),
+    "Not tested": ("○", "#98A2B3"),
+    "Unknown": ("?", "#98A2B3"),
+    "Running": ("▶", "#1B62D6"),
+    "Pending": ("○", "#98A2B3"),
+}
 
 
 class ClaimsPanel(Gtk.Frame):
@@ -54,7 +112,7 @@ class ClaimsPanel(Gtk.Frame):
         self._view.set_search_column(0)
         self._view.set_grid_lines(Gtk.TreeViewGridLines.BOTH)
         self._view.set_tooltip_column(0)
-        for index, title in enumerate(("Claim", "Layer", "Status", "Version")):
+        for index, title in enumerate(("Claim", "Category", "Status", "Version")):
             renderer = Gtk.CellRendererText()
             renderer.set_property("editable", False)
             renderer.set_property("ellipsize", Pango.EllipsizeMode.END)
@@ -166,6 +224,9 @@ class ClaimsPanel(Gtk.Frame):
         self._retry_btn.connect("clicked", self._on_retry_transmit)
         self._retry_btn.set_no_show_all(True)
         pending_row.pack_start(self._retry_btn, False, False, 2)
+        # Buttons only exist when there is something to decide; never let a
+        # window-wide show_all() reveal an empty confirm/cancel pair.
+        pending_row.set_no_show_all(True)
         self._pending_row = pending_row
         box.pack_start(pending_row, False, False, 0)
         self._set_pending({})
@@ -183,6 +244,11 @@ class ClaimsPanel(Gtk.Frame):
     def set_font_pt(self, pt):
         self._font_pt = max(10, int(pt))
         self._apply_font()
+
+    def _font_desc(self, delta=0):
+        desc = Pango.FontDescription()
+        desc.set_size(max(9, self._font_pt + delta) * Pango.SCALE)
+        return desc
 
     def _apply_font(self):
         desc = Pango.FontDescription()
@@ -218,7 +284,7 @@ class ClaimsPanel(Gtk.Frame):
             self._store.append(
                 [
                     str(claim.get("statement", "")),
-                    str(claim.get("layer", "")),
+                    layer_label(claim.get("layer", "")),
                     str(claim.get("status", "NotTested")),
                     int(claim.get("project_version", 0)),
                 ]
@@ -322,80 +388,135 @@ class ClaimsPanel(Gtk.Frame):
             self._workflow_steps.remove(child)
         if not workflow.get("visible"):
             self._workflow_monitor.set_label("No Active Workflow")
-            label = _monitor_label(
-                "Stages will appear here in real time after the intent is confirmed and the workflow is created."
-            )
-            self._workflow_steps.pack_start(label, False, False, 0)
-            label.show()
+            # Nothing to expand; stay collapsed instead of reserving space.
+            self._workflow_monitor.set_expanded(False)
             return
+        self._workflow_monitor.set_expanded(True)
         stages = list(workflow.get("stages") or [])
-        current = next((item for item in stages if item.get("current")), {})
         status = str(
             workflow.get("outcome") or workflow.get("execution_status") or "pending"
         )
         self._workflow_monitor.set_label(
-            "{} · {} {}/{} · {}".format(
+            "{} · Step {}/{} · {}".format(
                 workflow.get("title") or "Workflow",
-                current.get("label") or "—",
                 workflow.get("stage_index") or 0,
                 workflow.get("stage_total") or len(stages),
-                status,
+                status.title(),
             )
         )
-        colors = {
-            "passed": "#EAF7ED", "failed": "#FDECEC",
-            "running": "#FFF4E5", "waiting": "#FFF4E5",
-            "pending": "#F2F4F7", "invalidated": "#F2F4F7",
-        }
-        for index, stage in enumerate(stages):
-            stage_status = str(stage.get("status") or "pending")
-            marker = (
-                "✓" if stage_status == "passed"
-                else "✕" if stage_status in {"failed", "error", "errored"}
-                else "▶" if stage.get("current")
-                else "○"
+        for stage in stages:
+            self._workflow_steps.pack_start(
+                self._build_stage_row(stage), False, False, 0
             )
-            event = Gtk.EventBox()
-            color = Gdk.RGBA()
-            color.parse(colors.get(stage_status, "#F2F4F7"))
-            event.override_background_color(Gtk.StateFlags.NORMAL, color)
-            box = Gtk.VBox(spacing=2)
-            box.set_margin_top(5)
-            box.set_margin_bottom(5)
-            box.set_margin_start(7)
-            box.set_margin_end(7)
-            box.pack_start(_monitor_label(
-                "{} {}    {}".format(
-                    marker,
-                    stage.get("label") or stage.get("id") or "Stage",
-                    stage_status.title(),
-                )
-            ), False, False, 0)
-            for claim in stage.get("claims") or []:
-                box.pack_start(_monitor_label(
-                    "   Claim · {} — {}".format(
-                        claim.get("statement") or "Evidence",
-                        claim.get("status") or "Not tested",
-                    )
-                ), False, False, 0)
-            event.add(box)
-            self._workflow_steps.pack_start(event, False, False, 0)
-            if index < len(stages) - 1:
-                connector = _monitor_label("│\n↓")
-                connector.set_margin_start(12)
-                self._workflow_steps.pack_start(connector, False, False, 0)
         transition = dict(workflow.get("transition") or {})
         if transition:
             marker = "↩" if transition.get("kind") == "back" else "→"
-            self._workflow_steps.pack_start(_monitor_label(
-                "{} Latest transition: {} → {} ({})".format(
-                    marker,
-                    transition.get("from") or "—",
-                    transition.get("to") or "—",
-                    transition.get("reason") or "State transition",
-                )
-            ), False, False, 0)
+            text = "{} {} → {} ({})".format(
+                marker,
+                transition.get("from") or "—",
+                transition.get("to") or "—",
+                transition.get("reason") or "state transition",
+            )
+            label = _stage_label()
+            label.set_markup("<span foreground='#98A2B3'>{}</span>".format(
+                _escape(text)))
+            label.set_margin_top(3)
+            label.override_font(self._font_desc(-2))
+            self._workflow_steps.pack_start(label, False, False, 0)
+        for attempt in workflow.get("previous_workflows") or []:
+            self._workflow_steps.pack_start(
+                self._build_previous_attempt_line(attempt), False, False, 0
+            )
         self._workflow_steps.show_all()
+
+    def _build_previous_attempt_line(self, attempt):
+        """Dim summary of a superseded workflow (Previous Attempt)."""
+        status = str(attempt.get("outcome") or attempt.get("status") or "")
+        text = "↩ Previous attempt: {}{} · {} stages{}".format(
+            attempt.get("task_label") or "Workflow",
+            (
+                " (stopped at {})".format(attempt.get("stage_label"))
+                if attempt.get("stage_label") else ""
+            ),
+            attempt.get("stage_count") or 0,
+            " · {}".format(status) if status else "",
+        )
+        label = _stage_label()
+        label.set_markup("<span foreground='#B0B7C3'>{}</span>".format(
+            _escape(text)))
+        label.set_margin_top(6)
+        label.override_font(self._font_desc(-2))
+        return label
+
+    def _build_stage_row(self, stage):
+        """One stepper line: marker + label, styled by state, claims nested."""
+        stage_status = str(stage.get("status") or "pending")
+        is_current = bool(stage.get("current"))
+        if is_current:
+            style = _STAGE_STYLES.get(
+                stage_status if stage_status in ("running", "waiting", "failed")
+                else "running"
+            )
+        else:
+            style = _STAGE_STYLES.get(stage_status, _STAGE_STYLES["pending"])
+        box = Gtk.VBox(spacing=1)
+        box.set_margin_top(3)
+        box.set_margin_bottom(3)
+        box.set_margin_start(6 if style["background"] else 7)
+        box.set_margin_end(7)
+
+        header = _stage_label()
+        status_word = _STAGE_STATUS_WORDS.get(stage_status, "") if is_current else (
+            "Failed" if style is _STAGE_STYLES["failed"]
+            else "Planned" if stage_status == "deferred"
+            else ""
+        )
+        header_text = "{} {}".format(
+            style["marker"], stage.get("label") or stage.get("id") or "Stage"
+        )
+        if status_word:
+            header_text += "  ·  {}".format(status_word)
+        header.set_markup(
+            "<span foreground='{}'{}>{}</span>".format(
+                style["text"],
+                " weight='bold'" if style["bold"] else "",
+                _escape(header_text),
+            )
+        )
+        header.override_font(self._font_desc(style["scale"]))
+        box.pack_start(header, False, False, 0)
+        for claim in stage.get("claims") or []:
+            box.pack_start(
+                self._build_stage_claim_line(claim), False, False, 0
+            )
+
+        if style["background"]:
+            event = Gtk.EventBox()
+            color = Gdk.RGBA()
+            color.parse(style["background"])
+            event.override_background_color(Gtk.StateFlags.NORMAL, color)
+            event.add(box)
+            return event
+        return box
+
+    def _build_stage_claim_line(self, claim):
+        status = str(claim.get("status") or "Not tested")
+        marker, color = _CLAIM_STATUS_STYLES.get(status, ("○", "#98A2B3"))
+        layer = str(claim.get("layer_label") or layer_label(claim.get("layer")))
+        label = _stage_label(wrap=True)
+        label.set_markup(
+            "<span foreground='{color}'>{marker}</span>"
+            "<span foreground='#6B7A8C'> {layer} · {statement} · {status}</span>".format(
+                color=color,
+                marker=_escape(marker),
+                layer=_escape(layer),
+                statement=_escape(str(claim.get("statement") or "Evidence")),
+                status=_escape(status),
+            )
+        )
+        label.set_margin_start(18)
+        label.override_font(self._font_desc(-2))
+        return label
 
     def _set_activity(self, activity, workflow=None):
         workflow = workflow or {}
@@ -764,9 +885,14 @@ class ClaimsPanel(Gtk.Frame):
     @staticmethod
     def _default_details(spec):
         lines = []
-        questions = spec.get("open_questions") or []
+        questions = [
+            str(item).strip()
+            for item in spec.get("open_questions") or []
+            if str(item).strip()
+        ]
         if questions:
-            lines.append("Open Questions:\n" + "\n".join(questions))
+            label = "Open question" if len(questions) == 1 else "Open questions"
+            lines.append(label + ": " + " · ".join(questions))
         conditions = spec.get("success_conditions") or []
         if conditions:
             lines.append("Success Conditions:\n" + "\n".join(map(str, conditions)))
@@ -784,9 +910,9 @@ class ClaimsPanel(Gtk.Frame):
             return
         claim = self._claims[index]
         evidence = claim.get("evidence") or []
-        text = "{}\nLayer: {}\nStatus: {}\nVersion: {}\n{}".format(
+        text = "{}\nCategory: {}\nStatus: {}\nVersion: {}\n{}".format(
             claim.get("statement", ""),
-            claim.get("layer", ""),
+            layer_label(claim.get("layer", "")),
             claim.get("status", ""),
             claim.get("project_version", 0),
             json.dumps(evidence, ensure_ascii=False, indent=2),
@@ -871,12 +997,30 @@ def _fmt_metric(value):
     return "{:.3f}".format(number)
 
 
-def _monitor_label(text):
+def _stage_label(wrap=False):
+    """Stage-row label that never collapses to char-per-line wrapping.
+
+    ``_monitor_label``-style ``set_max_width_chars(1)`` caps the label's own
+    allocation at one character, which makes wrapped text render vertically.
+    Here headers stay single-line and ellipsize; claim lines wrap on word
+    boundaries only when the panel is genuinely narrower than the text.
+    """
+    label = Gtk.Label()
+    label.set_halign(Gtk.Align.START)
+    label.set_xalign(0.0)
+    if wrap:
+        label.set_line_wrap(True)
+        label.set_line_wrap_mode(Pango.WrapMode.WORD)
+    else:
+        label.set_ellipsize(Pango.EllipsizeMode.END)
+    label.set_hexpand(True)
+    return label
+
+
+def _monitor_label(text):  # retained for compatibility; unused
     label = Gtk.Label(label=str(text or ""))
     label.set_halign(Gtk.Align.START)
     label.set_xalign(0.0)
-    label.set_line_wrap(True)
-    label.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
-    label.set_max_width_chars(1)
+    label.set_ellipsize(Pango.EllipsizeMode.END)
     label.set_hexpand(True)
     return label

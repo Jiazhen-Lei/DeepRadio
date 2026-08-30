@@ -149,16 +149,115 @@ def ensure_rf_bounds(intent: Any) -> None:
     slots.setdefault("max_duration_seconds", slots.get("duration_seconds") or 30.0)
 
 
+class PlanCoverageError(ValueError):
+    """Raised when a required planner action cannot be compiled at all."""
+
+
+def _stage_tool_index() -> dict[str, set[str]]:
+    """Map stage ids to their host tool allowlists."""
+    try:
+        from ..service.orchestrator import _STAGE_TOOLS
+
+        return {
+            str(stage_id): set(tools or ())
+            for stage_id, tools in dict(_STAGE_TOOLS).items()
+        }
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def ensure_plan_coverage(
+    stages: list[Stage],
+    accepted: list[PlanNode],
+    *,
+    catalog: Mapping[str, Any] | None = None,
+) -> tuple[list[Stage], list[str], list[str]]:
+    """Bind planner actions the composed stages do not already cover.
+
+    Returns ``(stages, bound_action_ids, unbound_action_ids)``.  Planner
+    actions matching a catalog stage (directly or through the stage's tool
+    allowlist) are inserted before the first checkpoint so they execute
+    before the next decision boundary.  Actions that cannot be bound to any
+    stage are returned as ``unbound`` — the caller decides whether to block.
+    """
+    if not accepted:
+        return stages, [], []
+    tool_index = _stage_tool_index()
+    covered_stage_ids = {stage.id for stage in stages}
+    covered_tools: set[str] = set()
+    for stage in stages:
+        covered_tools |= tool_index.get(stage.id, set())
+        covered_tools |= set(stage.recommended_agents or [])
+    catalog_index = catalog_stage_index(catalog)
+    bound: list[str] = []
+    unbound: list[str] = []
+    additions: list[Stage] = []
+    for node in accepted:
+        action_id = node.stage_id or node.id
+        if not action_id:
+            continue
+        if action_id in covered_stage_ids or action_id in covered_tools:
+            continue
+        # A planner action may name a tool; find the catalog stage that owns it.
+        owner_ids = [
+            stage_id for stage_id, tools in tool_index.items()
+            if action_id in tools
+        ]
+        fragment_id = action_id if action_id in catalog_index else (
+            owner_ids[0] if owner_ids else ""
+        )
+        fragment = catalog_index.get(fragment_id)
+        if fragment is None:
+            unbound.append(action_id)
+            continue
+        stage = Stage.from_dict(dict(fragment))
+        if stage.id in covered_stage_ids:
+            covered_stage_ids.add(stage.id)
+            covered_tools |= tool_index.get(stage.id, set())
+            continue
+        stage.objective = node.objective or stage.objective
+        if node.success_predicates:
+            bound_predicates = [
+                name for name in node.success_predicates
+                if name in KNOWN_COMPLETIONS
+            ]
+            if bound_predicates:
+                stage.success_predicates = list(dict.fromkeys(
+                    list(stage.success_predicates or stage.completion)
+                    + bound_predicates
+                ))
+        additions.append(stage)
+        covered_stage_ids.add(stage.id)
+        covered_tools |= tool_index.get(stage.id, set())
+        covered_tools |= set(stage.recommended_agents or [])
+        bound.append(action_id)
+    if additions:
+        insert_at = next(
+            (
+                index for index, stage in enumerate(stages)
+                if "checkpoint" in str(getattr(stage, "interaction", "") or "")
+            ),
+            len(stages),
+        )
+        stages = stages[:insert_at] + additions + stages[insert_at:]
+    return stages, bound, unbound
+
+
 def compile_stages(
     intent: Any,
     stages: list[Stage],
     *,
     catalog: Mapping[str, Any] | None = None,
     proposal: Iterable[Any] | None = None,
-) -> tuple[list[Stage], list[PlanNode], list[str]]:
-    """Attach PlanNodes, apply generic RF bounds, optionally merge an LLM tail."""
+) -> tuple[list[Stage], list[PlanNode], list[str], list[str]]:
+    """Attach PlanNodes, apply RF bounds, and enforce plan coverage.
+
+    Returns ``(stages, nodes, rejected, unbound)``.  ``unbound`` lists
+    validated planner actions that no composed or catalog stage can serve.
+    """
     ensure_rf_bounds(intent)
     rejected: list[str] = []
+    unbound: list[str] = []
     if proposal:
         accepted, rejected = validate_proposal(proposal, catalog=catalog)
         by_id = {stage.id: stage for stage in stages}
@@ -176,7 +275,7 @@ def compile_stages(
                     name for name in node.success_predicates
                     if name in KNOWN_COMPLETIONS
                 ]
-                unbound = [
+                unbound_predicates = [
                     name for name in node.success_predicates
                     if name not in KNOWN_COMPLETIONS
                 ]
@@ -185,12 +284,15 @@ def compile_stages(
                         list(stage.success_predicates or stage.completion) + bound
                     ))
                 stage.unbound_predicates = list(dict.fromkeys(
-                    list(stage.unbound_predicates) + unbound
+                    list(stage.unbound_predicates) + unbound_predicates
                 ))
+        stages, _bound, unbound = ensure_plan_coverage(
+            stages, accepted, catalog=catalog
+        )
     for stage in stages:
         _apply_tool_effect_floor(stage)
     nodes = attach_plan_metadata(stages)
-    return stages, nodes, rejected
+    return stages, nodes, rejected, unbound
 
 
 def _apply_tool_effect_floor(stage: Stage) -> None:

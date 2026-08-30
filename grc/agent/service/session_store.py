@@ -37,6 +37,11 @@ _EVENT_LOCKS: Dict[str, threading.Lock] = {}
 _EVENT_LOCKS_GUARD = threading.Lock()
 
 
+def _posix_relpath(target: str, start: str) -> str:
+    """Return a relocatable relative path with stable POSIX separators."""
+    return os.path.relpath(target, start).replace(os.sep, "/")
+
+
 def _event_lock(path: str) -> threading.Lock:
     with _EVENT_LOCKS_GUARD:
         return _EVENT_LOCKS.setdefault(path, threading.Lock())
@@ -190,7 +195,7 @@ def _source_tree_hash(root: str) -> str:
                 if not name.endswith((".py", ".yaml", ".yml", ".json")):
                     continue
                 path = os.path.join(current_root, name)
-                relative = os.path.relpath(path, root).replace(os.sep, "/")
+                relative = _posix_relpath(path, root)
                 digest.update(relative.encode("utf-8"))
                 try:
                     with open(path, "rb") as handle:
@@ -623,7 +628,7 @@ def attach_evidence(
         size = len(payload)
     except OSError:
         size = os.path.getsize(destination)
-    relative = os.path.relpath(destination, session_root(session_id))
+    relative = _posix_relpath(destination, session_root(session_id))
     meta = {
         "run_id": run_id,
         "source_name": os.path.basename(source),
@@ -677,7 +682,7 @@ def write_artifact_manifest(
         except OSError:
             continue
         try:
-            rel = os.path.relpath(path, root)
+            rel = _posix_relpath(path, root)
         except ValueError:
             rel = os.path.basename(path)
         role = roles.get(os.path.abspath(path)) or _infer_artifact_role(rel)
@@ -715,10 +720,17 @@ def rewrite_exported_grc_paths(session_id: str, destination_dir: str) -> None:
         try:
             with open(path, "r", encoding="utf-8") as handle:
                 text = handle.read()
-            rewritten = text.replace(f"{source_final}{os.sep}", "")
-            rewritten = rewritten.replace(
-                f"{os.path.abspath(destination_dir)}{os.sep}", ""
-            )
+            rewritten = text
+            for prefix in (source_final, os.path.abspath(destination_dir)):
+                variants = {
+                    prefix.rstrip("/\\"),
+                    prefix.replace("\\", "/").rstrip("/"),
+                    prefix.replace("/", "\\").rstrip("\\"),
+                }
+                for variant in variants:
+                    rewritten = rewritten.replace(variant + "/", "")
+                    rewritten = rewritten.replace(variant + "\\", "")
+            rewritten = rewritten.replace("\\", "/")
             if rewritten != text:
                 tmp = f"{path}.tmp"
                 with open(tmp, "w", encoding="utf-8") as handle:
@@ -741,7 +753,7 @@ def write_export_manifest(
     destination = os.path.abspath(destination_dir)
     explicit_roles = {
         os.path.abspath(path): _infer_artifact_role(
-            os.path.relpath(os.path.abspath(path), destination)
+            _posix_relpath(os.path.abspath(path), destination)
         )
         for path in (exported_paths or [])
         if isinstance(path, str) and os.path.isfile(path)
@@ -760,7 +772,7 @@ def write_export_manifest(
         abs_path = os.path.abspath(path)
         if os.path.commonpath([destination, abs_path]) != destination:
             continue
-        rel = os.path.relpath(abs_path, destination)
+        rel = _posix_relpath(abs_path, destination)
         if rel in seen_rel:
             continue
         try:
@@ -842,7 +854,9 @@ def export_session_artifacts(
         if copied:
             exported.append(copied)
             try:
-                source_path = os.path.relpath(absolute, session_root(session_id))
+                source_path = _posix_relpath(
+                    absolute, session_root(session_id)
+                )
                 if source_path.startswith(".."):
                     source_path = absolute
             except ValueError:

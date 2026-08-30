@@ -1148,10 +1148,7 @@ class AgentPanel(Gtk.VBox):
         }
         current_group = ""
         for row in rows:
-            group = (
-                "Required" if row.get("requirement") == "required"
-                else "Mentioned / Added / Derived"
-            )
+            group = str(row.get("group") or "Added") + ":"
             if group != current_group:
                 group_label = _FlowLabel(label=group)
                 group_label.set_markup("<b>{}</b>".format(escape_pango(group)))
@@ -1175,13 +1172,12 @@ class AgentPanel(Gtk.VBox):
             name.set_markup("<b>{}</b>".format(escape_pango(name.get_text())))
             header.pack_start(name, True, True, 0)
             source = str(row.get("source") or "System")
-            suffix = " · Needs Confirmation" if row.get("needs_confirmation") else ""
             badge = Gtk.Label()
             badge.set_halign(Gtk.Align.END)
             badge.set_markup(
-                "<span foreground='{}'>[{}{}]</span>".format(
+                "<span foreground='{}'>[{}]</span>".format(
                     source_colors.get(source, "#52606D"),
-                    escape_pango(source), escape_pango(suffix),
+                    escape_pango(source),
                 )
             )
             header.pack_end(badge, False, False, 0)
@@ -1189,27 +1185,14 @@ class AgentPanel(Gtk.VBox):
             value = _FlowLabel(label=str(row.get("value") or "?"))
             value.set_selectable(True)
             row_box.pack_start(value, False, False, 0)
-            if row.get("reason"):
-                reason = _FlowLabel(label=str(row.get("reason")))
-                reason.override_font(self._font_desc(-3))
-                row_box.pack_start(reason, False, False, 0)
             item.add(row_box)
             content.pack_start(item, False, False, 0)
         questions = list(specification.get("blocking_questions") or [])
-        if questions:
-            question_lines = ["Open Questions"] + [
-                "• " + str(item.get("prompt") or item.get("field") or "")
-                for item in questions
-            ]
-            question_label = _FlowLabel(label="\n".join(question_lines))
+        open_question = str(specification.get("open_question") or "")
+        if open_question:
+            question_label = _FlowLabel(label=open_question)
             question_label.set_margin_top(4)
             content.pack_start(question_label, False, False, 0)
-        guidance = _FlowLabel(label=(
-            "Add or revise parameters directly in the conversation. "
-            "When all required information is complete, reply 'confirm'. "
-            "You can also ask about optional fields or request an explanation of any parameter."
-        ))
-        content.pack_start(guidance, False, False, 0)
         expander.add(content)
         expander.set_expanded(bool(questions) or status != "confirmed")
         body.pack_start(expander, False, False, 0)

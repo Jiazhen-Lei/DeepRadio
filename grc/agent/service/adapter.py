@@ -12,9 +12,10 @@ import logging
 import os
 import time
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from ..schema import AgentReply, ToolInvocation
+from ..llm import SemanticUnderstandingError
 from ..memory.profile import UserProfile
 from ..state import (
     Claim,
@@ -27,6 +28,10 @@ from ..state import (
 from ..tools.registry import ToolContext
 from ..tools.hardware_profiles import device_args_for, normalize_hardware
 from ..workflow import WorkflowEngine
+from ..workflow.completion import (
+    EXTERNAL_PRECONDITION_COMPLETIONS,
+    external_waiting_note,
+)
 from ..workflow.intent_alignment import IntentAlignmentCoordinator
 from ..workflow.planning import is_rf_grant_effect, stage_display_label
 from ..workflow.revision import analyze_intent_patch
@@ -132,6 +137,82 @@ _DETERMINISTIC_PROGRESS = {
     "stop_flowgraph": "✓ Bounded TX stopped",
 }
 
+#: User-facing explanations for completion predicates.  Internal predicate
+#: names and failure codes must never reach the user reply directly; they stay
+#: in events.jsonl for audit.
+_COMPLETION_EXPLANATIONS = {
+    "flowgraph_saved": "the flowgraph file was not saved",
+    "structural_validation_completed": "the flowgraph did not pass structural validation",
+    "hardware_endpoint_present": "the flowgraph has no active SDR hardware output yet",
+    "radio_parameters_match": (
+        "the hardware parameters do not match the requested "
+        "frequency or sample rate"
+    ),
+    "realtime_sink_present": "no live spectrum display is present",
+    "device_discovered": "no SDR device was discovered",
+    "device_probed": "the SDR device could not be probed",
+    "device_identity_matched": "the connected device does not match the requested SDR model",
+    "flowgraph_armed": "the hardware output has not been armed yet",
+    "ble_packet_created": "the BLE packet was not created",
+    "ble_waveform_generated": "the BLE waveform was not generated",
+    "ble_packet_valid": "the BLE packet did not pass offline verification",
+    "transmit_started": "the transmission did not start",
+    "transmit_stopped": "the transmission did not stop cleanly",
+    "runtime_started": "the runtime did not start",
+    "over_air_observed": "the target signal has not been observed over the air yet",
+    "measurement_completed": "the measurement was not completed",
+    "receive_quality_evaluated": "the receive quality was not evaluated",
+    "diagnosis_created": "no diagnosis was produced",
+    "repair_applied": "the repair was not applied",
+    "change_plan_created": "no change plan was produced",
+    "configuration_recorded": "the device configuration has not been recorded",
+    "hardware_check_completed": "the hardware check did not complete",
+    "hardware_precheck_completed": "the hardware pre-check did not complete",
+}
+
+_FAILURE_CODE_EXPLANATIONS = {
+    "REPLY_STATUS_REJECTED": "the stage could not produce a valid result",
+    "PROTOCOL_INVALID_JSON": "the stage reported a malformed result",
+}
+
+
+def _friendly_stage_failure(
+    missing_completion: List[str],
+    failure_codes: List[str],
+) -> str:
+    """Render a failed stage as phenomenon + cause + next step.
+
+    Internal predicate names and codes (``MISSING_COMPLETION:*``,
+    ``REPLY_STATUS_REJECTED`` …) are translated to plain language; the raw
+    codes remain in the session event stream for audit.
+    """
+    reasons: List[str] = []
+    for name in missing_completion:
+        reasons.append(
+            _COMPLETION_EXPLANATIONS.get(name, str(name).replace("_", " "))
+        )
+    for code in failure_codes:
+        if code.startswith("MISSING_COMPLETION:"):
+            inner = code.split(":", 1)[1]
+            reasons.append(
+                _COMPLETION_EXPLANATIONS.get(
+                    inner, inner.replace("_", " ")
+                )
+            )
+            continue
+        reasons.append(
+            _FAILURE_CODE_EXPLANATIONS.get(
+                code, str(code).replace("_", " ").lower()
+            )
+        )
+    reasons = list(dict.fromkeys(item for item in reasons if item))
+    body = "; ".join(reasons) if reasons else "the stage could not complete"
+    return (
+        "This stage did not finish: {}. The current project is unchanged. "
+        "You can retry, adjust the parameters, or ask me to diagnose the "
+        "problem.".format(body)
+    )
+
 
 def _read_log_tail(path: str, limit: int = 20) -> str:
     if not path or not os.path.isfile(path):
@@ -198,6 +279,10 @@ class ServiceAgent:
             if claim.id != "rf_plan_awaiting_decision"
         ]
         self._tool_ctx: Optional[ToolContext] = None
+        # Tool events captured by a retry pre-check (device discovery/probe).
+        # They are re-injected into the next stage context so completion
+        # evaluation sees the CURRENT device state after a hardware retry.
+        self._retry_preflight_events: List[Dict[str, Any]] = []
         event_sink = self._sink_engine_event
         try:
             self._workflow = WorkflowEngine(
@@ -261,6 +346,11 @@ class ServiceAgent:
         ctx.extra["snapshots_dir"] = _store.snapshots_dir(self.session_id)
         ctx.extra["artifacts"] = {}
         ctx.extra["events"] = []
+        if self._retry_preflight_events:
+            # Hardware pre-check evidence from a retry must survive the
+            # per-stage context reset so completion evaluation can use it.
+            ctx.extra["events"].extend(self._retry_preflight_events)
+            self._retry_preflight_events = []
         ctx.extra["metrics"] = {}
         ctx.extra["subagent_invocations"] = []
         ctx.extra["export_dir"] = export_dir
@@ -276,34 +366,67 @@ class ServiceAgent:
     def _refresh_mutation_gate(
         self, ctx: ToolContext, user_text: str, workflow: Any
     ) -> None:
-        """Only-read is computed for this Turn / Stage, never inherited."""
-        from ..tools.state_tools import is_confirmation_utterance, is_read_only_request
+        """Compute write access from semantic intent plus host safety policy.
 
+        An LLM decision may tighten a turn to read-only. It never overrides a
+        deterministic forbidden capability or grants a higher effect level.
+        """
         forbidden = set()
         task_type = ""
         stage_id = ""
+        semantics: Dict[str, Any] = {}
         if workflow is not None:
             forbidden = set(
                 (workflow.intent.context or {}).get("forbidden_capabilities") or []
             )
             task_type = str(workflow.task_type or "")
             stage_id = str(workflow.current_stage or "")
+            semantics = self._turn_semantics(workflow)
         readonly = "modify_project" in forbidden
-        if task_type == "MODIFY_PROJECT":
-            readonly = False
-        elif (
-            user_text
-            and is_read_only_request(user_text)
-            and not is_confirmation_utterance(user_text)
-        ):
+        if semantics.get("read_only") is True:
             readonly = True
-        if stage_id in {
+        elif task_type == "MODIFY_PROJECT" and "modify_project" not in forbidden:
+            readonly = False
+        if not readonly and stage_id in {
             "apply_and_verify",
             "change_confirmation",
             "repair_and_verify",
         }:
             readonly = False
         ctx.extra["mutation_forbidden"] = bool(readonly)
+
+    @staticmethod
+    def _turn_semantics(workflow: Any) -> Dict[str, Any]:
+        if workflow is None:
+            return {}
+        context = dict(getattr(workflow.intent, "context", {}) or {})
+        semantics = context.get("turn_semantics")
+        return dict(semantics) if isinstance(semantics, dict) else {}
+
+    def _semantic_recipe_switch(self, workflow: Any) -> tuple[str, str]:
+        """Return (target_recipe, already_active_label) from LLM semantics."""
+        from ..knowledge import recipes
+
+        semantics = self._turn_semantics(workflow)
+        target = str(semantics.get("recipe_switch_target") or "").strip()
+        if not target:
+            target = str((workflow.intent.slots or {}).get("target_recipe") or "").strip()
+        if target not in recipes.RECIPES:
+            return "", ""
+        current = str(self._state.project.config.get("recipe") or "")
+        current_mod = str(
+            self._state.project.config.get("modulation")
+            or recipes.guess_modulation(current)
+            or ""
+        )
+        target_mod = str(recipes.guess_modulation(target) or "")
+        if target == current or (
+            target_mod and current_mod and target_mod == current_mod
+        ):
+            return "", (current_mod or target).upper()
+        if not (self._state.project.grc_path or current):
+            return "", ""
+        return target, ""
 
     def _sync_workflow_intent_to_state(self) -> None:
         """Project canonical Workflow Intent into RadioSpec without reparsing."""
@@ -312,7 +435,10 @@ class ServiceAgent:
             return
         intent = workflow.intent
         self._alignment.project_confirmed(intent, source="workflow_sync")
-        from ..tools.state_tools import looks_like_task_dump
+        from ..tools.state_tools import (
+            ensure_success_condition_claims,
+            looks_like_task_dump,
+        )
 
         if self._spec_workflow_id != workflow.workflow_id:
             self._spec_workflow_id = workflow.workflow_id
@@ -324,9 +450,9 @@ class ServiceAgent:
             and not looks_like_task_dump(intent.raw_text)
         ):
             self._state.spec.goals.append(intent.raw_text)
-        for condition in list(intent.slots.get("success_conditions") or []):
-            if condition not in self._state.spec.success_conditions:
-                self._state.spec.success_conditions.append(condition)
+        ensure_success_condition_claims(
+            self._state, list(intent.slots.get("success_conditions") or [])
+        )
         stage = self._workflow.current_stage()
         planning = (
             workflow.task_type == "MODIFY_PROJECT"
@@ -635,6 +761,17 @@ class ServiceAgent:
                 try:
                     aligned = self._alignment.consume_text(user_text)
                     self._state.save(_store.state_path(self.session_id))
+                except SemanticUnderstandingError as exc:
+                    logger.warning("Semantic understanding unavailable: %s", exc)
+                    _store.append_session_event(
+                        self.session_id,
+                        "semantic_understanding_blocked",
+                        self._workflow_event_payload({
+                            "error_type": type(exc).__name__,
+                            "state_preserved": True,
+                        }),
+                    )
+                    return self._semantic_retry_reply()
                 except Exception as exc:  # noqa: BLE001
                     logger.exception("Intent alignment 失败")
                     return self._error_reply(f"Intent alignment failed: {exc}")
@@ -654,6 +791,9 @@ class ServiceAgent:
                 workflow = workflow or self._workflow.consume_turn(
                     user_text, self._state
                 )
+            except SemanticUnderstandingError as exc:
+                logger.warning("Semantic workflow update unavailable: %s", exc)
+                return self._semantic_retry_reply()
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Workflow consume_turn 失败")
                 return self._error_reply(f"Workflow state error: {exc}")
@@ -716,8 +856,8 @@ class ServiceAgent:
         ctx.extra["workflow_digest"] = self._workflow.digest()
         if workflow.execution_status == "completed" and workflow.outcome == "cancelled":
             try:
-                from ..tools.state_tools import resolve_confirmation
-                resolve_confirmation(ctx, user_text)
+                from ..tools.state_tools import resolve_confirmation_decision
+                resolve_confirmation_decision(ctx, approved=False)
                 self._state.save(_store.state_path(self.session_id))
             except Exception as exc:  # noqa: BLE001
                 logger.debug("取消 Workflow 时清理旧 Policy pending 失败: %s", exc)
@@ -765,16 +905,24 @@ class ServiceAgent:
             })
         )
         try:
-            from ..tools.state_tools import (
-                commit_intent,
-                detect_recipe_switch,
-                is_confirmation_utterance,
-                is_read_only_request,
-                redundant_recipe_switch,
-                resolve_confirmation,
-            )
+            from ..tools.state_tools import resolve_confirmation_decision
 
-            resolution = resolve_confirmation(ctx, user_text) if user_text else {}
+            semantics = self._turn_semantics(workflow)
+            decision = str(semantics.get("confirmation_decision") or "none") \
+                if user_text else "none"
+            resolution = (
+                resolve_confirmation_decision(
+                    ctx, approved=decision == "approved"
+                )
+                if decision in {"approved", "rejected"}
+                else {"ok": True, "resolved": False}
+            )
+            if decision in {"approved", "rejected"}:
+                # Confirmation is a turn event, not a durable authorization.
+                # Consume it once so autonomous continuation cannot approve a
+                # later checkpoint without another explicit user decision.
+                semantics["confirmation_decision"] = "none"
+                workflow.intent.context["turn_semantics"] = semantics
             if resolution.get("resolved") and not resolution.get("approved"):
                 self._state.save(_store.state_path(self.session_id))
                 self._workflow.finish("cancelled")
@@ -802,41 +950,32 @@ class ServiceAgent:
                     except OSError as exc:
                         logger.warning("SharedState 落盘失败: %s", exc)
                     return reply
-            if user_text and is_read_only_request(user_text):
-                self._refresh_mutation_gate(ctx, user_text, workflow)
-            if user_text and workflow.intent.turn_relation == "new_task" \
-                    and not is_confirmation_utterance(user_text):
-                commit_intent(ctx, user_text)
-                # ``commit_intent`` is a generic radio helper and historically
-                # reintroduced a modulation question even for signal-agnostic
-                # hardware configuration/observation.  The instantiated
-                # Workflow owns required slots, so project its authoritative
-                # question set back into SharedState immediately.
-                self._sync_workflow_intent_to_state()
-            target_recipe = detect_recipe_switch(self._state, user_text)
+            target_recipe, already = (
+                self._semantic_recipe_switch(workflow)
+                if user_text else ("", "")
+            )
             if (
                 not target_recipe
+                and already
                 and not ctx.extra.get("mutation_forbidden")
             ):
-                already = redundant_recipe_switch(self._state, user_text)
-                if already:
-                    try:
-                        self._state.save(_store.state_path(self.session_id))
-                    except OSError as exc:
-                        logger.warning("SharedState 落盘失败: %s", exc)
-                    reply = AgentReply(
-                        text="The current project already uses {}; no recipe change is needed.".format(already),
-                        stage="DELIVER",
-                        claims=ClaimStore(self._state).summary(),
-                        spec_digest=self._state.spec_digest(),
-                    )
-                    _store.append_session_event(
-                        self.session_id, "recipe_switch_noop",
-                        {"already": already},
-                    )
-                    self._workflow.finish("passed")
-                    reply.workflow_digest = self._workflow.digest()
-                    return reply
+                try:
+                    self._state.save(_store.state_path(self.session_id))
+                except OSError as exc:
+                    logger.warning("SharedState 落盘失败: %s", exc)
+                reply = AgentReply(
+                    text="The current project already uses {}; no recipe change is needed.".format(already),
+                    stage="DELIVER",
+                    claims=ClaimStore(self._state).summary(),
+                    spec_digest=self._state.spec_digest(),
+                )
+                _store.append_session_event(
+                    self.session_id, "recipe_switch_noop",
+                    {"already": already},
+                )
+                self._workflow.finish("passed")
+                reply.workflow_digest = self._workflow.digest()
+                return reply
             planning_recipe_change = bool(
                 target_recipe
                 and workflow.task_type == "MODIFY_PROJECT"
@@ -1296,13 +1435,99 @@ class ServiceAgent:
                 if blocker.get("remediation") else "",
             )
             return reply
+        # A retry must observe the CURRENT external state.  When the workflow
+        # involves hardware, re-discover and re-probe the device first so a
+        # reconnected SDR is actually picked up instead of replaying the old
+        # failure with stale inputs.
+        probe_note = self._refresh_hardware_for_retry()
+        if probe_note.startswith("SDR_NOT_FOUND:"):
+            reply = self._workflow_waiting_reply()
+            reply.stage = "WAITING"
+            reply.needs_confirmation = False
+            reply.text = probe_note.split("SDR_NOT_FOUND:", 1)[1]
+            return reply
         stage.execution_status = "pending"
         stage.outcome = ""
         stage.resume_pending = True
         workflow.execution_status = "pending"
         self._workflow.save()
         reply = self._step_once("", recipe="", simulate=True, consume_turn=False)
-        return self._continue_autonomous(reply, recipe="", simulate=True)
+        reply = self._continue_autonomous(reply, recipe="", simulate=True)
+        if probe_note and probe_note not in (reply.text or ""):
+            reply.text = "{}\n{}".format(reply.text, probe_note).strip()
+        return reply
+
+    def _refresh_hardware_for_retry(self) -> str:
+        """Re-check the SDR before a retry; stash evidence for the next stage.
+
+        Returns an empty string when the workflow does not involve hardware,
+        a ``SDR_NOT_FOUND:``-prefixed message when nothing was detected, or a
+        short confirmation note when the device was found and probed.
+        """
+        workflow = self._workflow.workflow
+        if workflow is None:
+            return ""
+        capabilities = set(workflow.intent.capabilities or [])
+        if not capabilities & {"hardware_configure", "deploy", "hardware_runtime"}:
+            return ""
+        from ..tools import registry
+
+        ctx = self._tool_ctx or self._make_ctx()
+        discovery = registry.call("discover_devices", {}, ctx)
+        self._record_tool_result(ctx, "discover_devices", discovery, {})
+        devices = list(discovery.get("devices") or [])
+        found = bool(discovery.get("device_found") or devices)
+        identity = ""
+        if found:
+            slots = dict(workflow.intent.slots or {})
+            probe_args = {"device_type": slots.get("hardware") or "sdr"}
+            if devices:
+                first = devices[0] if isinstance(devices[0], dict) else {}
+                identity = str(
+                    first.get("device_identity") or first.get("uri") or ""
+                )
+                probe_args["uri"] = identity
+            probe = registry.call("probe_device", probe_args, ctx)
+            self._record_tool_result(
+                ctx, "probe_device", probe, probe_args
+            )
+            if probe.get("device_probed"):
+                identity = str(
+                    probe.get("device_identity") or identity
+                )
+            found = bool(probe.get("device_probed", found))
+        # Keep the fresh evidence for the re-run stage and mirror it into
+        # shared state (observed_device) so identity checks see it too.
+        self._retry_preflight_events = [
+            item for item in (ctx.extra.get("events") or [])
+            if item.get("kind") in ("discover_devices", "probe_device")
+        ]
+        scratch = AgentReply()
+        scratch.tool_invocations = [
+            ToolInvocation(
+                name=str(item.get("kind") or ""),
+                args=dict(item.get("args") or {}),
+                result=item.get("payload") or {},
+                ok=bool(isinstance(item.get("payload"), dict) and item["payload"].get("ok", True)),
+            )
+            for item in self._retry_preflight_events
+        ]
+        try:
+            self._project_tool_results(self._workflow.current_stage(), scratch)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("retry 预检查结果投影失败,忽略: %s", exc)
+        if not found:
+            return (
+                "SDR_NOT_FOUND:No SDR was detected just now. "
+                "Connect the device (and wait for it to enumerate), then press "
+                "Retry — I will re-check it automatically."
+            )
+        device = str(discovery.get("device_type") or "")
+        if devices and isinstance(devices[0], dict):
+            device = str(devices[0].get("device_type") or device)
+        return "Re-checked the SDR before retrying: {} {} detected and probed.".format(
+            device or "SDR", identity,
+        ).replace("  ", " ")
 
     def _cancel_waiting_workflow(self) -> AgentReply:
         if self._workflow.workflow is None:
@@ -1403,7 +1628,15 @@ class ServiceAgent:
                     "messages": [
                         {
                             "role": "user",
-                            "content": f"{user_text}\n\nCurrent Stage TaskCard: {task_json}\n\nReturn all user-facing narrative in English.",
+                            "content": (
+                                f"{user_text}\n\nCurrent Stage TaskCard: {task_json}\n\n"
+                                "Return all user-facing narrative in English. "
+                                "Write the final answer as a concise, friendly message for the user: "
+                                "first what was accomplished, then the key results with units, "
+                                "then what happens next or what you need from them. "
+                                "Do not mention tool names, tool-call success or failure, "
+                                "internal field names, JSON, or session bookkeeping."
+                            ),
                         }
                     ]
                 },
@@ -1751,19 +1984,19 @@ class ServiceAgent:
     @staticmethod
     def _tx_preview_note(slots: Dict[str, Any], *, reused: bool) -> str:
         tone = (
-            "A low-amplitude 1 kHz test tone is used as placeholder baseband when no modulation is specified."
+            " A quiet 1 kHz test tone stands in as the signal."
             if not slots.get("modulation") else ""
         )
-        grey = "The grey hardware sink indicates unauthorized RF and remains disabled; the active Null Sink is a preview path and does not transmit."
-        if reused:
-            head = "Reusing the saved safe-preview flowgraph (sink remains disabled)."
-        else:
-            head = "Generated an unarmed SDR transmit flowgraph (sink remains disabled)."
+        head = (
+            "Reusing the transmit flowgraph you already saved."
+            if reused
+            else "Your transmit flowgraph is ready in safe preview mode."
+        )
         if slots.get("operation") == "deploy":
-            tail = "It will be armed and started only after RF authorization."
+            tail = " Nothing will be transmitted until you approve it."
         else:
-            tail = "The workflow stops for confirmation after saving the configuration and will not start automatically."
-        return f"{head} {grey} {tone} {tail}".strip()
+            tail = " Nothing is being transmitted — I'll wait for your confirmation before anything runs."
+        return f"{head}{tone}{tail}"
 
     def _validate_loaded(self, ctx: ToolContext) -> Dict[str, Any]:
         from ..tools import registry
@@ -1888,20 +2121,31 @@ class ServiceAgent:
             missing_completion = [
                 name for name, passed in envelope.completion.items() if not passed
             ]
+            note = ""
             if not envelope.ok and reply.stage not in ("ERROR", "DENY", "CONFIRM"):
-                reply.stage = "CRITIC"
                 reply.needs_confirmation = False
-                if missing_completion:
-                    reply.text = "{}\nStage completion conditions not met: {}.".format(
-                        reply.text, ", ".join(missing_completion)
-                    ).strip()
                 failure_codes = list(envelope.acceptance.get("failure_codes") or [])
-                if failure_codes:
-                    reply.text = "{}\nStage acceptance failed: {}.".format(
-                        reply.text, ", ".join(failure_codes)
-                    ).strip()
+                external_only = bool(missing_completion) and all(
+                    name in EXTERNAL_PRECONDITION_COMPLETIONS
+                    for name in missing_completion
+                )
+                if external_only:
+                    # Engine parks the stage as waiting; the reply mirrors
+                    # that state instead of a hard failure verdict.
+                    note = external_waiting_note(missing_completion)
+                    reply.stage = "WAITING"
+                    reply.text = "{}\n{}".format(reply.text, note).strip()
+                else:
+                    note = _friendly_stage_failure(
+                        missing_completion, failure_codes
+                    )
+                    reply.stage = "CRITIC"
+                    reply.text = "{}\n{}".format(reply.text, note).strip()
             result = vars(envelope)
             result["errored"] = reply.stage == "ERROR"
+            if not envelope.ok and missing_completion:
+                # Digest/monitor show this note as the waiting reason.
+                result["note"] = note
             if getattr(stage, "resume_from", ""):
                 result["resume_from"] = stage.resume_from
             result["improvement_available"] = any(
@@ -2296,6 +2540,24 @@ class ServiceAgent:
             workflow_digest=self._digest_with_timeline(),
         )
 
+    def _semantic_retry_reply(self) -> AgentReply:
+        """Expose an LLM outage without inventing a rule-based interpretation."""
+        return AgentReply(
+            text=(
+                "⚠️ I couldn't reach the language model, so your message was not "
+                "interpreted — nothing was changed. Please check the model "
+                "connection (endpoint, key, network) and send the message again."
+            ),
+            stage="ALIGN",
+            done=False,
+            needs_confirmation=False,
+            claims=ClaimStore(self._state).summary(),
+            spec_digest=self._state.spec_digest(),
+            pending={},
+            artifacts=self._current_grc_artifacts(),
+            workflow_digest=self._digest_with_timeline(),
+        )
+
     def peek_runtime_digest(self) -> Dict[str, Any]:
         """Refresh hardware runtime for GUI polling without advancing Workflow."""
         if self._tool_ctx is None:
@@ -2424,9 +2686,12 @@ class ServiceAgent:
                     )
         else:
             pending = {}
-            text = (
-                "The current stage did not meet its completion conditions. Provide more information, revise the plan, "
-                "or explicitly request a retry. This is not an approval checkpoint."
+            note = str(
+                (getattr(stage, "result", {}) or {}).get("note") or ""
+            )
+            text = note or (
+                "The current stage could not complete. Tell me what to adjust, "
+                "or press Retry to run it again."
             )
         return AgentReply(
             text=text,
@@ -2554,7 +2819,9 @@ class ServiceAgent:
         artifacts["manifest"] = manifest
         self._sync_artifact_index(manifest)
         self._state.project.config["artifact_refs"] = {
-            key: os.path.relpath(value, _store.session_root(self.session_id))
+            key: os.path.relpath(
+                value, _store.session_root(self.session_id)
+            ).replace(os.sep, "/")
             for key, value in artifacts.items()
             if isinstance(value, str) and os.path.isfile(value)
         }
@@ -2688,21 +2955,32 @@ class ServiceAgent:
     def _render_evidence_text(
         ctx: ToolContext, narrative: str, source: str
     ) -> str:
-        """Keep host Tool observations authoritative over model narration."""
+        """Render a user-facing reply: friendly narrative first, compact facts after.
+
+        The narrative (deterministic handler note or LLM answer) leads the
+        reply.  Host tool observations stay authoritative but are folded into
+        at most a few short lines: what completed, what needs attention,
+        saved artifacts and measurement caveats.  Raw per-tool success logs
+        are deliberately not replayed to the user.
+        """
         events = list(ctx.extra.get("events") or [])
+        parts: List[str] = []
+        if narrative:
+            parts.append(narrative)
         if source.startswith("deterministic"):
-            marks = []
+            completed = []
+            failed = []
             for event in events:
                 name = str(event.get("kind") or "")
                 payload = event.get("payload") or {}
                 label = _DETERMINISTIC_PROGRESS.get(name)
                 if not label:
                     continue
-                failed = isinstance(payload, dict) and (
+                failed_flag = isinstance(payload, dict) and (
                     payload.get("ok") is False or payload.get("valid") is False
                 )
-                if failed:
-                    marks.append("✗ " + name)
+                if failed_flag:
+                    failed.append(name)
                     continue
                 if name == "probe_device":
                     identity = str(
@@ -2710,66 +2988,69 @@ class ServiceAgent:
                     )
                     device = str(payload.get("device_type") or "SDR")
                     label = (
-                        f"✓ {device} {identity} probed" if identity
-                        else "✓ SDR probed"
+                        f"{device} {identity} detected and probed" if identity
+                        else "SDR detected and probed"
                     )
-                marks.append(label)
-            parts = list(dict.fromkeys(marks))
-            metrics = dict(ctx.extra.get("metrics") or {})
-            source_scope = str(metrics.get("signal_source_scope") or "")
-            source_labels = {
-                "generated_fixture": "Measurement source: self-contained generated fixture (not the current over-the-air signal).",
-                "current_project_offline": "Measurement source: offline simulation of the current project (not live reception).",
-                "live_device": "Measurement source: the bound live hardware receive path.",
-            }
-            if source_labels.get(source_scope):
-                parts.append(source_labels[source_scope])
-            ber = metrics.get("ber_report")
-            if isinstance(ber, dict) and ber.get("valid"):
+                completed.append(label.lstrip("✓ ").strip())
+            if completed:
+                parts.append("Completed: " + " · ".join(dict.fromkeys(completed)) + ".")
+            if failed:
                 parts.append(
-                    "BER={} ({}/{} bits; 95% one-sided upper bound={}; {}).".format(
-                        ber.get("value"), ber.get("bit_errors"),
-                        ber.get("compared_bits"),
-                        ber.get("confidence_upper_bound"),
-                        ber.get("alignment_method") or "alignment unavailable",
-                    )
+                    "These steps did not complete: "
+                    + ", ".join(dict.fromkeys(failed)) + "."
                 )
-            if narrative:
-                parts.append(narrative)
-            return "\n".join(parts) if parts else (narrative or "")
-        if not source.startswith("deepagents") or not events:
+        elif source.startswith("deepagents"):
+            failed = []
+            not_started = False
+            for event in events:
+                name = str(event.get("kind") or "")
+                payload = event.get("payload") or {}
+                if not name:
+                    continue
+                if isinstance(payload, dict) and payload.get("ok") is False:
+                    failed.append(name)
+                if isinstance(payload, dict) and payload.get("not_started"):
+                    not_started = True
+            if failed:
+                parts.append(
+                    "These steps need attention: "
+                    + ", ".join(dict.fromkeys(failed)) + "."
+                )
+            artifacts = [
+                os.path.basename(value)
+                for value in (ctx.extra.get("artifacts") or {}).values()
+                if isinstance(value, str) and value
+            ]
+            if artifacts:
+                parts.append("Saved: " + ", ".join(dict.fromkeys(artifacts)) + ".")
+            if not_started:
+                parts.append("The flowgraph has not started, so this cannot support a claim of successful RF or over-the-air verification.")
+            if not parts:
+                return narrative or "The current stage has ended; see the tool results for detailed facts."
+        else:
             return narrative or ServiceAgent._fallback_text(
                 {"recipe": None, "metrics": ctx.extra.get("metrics")}
             )
-        passed = []
-        failed = []
-        not_started = False
-        for event in events:
-            name = str(event.get("kind") or "")
-            payload = event.get("payload") or {}
-            if not name:
-                continue
-            if isinstance(payload, dict) and payload.get("ok") is False:
-                failed.append(name)
-            else:
-                passed.append(name)
-            if isinstance(payload, dict) and payload.get("not_started"):
-                not_started = True
-        parts = []
-        if passed:
-            parts.append("Completed tools: " + ", ".join(dict.fromkeys(passed)) + ".")
-        if failed:
-            parts.append("Failed tools: " + ", ".join(dict.fromkeys(failed)) + ".")
-        artifacts = [
-            os.path.basename(value)
-            for value in (ctx.extra.get("artifacts") or {}).values()
-            if isinstance(value, str) and value
-        ]
-        if artifacts:
-            parts.append("Recorded artifacts: " + ", ".join(dict.fromkeys(artifacts)) + ".")
-        if not_started:
-            parts.append("The flowgraph has not started, so this cannot support a claim of successful RF or over-the-air verification.")
-        return " ".join(parts) or "The current stage has ended; see the tool results for detailed facts."
+        metrics = dict(ctx.extra.get("metrics") or {})
+        source_scope = str(metrics.get("signal_source_scope") or "")
+        source_labels = {
+            "generated_fixture": "Measurement source: self-contained generated fixture (not the current over-the-air signal).",
+            "current_project_offline": "Measurement source: offline simulation of the current project (not live reception).",
+            "live_device": "Measurement source: the bound live hardware receive path.",
+        }
+        if source_labels.get(source_scope):
+            parts.append(source_labels[source_scope])
+        ber = metrics.get("ber_report")
+        if isinstance(ber, dict) and ber.get("valid"):
+            parts.append(
+                "BER={} ({}/{} bits; 95% one-sided upper bound={}; {}).".format(
+                    ber.get("value"), ber.get("bit_errors"),
+                    ber.get("compared_bits"),
+                    ber.get("confidence_upper_bound"),
+                    ber.get("alignment_method") or "alignment unavailable",
+                )
+            )
+        return "\n".join(parts)
 
     @staticmethod
     def _fallback_text(data: dict) -> str:

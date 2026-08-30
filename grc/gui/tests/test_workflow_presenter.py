@@ -82,9 +82,9 @@ class WorkflowPresenterTest(unittest.TestCase):
 
         self.assertIn("配置 SDR", self.panel._activity_label.text)
         self.assertIn("有限时长发射 6/8", self.panel._activity_label.text)
-        self.assertIn("等待批准", self.panel._activity_label.text)
+        self.assertIn("Waiting for approval", self.panel._activity_label.text)
         self.assertNotIn("run_id=", self.panel._runtime_label.text)
-        self.assertIn("剩余 12.5s", self.panel._runtime_label.text)
+        self.assertIn("Remaining 12.5s", self.panel._runtime_label.text)
         self.assertNotIn("pid=", self.panel._runtime_label.text)
         self.assertNotIn("UUU", self.panel._runtime_label.text)
         self.assertTrue(self.panel._runtime_label.visible)
@@ -165,9 +165,19 @@ class WorkflowPresenterTest(unittest.TestCase):
             "reason": "当前 Stage 未满足完成条件",
             "approved": False,
         })
-        self.assertEqual(self.panel._confirm_btn.label, "重试本阶段")
-        self.assertEqual(self.panel._cancel_btn.label, "取消任务")
+        self.assertEqual(self.panel._confirm_btn.label, "Retry This Stage")
+        self.assertEqual(self.panel._cancel_btn.label, "Cancel Task")
         self.assertTrue(self.panel._pending_row.visible)
+
+    def test_open_questions_use_one_compact_line(self):
+        details = self.panel._default_details({
+            "open_questions": ["Which device?", "How long may it run?"],
+        })
+        self.assertEqual(
+            details,
+            "Open questions: Which device? · How long may it run?",
+        )
+        self.assertNotIn("\n", details)
 
     def test_completion_count_is_projected_as_acceptance_predicates(self):
         card = present(spec={}, claims=[], workflow={
@@ -194,13 +204,13 @@ class WorkflowPresenterTest(unittest.TestCase):
             "tx_attenuation": 30.0,
             "approved": False,
         })
-        self.assertEqual(self.panel._confirm_btn.label, "批准有限时长发射")
-        self.assertEqual(self.panel._cancel_btn.label, "取消")
-        self.assertIn("最长 30 秒", self.panel._pending_label.text)
+        self.assertEqual(self.panel._confirm_btn.label, "Approve Bounded Transmission")
+        self.assertEqual(self.panel._cancel_btn.label, "Cancel")
+        self.assertIn("up to 30 seconds", self.panel._pending_label.text)
         self.assertIn("usb:test.pluto", self.panel._pending_label.text)
         self.assertIn("2.402 GHz", self.panel._pending_label.text)
         self.assertIn("2 Msps", self.panel._pending_label.text)
-        self.assertIn("衰减 30.0 dB", self.panel._pending_label.text)
+        self.assertIn("Attenuation 30.0 dB", self.panel._pending_label.text)
         self.assertFalse(self.panel._evidence_btn.visible)
 
         self.panel._set_pending({
@@ -213,9 +223,9 @@ class WorkflowPresenterTest(unittest.TestCase):
             "tx_attenuation": 30.0,
             "approved": False,
         })
-        self.assertEqual(self.panel._confirm_btn.label, "确认已保存")
-        self.assertIn("不启动射频", self.panel._pending_label.text)
-        self.assertNotIn("受控发射", self.panel._pending_label.text)
+        self.assertEqual(self.panel._confirm_btn.label, "Confirm Saved Configuration")
+        self.assertIn("without starting RF", self.panel._pending_label.text)
+        self.assertNotIn("bounded transmission", self.panel._pending_label.text)
 
         self.panel._set_pending({
             "action": "rf_plan_confirmation",
@@ -228,20 +238,20 @@ class WorkflowPresenterTest(unittest.TestCase):
             "tx_attenuation": 30.0,
             "approved": False,
         })
-        self.assertEqual(self.panel._confirm_btn.label, "确认配置")
-        self.assertIn("不启动射频", self.panel._pending_label.text)
-        self.assertNotIn("受控发射", self.panel._pending_label.text)
+        self.assertEqual(self.panel._confirm_btn.label, "Confirm Configuration")
+        self.assertIn("without starting RF", self.panel._pending_label.text)
+        self.assertNotIn("bounded transmission", self.panel._pending_label.text)
 
         self.panel._set_pending({
             "action": "over_air_verification",
             "purpose": "ota_observation",
             "approved": False,
         })
-        self.assertEqual(self.panel._confirm_btn.label, "已观察到目标信号")
-        self.assertEqual(self.panel._cancel_btn.label, "未看到")
+        self.assertEqual(self.panel._confirm_btn.label, "Target Signal Observed")
+        self.assertEqual(self.panel._cancel_btn.label, "Not Observed")
         self.assertTrue(self.panel._evidence_btn.visible)
         self.assertTrue(self.panel._evidence_btn.sensitive)
-        self.assertIn("人工确认、附件缺失", self.panel._pending_label.text)
+        self.assertIn("Human confirmation required", self.panel._pending_label.text)
 
     def test_quality_warning_is_visible_without_raw_warning_dump(self):
         workflow = {
@@ -261,7 +271,7 @@ class WorkflowPresenterTest(unittest.TestCase):
             "stages": [],
         }
         self.panel._set_activity({}, workflow)
-        self.assertIn("质量: warning", self.panel._activity_label.text)
+        self.assertIn("Quality: warning", self.panel._activity_label.text)
         runtime = present(spec={}, workflow=workflow, claims=[])["runtime"]
         self.assertEqual(runtime["quality"], "warning")
         self.assertNotIn("rf_stream_quality", str(runtime))
@@ -286,8 +296,16 @@ class WorkflowPresenterTest(unittest.TestCase):
         view = present(
             spec={
                 "intent_status": "awaiting_input",
+                "blocking_questions": [
+                    {"field": "success_conditions", "prompt": "How will you verify success?"},
+                    {"field": "duration_seconds", "prompt": "How long may it run?"},
+                ],
                 "radio_specification": [
-                    {"key": "goal", "label": "Goal", "value": "BLE advertising", "source": "user"},
+                    {
+                        "key": "goal", "label": "Goal", "value": "BLE advertising",
+                        "source": "user", "requirement": "required",
+                        "reason": "This legacy sentence must not reach the view model",
+                    },
                     {"key": "carrier_frequency", "label": "Carrier", "display_value": "2.402 GHz", "source": "protocol_default"},
                     {"key": "success_conditions", "label": "Success condition", "unresolved": True},
                 ],
@@ -302,8 +320,15 @@ class WorkflowPresenterTest(unittest.TestCase):
         self.assertEqual(view["phase"]["label"], "ALIGN INTENT")
         rows = {item["key"]: item for item in view["specification"]["rows"]}
         self.assertEqual(rows["goal"]["source"], "User")
+        self.assertEqual(rows["goal"]["group"], "Required")
+        self.assertEqual(rows["carrier_frequency"]["group"], "Added")
         self.assertEqual(rows["carrier_frequency"]["source"], "Protocol Default")
         self.assertEqual(rows["success_conditions"]["value"], "?")
+        self.assertNotIn("reason", rows["goal"])
+        self.assertEqual(
+            view["specification"]["open_question"],
+            "Open questions: How will you verify success? · How long may it run?",
+        )
         self.assertFalse(view["specification"]["aligned"])
 
     def test_workflow_monitor_binds_claims_and_exposes_latest_transition(self):
@@ -342,6 +367,52 @@ class WorkflowPresenterTest(unittest.TestCase):
         self.assertEqual(monitor["transition"]["from"], "build")
         self.assertEqual(monitor["transition"]["to"], "verify")
         self.assertIn("revision", monitor["transition"]["reason"])
+
+    def test_stage_row_labels_do_not_collapse_to_one_char_per_line(self):
+        """Regression: set_max_width_chars(1)+START made stage text vertical."""
+        try:
+            import gi
+
+            gi.require_version("Gtk", "3.0")
+            from gi.repository import Gtk
+        except Exception:  # noqa: BLE001
+            self.skipTest("GTK unavailable")
+        if not Gtk.init_check()[0]:
+            self.skipTest("no display available")
+
+        from grc.gui.ClaimsPanel import ClaimsPanel
+
+        class _Harness:
+            _build_stage_row = ClaimsPanel._build_stage_row
+            _build_stage_claim_line = ClaimsPanel._build_stage_claim_line
+            _font_desc = ClaimsPanel._font_desc
+
+            def __init__(self):
+                self._font_pt = 10
+
+        row = _Harness()._build_stage_row({
+            "id": "tx_build",
+            "label": "Build Transmit Chain",
+            "status": "running",
+            "current": True,
+            "claims": [{
+                "statement": "Saved flowgraph passed structural validation",
+                "layer": "structure",
+                "layer_label": "Flowgraph check",
+                "status": "Passed",
+            }],
+        })
+        window = Gtk.OffscreenWindow()
+        window.set_size_request(340, 300)
+        box = Gtk.VBox()
+        box.pack_start(row, False, False, 0)
+        window.add(box)
+        window.show_all()
+        _minimum, natural = row.get_preferred_width()
+        self.assertGreater(
+            natural, 100,
+            "stage row natural width collapsed; text would wrap per character",
+        )
 
     def test_diagnosis_card_only_uses_scoped_findings(self):
         view = present(

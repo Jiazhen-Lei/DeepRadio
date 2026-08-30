@@ -97,6 +97,10 @@ class LLMError(Exception):
     """LLM 请求或响应异常(网络错误 / HTTP 非 2xx / 响应格式不符)。"""
 
 
+class SemanticUnderstandingError(RuntimeError):
+    """Semantic interpretation was unavailable; callers must not guess."""
+
+
 # ---------------------------------------------------------------------------- #
 # 配置
 # ---------------------------------------------------------------------------- #
@@ -167,6 +171,11 @@ def _unittest_runner_active() -> bool:
         or "unittest" in joined
         or "pytest" in joined
     )
+
+
+def intent_test_bypass_enabled() -> bool:
+    """Allow rule seeds only in a test runner, never in the production GUI."""
+    return _unittest_runner_active()
 
 
 def is_configured() -> bool:

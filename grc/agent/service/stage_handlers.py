@@ -265,7 +265,15 @@ def _handle_inspect_plan(self, ctx, user_text, recipe, simulate) -> AgentReply:
                 "Continuing will explicitly use the rebuild path."
             )
     elif result.get("ok"):
-        note = "The current project was inspected and a change plan was created. It will be applied and revalidated only after confirmation."
+        # No target recipe and no derivable patch: report honestly instead of
+        # claiming a change plan exists.
+        note = (
+            "I inspected the current project ({}), but I could not derive a "
+            "concrete change plan from this request, so nothing was modified. "
+            "Tell me which parameter to change (for example, "
+            "'local name = cindysha' or 'sample rate = 2 MHz'), or restate "
+            "what the changed project should do."
+        ).format(current or "Untitled")
     else:
         note = result.get("error", "Project inspection failed")
     return self._fold(

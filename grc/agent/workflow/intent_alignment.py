@@ -7,6 +7,9 @@ and only hands a confirmed WorkflowIntent to the existing WorkflowEngine.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import re
 import time
 import uuid
@@ -58,24 +61,47 @@ class IntentAlignmentCoordinator:
         shared = self.state.intent
         if self.needs_alignment():
             if shared.status == "awaiting_confirmation":
-                normalized = str(text or "").strip().lower()
-                if normalized in _APPROVE:
+                semantic = self._alignment_turn_from_llm(text, [])
+                if semantic is None:
+                    # The fixed vocabulary is retained strictly for isolated
+                    # deterministic unit tests. Production never falls back
+                    # to it when semantic understanding is unavailable.
+                    return self._consume_confirmation_test_bypass(text)
+                action = str(semantic.get("intent_action") or "param_update")
+                if action == "confirm":
                     return self._confirm()
-                if normalized in _REVISE:
+                if action == "revise":
                     return self._request_revision()
-                if normalized in {
-                    "可选字段", "有哪些可选字段", "还能添加什么字段",
-                    "optional fields", "what optional fields are available",
-                }:
+                if action == "optional_fields":
                     return self._describe_optional_fields()
-                if any(word in normalized for word in (
-                    "介绍这些参数", "解释这些参数", "参数教学",
-                    "explain these parameters", "teach me these parameters",
-                )):
+                if action == "teach":
                     return self._teach_specification()
-                return self._merge_free_text(text)
+                return self._merge_free_text(
+                    text,
+                    semantic_updates=dict(semantic.get("updates") or {}),
+                    semantic_ready=True,
+                )
             return self._answer_fields(text, source="user_text")
         return self._start(text)
+
+    def _consume_confirmation_test_bypass(self, text: str) -> AlignmentOutcome:
+        """Legacy deterministic router, reachable only with the test bypass."""
+        normalized = str(text or "").strip().lower()
+        if normalized in _APPROVE:
+            return self._confirm()
+        if normalized in _REVISE:
+            return self._request_revision()
+        if normalized in {
+            "可选字段", "有哪些可选字段", "还能添加什么字段",
+            "optional fields", "what optional fields are available",
+        }:
+            return self._describe_optional_fields()
+        if any(word in normalized for word in (
+            "介绍这些参数", "解释这些参数", "参数教学",
+            "explain these parameters", "teach me these parameters",
+        )):
+            return self._teach_specification()
+        return self._merge_free_text(text)
 
     def consume_response(self, response: Dict[str, Any]) -> AlignmentOutcome:
         shared = self.state.intent
@@ -241,8 +267,17 @@ class IntentAlignmentCoordinator:
             fields.insert(0, field)
         if not fields:
             return self._merge_free_text(text)
-        update = self.engine.classify(text, self.state)
-        update = self.engine._reconcile_intent(update, text, self.state)
+        semantic_updates = self._alignment_updates_from_llm(text, fields)
+        if semantic_updates is None:
+            # Deterministic unit-test bypass only. Production never reaches
+            # this branch, so a model outage cannot become a regex guess.
+            update = self.engine.classify(text, self.state)
+            update = self.engine._reconcile_intent(update, text, self.state)
+            update_slots = dict(update.slots or {})
+            update_sources = dict(update.slot_sources or {})
+        else:
+            update_slots = semantic_updates
+            update_sources = {key: "llm" for key in semantic_updates}
         shared = self.state.intent
         changed = []
         before = dict(shared.parameters or {})
@@ -253,7 +288,7 @@ class IntentAlignmentCoordinator:
         # not a request to turn a TX workflow into RX.  These identity fields
         # may still be supplied when they are themselves being requested.
         stable_identity_fields = {"protocol", "direction", "operation", "hardware"}
-        for key, value in dict(update.slots or {}).items():
+        for key, value in update_slots.items():
             if value in (None, "", []):
                 continue
             if (
@@ -262,12 +297,12 @@ class IntentAlignmentCoordinator:
                 and shared.parameters.get(key) not in (None, "", [])
             ):
                 continue
-            value_source = str(update.slot_sources.get(key) or "")
+            value_source = str(update_sources.get(key) or "")
             # Protocol defaults may accompany an explicitly named protocol;
             # retain them as defaults, but never claim the user supplied them.
             accepted_default = bool(
-                update.slots.get("protocol")
-                and update.slot_sources.get("protocol") in explicit_sources
+                update_slots.get("protocol")
+                and update_sources.get("protocol") in explicit_sources
                 and value_source in {"protocol_default", "derived"}
             )
             if value_source not in explicit_sources and not accepted_default:
@@ -288,12 +323,15 @@ class IntentAlignmentCoordinator:
                 source if value_source in explicit_sources else value_source
             )
             changed.append(key)
-        if not changed and len(fields) == 1:
+        if semantic_updates is None and not changed and len(fields) == 1:
             value = self._coerce(fields[0], text)
             if value not in (None, "", []):
                 shared.parameters[fields[0]] = value
                 shared.parameter_sources[fields[0]] = source
                 changed.append(fields[0])
+        if "duration_seconds" in changed:
+            shared.parameters["max_duration_seconds"] = shared.parameters["duration_seconds"]
+            shared.parameter_sources["max_duration_seconds"] = source
         if not changed:
             return AlignmentOutcome(
                 True,
@@ -314,6 +352,159 @@ class IntentAlignmentCoordinator:
         return self._evaluate(
             self._to_workflow_intent(shared), had_user_questions=True
         )
+
+    def _alignment_turn_from_llm(
+        self, text: str, fields: list[str]
+    ) -> Optional[Dict[str, Any]]:
+        """Classify a follow-up action and extract parameter updates once.
+
+        ``None`` means the deterministic test-only bypass is active. Any
+        production configuration/request failure raises instead of returning
+        a rule-derived approximation.
+        """
+        from ..llm import (
+            SemanticUnderstandingError,
+            chat,
+            get_config,
+            intent_test_bypass_enabled,
+            is_configured,
+            parse_json_object,
+        )
+        if not is_configured():
+            if intent_test_bypass_enabled():
+                return None
+            self.event_sink("alignment_llm_failed", {
+                **self._event_payload(), "reason": "not_configured",
+            })
+            raise SemanticUnderstandingError(
+                "The language model is not configured. Your answer was not interpreted."
+            )
+
+        from ..knowledge.spec_requirements import load_requirements
+
+        allowed = set((load_requirements().get("fields") or {}).keys())
+        allowed.update({"max_duration_seconds", "deploy_permission", "hardware_access"})
+        shared = self.state.intent
+        payload = {
+            "user_reply": str(text or ""),
+            "requested_fields": list(fields),
+            "established_intent": {
+                "task_type": shared.task_type,
+                "capabilities": list(shared.capabilities),
+                "parameters": dict(shared.parameters),
+                "parameter_sources": dict(shared.parameter_sources),
+                "missing_fields": list(shared.missing_fields),
+            },
+            "allowed_update_fields": sorted(allowed),
+        }
+        request_hash = hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        cfg = dict(get_config())
+        try:
+            semantic_timeout = float(
+                os.environ.get("GRC_AGENT_SEMANTIC_TIMEOUT", "45")
+            )
+        except ValueError:
+            semantic_timeout = 45.0
+        cfg["timeout"] = max(5.0, min(float(cfg.get("timeout") or 45.0), semantic_timeout))
+        try:
+            retries = max(0, int(os.environ.get("GRC_AGENT_SEMANTIC_RETRIES", "1")))
+        except ValueError:
+            retries = 1
+        prompt = (
+            "You interpret a follow-up to an existing GNU Radio Radio Specification. "
+            "Return one JSON object with 'intent_action' and 'updates'. intent_action "
+            "must be exactly one of confirm, revise, optional_fields, teach, or "
+            "param_update. Use confirm only when the user accepts the specification; "
+            "revise when they reject it without yet supplying a concrete replacement; "
+            "optional_fields when they ask what else can be added; teach when they ask "
+            "for an explanation; otherwise use param_update. The established "
+            "task identity is context, not something to reclassify. Extract every "
+            "field explicitly answered or newly mentioned in this reply, including "
+            "optional fields such as local_name. Interpret durations with units and "
+            "put observable acceptance evidence in success_conditions as a string list. "
+            "Do not invent values, defaults, capabilities, or task types. If a requested "
+            "field is unanswered, omit it. Use only allowed_update_fields."
+        )
+        self.event_sink("alignment_llm_started", {
+            **self._event_payload(), "request_hash": request_hash,
+            "model": str(cfg.get("model") or ""), "requested_fields": list(fields),
+        })
+        started_at = time.perf_counter()
+        last_error: Optional[Exception] = None
+        parsed: Dict[str, Any] = {}
+        for attempt in range(retries + 1):
+            try:
+                content = chat([
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ], config=cfg)
+                parsed = parse_json_object(content)
+                last_error = None
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                self.event_sink("alignment_llm_retry", {
+                    **self._event_payload(), "request_hash": request_hash,
+                    "attempt": attempt + 1, "will_retry": attempt < retries,
+                    "error_type": type(exc).__name__,
+                })
+        if last_error is not None:
+            self.event_sink("alignment_llm_failed", {
+                **self._event_payload(), "reason": "request_failed",
+                "request_hash": request_hash,
+                "latency_ms": round((time.perf_counter() - started_at) * 1000, 3),
+                "error_type": type(last_error).__name__,
+            })
+            raise SemanticUnderstandingError(
+                "The language model did not understand this reply after retrying. "
+                "The current Radio Specification is unchanged."
+            ) from last_error
+
+        raw_updates = parsed.get("updates")
+        if not isinstance(raw_updates, dict):
+            raise SemanticUnderstandingError(
+                "The language model returned an invalid specification update. "
+                "The current Radio Specification is unchanged."
+            )
+        updates: Dict[str, Any] = {}
+        for key, raw in raw_updates.items():
+            key = str(key or "")
+            if key not in allowed or raw in (None, "", []):
+                continue
+            if key == "success_conditions":
+                value = [str(item).strip() for item in raw] if isinstance(raw, list) else [str(raw).strip()]
+                value = [item for item in value if item]
+            elif key == "advertising_channels" and isinstance(raw, list):
+                value = raw
+            else:
+                value = self._coerce(key, raw)
+            if value not in (None, "", []):
+                updates[key] = value
+        action = str(parsed.get("intent_action") or "param_update").strip().lower()
+        if action not in {
+            "confirm", "revise", "optional_fields", "teach", "param_update",
+        }:
+            raise SemanticUnderstandingError(
+                "The language model returned an invalid alignment action. "
+                "The current Radio Specification is unchanged."
+            )
+        self.event_sink("alignment_llm_succeeded", {
+            **self._event_payload(), "request_hash": request_hash,
+            "latency_ms": round((time.perf_counter() - started_at) * 1000, 3),
+            "intent_action": action, "updated_fields": sorted(updates),
+        })
+        return {"intent_action": action, "updates": updates}
+
+    def _alignment_updates_from_llm(
+        self, text: str, fields: list[str]
+    ) -> Optional[Dict[str, Any]]:
+        """Compatibility wrapper for callers that only need field updates."""
+        semantic = self._alignment_turn_from_llm(text, fields)
+        if semantic is None:
+            return None
+        return dict(semantic.get("updates") or {})
 
     def _apply_field(self, field: str, value: Any, *, source: str) -> AlignmentOutcome:
         shared = self.state.intent
@@ -348,11 +539,22 @@ class IntentAlignmentCoordinator:
         intent = self._to_workflow_intent(shared)
         return self._evaluate(intent, had_user_questions=True)
 
-    def _merge_free_text(self, text: str) -> AlignmentOutcome:
+    def _merge_free_text(
+        self,
+        text: str,
+        *,
+        semantic_updates: Optional[Dict[str, Any]] = None,
+        semantic_ready: bool = False,
+    ) -> AlignmentOutcome:
         shared = self.state.intent
-        update = self.engine.classify(text, self.state)
+        if not semantic_ready:
+            semantic_updates = self._alignment_updates_from_llm(text, [])
+        update_slots = (
+            self.engine.classify(text, self.state).slots
+            if semantic_updates is None else semantic_updates
+        )
         changed = []
-        for key, value in update.slots.items():
+        for key, value in update_slots.items():
             if value in (None, "", []) or shared.parameters.get(key) == value:
                 continue
             shared.parameters[key] = value
@@ -467,7 +669,7 @@ class IntentAlignmentCoordinator:
             "interaction_id": f"interaction-{uuid.uuid4().hex[:10]}",
             "base_intent_revision": shared.revision,
             "prompt": (
-                "Confirm the aligned intent before the workflow is created. "
+                "✅ The Radio Specification is complete. Confirm it to create the workflow. "
                 "You can also state a field to revise or add, or ask to explain these parameters."
             ),
             "reason": "Confirm, continue revising, add optional fields, or request parameter guidance.",

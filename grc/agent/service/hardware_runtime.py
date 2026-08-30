@@ -6,6 +6,7 @@ import os
 import re
 import signal
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -35,7 +36,16 @@ class HardwareRuntime:
                 self._reap_locked(session_id)
             if session_id in self._processes:
                 return {"ok": False, "error": "A hardware flowgraph is already running in this session"}
-            command = [interpreter, "-u", program] if interpreter else [program]
+            if interpreter:
+                command = [interpreter, "-u", program]
+                resolved_interpreter = interpreter
+            elif os.name == "nt" and program.lower().endswith((".py", ".pyw")):
+                # Windows has no shebang support; run scripts with this Python.
+                command = [sys.executable, "-u", program]
+                resolved_interpreter = sys.executable
+            else:
+                command = [program]
+                resolved_interpreter = interpreter
             try:
                 process = subprocess.Popen(
                     command,
@@ -43,7 +53,7 @@ class HardwareRuntime:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
-                    start_new_session=True,
+                    start_new_session=(os.name == "posix"),
                 )
             except OSError as exc:
                 return {
@@ -52,12 +62,12 @@ class HardwareRuntime:
                     "ready": False,
                     "error": f"Failed to create the hardware flowgraph process: {exc}",
                     "program": program,
-                    "interpreter": interpreter,
+                    "interpreter": resolved_interpreter,
                 }
             record = {
                 "process": process,
                 "program": program,
-                "interpreter": interpreter,
+                "interpreter": resolved_interpreter,
                 "command": command,
                 "run_id": f"run-{uuid.uuid4().hex[:12]}",
                 "started_at": time.time(),
@@ -90,7 +100,7 @@ class HardwareRuntime:
                 "deadline": record["started_at"] + duration,
                 "duration_seconds": duration,
                 "program": program,
-                "interpreter": interpreter,
+                "interpreter": resolved_interpreter,
             }
 
     def status(self, session_id: str) -> Dict[str, Any]:
@@ -139,11 +149,11 @@ class HardwareRuntime:
             was_running = process.poll() is None
             if was_running:
                 try:
-                    os.killpg(process.pid, signal.SIGKILL if emergency else signal.SIGTERM)
+                    self._terminate_process(process, emergency)
                     process.wait(timeout=2.0)
                 except (OSError, subprocess.TimeoutExpired):
                     try:
-                        os.killpg(process.pid, signal.SIGKILL)
+                        self._terminate_process(process, emergency=True)
                         process.wait(timeout=2.0)
                     except (OSError, subprocess.TimeoutExpired):
                         pass
@@ -152,6 +162,19 @@ class HardwareRuntime:
                 emergency=emergency,
                 requested_stop=was_running,
             )
+
+    @staticmethod
+    def _terminate_process(process: subprocess.Popen, emergency: bool) -> None:
+        """Cross-platform termination: process groups on Unix, terminate/kill on Windows."""
+        if os.name == "posix":
+            os.killpg(
+                os.getpgid(process.pid),
+                signal.SIGKILL if emergency else signal.SIGTERM,
+            )
+        elif emergency:
+            process.kill()
+        else:
+            process.terminate()
 
     @staticmethod
     def _drain_output(process: subprocess.Popen, record: Dict[str, Any]) -> None:

@@ -109,6 +109,60 @@ KNOWN_COMPLETIONS = frozenset(
 )
 
 
+#: Completion predicates that describe external preconditions (device presence,
+#: endpoint armed, parameters echoed by hardware) rather than execution
+#: quality.  When only these are unmet, the stage is parked as ``waiting``
+#: instead of ``failed`` so the user can fix the condition and retry.
+EXTERNAL_PRECONDITION_COMPLETIONS = frozenset({
+    "hardware_endpoint_present",
+    "radio_parameters_match",
+    "realtime_sink_present",
+    "device_discovered",
+    "device_probed",
+    "device_identity_matched",
+    "flowgraph_armed",
+    "hardware_check_completed",
+    "hardware_precheck_completed",
+    "configuration_recorded",
+})
+
+#: User-facing explanations for the predicates above.
+EXTERNAL_PRECONDITION_NOTES = {
+    "hardware_endpoint_present": (
+        "the flowgraph has no active SDR hardware output yet"
+    ),
+    "radio_parameters_match": (
+        "the hardware parameters do not match the requested "
+        "frequency or sample rate"
+    ),
+    "realtime_sink_present": "no live spectrum display is present yet",
+    "device_discovered": "no SDR device was discovered",
+    "device_probed": "the SDR device could not be probed",
+    "device_identity_matched": (
+        "the connected device does not match the requested SDR model"
+    ),
+    "flowgraph_armed": "the hardware output has not been armed yet",
+    "hardware_check_completed": "the hardware check has not completed yet",
+    "hardware_precheck_completed": "the hardware pre-check has not completed yet",
+    "configuration_recorded": "the device configuration has not been recorded yet",
+}
+
+
+def external_waiting_note(missing: list) -> str:
+    """Friendly explanation shown while waiting on external preconditions."""
+    reasons = [
+        EXTERNAL_PRECONDITION_NOTES.get(
+            name, str(name).replace("_", " ")
+        )
+        for name in missing
+    ]
+    return (
+        "Waiting on hardware conditions: {}. "
+        "Connect or re-check the SDR, then press Retry; "
+        "I will re-check the device first.".format("; ".join(dict.fromkeys(reasons)))
+    )
+
+
 def evaluate(stage: Any, workflow: Any, state: Any, reply: Any) -> Dict[str, bool]:
     """Evaluate only facts produced by tools/state; never trust narrative text."""
     invocations = list(getattr(reply, "tool_invocations", None) or [])

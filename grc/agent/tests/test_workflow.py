@@ -18,6 +18,391 @@ from grc.agent.workflow.intent_alignment import IntentAlignmentCoordinator
 from grc.agent.workflow.revision import analyze_intent_patch
 
 
+class WindowsPersistenceContractTest(unittest.TestCase):
+    def test_workflow_atomic_replace_retries_short_file_lock(self):
+        from grc.agent.workflow import engine as engine_module
+
+        replace = mock.Mock(
+            side_effect=[PermissionError("locked"), PermissionError("locked"), None]
+        )
+        with mock.patch.object(engine_module.os, "replace", replace), mock.patch.object(
+            engine_module.time, "sleep"
+        ) as sleep:
+            engine_module._atomic_replace("workflow.tmp", "workflow.yaml")
+        self.assertEqual(replace.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_workflow_atomic_replace_propagates_persistent_lock(self):
+        from grc.agent.workflow import engine as engine_module
+
+        with mock.patch.object(
+            engine_module.os, "replace", side_effect=PermissionError("locked")
+        ), mock.patch.object(engine_module.time, "sleep"):
+            with self.assertRaises(PermissionError):
+                engine_module._atomic_replace(
+                    "workflow.tmp", "workflow.yaml", retries=2
+                )
+
+
+class UserFacingNarrationTest(unittest.TestCase):
+    def test_offline_design_reply_is_friendly_and_hides_gui_internals(self):
+        from grc.agent.tools.narrate import narrate_design
+
+        recipe = mock.Mock(
+            title="QPSK Transmitter", difficulty="T2", knobs={}
+        )
+        text = narrate_design(
+            recipe,
+            {"valid": True, "num_blocks": 6, "metrics": {}},
+            mock.Mock(level="student"),
+        )
+        self.assertIn("✅", text)
+        self.assertIn("passed validation", text)
+        self.assertIn("No hardware was accessed", text)
+        self.assertNotIn("QT GUI", text)
+        self.assertNotIn("File Sink", text)
+        self.assertNotIn("headless", text)
+
+
+class SemanticControlPlaneContractTest(unittest.TestCase):
+    def test_llm_readonly_false_cannot_override_host_forbidden_policy(self):
+        from types import SimpleNamespace
+        from grc.agent.service.adapter import ServiceAgent
+
+        agent = ServiceAgent.__new__(ServiceAgent)
+        workflow = SimpleNamespace(
+            task_type="MODIFY_PROJECT",
+            current_stage="apply_and_verify",
+            intent=WorkflowIntent(
+                context={
+                    "forbidden_capabilities": ["modify_project"],
+                    "turn_semantics": {"read_only": False},
+                }
+            ),
+        )
+        ctx = SimpleNamespace(extra={})
+        agent._refresh_mutation_gate(ctx, "change it", workflow)
+        self.assertTrue(ctx.extra["mutation_forbidden"])
+
+    def test_semantic_readonly_tightens_an_otherwise_writable_turn(self):
+        from types import SimpleNamespace
+        from grc.agent.service.adapter import ServiceAgent
+
+        agent = ServiceAgent.__new__(ServiceAgent)
+        workflow = SimpleNamespace(
+            task_type="MODIFY_PROJECT",
+            current_stage="inspect_and_plan",
+            intent=WorkflowIntent(
+                context={"turn_semantics": {"read_only": True}}
+            ),
+        )
+        ctx = SimpleNamespace(extra={})
+        agent._refresh_mutation_gate(ctx, "inspect it", workflow)
+        self.assertTrue(ctx.extra["mutation_forbidden"])
+
+    def test_recipe_switch_reads_canonical_llm_target(self):
+        from types import SimpleNamespace
+        from grc.agent.service.adapter import ServiceAgent
+
+        agent = ServiceAgent.__new__(ServiceAgent)
+        agent._state = SharedState()
+        agent._state.project.grc_path = "/tmp/current.grc"
+        agent._state.project.config.update({
+            "recipe": "bpsk_awgn", "modulation": "bpsk",
+        })
+        workflow = SimpleNamespace(
+            intent=WorkflowIntent(
+                context={
+                    "turn_semantics": {
+                        "recipe_switch_target": "qpsk_awgn",
+                    }
+                }
+            )
+        )
+        target, already = agent._semantic_recipe_switch(workflow)
+        self.assertEqual(target, "qpsk_awgn")
+        self.assertEqual(already, "")
+
+
+class PlanCoverageAndRelationContractTest(unittest.TestCase):
+    """P0 contracts: plan coverage binding, LLM turn relation, archival."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def engine(self):
+        return WorkflowEngine(str(self.root / "workflow.yaml"))
+
+    def _pluto_workflow(self, session_id):
+        state = SharedState(session_id=session_id)
+        engine = self.engine()
+        workflow = engine.consume_turn(
+            "为 PlutoSDR 配置 2.402 GHz、2 Msps 的发射流图，"
+            "保存配置并停在发射确认。",
+            state,
+        )
+        return engine, workflow, state
+
+    def test_planner_tool_actions_bind_missing_catalog_stages(self):
+        """V4 regression: BLE planner actions must not be silently dropped."""
+        from grc.agent.workflow.plan_compiler import compile_stages
+
+        engine, workflow, state = self._pluto_workflow("coverage-bind")
+        stage = engine.start_stage()
+        intent = workflow.intent
+        composed = [item.id for item in workflow.stages]
+        self.assertNotIn("build_ble_advertiser", composed)
+        # The planner proposed BLE builder tool actions for a generic TX plan.
+        proposal = [
+            {"id": "build_ble_advertising_pdu", "objective": "BLE PDU"},
+            {"id": "generate_ble_1m_waveform", "objective": "BLE waveform"},
+            {"id": "verify_ble_packet_bits", "objective": "BLE verify"},
+        ]
+        stages = [
+            engine.catalog["task_candidates"]["TX_BUILD"]["stages"][0]
+        ]
+        stages = [type(stage).from_dict(dict(s)) for s in stages]
+        compiled, _nodes, rejected, unbound = compile_stages(
+            intent, stages, catalog=engine.catalog, proposal=proposal
+        )
+        self.assertEqual(rejected, [])
+        self.assertEqual(unbound, [])
+        ids = [item.id for item in compiled]
+        self.assertIn("build_ble_advertiser", ids)
+        self.assertIn("offline_protocol_verify", ids)
+        # Bound stages must execute before the next decision boundary.
+        checkpoint_index = next(
+            (
+                index for index, item in enumerate(compiled)
+                if "checkpoint" in str(getattr(item, "interaction", "") or "")
+            ),
+            len(compiled),
+        )
+        self.assertLess(ids.index("build_ble_advertiser"), checkpoint_index)
+
+    def test_unbound_rf_action_blocks_instantiation(self):
+        from grc.agent.workflow.plan_compiler import PlanCoverageError
+
+        engine, workflow, state = self._pluto_workflow("coverage-block")
+        intent = workflow.intent
+        node = type(
+            "Node", (), {
+                "id": "arm_hardware_flowgraph",
+                "stage_id": "arm_hardware_flowgraph",
+                "objective": "",
+                "requires": [],
+                "produces": [],
+                "success_predicates": [],
+                "tools": [],
+            },
+        )()
+        with mock.patch(
+            "grc.agent.workflow.llm_planner.propose_plan",
+            return_value=[{"id": "dummy_action"}],
+        ), mock.patch(
+            "grc.agent.workflow.plan_compiler.validate_proposal",
+            return_value=([node], []),
+        ), mock.patch(
+            "grc.agent.workflow.plan_compiler.ensure_plan_coverage",
+            return_value=(list(workflow.stages), [], ["arm_hardware_flowgraph"]),
+        ):
+            with self.assertRaises(PlanCoverageError):
+                engine.instantiate(intent, state)
+
+    def test_llm_relation_adjustment_does_not_supersede(self):
+        """V4 regression: 'local name must be X' is an adjustment, not a new task."""
+        engine, workflow, state = self._pluto_workflow("relation-adjust")
+        engine.start_stage()
+        original_id = workflow.workflow_id
+
+        def chat_side_effect(messages, *args, **kwargs):
+            system = str(messages[0].get("content") or "")
+            if "会话关系判定器" in system:
+                return json.dumps(
+                    {"relation": "adjustment", "reason": "parameter supplement"}
+                )
+            return json.dumps({
+                "task_type": workflow.task_type,
+                "confidence": 0.95,
+                "capabilities": list(workflow.intent.capabilities),
+                "slots": {"local_name": "cindysha"},
+            })
+
+        with mock.patch(
+            "grc.agent.llm.is_configured", return_value=True
+        ), mock.patch(
+            "grc.agent.llm.chat", side_effect=chat_side_effect,
+        ):
+            engine.consume_turn(
+                "The local name of the signal ble must be 'cindysha'.", state
+            )
+        self.assertEqual(engine.workflow.workflow_id, original_id)
+        self.assertEqual(
+            engine.workflow.intent.slots.get("local_name"), "cindysha"
+        )
+
+    def test_llm_unreachable_raises_instead_of_rule_fallback(self):
+        engine, workflow, state = self._pluto_workflow("relation-outage")
+        engine.start_stage()
+        engine._activate_current()
+        with mock.patch(
+            "grc.agent.llm.is_configured", return_value=False
+        ), mock.patch(
+            "grc.agent.llm.intent_test_bypass_enabled", return_value=False
+        ):
+            with self.assertRaises(Exception) as raised:
+                engine.consume_turn("继续调整一下参数", state)
+        self.assertIn("language model", str(raised.exception).lower())
+
+    def test_superseded_workflow_is_archived_as_previous_attempt(self):
+        engine, workflow, state = self._pluto_workflow("archive")
+        engine.start_stage()
+        old_id = workflow.workflow_id
+        old_task_type = workflow.task_type
+
+        def chat_side_effect(messages, *args, **kwargs):
+            system = str(messages[0].get("content") or "")
+            if "会话关系判定器" in system:
+                return json.dumps({"relation": "new_task", "reason": "different goal"})
+            return json.dumps({
+                "task_type": "END_TO_END_SIM",
+                "confidence": 0.9,
+                "capabilities": ["build_signal"],
+                "slots": {"modulation": "bpsk"},
+            })
+
+        with mock.patch(
+            "grc.agent.llm.is_configured", return_value=True
+        ), mock.patch(
+            "grc.agent.llm.chat", side_effect=chat_side_effect,
+        ), mock.patch(
+            "grc.agent.workflow.llm_planner.propose_plan",
+            return_value=None,
+        ):
+            engine.consume_turn("构建 BPSK AWGN 并测 EVM", state)
+        new_workflow = engine.workflow
+        self.assertNotEqual(new_workflow.workflow_id, old_id)
+        self.assertTrue(new_workflow.previous_attempts)
+        archived = new_workflow.previous_attempts[-1]
+        self.assertEqual(archived["workflow_id"], old_id)
+        self.assertEqual(archived["task_type"], old_task_type)
+        self.assertTrue(archived["stages"])
+        digest = engine.digest()
+        self.assertTrue(digest.get("previous_attempts"))
+
+    def test_rule_entities_do_not_leak_beside_llm_values(self):
+        """V4 regression: entities must not keep the regex guess 'of'."""
+        from grc.agent.workflow.engine import complete_intent
+
+        rules = WorkflowIntent(
+            raw_text="The local name of the signal ble must be 'cindysha'",
+            task_type="TX_BUILD",
+            confidence=0.65,
+            slots={"local_name": "of"},
+            slot_sources={"local_name": "rules"},
+            missing_slots=[],
+        )
+        rules.entities = {"local_name": "of"}
+        payload = {
+            "task_type": "TX_BUILD",
+            "confidence": 0.95,
+            "capabilities": ["build_tx"],
+            "slots": {"local_name": "cindysha"},
+        }
+        with mock.patch(
+            "grc.agent.llm.is_configured", return_value=True
+        ), mock.patch(
+            "grc.agent.llm.chat",
+            return_value=json.dumps(payload),
+        ):
+            completed = complete_intent(rules, rules.raw_text, SharedState())
+        self.assertEqual(completed.slots["local_name"], "cindysha")
+        self.assertEqual(completed.entities.get("local_name"), "cindysha")
+
+
+class ExternalWaitingAndFullPlanTest(unittest.TestCase):
+    """V4 regression contracts.
+
+    * A stage that only misses external hardware preconditions parks as
+      ``waiting`` with a friendly note instead of a hard ``failed`` verdict.
+    * The digest always exposes the whole plan, deferred stages included.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def engine(self):
+        return WorkflowEngine(str(self.root / "workflow.yaml"))
+
+    def _pluto_workflow(self, session_id):
+        state = SharedState(session_id=session_id)
+        engine = self.engine()
+        workflow = engine.consume_turn(
+            "为 PlutoSDR 配置 2.402 GHz、2 Msps 的发射流图，"
+            "保存配置并停在发射确认。",
+            state,
+        )
+        return engine, workflow
+
+    def test_external_precondition_miss_parks_stage_waiting(self):
+        engine, workflow = self._pluto_workflow("external-wait")
+        stage = engine.start_stage()
+        stage.completion = ["hardware_endpoint_present"]
+        accepted = engine.accept_result({
+            "ok": True,
+            "stage_id": stage.id,
+            "workflow_revision": workflow.revision,
+            "base_project_version": workflow.base_project_version,
+            "completion": {"hardware_endpoint_present": False},
+        })
+        self.assertTrue(accepted)
+        self.assertEqual(stage.execution_status, "waiting")
+        self.assertEqual(stage.outcome, "inconclusive")
+        self.assertEqual(workflow.execution_status, "waiting")
+        self.assertIn("Waiting on hardware", str(stage.result.get("note")))
+
+    def test_missing_execution_product_still_fails(self):
+        engine, workflow = self._pluto_workflow("real-failure")
+        stage = engine.start_stage()
+        stage.completion = ["flowgraph_saved"]
+        engine.accept_result({
+            "ok": True,
+            "stage_id": stage.id,
+            "workflow_revision": workflow.revision,
+            "base_project_version": workflow.base_project_version,
+            "completion": {"flowgraph_saved": False},
+        })
+        self.assertEqual(stage.outcome, "failed")
+
+    def test_digest_shows_full_plan_including_deferred(self):
+        engine, workflow = self._pluto_workflow("full-plan")
+        digest = engine.digest()
+        ids = [str(item.get("id")) for item in digest["stages"]]
+        deferred_ids = [
+            str(item.get("id")) for item in (workflow.deferred_plan or [])
+        ]
+        self.assertTrue(deferred_ids)
+        for deferred_id in deferred_ids:
+            self.assertIn(deferred_id, ids)
+        deferred_rows = [
+            item for item in digest["stages"]
+            if item.get("execution_status") == "deferred"
+        ]
+        self.assertEqual(len(deferred_rows), len(deferred_ids))
+        self.assertEqual(
+            digest.get("stage_total"),
+            len(workflow.stages) + len(deferred_ids),
+        )
+
+
 class DynamicWorkflowV2ContractTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -764,16 +1149,16 @@ class WorkflowCapabilityCompositionTest(unittest.TestCase):
             "config_handoff",
         )
         self.assertEqual(digest.get("checkpoint_purpose"), "config_handoff")
-        self.assertEqual(digest.get("stage_label"), "配置确认")
+        self.assertEqual(digest.get("stage_label"), "Configuration Confirmation")
         self.assertEqual(
             next(
                 item["label"] for item in digest["stages"]
                 if item["id"] == "rf_plan_confirmation"
             ),
-            "配置确认",
+            "Configuration Confirmation",
         )
         self.assertFalse(digest.get("max_duration_seconds"))
-        self.assertEqual(workflow.stage("rf_plan_confirmation").checkpoint.reason, "配置确认")
+        self.assertEqual(workflow.stage("rf_plan_confirmation").checkpoint.reason, "Configuration Confirmation")
         self.assertFalse(digest.get("blocker"))
         engine.resolve_checkpoint("approved")
         self.assertEqual(workflow.execution_status, "completed")
@@ -785,7 +1170,7 @@ class WorkflowCapabilityCompositionTest(unittest.TestCase):
         self.assertFalse(digest.get("can_confirm"))
         self.assertFalse(digest.get("checkpoint_id"))
         self.assertEqual(digest.get("requested_effect"), "")
-        self.assertEqual(digest.get("stage_label"), "配置确认")
+        self.assertEqual(digest.get("stage_label"), "Configuration Confirmation")
 
     def test_followup_transmit_reuses_saved_preview_as_deploy(self):
         engine = self.engine()
@@ -827,7 +1212,7 @@ class WorkflowCapabilityCompositionTest(unittest.TestCase):
                 follow.stage("rf_plan_confirmation").checkpoint.requested_effect,
                 "RF_RUN",
             )
-            self.assertEqual(digest.get("stage_label"), "RF 计划确认")
+            self.assertEqual(digest.get("stage_label"), "RF Plan Confirmation")
             self.assertEqual(digest.get("max_duration_seconds"), 10.0)
 
     def test_failed_stage_keeps_resume_from(self):
@@ -1007,7 +1392,48 @@ class IntentLlmTest(unittest.TestCase):
             completed = complete_intent(rules, rules.raw_text, SharedState())
         self.assertIs(completed, rules)
 
-    def test_llm_fills_ambiguous_slots_without_overriding_user(self):
+    def test_production_unconfigured_does_not_guess_from_rules(self):
+        from grc.agent.llm import SemanticUnderstandingError
+
+        rules = WorkflowIntent(
+            raw_text="Build something with QPSK",
+            task_type="END_TO_END_SIM",
+            slots={"modulation": "qpsk", "direction": "transceiver"},
+            slot_sources={"modulation": "rules", "direction": "rules"},
+        )
+        with mock.patch("grc.agent.llm.is_configured", return_value=False), mock.patch(
+            "grc.agent.llm.intent_test_bypass_enabled", return_value=False
+        ):
+            with self.assertRaises(SemanticUnderstandingError):
+                complete_intent(rules, rules.raw_text, SharedState())
+
+    def test_llm_corrects_ambiguous_rule_candidate_to_tx(self):
+        engine = WorkflowEngine(tempfile.mktemp(suffix=".json"))
+        rules = engine.classify(
+            "Build a QPSK baseband transmit chain, simulation only.", SharedState()
+        )
+        self.assertEqual(rules.slots["direction"], "transceiver")
+        payload = {
+            "task_type": "TX_BUILD",
+            "confidence": 0.98,
+            "capabilities": ["build_tx"],
+            "slots": {"modulation": "qpsk", "direction": "tx"},
+        }
+        with mock.patch("grc.agent.llm.is_configured", return_value=True), mock.patch(
+            "grc.agent.llm.chat", return_value=__import__("json").dumps(payload)
+        ):
+            completed = complete_intent(rules, rules.raw_text, SharedState())
+        self.assertEqual(completed.slots["direction"], "tx")
+        self.assertEqual(completed.slot_sources["direction"], "llm")
+
+    def test_llm_extraction_is_authoritative_over_regex_user_guesses(self):
+        """The LLM reading of the user's text is the user's voice.
+
+        Regex layers may label extracted values "user", but they are still
+        guesses about the text; the LLM extraction of the same text wins.
+        (V4 regression: regex local_name="of" survived beside the LLM's
+        corrected value, producing two disagreeing projections.)
+        """
         rules = WorkflowIntent(
             raw_text="帮我做一个无线通信系统，用 BPSK",
             task_type="END_TO_END_SIM",
@@ -1026,12 +1452,86 @@ class IntentLlmTest(unittest.TestCase):
             "grc.agent.llm.chat", return_value=__import__("json").dumps(payload)
         ):
             completed = complete_intent(rules, rules.raw_text, SharedState())
-        self.assertEqual(completed.slots["modulation"], "bpsk")
-        self.assertEqual(completed.slot_sources["modulation"], "user")
+        self.assertEqual(completed.slots["modulation"], "qpsk")
+        self.assertEqual(completed.slot_sources["modulation"], "llm")
         self.assertEqual(completed.slots["channel"], "awgn")
         self.assertEqual(completed.slot_sources["channel"], "llm")
         self.assertIn("build_signal", completed.capabilities)
         self.assertGreaterEqual(completed.confidence, 0.9)
+
+    def test_llm_omission_drops_nonconflicting_rule_candidates(self):
+        """A regex guess must not survive merely because the LLM omitted it."""
+        rules = WorkflowIntent(
+            raw_text="an ambiguous radio request",
+            task_type="HARDWARE_CONFIGURE",
+            confidence=0.99,
+            capabilities=["protocol", "deploy"],
+            slots={"protocol": "ble", "local_name": "of"},
+            slot_sources={"protocol": "rules", "local_name": "user"},
+            goals=["rule-derived goal"],
+            requested_operations=["deploy"],
+        )
+        payload = {
+            "task_type": "END_TO_END_SIM",
+            "confidence": 0.72,
+            "capabilities": ["build_signal"],
+            "slots": {"modulation": "qpsk"},
+        }
+        with mock.patch("grc.agent.llm.is_configured", return_value=True), mock.patch(
+            "grc.agent.llm.chat", return_value=json.dumps(payload)
+        ):
+            completed = complete_intent(rules, rules.raw_text, SharedState())
+        self.assertEqual(completed.slots, {"modulation": "qpsk"})
+        self.assertEqual(completed.capabilities, ["build_signal"])
+        self.assertNotIn("rule-derived goal", completed.goals)
+        self.assertNotIn("deploy", completed.requested_operations)
+        self.assertAlmostEqual(completed.confidence, 0.72)
+
+    def test_llm_turn_semantics_are_persisted_with_intent(self):
+        rules = WorkflowIntent(raw_text="inspect only", task_type="DIAGNOSE")
+        payload = {
+            "task_type": "DIAGNOSE",
+            "confidence": 0.9,
+            "capabilities": ["diagnose"],
+            "slots": {},
+            "turn_semantics": {
+                "read_only": True,
+                "confirmation_decision": "none",
+                "recipe_switch_target": "",
+            },
+        }
+        with mock.patch("grc.agent.llm.is_configured", return_value=True), mock.patch(
+            "grc.agent.llm.chat", return_value=json.dumps(payload)
+        ):
+            completed = complete_intent(rules, rules.raw_text, SharedState())
+        self.assertTrue(completed.context["turn_semantics"]["read_only"])
+
+    def test_llm_does_not_override_safety_bounds(self):
+        rules = WorkflowIntent(
+            raw_text="发射 10 秒",
+            task_type="HARDWARE_CONFIGURE",
+            confidence=0.95,
+            slots={"duration_seconds": 10.0, "max_duration_seconds": 10.0},
+            slot_sources={
+                "duration_seconds": "user",
+                "max_duration_seconds": "safety_default",
+            },
+            missing_slots=[],
+        )
+        payload = {
+            "task_type": "HARDWARE_CONFIGURE",
+            "confidence": 0.9,
+            "capabilities": ["deploy"],
+            "slots": {"max_duration_seconds": 600.0},
+        }
+        with mock.patch("grc.agent.llm.is_configured", return_value=True), mock.patch(
+            "grc.agent.llm.chat", return_value=__import__("json").dumps(payload)
+        ):
+            completed = complete_intent(rules, rules.raw_text, SharedState())
+        self.assertEqual(completed.slots["max_duration_seconds"], 10.0)
+        self.assertEqual(
+            completed.slot_sources["max_duration_seconds"], "safety_default"
+        )
 
     def test_llm_does_not_relabel_safety_duration_as_user_constraint(self):
         rules = WorkflowIntent(
@@ -1087,13 +1587,15 @@ class IntentLlmTest(unittest.TestCase):
         self.assertEqual(completed.slots["operation"], "deploy")
         self.assertNotIn("stop_at_decision_boundary", completed.stop_conditions)
 
-    def test_invalid_task_type_is_ignored(self):
+    def test_invalid_llm_contract_is_rejected_instead_of_guessed(self):
+        from grc.agent.llm import SemanticUnderstandingError
+
         rules = WorkflowIntent(raw_text="x", task_type="RX_BUILD", confidence=0.5)
         with mock.patch("grc.agent.llm.is_configured", return_value=True), mock.patch(
             "grc.agent.llm.chat", return_value='{"task_type": "EIGHTH", "confidence": 0.99}'
         ):
-            completed = complete_intent(rules, "x", SharedState())
-        self.assertEqual(completed.task_type, "RX_BUILD")
+            with self.assertRaises(SemanticUnderstandingError):
+                complete_intent(rules, "x", SharedState())
 
     def test_llm_can_drop_hardware_capability(self):
         rules = WorkflowIntent(
@@ -1109,6 +1611,7 @@ class IntentLlmTest(unittest.TestCase):
             "confidence": 0.96,
             "capabilities": ["build_tx"],
             "forbidden_capabilities": ["hardware_configure", "hardware_runtime"],
+            "slots": {"modulation": "qpsk", "direction": "tx"},
         }
         with mock.patch("grc.agent.llm.is_configured", return_value=True), mock.patch(
             "grc.agent.llm.chat", return_value=__import__("json").dumps(payload)
@@ -1124,10 +1627,16 @@ class IntentLlmTest(unittest.TestCase):
     def test_ble_deploy_stays_hardware_when_llm_says_tx_build(self):
         engine = WorkflowEngine(tempfile.mktemp(suffix=".yaml"))
         payload = {
-            "task_type": "TX_BUILD",
+            "task_type": "HARDWARE_CONFIGURE",
             "confidence": 0.99,
-            "capabilities": ["build_tx", "protocol"],
-            "slots": {"operation": "deploy", "protocol": "ble"},
+            "capabilities": [
+                "build_tx", "protocol", "hardware_configure", "deploy",
+                "hardware_runtime",
+            ],
+            "slots": {
+                "operation": "deploy", "protocol": "ble", "hardware": "pluto",
+                "direction": "tx", "local_name": "demo",
+            },
         }
         with mock.patch("grc.agent.llm.is_configured", return_value=True), mock.patch(
             "grc.agent.llm.chat", return_value=__import__("json").dumps(payload)
@@ -1698,6 +2207,113 @@ class IntentAlignmentContractTest(unittest.TestCase):
         )
         self.assertTrue(self.state.intent.semantic_hash)
 
+    def test_llm_followup_absorbs_all_answered_and_optional_fields(self):
+        self.alignment.consume_text(
+            "I want to use PlutoSDR to transmit a BLE signal."
+        )
+        payload = {
+            "updates": {
+                "duration_seconds": 30,
+                "success_conditions": [
+                    "The cindysha advertisement is visible in the phone app"
+                ],
+                "local_name": "cindysha",
+            }
+        }
+        config = {
+            "base_url": "https://unused.invalid",
+            "api_key": "test",
+            "model": "test-model",
+            "timeout": 120,
+            "max_messages": 20,
+        }
+        with mock.patch("grc.agent.llm.is_configured", return_value=True), mock.patch(
+            "grc.agent.llm.get_config", return_value=config
+        ), mock.patch(
+            "grc.agent.llm.chat", return_value=__import__("json").dumps(payload)
+        ):
+            result = self.alignment.consume_text(
+                "30s; use local name 'cindysha' so I can observe it in my phone app."
+            )
+        self.assertTrue(result.pending)
+        self.assertEqual(self.state.intent.interaction["kind"], "intent_confirmation")
+        self.assertEqual(self.state.intent.parameters["duration_seconds"], 30.0)
+        self.assertEqual(self.state.intent.parameters["max_duration_seconds"], 30.0)
+        self.assertEqual(self.state.intent.parameters["local_name"], "cindysha")
+        self.assertEqual(self.state.intent.missing_fields, [])
+
+    def test_llm_followup_timeout_preserves_specification(self):
+        from grc.agent.llm import SemanticUnderstandingError
+
+        self.alignment.consume_text(
+            "I want to use PlutoSDR to transmit a BLE signal."
+        )
+        before = dict(self.state.intent.parameters)
+        config = {
+            "base_url": "https://unused.invalid",
+            "api_key": "test",
+            "model": "test-model",
+            "timeout": 120,
+            "max_messages": 20,
+        }
+        with mock.patch("grc.agent.llm.is_configured", return_value=True), mock.patch(
+            "grc.agent.llm.get_config", return_value=config
+        ), mock.patch(
+            "grc.agent.llm.chat", side_effect=TimeoutError("timed out")
+        ), mock.patch.dict(os.environ, {"GRC_AGENT_SEMANTIC_RETRIES": "0"}):
+            with self.assertRaises(SemanticUnderstandingError):
+                self.alignment.consume_text("30 seconds, verify it in my phone app")
+        self.assertEqual(self.state.intent.parameters, before)
+
+    def test_confirmation_action_uses_llm_semantics_not_fixed_vocabulary(self):
+        self.alignment.consume_text("我要用硬件发射一段ble信号")
+        self.alignment.consume_text(
+            "硬件用 PlutoSDR，最多20秒，成功条件是独立接收端观察到目标信号"
+        )
+        self.assertEqual(self.state.intent.status, "awaiting_confirmation")
+        payload = {"intent_action": "confirm", "updates": {}}
+        config = {
+            "base_url": "https://unused.invalid", "api_key": "test",
+            "model": "test-model", "timeout": 120, "max_messages": 20,
+        }
+        with mock.patch("grc.agent.llm.is_configured", return_value=True), mock.patch(
+            "grc.agent.llm.get_config", return_value=config
+        ), mock.patch(
+            "grc.agent.llm.chat", return_value=json.dumps(payload)
+        ):
+            outcome = self.alignment.consume_text(
+                "Everything in that specification matches what I meant."
+            )
+        self.assertFalse(outcome.pending)
+        self.assertEqual(self.state.intent.status, "confirmed")
+
+    def test_confirmation_parameter_update_is_extracted_in_same_llm_call(self):
+        self.alignment.consume_text("我要用硬件发射一段ble信号")
+        self.alignment.consume_text(
+            "硬件用 PlutoSDR，最多20秒，成功条件是独立接收端观察到目标信号"
+        )
+        payload = {
+            "intent_action": "param_update",
+            "updates": {"local_name": "research-demo"},
+        }
+        config = {
+            "base_url": "https://unused.invalid", "api_key": "test",
+            "model": "test-model", "timeout": 120, "max_messages": 20,
+        }
+        with mock.patch("grc.agent.llm.is_configured", return_value=True), mock.patch(
+            "grc.agent.llm.get_config", return_value=config
+        ), mock.patch(
+            "grc.agent.llm.chat", return_value=json.dumps(payload)
+        ) as chat:
+            outcome = self.alignment.consume_text(
+                "One adjustment: call the advertisement research-demo."
+            )
+        self.assertTrue(outcome.pending)
+        self.assertEqual(chat.call_count, 1)
+        self.assertEqual(
+            self.state.intent.parameters["local_name"], "research-demo"
+        )
+
     def test_radio_specification_table_fills_open_fields_atomically(self):
         first = self.alignment.consume_text("我要用硬件发射一段ble信号")
         interaction = dict(self.state.intent.interaction)
@@ -1780,7 +2396,7 @@ class IntentAlignmentContractTest(unittest.TestCase):
         catalog = self.alignment.consume_text("有哪些可选字段")
         self.assertIn("Advertising name", catalog.message)
         teaching = self.alignment.consume_text("介绍这些参数")
-        self.assertIn("只是解释", teaching.message)
+        self.assertIn("This explanation does not confirm", teaching.message)
         self.assertEqual(self.state.intent.status, "awaiting_confirmation")
         self.assertEqual(self.state.intent.revision, revision)
         self.assertEqual(self.state.intent.parameters, parameters)
@@ -1853,6 +2469,9 @@ class IntentAlignmentContractTest(unittest.TestCase):
         self.assertIn("local_name", [item["field"] for item in ble.optional_prompts])
         self.assertIn("ssid", [item["field"] for item in wifi.optional_prompts])
         self.assertNotIn("ssid", [item["field"] for item in generic.optional_prompts])
+        self.assertTrue(all(not item.reason for item in ble.fields))
+        self.assertTrue(all(not item.reason for item in wifi.fields))
+        self.assertTrue(all(not item.reason for item in generic.fields))
 
     def test_physical_tx_questions_only_apply_to_actual_deploy(self):
         deploy_state = SharedState(session_id="generic-deploy")
@@ -1927,7 +2546,7 @@ class IntentAlignmentContractTest(unittest.TestCase):
         })
         self.assertTrue(result.pending)
         self.assertNotIn("hardware", self.state.intent.parameters)
-        self.assertIn("版本已变化", result.message)
+        self.assertIn("The intent revision has changed", result.message)
 
     def test_revision_impact_is_field_based(self):
         impact = analyze_intent_patch(
