@@ -13,8 +13,11 @@
     {
       "id": "build_tx",
       "when_any_capability": ["build_tx", "build_signal"],
-      "optional": [
+      "required_display": [
         "modulation",
+        "direction"
+      ],
+      "optional": [
         "sample_rate",
         "bandwidth",
         "payload"
@@ -23,6 +26,9 @@
     {
       "id": "build_rx",
       "when_any_capability": ["build_rx", "realtime_observe"],
+      "required_display": [
+        "direction"
+      ],
       "optional": [
         "expected_signal",
         "bandwidth",
@@ -40,6 +46,10 @@
         "sample_rate",
         "duration_seconds",
         "success_conditions"
+      ],
+      "required_display": [
+        "direction",
+        "modulation"
       ],
       "require_explicit_sources": [
         "duration_seconds",
@@ -61,6 +71,9 @@
         "carrier_frequency",
         "sample_rate"
       ],
+      "required_display": [
+        "direction"
+      ],
       "optional": [
         "bandwidth",
         "capture_duration",
@@ -71,6 +84,9 @@
     {
       "id": "protocol_ble",
       "when_slots": {"protocol": "ble"},
+      "required_display": [
+        "modulation"
+      ],
       "optional": [
         "ble_mode",
         "advertising_channels",
@@ -78,7 +94,6 @@
         "payload"
       ],
       "derived_display": [
-        "modulation",
         "carrier_frequency",
         "sample_rate"
       ]

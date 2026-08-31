@@ -401,9 +401,9 @@ class SharedState:
         digest["summary"] = _spec_summary_line(digest)
         if protocol.lower() == "ble" and duration not in ("", None):
             digest["duration_note"] = (
-                f"最大时长 {duration:g} 秒；OTA 确认或取消后会提前停止"
+                f"Maximum duration: {duration:g} seconds; OTA confirmation or cancellation stops it early."
                 if isinstance(duration, (int, float))
-                else f"最大时长 {duration} 秒；OTA 确认或取消后会提前停止"
+                else f"Maximum duration: {duration} seconds; OTA confirmation or cancellation stops it early."
             )
         return digest
 

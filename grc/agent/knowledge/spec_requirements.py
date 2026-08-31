@@ -31,6 +31,20 @@ _SLOT_ALIAS_CANON = {
     "sdr": "hardware",
     "radio": "hardware",
 }
+_DIRECTION_ALIASES = {
+    "transceiver": "sim",
+    "simulate": "sim",
+    "simulation": "sim",
+    "baseband": "sim",
+}
+
+
+def normalize_direction(value: Any) -> Any:
+    """Map legacy aliases onto the public direction classes tx / rx / sim."""
+    if value in (None, "", []):
+        return value
+    raw = str(value).strip().lower()
+    return _DIRECTION_ALIASES.get(raw, raw)
 
 
 @lru_cache(maxsize=1)
@@ -137,6 +151,8 @@ def resolve_specification(
             values[canonical] = alias_value
             if canonical not in sources:
                 sources[canonical] = alias_source
+    if values.get("direction") not in (None, "", []):
+        values["direction"] = normalize_direction(values.get("direction"))
     missing = list(dict.fromkeys(str(item) for item in missing_fields or [] if item))
     active_profiles = []
     profile_required: List[str] = []
@@ -147,6 +163,7 @@ def resolve_specification(
             continue
         active_profiles.append(str(profile.get("id") or "profile"))
         _extend_unique(profile_required, profile.get("required") or [])
+        _extend_unique(profile_required, profile.get("required_display") or [])
         _extend_unique(optional, profile.get("optional") or [])
         _extend_unique(derived_display, profile.get("derived_display") or [])
 
@@ -256,14 +273,14 @@ def combined_question(fields: Iterable[str]) -> str:
     if not questions:
         return ""
     noun = "detail" if len(questions) == 1 else "details"
-    lines = [f"🧭 I need {len(questions)} more {noun} before I create the workflow:"]
-    for index, item in enumerate(questions, 1):
+    lines = [f"🧭 I need {len(questions)} more {noun} before I can continue:"]
+    for item in questions:
         label = str(question_for(item["field"]).get("label") or item["field"])
-        line = f"{index}. {label}: {item['prompt']}"
+        line = f"- **{label}** — {item['prompt']}"
         if item["suggestions"]:
-            line += " Suggested: " + ", ".join(item["suggestions"][:4])
+            line += f" ({', '.join(item['suggestions'][:4])})"
         lines.append(line)
-    lines.append("Reply in one natural-language message; I will keep only unanswered items open.")
+    lines.append("Reply in one message. You can also ask a question or suggest a change.")
     return "\n".join(lines)
 
 

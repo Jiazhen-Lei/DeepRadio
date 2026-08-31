@@ -7,10 +7,11 @@ subject to the same safety rules as a catalog-backed compatibility workflow.
 
 from __future__ import annotations
 
-import os
 from dataclasses import asdict, dataclass, field
 from enum import IntEnum
 from typing import Any, Iterable, Mapping
+
+from ..runtime_config import rf_runtime_enabled
 
 
 class EffectLevel(IntEnum):
@@ -43,6 +44,8 @@ def stage_display_label(
     """Human stage name. Config confirm is not an RF authorization."""
     if str(stage_id or "") == "rf_plan_confirmation":
         return "RF Plan Confirmation" if is_rf_grant_effect(requested_effect) else "Configuration Confirmation"
+    if str(stage_id or "") == "flowgraph_confirmation":
+        return "Flowgraph Review"
     return default_label or str(stage_id or "")
 
 
@@ -71,7 +74,7 @@ class CapabilityBlocker:
 
 
 def system_capability_blocker(effect: Any) -> CapabilityBlocker | None:
-    """Return the launch-time blocker for an upcoming side effect.
+    """Return the user-preference blocker for an upcoming side effect.
 
     Offline design, artifact generation, and read-only probing stay available
     when RF runtime is disabled.  Device mutation and RF execution require the
@@ -80,19 +83,19 @@ def system_capability_blocker(effect: Any) -> CapabilityBlocker | None:
     requested = normalize_effect(effect)
     if requested < EffectLevel.DEVICE_CONFIG:
         return None
-    if os.environ.get("GRC_AGENT_ENABLE_RF") == "1":
+    if rf_runtime_enabled():
         return None
     return CapabilityBlocker(
         code="SYSTEM_CAPABILITY_MISSING",
         capability="rf_runtime",
         requested_effect=requested.name,
-        message="RF runtime capability is not enabled in the current GUI process, so this execution authorization cannot be accepted.",
+        message="Physical RF runtime is disabled, so this execution authorization cannot be accepted.",
         remediation=(
-            "Close GRC, set GRC_AGENT_ENABLE_RF=1, and restart. "
-            "Confirm again after the session is restored."
+            "Enable Physical RF in the DeepRadio toolbar, then confirm again. "
+            "The preference is persisted for future sessions."
         ),
         retryable=False,
-        requires_restart=True,
+        requires_restart=False,
     )
 
 
@@ -116,8 +119,9 @@ def split_at_decision_boundary(items: Iterable[Any]) -> tuple[list[Any], list[An
 def stops_at_boundary(intent: Any, stage_id: str) -> bool:
     """True when the current decision is a requested handoff, not RF grant.
 
-    Slot-filling alignment is never the handoff, even when the user asked to
-    stop at the next real decision boundary.
+    Slot-filling alignment, flowgraph review, and post-RF observation are
+    never the RF/config handoff.  Approving those checkpoints must continue
+    into hardware, transmission, or stop-and-finalize.
     """
     stage_id = str(stage_id or "")
     conditions = [str(item) for item in (getattr(intent, "stop_conditions", None) or [])]
@@ -125,7 +129,13 @@ def stops_at_boundary(intent: Any, stage_id: str) -> bool:
         return True
     if "stop_at_decision_boundary" not in conditions:
         return False
-    return "alignment" not in stage_id
+    if "alignment" in stage_id or stage_id in {
+        "flowgraph_confirmation",
+        "over_air_verification",
+        "runtime_observation",
+    }:
+        return False
+    return True
 
 
 def stage_plan_item(stage: Any) -> dict:
@@ -155,23 +165,6 @@ def highest_effect(items: Iterable[Any]) -> EffectLevel:
             break
         highest = max(highest, normalize_effect(_field(item, "effect_level")))
     return highest
-
-
-def visible_plan_horizon(stages: Iterable[Any], current_stage: str) -> list[Any]:
-    """Expose completed/current work only through the next decision boundary."""
-    items = list(stages)
-    if not items:
-        return []
-    current_index = next(
-        (index for index, item in enumerate(items)
-         if _field(item, "id") == current_stage), 0
-    )
-    end = len(items)
-    for index in range(current_index, len(items)):
-        if "checkpoint" in str(_field(items[index], "interaction") or ""):
-            end = index + 1
-            break
-    return items[:end]
 
 
 def project_intent_ir(intent: Any) -> None:

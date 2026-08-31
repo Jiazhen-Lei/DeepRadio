@@ -29,7 +29,10 @@ from .schema import WorkflowIntent
 from .revision import analyze_intent_patch
 
 
-_APPROVE = frozenset({"确认", "确认意图", "同意", "正确", "继续", "approve", "confirmed"})
+_APPROVE = frozenset({
+    "确认", "确认意图", "同意", "正确", "继续",
+    "approve", "confirm", "confirmed", "yes", "ok",
+})
 _REVISE = frozenset({"修改", "不对", "返回修改", "重新填写", "revise", "reject"})
 
 
@@ -38,6 +41,7 @@ class AlignmentOutcome:
     pending: bool
     intent: Optional[WorkflowIntent] = None
     message: str = ""
+    kind: str = ""
 
 
 class IntentAlignmentCoordinator:
@@ -76,17 +80,29 @@ class IntentAlignmentCoordinator:
                     return self._describe_optional_fields()
                 if action == "teach":
                     return self._teach_specification()
+                if action == "question":
+                    return self._answer_question(text)
                 return self._merge_free_text(
                     text,
                     semantic_updates=dict(semantic.get("updates") or {}),
                     semantic_ready=True,
                 )
+            from .engine import _looks_like_question
+
+            semantic = self._alignment_turn_from_llm(
+                text, list(shared.missing_fields or [])
+            )
+            if (
+                semantic is not None
+                and str(semantic.get("intent_action") or "") == "question"
+            ) or (semantic is None and _looks_like_question(text)):
+                return self._answer_question(text)
             return self._answer_fields(text, source="user_text")
         return self._start(text)
 
     def _consume_confirmation_test_bypass(self, text: str) -> AlignmentOutcome:
         """Legacy deterministic router, reachable only with the test bypass."""
-        normalized = str(text or "").strip().lower()
+        normalized = str(text or "").strip().lower().rstrip(".,!?")
         if normalized in _APPROVE:
             return self._confirm()
         if normalized in _REVISE:
@@ -101,6 +117,10 @@ class IntentAlignmentCoordinator:
             "explain these parameters", "teach me these parameters",
         )):
             return self._teach_specification()
+        from .engine import _looks_like_question
+
+        if _looks_like_question(text):
+            return self._answer_question(text)
         return self._merge_free_text(text)
 
     def consume_response(self, response: Dict[str, Any]) -> AlignmentOutcome:
@@ -252,6 +272,24 @@ class IntentAlignmentCoordinator:
     def _start(self, text: str) -> AlignmentOutcome:
         intent = self.engine.classify(text, self.state)
         intent = self.engine._reconcile_intent(intent, text, self.state)
+        semantics = dict((intent.context or {}).get("turn_semantics") or {})
+        decision = str(semantics.get("confirmation_decision") or "none")
+        if decision in {"approved", "rejected"}:
+            # This decision came from the LLM, not a vocabulary match.  With no
+            # active checkpoint there is nothing safe to approve/reject, so do
+            # not reinterpret the short control turn as a new underspecified
+            # radio task and overwrite the existing SharedIntent.
+            self.event_sink("orphan_confirmation_rejected", {
+                "confirmation_decision": decision,
+                "state_preserved": True,
+            })
+            return AlignmentOutcome(
+                True,
+                message=(
+                    "There is no pending confirmation in the current workflow. "
+                    "State the new radio goal if you want to begin another task."
+                ),
+            )
         shared = SharedIntent.new(text)
         self.state.intent = shared
         self._project(shared, intent)
@@ -329,6 +367,24 @@ class IntentAlignmentCoordinator:
                 shared.parameters[fields[0]] = value
                 shared.parameter_sources[fields[0]] = source
                 changed.append(fields[0])
+        if semantic_updates is None:
+            numbered = [
+                item.strip(" .")
+                for item in re.findall(
+                    r"(?:^|\n|;|\s)\d+\.\s+(.+?)(?=(?:\s+\d+\.\s+)|$)",
+                    str(text or "").strip(),
+                )
+                if item.strip()
+            ]
+            for index, remaining in enumerate(fields):
+                if remaining in changed or index >= len(numbered):
+                    continue
+                value = self._coerce(remaining, numbered[index])
+                if value in (None, "", []):
+                    continue
+                shared.parameters[remaining] = value
+                shared.parameter_sources[remaining] = source
+                changed.append(remaining)
         if "duration_seconds" in changed:
             shared.parameters["max_duration_seconds"] = shared.parameters["duration_seconds"]
             shared.parameter_sources["max_duration_seconds"] = source
@@ -415,11 +471,13 @@ class IntentAlignmentCoordinator:
         prompt = (
             "You interpret a follow-up to an existing GNU Radio Radio Specification. "
             "Return one JSON object with 'intent_action' and 'updates'. intent_action "
-            "must be exactly one of confirm, revise, optional_fields, teach, or "
-            "param_update. Use confirm only when the user accepts the specification; "
-            "revise when they reject it without yet supplying a concrete replacement; "
-            "optional_fields when they ask what else can be added; teach when they ask "
-            "for an explanation; otherwise use param_update. The established "
+            "must be exactly one of confirm, revise, optional_fields, teach, "
+            "question, or param_update. Use confirm only when the user accepts the "
+            "specification; revise when they reject it without yet supplying a "
+            "concrete replacement; optional_fields when they ask what else can be "
+            "added; teach when they ask for an explanation of the listed parameters; "
+            "question when they ask a factual or how/why question that should not "
+            "change the specification; otherwise use param_update. The established "
             "task identity is context, not something to reclassify. Extract every "
             "field explicitly answered or newly mentioned in this reply, including "
             "optional fields such as local_name. Interpret durations with units and "
@@ -484,7 +542,8 @@ class IntentAlignmentCoordinator:
                 updates[key] = value
         action = str(parsed.get("intent_action") or "param_update").strip().lower()
         if action not in {
-            "confirm", "revise", "optional_fields", "teach", "param_update",
+            "confirm", "revise", "optional_fields", "teach", "question",
+            "param_update",
         }:
             raise SemanticUnderstandingError(
                 "The language model returned an invalid alignment action. "
@@ -603,7 +662,22 @@ class IntentAlignmentCoordinator:
             return self._ask(field, validation_error=intent.validation_errors[0])
         if intent.missing_slots:
             return self._ask_missing(intent.missing_slots)
-        if had_user_questions or bool(shared.patch_history):
+        # Hardware/deploy stakes must never be silently confirmed: the
+        # specification card locks device identity and physical RF facts the
+        # user has not seen yet.  (V6: a PlutoSDR TX plan reached
+        # "confirmed" 0.7 ms after the draft with every spec field marked
+        # confirmed and no user turn in between.)
+        hardware_stakes = bool(
+            set(intent.capabilities or [])
+            & {"hardware_configure", "deploy", "hardware_runtime"}
+        ) or str(
+            (intent.slots or {}).get("operation") or ""
+        ).lower() == "deploy"
+        if (
+            had_user_questions
+            or bool(shared.patch_history)
+            or hardware_stakes
+        ):
             return self._ask_confirmation()
         shared.status = "confirmed"
         shared.confirmed_at = time.time()
@@ -669,8 +743,10 @@ class IntentAlignmentCoordinator:
             "interaction_id": f"interaction-{uuid.uuid4().hex[:10]}",
             "base_intent_revision": shared.revision,
             "prompt": (
-                "✅ The Radio Specification is complete. Confirm it to create the workflow. "
-                "You can also state a field to revise or add, or ask to explain these parameters."
+                "✅ The Radio Specification is complete.\n\n"
+                "- Confirm it to create the workflow\n"
+                "- Or name a field to change\n"
+                "- Or ask a question about these parameters"
             ),
             "reason": "Confirm, continue revising, add optional fields, or request parameter guidance.",
             "summary": summary,
@@ -686,7 +762,10 @@ class IntentAlignmentCoordinator:
         shared.interaction = interaction
         shared.refresh_hash()
         self.event_sink("interaction_requested", {**self._event_payload(), **interaction})
-        return AlignmentOutcome(True, message=interaction["prompt"] + "\n" + summary)
+        # The structured Specification card is the single public rendering of
+        # resolved fields.  The chat bubble should contain only the next
+        # action, not a second copy of the same parameter list.
+        return AlignmentOutcome(True, message=interaction["prompt"])
 
     def _describe_optional_fields(self) -> AlignmentOutcome:
         optional = list(self.state.intent.specification.optional_prompts or [])
@@ -709,6 +788,26 @@ class IntentAlignmentCoordinator:
             lines.append("- {}: {}".format(item.label or item.key, teaching))
         lines.append("This explanation does not confirm any parameters. Continue revising or reply 'confirm'.")
         return AlignmentOutcome(True, message="\n".join(lines))
+
+    def _answer_question(self, text: str) -> AlignmentOutcome:
+        from .narration import answer_question
+
+        shared = self.state.intent
+        context = {
+            "specification": [
+                {
+                    "key": item.key,
+                    "label": item.label,
+                    "value": item.value,
+                    "requirement": item.requirement,
+                }
+                for item in (shared.specification.fields or [])
+            ],
+            "missing_fields": list(shared.missing_fields or []),
+            "status": shared.status,
+        }
+        message = answer_question(user_text=text, context=context)
+        return AlignmentOutcome(True, message=message, kind="question")
 
     def _request_revision(self, message: str = "State the field and value you want to revise.") -> AlignmentOutcome:
         shared = self.state.intent
@@ -818,17 +917,27 @@ class IntentAlignmentCoordinator:
 
     @staticmethod
     def _summary(shared: SharedIntent) -> str:
+        labels = {
+            "protocol": "Protocol",
+            "modulation": "Modulation",
+            "direction": "Direction",
+            "hardware": "Hardware",
+            "local_name": "Local name",
+            "carrier_frequency": "Carrier frequency",
+            "sample_rate": "Sample rate",
+            "bandwidth": "Bandwidth",
+            "ebn0_db": "Eb/No",
+            "duration_seconds": "Maximum duration",
+            "operation": "Requested operation",
+            "signal_source_scope": "Signal source",
+        }
         visible = [
-            f"{key}={value}"
+            f"{labels[key]}: {value}"
             for key, value in shared.parameters.items()
             if value not in (None, "", [])
-            and key in {
-                "protocol", "modulation", "direction", "hardware", "local_name",
-                "carrier_frequency", "sample_rate", "bandwidth", "ebn0_db",
-                "duration_seconds", "operation", "signal_source_scope",
-            }
+            and key in labels
         ]
-        return "Intent: {}; {}".format(shared.task_type or "Unclassified", ", ".join(visible))
+        return "Proposed radio specification: " + "; ".join(visible)
 
     @staticmethod
     def _coerce(field: str, value: Any) -> Any:
@@ -843,6 +952,11 @@ class IntentAlignmentCoordinator:
             match = re.search(r"[-+]?\d+(?:\.\d+)?", text)
             return float(match.group(0)) if match else text
         if field == "duration_seconds":
+            labeled = re.search(
+                r"(\d+(?:\.\d+)?)\s*(?:seconds?|秒)\b", text, re.I
+            )
+            if labeled:
+                return float(labeled.group(1))
             match = re.search(r"\d+(?:\.\d+)?", text)
             return float(match.group(0)) if match else text
         if field == "success_conditions":

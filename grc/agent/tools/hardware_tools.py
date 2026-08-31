@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict
 
+from ..runtime_config import rf_runtime_enabled
 from ..service.hardware_runtime import RUNTIME
 from .hardware_profiles import (
     device_args_for,
@@ -488,7 +489,7 @@ def probe_device(
 def arm_hardware_flowgraph(
     ctx: ToolContext, grc_path: str, device_identity: str = ""
 ) -> Dict[str, Any]:
-    if os.environ.get("GRC_AGENT_ENABLE_RF") != "1":
+    if not rf_runtime_enabled():
         return {
             "ok": False,
             "armed": False,
@@ -626,12 +627,12 @@ def start_flowgraph(
         replay = dict(action_results[action_key])
         replay["idempotent_replay"] = True
         return replay
-    if os.environ.get("GRC_AGENT_ENABLE_RF") != "1":
+    if not rf_runtime_enabled():
         return {
             "ok": False,
             "enabled": False,
             "requires_confirmation": True,
-            "error": "Physical RF is disabled by default; explicitly set GRC_AGENT_ENABLE_RF=1 only after completing safety checks",
+            "error": "Physical RF is disabled; enable the persistent Physical RF preference before authorizing this run",
         }
     if not _rf_approved(ctx):
         return {"ok": False, "requires_confirmation": True, "error": "RF_RUN user authorization is missing"}

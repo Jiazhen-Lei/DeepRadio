@@ -12,7 +12,10 @@ EXECUTION_STATUSES = frozenset(
 OUTCOMES = frozenset({"passed", "failed", "inconclusive", "cancelled", ""})
 DECISIONS = frozenset({"pending", "approved", "rejected"})
 TURN_RELATIONS = frozenset(
-    {"new_task", "answer", "adjustment", "feedback", "approval", "rejection", "cancel"}
+    {
+        "new_task", "answer", "adjustment", "feedback",
+        "approval", "rejection", "cancel", "question",
+    }
 )
 EFFECT_LEVELS = frozenset(
     {"READ", "ARTIFACT_WRITE", "DEVICE_READ", "DEVICE_CONFIG", "RF_RUN"}

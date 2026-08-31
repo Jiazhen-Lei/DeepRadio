@@ -7,7 +7,7 @@ without constructing a real GTK window.  Visual layout remains a manual check.
 import unittest
 
 from grc.gui.ClaimsPanel import ClaimsPanel
-from grc.gui.workflow_presenter import present
+from grc.gui.workflow_presenter import interaction_view, present
 
 
 class _Widget:
@@ -139,6 +139,93 @@ class WorkflowPresenterTest(unittest.TestCase):
         self.assertNotIn("return_code", text)
         self.assertNotIn("pid", text)
 
+    def test_default_ui_text_is_english_and_hides_control_plane_fields(self):
+        view = present(
+            spec={},
+            claims=[],
+            workflow={
+                "workflow_id": "wf-secret",
+                "task_type": "HARDWARE_CONFIGURE",
+                "execution_status": "completed",
+                "current_stage": "rf_plan_confirmation",
+                "stages": [{
+                    "id": "rf_plan_confirmation",
+                    "label": "射频确认",
+                    "execution_status": "completed",
+                    "completion": ["rf_plan_approved"],
+                }],
+            },
+            pending={
+                "action": "rf_plan_confirmation",
+                "purpose": "config_handoff",
+                "device": {"type": "pluto", "identity": "usb:test"},
+            },
+        )
+        public_text = " ".join([
+            view["phase"]["label"],
+            view["specification"]["title"],
+            view["workflow"]["title"],
+            view["workflow"]["state_label"],
+            *[item["label"] for item in view["workflow"]["stages"]],
+            view["interaction"]["message"],
+            view["interaction"]["confirm_label"],
+            view["interaction"]["cancel_label"],
+        ]).lower()
+        for token in (
+            "workflow_id", "task_type", "stage_id", "revision",
+            "completion", "intent:", "completed",
+        ):
+            self.assertNotIn(token, public_text)
+        self.assertFalse(any("\u4e00" <= char <= "\u9fff" for char in public_text))
+
+    def test_specification_hides_duplicate_internal_duration_ceiling(self):
+        view = present(
+            workflow={"shared_intent": {"status": "awaiting_confirmation"}},
+            claims=[],
+            spec={
+                "intent_status": "awaiting_confirmation",
+                "radio_specification": [
+                    {
+                        "key": "duration_seconds",
+                        "label": "Maximum duration",
+                        "value": 30,
+                        "source": "user_text",
+                    },
+                    {
+                        "key": "max_duration_seconds",
+                        "label": "Max Duration Seconds",
+                        "value": 30,
+                        "source": "user_text",
+                    },
+                    {
+                        "key": "hardware",
+                        "label": "Device",
+                        "value": "plutosdr",
+                        "source": "llm",
+                    },
+                ],
+            },
+        )
+        rows = view["specification"]["rows"]
+        self.assertEqual(
+            [row["key"] for row in rows],
+            ["duration_seconds", "hardware"],
+        )
+        self.assertEqual(rows[1]["source"], "Extracted")
+
+    def test_alignment_is_visible_before_workflow_creation(self):
+        workflow = present(
+            workflow={},
+            claims=[],
+            spec={"intent_status": "awaiting_confirmation"},
+        )["workflow"]
+        self.assertTrue(workflow["visible"])
+        self.assertEqual(workflow["title"], "Radio Specification")
+        self.assertEqual(
+            workflow["stages"][0]["label"],
+            "Awaiting Specification Confirmation",
+        )
+
     def test_inspector_failed_outcome_not_masked_by_completion(self):
         workflow = {
             "workflow_id": "wf-hw",
@@ -160,13 +247,13 @@ class WorkflowPresenterTest(unittest.TestCase):
         self.assertEqual(card["stages"][0]["acceptance_count"], 4)
 
     def test_recovery_buttons_are_actionable(self):
-        self.panel._set_pending({
+        self.panel._set_pending(interaction_view({}, {
             "action": "stage_recovery",
             "reason": "当前 Stage 未满足完成条件",
             "approved": False,
-        })
-        self.assertEqual(self.panel._confirm_btn.label, "Retry This Stage")
-        self.assertEqual(self.panel._cancel_btn.label, "Cancel Task")
+        }))
+        self.assertEqual(self.panel._confirm_btn.label, "Retry This Step")
+        self.assertEqual(self.panel._cancel_btn.label, "Cancel Workflow")
         self.assertTrue(self.panel._pending_row.visible)
 
     def test_open_questions_use_one_compact_line(self):
@@ -192,7 +279,7 @@ class WorkflowPresenterTest(unittest.TestCase):
         self.assertNotIn("attempt", str(card))
 
     def test_checkpoint_buttons_are_stage_specific(self):
-        self.panel._set_pending({
+        self.panel._set_pending(interaction_view({}, {
             "action": "rf_plan_confirmation",
             "purpose": "rf_authorization",
             "requested_effect": "RF_RUN",
@@ -203,7 +290,7 @@ class WorkflowPresenterTest(unittest.TestCase):
             "bandwidth": 2_000_000.0,
             "tx_attenuation": 30.0,
             "approved": False,
-        })
+        }))
         self.assertEqual(self.panel._confirm_btn.label, "Approve Bounded Transmission")
         self.assertEqual(self.panel._cancel_btn.label, "Cancel")
         self.assertIn("up to 30 seconds", self.panel._pending_label.text)
@@ -213,7 +300,7 @@ class WorkflowPresenterTest(unittest.TestCase):
         self.assertIn("Attenuation 30.0 dB", self.panel._pending_label.text)
         self.assertFalse(self.panel._evidence_btn.visible)
 
-        self.panel._set_pending({
+        self.panel._set_pending(interaction_view({}, {
             "action": "rf_plan_confirmation",
             "purpose": "config_handoff",
             "device": {"type": "pluto", "identity": "usb:test.pluto"},
@@ -222,12 +309,12 @@ class WorkflowPresenterTest(unittest.TestCase):
             "bandwidth": 2_000_000.0,
             "tx_attenuation": 30.0,
             "approved": False,
-        })
+        }))
         self.assertEqual(self.panel._confirm_btn.label, "Confirm Saved Configuration")
         self.assertIn("without starting RF", self.panel._pending_label.text)
         self.assertNotIn("bounded transmission", self.panel._pending_label.text)
 
-        self.panel._set_pending({
+        self.panel._set_pending(interaction_view({}, {
             "action": "rf_plan_confirmation",
             "purpose": "device_configuration",
             "requested_effect": "DEVICE_READ",
@@ -237,21 +324,21 @@ class WorkflowPresenterTest(unittest.TestCase):
             "bandwidth": 2_000_000.0,
             "tx_attenuation": 30.0,
             "approved": False,
-        })
+        }))
         self.assertEqual(self.panel._confirm_btn.label, "Confirm Configuration")
         self.assertIn("without starting RF", self.panel._pending_label.text)
         self.assertNotIn("bounded transmission", self.panel._pending_label.text)
 
-        self.panel._set_pending({
+        self.panel._set_pending(interaction_view({}, {
             "action": "over_air_verification",
             "purpose": "ota_observation",
             "approved": False,
-        })
+        }))
         self.assertEqual(self.panel._confirm_btn.label, "Target Signal Observed")
         self.assertEqual(self.panel._cancel_btn.label, "Not Observed")
         self.assertTrue(self.panel._evidence_btn.visible)
         self.assertTrue(self.panel._evidence_btn.sensitive)
-        self.assertIn("Human confirmation required", self.panel._pending_label.text)
+        self.assertIn("Human confirmation", self.panel._pending_label.text)
 
     def test_quality_warning_is_visible_without_raw_warning_dump(self):
         workflow = {
@@ -325,10 +412,7 @@ class WorkflowPresenterTest(unittest.TestCase):
         self.assertEqual(rows["carrier_frequency"]["source"], "Protocol Default")
         self.assertEqual(rows["success_conditions"]["value"], "?")
         self.assertNotIn("reason", rows["goal"])
-        self.assertEqual(
-            view["specification"]["open_question"],
-            "Open questions: How will you verify success? · How long may it run?",
-        )
+        self.assertEqual(view["specification"]["open_question"], "")
         self.assertFalse(view["specification"]["aligned"])
 
     def test_workflow_monitor_binds_claims_and_exposes_latest_transition(self):
@@ -364,8 +448,8 @@ class WorkflowPresenterTest(unittest.TestCase):
         verify = next(item for item in monitor["stages"] if item["id"] == "verify")
         self.assertTrue(verify["current"])
         self.assertEqual(verify["claims"][0]["statement"], "PHY valid")
-        self.assertEqual(monitor["transition"]["from"], "build")
-        self.assertEqual(monitor["transition"]["to"], "verify")
+        self.assertEqual(monitor["transition"]["from"], "Build")
+        self.assertEqual(monitor["transition"]["to"], "Verify")
         self.assertIn("revision", monitor["transition"]["reason"])
 
     def test_stage_row_labels_do_not_collapse_to_one_char_per_line(self):
@@ -438,6 +522,76 @@ class WorkflowPresenterTest(unittest.TestCase):
         self.assertEqual([item["status"] for item in diagnosis["findings"]], ["Passed", "Unknown"])
         self.assertNotIn("EVM", str(diagnosis))
         self.assertEqual(view["claims"]["rows"], [])
+
+    def test_hardware_detection_exposes_five_states(self):
+        view = present(
+            spec={},
+            claims=[],
+            workflow={
+                "task_type": "HARDWARE_CONFIGURE",
+                "capabilities": ["hardware_configure", "deploy"],
+                "current_stage": "discover_and_probe_hardware",
+                "stages": [
+                    {
+                        "id": "hardware_precheck",
+                        "execution_status": "completed",
+                        "outcome": "passed",
+                    },
+                    {
+                        "id": "discover_and_probe_hardware",
+                        "execution_status": "waiting",
+                        "outcome": "failed",
+                        "result": {"note": "no SDR was found"},
+                    },
+                    {"id": "configure_device", "execution_status": "pending"},
+                ],
+                "observed_device": {},
+            },
+        )
+        hw = view["hardware_detection"]
+        self.assertEqual(hw["state"], "not_found")
+        self.assertEqual(hw["label"], "Hardware")
+        self.assertEqual(len(hw["rows"]), 1)
+        self.assertEqual(hw["rows"][0]["state"], "not_found")
+        sim = present(
+            spec={},
+            claims=[],
+            workflow={"task_type": "TX_BUILD", "capabilities": ["build_tx"]},
+        )
+        self.assertEqual(sim["hardware_detection"]["state"], "not_applicable")
+        idle = present(
+            spec={},
+            claims=[],
+            workflow={
+                "task_type": "HARDWARE_CONFIGURE",
+                "capabilities": ["hardware_configure"],
+                "stages": [
+                    {"id": "hardware_precheck", "execution_status": "pending"},
+                ],
+            },
+        )
+        self.assertEqual(idle["hardware_detection"]["state"], "not_started")
+
+    def test_workflow_keeps_completed_and_pending_groups(self):
+        view = present(
+            spec={},
+            claims=[],
+            workflow={
+                "task_type": "HARDWARE_CONFIGURE",
+                "current_stage": "flowgraph_confirmation",
+                "execution_status": "waiting",
+                "stages": [
+                    {"id": "build_ble_advertiser", "execution_status": "completed", "outcome": "passed"},
+                    {"id": "flowgraph_confirmation", "execution_status": "waiting", "outcome": ""},
+                    {"id": "hardware_precheck", "execution_status": "pending"},
+                ],
+            },
+        )
+        monitor = view["workflow"]
+        self.assertEqual([item["id"] for item in monitor["completed"]], ["build_ble_advertiser"])
+        self.assertEqual([item["id"] for item in monitor["current"]], ["flowgraph_confirmation"])
+        self.assertEqual([item["id"] for item in monitor["pending"]], ["hardware_precheck"])
+        self.assertEqual(len(monitor["stages"]), 3)
 
 
 if __name__ == "__main__":

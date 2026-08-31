@@ -27,6 +27,10 @@ import gi
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, GLib, GObject, Gdk, GdkPixbuf, Pango
 
+from grc.agent.runtime_config import (
+    rf_runtime_enabled,
+    set_rf_runtime_enabled,
+)
 from .ClaimsPanel import ClaimsPanel
 from .chat_markup import escape_pango, markdown_to_pango
 from .workflow_presenter import present
@@ -337,6 +341,14 @@ class AgentPanel(Gtk.VBox):
         self.baseline_check = Gtk.CheckButton(label="One-shot baseline")
         row2.pack_start(self.baseline_check, False, False, 2)
 
+        self.rf_runtime_check = Gtk.CheckButton(label="Physical RF")
+        self.rf_runtime_check.set_tooltip_text(
+            "Persistently allow bounded physical RF operations; each run still requires confirmation."
+        )
+        self.rf_runtime_check.set_active(rf_runtime_enabled())
+        self.rf_runtime_check.connect('toggled', self._on_rf_runtime_toggled)
+        row2.pack_start(self.rf_runtime_check, False, False, 8)
+
         self.reset_button = Gtk.Button(label="Reset")
         self.reset_button.connect('clicked', self._on_reset)
         row2.pack_end(self.reset_button, False, False, 2)
@@ -397,6 +409,7 @@ class AgentPanel(Gtk.VBox):
         self._split = split
         self._split_inited = False
         self.pack_start(split, expand=True, fill=True, padding=0)
+        self.pack_start(self.claims_panel._pending_row, expand=False, fill=True, padding=2)
 
         # ---- 输入区: 文本框 + 发送按钮 ----
         input_box = Gtk.HBox()
@@ -451,6 +464,28 @@ class AgentPanel(Gtk.VBox):
                 except Exception as exc:  # noqa: BLE001
                     log.warning("绑定画布工程失败: %s", exc)
         return self._agent
+
+    def _on_rf_runtime_toggled(self, button):
+        enabled = bool(button.get_active())
+        try:
+            set_rf_runtime_enabled(enabled)
+            if self._agent is not None:
+                view = self._agent.refresh_runtime_capability()
+                claims = view.get("claims") or []
+                spec = view.get("spec_digest") or {}
+                workflow = view.get("workflow_digest") or {}
+                self.claims_panel.update_data(
+                    claims, spec, workflow=workflow
+                )
+                self._replace_interaction_cards(
+                    spec, workflow, claims,
+                    workflow.get("interaction_request") or {},
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Failed to persist RF runtime preference: %s", exc)
+            button.handler_block_by_func(self._on_rf_runtime_toggled)
+            button.set_active(not enabled)
+            button.handler_unblock_by_func(self._on_rf_runtime_toggled)
 
     def _on_confirm_pending(self, _panel):
         self._submit_checkpoint_decision("approved")
@@ -1126,8 +1161,7 @@ class AgentPanel(Gtk.VBox):
 
     def _append_specification_card(self, specification, spec, workflow, pending):
         status = str(specification.get("status") or "draft")
-        revision = int(specification.get("revision") or 0)
-        title = "Radio Specification · {} · rev {}".format(status, revision)
+        title = "Radio Specification"
         wrap, body = self._new_conversation_card(title, "#F5F2FF", "#8A6FD1")
         expander = Gtk.Expander(label="View Current Specification")
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=7)
@@ -1187,14 +1221,8 @@ class AgentPanel(Gtk.VBox):
             row_box.pack_start(value, False, False, 0)
             item.add(row_box)
             content.pack_start(item, False, False, 0)
-        questions = list(specification.get("blocking_questions") or [])
-        open_question = str(specification.get("open_question") or "")
-        if open_question:
-            question_label = _FlowLabel(label=open_question)
-            question_label.set_margin_top(4)
-            content.pack_start(question_label, False, False, 0)
         expander.add(content)
-        expander.set_expanded(bool(questions) or status != "confirmed")
+        expander.set_expanded(status != "confirmed")
         body.pack_start(expander, False, False, 0)
         self._log_box.pack_start(wrap, False, False, 0)
         self._live_cards.append(wrap)

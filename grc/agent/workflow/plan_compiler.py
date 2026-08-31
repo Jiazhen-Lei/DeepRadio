@@ -6,6 +6,8 @@ effect, and truncation rules.  It must not mention dataset utterances.
 
 from __future__ import annotations
 
+import logging
+
 from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable, Mapping
 
@@ -18,6 +20,8 @@ from .planning import (
 )
 from .schema import Stage
 from .completion import KNOWN_COMPLETIONS
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -185,10 +189,18 @@ def ensure_plan_coverage(
     tool_index = _stage_tool_index()
     covered_stage_ids = {stage.id for stage in stages}
     covered_tools: set[str] = set()
+    covered_predicates: set[str] = set()
     for stage in stages:
         covered_tools |= tool_index.get(stage.id, set())
         covered_tools |= set(stage.recommended_agents or [])
+        covered_predicates |= set(stage.completion or [])
+        covered_predicates |= set(stage.produces or [])
+        covered_predicates |= set(stage.success_predicates or [])
     catalog_index = catalog_stage_index(catalog)
+    base_effect_ceiling = max(
+        (normalize_effect(stage.effect_level) for stage in stages),
+        default=EffectLevel.READ,
+    )
     bound: list[str] = []
     unbound: list[str] = []
     additions: list[Stage] = []
@@ -197,6 +209,19 @@ def ensure_plan_coverage(
         if not action_id:
             continue
         if action_id in covered_stage_ids or action_id in covered_tools:
+            continue
+        requested_predicates = {
+            name for name in (
+                list(node.produces or []) + list(node.success_predicates or [])
+            )
+            if name in KNOWN_COMPLETIONS
+        }
+        if requested_predicates and requested_predicates <= covered_predicates:
+            # Bind by outcome, not merely by stage id.  A protocol-specific
+            # producer plus its verifier already covers a generic "build and
+            # validate" request; inserting another producer would overwrite
+            # the authoritative artifact with an unrelated implementation.
+            bound.append(action_id)
             continue
         # A planner action may name a tool; find the catalog stage that owns it.
         owner_ids = [
@@ -211,6 +236,12 @@ def ensure_plan_coverage(
             unbound.append(action_id)
             continue
         stage = Stage.from_dict(dict(fragment))
+        _apply_tool_effect_floor(stage)
+        if normalize_effect(stage.effect_level) > base_effect_ceiling:
+            # An open planner may fill a coverage gap, but it cannot raise the
+            # deterministic capability plan's side-effect authority.
+            unbound.append(action_id)
+            continue
         if stage.id in covered_stage_ids:
             covered_stage_ids.add(stage.id)
             covered_tools |= tool_index.get(stage.id, set())
@@ -230,17 +261,138 @@ def ensure_plan_coverage(
         covered_stage_ids.add(stage.id)
         covered_tools |= tool_index.get(stage.id, set())
         covered_tools |= set(stage.recommended_agents or [])
+        covered_predicates |= set(stage.completion or [])
+        covered_predicates |= set(stage.produces or [])
+        covered_predicates |= set(stage.success_predicates or [])
         bound.append(action_id)
     if additions:
-        insert_at = next(
-            (
-                index for index, stage in enumerate(stages)
-                if "checkpoint" in str(getattr(stage, "interaction", "") or "")
-            ),
-            len(stages),
+        insert_at = _dependency_aware_insert_index(stages, additions)
+        successor_id = (
+            stages[insert_at].id if insert_at < len(stages) else "completed"
         )
         stages = stages[:insert_at] + additions + stages[insert_at:]
+        _rewire_inserted_chain(stages, additions, insert_at, successor_id)
     return stages, bound, unbound
+
+
+def _dependency_aware_insert_index(
+    stages: list[Stage],
+    additions: list[Stage],
+) -> int:
+    """Place planner additions after their evidence and before higher effects."""
+    checkpoint = next(
+        (
+            index for index, stage in enumerate(stages)
+            if "checkpoint" in str(getattr(stage, "interaction", "") or "")
+        ),
+        len(stages),
+    )
+    produced_by_additions = {
+        predicate
+        for stage in additions
+        for predicate in list(stage.completion or []) + list(stage.produces or [])
+    }
+    external_requirements = {
+        predicate
+        for stage in additions
+        for predicate in list(stage.depends_on or []) + list(stage.requires or [])
+        if predicate not in produced_by_additions
+    }
+    lower_bound = 0
+    for index, stage in enumerate(stages[:checkpoint]):
+        produced = set(stage.completion or []) | set(stage.produces or [])
+        if produced & external_requirements:
+            lower_bound = index + 1
+    addition_effect = max(
+        (normalize_effect(stage.effect_level) for stage in additions),
+        default=EffectLevel.READ,
+    )
+    for index in range(lower_bound, checkpoint):
+        if normalize_effect(stages[index].effect_level) > addition_effect:
+            return index
+    return checkpoint
+
+
+#: Transition targets that are workflow control states, not stage ids.
+#: Keep in sync with ``engine._NON_STAGE_TARGETS`` (plus wait park states).
+_RESERVED_TRANSITION_TARGETS = frozenset({
+    "completed", "errored", "cancelled", "stop", "waiting_user",
+    "waiting", "not_required", "invalidated",
+})
+
+
+def _rewire_inserted_chain(
+    stages: list[Stage],
+    additions: list[Stage],
+    insert_at: int,
+    successor_id: str,
+) -> None:
+    """Rewire transitions around planner-materialized stages (in place).
+
+    Catalog fragments carry the transitions of the template they were copied
+    from (e.g. a runtime-chain ``passed → rf_plan_confirmation`` target that
+    does not exist in this plan), and the predecessor still points at the
+    original successor, which would bypass the whole inserted chain.  Both
+    defects produced dead stages and dangling targets (V6: a BLE deploy plan
+    where ``build_ble_advertiser`` was unreachable and the final transmitter
+    would have been a 1 kHz diagnostic tone), so after insertion:
+
+    * every earlier transition that pointed at the successor is redirected
+      to the first inserted stage — nothing may bypass the planner's
+      actions;
+    * each inserted stage's transitions that point at a stage missing from
+      this plan follow the chain: next addition, then the successor.
+    """
+    if not additions:
+        return
+    valid_ids = {stage.id for stage in stages}
+    for stage in stages[:insert_at]:
+        for outcome, target in list(stage.transitions.items()):
+            if target == successor_id:
+                stage.transitions[outcome] = additions[0].id
+    success_outcomes = {"passed", "approved", "not_required", "completed"}
+    for index, stage in enumerate(additions):
+        next_id = (
+            additions[index + 1].id
+            if index + 1 < len(additions) else successor_id
+        )
+        for outcome, target in list(stage.transitions.items()):
+            # A copied fragment's positive edge belongs to its source
+            # template.  Rebuild it from compiled order even when the old
+            # target happens to exist here; retaining such a backward edge
+            # previously created a hardware/protocol execution cycle.
+            if outcome in success_outcomes:
+                stage.transitions[outcome] = next_id
+                continue
+            if target in _RESERVED_TRANSITION_TARGETS or target in valid_ids:
+                continue
+            stage.transitions[outcome] = next_id
+
+
+def _repair_dangling_transitions(stages: list[Stage]) -> list[str]:
+    """Defensive sweep: no transition may point outside this plan.
+
+    Returns a description of each repair so callers can log/audit; success
+    transitions are redirected to the next stage in plan order (or
+    ``completed`` at the end), failure transitions to ``waiting_user``.
+    """
+    valid_ids = {stage.id for stage in stages}
+    repairs: list[str] = []
+    for index, stage in enumerate(stages):
+        next_id = stages[index + 1].id if index + 1 < len(stages) else "completed"
+        for outcome, target in list(stage.transitions.items()):
+            if target in _RESERVED_TRANSITION_TARGETS or target in valid_ids:
+                continue
+            if outcome in ("passed", "approved", "not_required"):
+                stage.transitions[outcome] = next_id
+            else:
+                stage.transitions[outcome] = "waiting_user"
+            repairs.append(
+                "{}.{}: {} -> {}".format(
+                    stage.id, outcome, target, stage.transitions[outcome]
+                )
+            )
+    return repairs
 
 
 def compile_stages(
@@ -256,6 +408,8 @@ def compile_stages(
     validated planner actions that no composed or catalog stage can serve.
     """
     ensure_rf_bounds(intent)
+    for stage in stages:
+        _apply_tool_effect_floor(stage)
     rejected: list[str] = []
     unbound: list[str] = []
     if proposal:
@@ -265,34 +419,169 @@ def compile_stages(
             stage = by_id.get(node.stage_id or node.id)
             if stage is None:
                 continue
+            # Existing executable facts come from the catalog/Registry.  The
+            # LLM may improve presentation metadata, but must not rewrite
+            # dependencies, producers, or completion semantics.
             stage.objective = node.objective or stage.objective
-            if node.requires:
-                stage.requires = list(node.requires)
-            if node.produces:
-                stage.produces = list(node.produces)
-            if node.success_predicates:
-                bound = [
-                    name for name in node.success_predicates
-                    if name in KNOWN_COMPLETIONS
-                ]
-                unbound_predicates = [
+            stage.unbound_predicates = list(dict.fromkeys(
+                list(stage.unbound_predicates or [])
+                + [
                     name for name in node.success_predicates
                     if name not in KNOWN_COMPLETIONS
                 ]
-                if bound:
-                    stage.success_predicates = list(dict.fromkeys(
-                        list(stage.success_predicates or stage.completion) + bound
-                    ))
-                stage.unbound_predicates = list(dict.fromkeys(
-                    list(stage.unbound_predicates) + unbound_predicates
-                ))
+            ))
         stages, _bound, unbound = ensure_plan_coverage(
             stages, accepted, catalog=catalog
         )
     for stage in stages:
         _apply_tool_effect_floor(stage)
+    # Defensive invariant: every transition target is either a stage in this
+    # plan or a reserved control state.  Broken wirings previously surfaced
+    # only at runtime as a jump to a nonexistent stage.
+    repairs = _repair_dangling_transitions(stages)
+    if repairs:
+        logger.warning("repaired dangling plan transitions: %s", repairs)
+    _validate_success_flow_acyclic(stages)
+    _validate_intent_effect_contract(intent, stages)
+    _validate_evidence_contract(stages)
     nodes = attach_plan_metadata(stages)
     return stages, nodes, rejected, unbound
+
+
+def _validate_success_flow_acyclic(stages: list[Stage]) -> None:
+    """Reject cycles on ordinary successful execution edges."""
+    success_outcomes = {"passed", "approved", "not_required", "completed"}
+    edges = {
+        stage.id: {
+            target
+            for outcome, target in stage.transitions.items()
+            if outcome in success_outcomes
+            and target not in _RESERVED_TRANSITION_TARGETS
+        }
+        for stage in stages
+    }
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(stage_id: str) -> None:
+        if stage_id in visiting:
+            raise PlanCoverageError(
+                f"The compiled plan contains a successful execution cycle at {stage_id}."
+            )
+        if stage_id in visited:
+            return
+        visiting.add(stage_id)
+        for target in edges.get(stage_id, set()):
+            visit(target)
+        visiting.remove(stage_id)
+        visited.add(stage_id)
+
+    for stage in stages:
+        visit(stage.id)
+
+
+def _validate_intent_effect_contract(intent: Any, stages: list[Stage]) -> None:
+    """Ensure the compiled plan can realize the LLM's requested effect."""
+    if not stages:
+        return
+    slots = dict(getattr(intent, "slots", None) or {})
+    context = dict(getattr(intent, "context", None) or {})
+    execution_mode = str(
+        context.get("execution_mode") or slots.get("operation") or ""
+    ).lower()
+    if execution_mode != "deploy":
+        return
+    if not any(
+        normalize_effect(stage.effect_level) >= EffectLevel.RF_RUN
+        and not stage.safety_finalizer
+        for stage in stages
+    ):
+        raise PlanCoverageError(
+            "The request requires RF execution, but the compiled plan has no "
+            "non-finalizer RF_RUN stage."
+        )
+
+
+def _validate_evidence_contract(stages: list[Stage]) -> None:
+    """Reject plans that request effects without prerequisite evidence.
+
+    The invariant is expressed only in effects and evidence predicates; it is
+    independent of protocol, hardware model, language, or task wording.
+    """
+    first_mutation = next(
+        (
+            index for index, stage in enumerate(stages)
+            if normalize_effect(stage.effect_level) >= EffectLevel.DEVICE_CONFIG
+        ),
+        None,
+    )
+    if first_mutation is None:
+        return
+    prior_evidence = {
+        predicate
+        for stage in stages[:first_mutation]
+        for predicate in list(stage.completion or []) + list(stage.produces or [])
+    }
+    required = {
+        "hardware_precheck_completed",
+        "device_discovered",
+        "device_probed",
+    }
+    missing = sorted(required - prior_evidence)
+    if not prior_evidence.intersection(
+        {"rf_plan_approved", "hardware_decision_recorded"}
+    ):
+        missing.append("explicit_device_grant")
+    if missing:
+        raise PlanCoverageError(
+            "Device mutation requires host readiness, physical discovery, "
+            "exact probing, and an explicit grant; missing evidence: {}"
+            .format(", ".join(missing))
+        )
+    rf_indices = [
+        index for index, stage in enumerate(stages)
+        if normalize_effect(stage.effect_level) >= EffectLevel.RF_RUN
+        and not stage.safety_finalizer
+    ]
+    if not rf_indices:
+        return
+    if not any(
+        stage.safety_finalizer
+        and normalize_effect(stage.effect_level) >= EffectLevel.RF_RUN
+        for stage in stages[rf_indices[-1] + 1:]
+    ):
+        raise PlanCoverageError(
+            "An RF_RUN stage requires a later RF_RUN safety finalizer."
+        )
+
+
+def plan_needs_proposal(intent: Any, stages: Iterable[Stage]) -> bool:
+    """Return whether typed, compiler-bindable intent lacks stage coverage.
+
+    Free-form artifact/evidence prose is valuable for presentation and final
+    evaluation, but it is not an executable action id.  Treating arbitrary
+    LLM wording as an exact catalog key caused a planner call on every
+    otherwise-complete workflow and a 120-second V4 timeout.
+    """
+    sequence = list(stages)
+    covered = {stage.id for stage in sequence}
+    for stage in sequence:
+        covered.update(stage.completion or [])
+        covered.update(stage.produces or [])
+        covered.update(stage.success_predicates or [])
+    abstract = set(getattr(intent, "capabilities", None) or [])
+    requested = {
+        str(item)
+        for item in (
+            list(getattr(intent, "requested_operations", None) or [])
+            + list(getattr(intent, "desired_artifacts", None) or [])
+            + list(getattr(intent, "evidence_requirements", None) or [])
+        )
+        if str(item)
+    }
+    bindable = known_action_ids() | set(KNOWN_COMPLETIONS)
+    concrete = {item for item in requested if item in bindable} - abstract
+    return bool(concrete - covered)
 
 
 def _apply_tool_effect_floor(stage: Stage) -> None:
@@ -517,7 +806,3 @@ def compiled_plan_summary(
         if isinstance(item, Mapping):
             summary.append(PlanNode.from_dict(item).to_dict())
     return summary
-
-
-def next_horizon_effect(deferred: Iterable[Any]) -> EffectLevel:
-    return highest_effect(deferred)

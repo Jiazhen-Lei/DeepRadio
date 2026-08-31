@@ -21,6 +21,27 @@ from grc.agent.tools.hardware_profiles import output_indicates_successful_probe
 from grc.agent.tools.registry import ToolContext
 
 
+class PersistentRuntimeConfigTest(unittest.TestCase):
+    def test_rf_preference_persists_and_explicit_environment_wins(self):
+        from grc.agent.runtime_config import (
+            rf_runtime_enabled,
+            set_rf_runtime_enabled,
+        )
+
+        with tempfile.TemporaryDirectory() as root, mock.patch.dict(
+            os.environ,
+            {"GRC_AGENT_SETTINGS_PATH": str(Path(root) / "settings.json")},
+        ):
+            os.environ.pop("GRC_AGENT_ENABLE_RF", None)
+            self.assertFalse(rf_runtime_enabled())
+            set_rf_runtime_enabled(True)
+            self.assertTrue(rf_runtime_enabled())
+            os.environ.pop("GRC_AGENT_ENABLE_RF", None)
+            self.assertTrue(rf_runtime_enabled())
+            os.environ["GRC_AGENT_ENABLE_RF"] = "0"
+            self.assertFalse(rf_runtime_enabled())
+
+
 class V3HardwareWorkflowRegressionTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -181,7 +202,7 @@ class V3HardwareWorkflowRegressionTest(unittest.TestCase):
             self.assertEqual(observation["observed_name"], "variable-name")
             self.assertTrue(reply.done, reply.workflow_digest)
 
-    def test_ota_approval_rejects_inactive_runtime(self) -> None:
+    def test_ota_approval_finalizes_when_runtime_already_stopped(self) -> None:
         sessions = self.root / "expired-sessions"
         with mock.patch(
             "grc.agent.service.session_store.sessions_root",
@@ -203,17 +224,18 @@ class V3HardwareWorkflowRegressionTest(unittest.TestCase):
             stage.execution_status = "running"
             checkpoint = agent._workflow.wait_for_checkpoint("LightBlue 空口验收")
             checkpoint.resume_stage = False
+            stopped = {
+                "ok": True,
+                "running": False,
+                "ready": False,
+                "run_id": "run-expired",
+                "reason": "stopped",
+                "return_code": -15,
+                "crashed": False,
+            }
             with mock.patch(
                 "grc.agent.tools.registry.call",
-                return_value={
-                    "ok": True,
-                    "running": False,
-                    "ready": False,
-                    "run_id": "run-expired",
-                    "reason": "stopped",
-                    "return_code": -15,
-                    "crashed": False,
-                },
+                return_value=stopped,
             ), mock.patch(
                 "grc.agent.service.orchestrator.build_agent", return_value=None,
             ):
@@ -226,9 +248,10 @@ class V3HardwareWorkflowRegressionTest(unittest.TestCase):
                         "observed_at": time.time(),
                     },
                 })
-            self.assertEqual(reply.stage, "CRITIC")
-            self.assertIn("not within a valid runtime window", reply.text)
-            self.assertEqual(stage.execution_status, "waiting")
+            self.assertTrue(reply.done, reply.text)
+            self.assertEqual(
+                reply.workflow_digest.get("execution_status"), "completed"
+            )
 
     def test_unarmed_tx_preview_is_valid_and_compiles(self) -> None:
         if "iio_pluto_sink" not in self.ctx.platform.blocks:
@@ -443,6 +466,7 @@ class V6FollowupContractTest(unittest.TestCase):
             "用 plutosdr 发射 ble 信号，local name 为 loveu",
             SharedState(),
         )
+        engine.ensure_stage("rf_plan_confirmation")
         workflow.current_stage = "rf_plan_confirmation"
         with mock.patch.dict(os.environ, {"GRC_AGENT_ENABLE_RF": "1"}):
             engine._activate_current()
@@ -462,6 +486,7 @@ class V6FollowupContractTest(unittest.TestCase):
                 "用 plutosdr 发射 ble 信号，local name 为 loveu",
                 SharedState(),
             )
+            engine.ensure_stage("rf_plan_confirmation")
             workflow.current_stage = "rf_plan_confirmation"
             engine._activate_current()
             engine.save()
@@ -524,7 +549,7 @@ class V6FollowupContractTest(unittest.TestCase):
         self.assertIn("PlutoSDR", digest["summary"])
         self.assertIn("Local Name=loveu", digest["summary"])
         self.assertNotIn("GFSK → ? → ?", digest["summary"])
-        self.assertIn("最大时长", digest["duration_note"])
+        self.assertIn("Maximum duration", digest["duration_note"])
 
     def test_hardware_spec_digest_is_not_link_placeholders(self):
         state = SharedState(session_id="hw-spec")
@@ -693,6 +718,8 @@ class V6FollowupContractTest(unittest.TestCase):
                 "用plutosdr发射一段2.402GHz的ble信号，local name为loveu，"
                 "发射30秒，成功条件为LightBlue观察到loveu"
             )
+            self.assertEqual(reply.pending.get("kind"), "intent_confirmation")
+            reply = agent.step("确认")
         events = (self.sessions / "ble-events" / "events.jsonl").read_text(
             encoding="utf-8"
         )
@@ -701,7 +728,8 @@ class V6FollowupContractTest(unittest.TestCase):
         self.assertNotIn('"event": "subagent_invoked"', events)
         self.assertIn("BLE 1M", reply.spec_digest.get("summary") or "")
         self.assertIn("loveu", reply.spec_digest.get("summary") or "")
-        self.assertIn("BLE PDU generated", reply.text or "")
+        self.assertIn("BLE advertising PDU", reply.text or "")
+        self.assertNotIn("Completed:", reply.text or "")
 
     def test_gui_emergency_stop_command_revokes_rf_grant(self):
         from grc.agent.service.adapter import ServiceAgent
@@ -737,8 +765,21 @@ class FriendlyFailureAndRetryContractTest(unittest.TestCase):
         self.root = Path(self.temp.name)
         self._old_cwd = os.getcwd()
         os.chdir(self.temp.name)
+        # Session storage is keyed to a fixed repo directory by default;
+        # isolate it per test or counters like hw_retry_failures leak across
+        # runs (V6: a stale workflow.yaml made the first retry of a fresh
+        # agent jump straight to the >=2 escalation).
+        self._old_sessions_env = os.environ.pop(
+            "GRC_AGENT_SESSIONS_ROOT", None
+        )
+        os.environ["GRC_AGENT_SESSIONS_ROOT"] = str(
+            self.root / "sessions"
+        )
 
     def tearDown(self):
+        os.environ.pop("GRC_AGENT_SESSIONS_ROOT", None)
+        if self._old_sessions_env is not None:
+            os.environ["GRC_AGENT_SESSIONS_ROOT"] = self._old_sessions_env
         os.chdir(self._old_cwd)
         self.temp.cleanup()
 
@@ -768,6 +809,21 @@ class FriendlyFailureAndRetryContractTest(unittest.TestCase):
                 "为 PlutoSDR 配置 2.402 GHz、2 Msps 的发射流图，"
                 "保存配置并停在发射确认。"
             )
+            # Hardware stakes require an explicit confirmation turn before
+            # the workflow is built — silent single-turn confirmation is
+            # forbidden for device/RF plans (V6).
+            agent.step("确认")
+            current = agent._workflow.current_stage()
+            if (
+                current is not None
+                and current.id == "flowgraph_confirmation"
+                and current.checkpoint
+            ):
+                agent.step_command({
+                    "action": "checkpoint_decision",
+                    "checkpoint_id": current.checkpoint.id,
+                    "decision": "approved",
+                })
         return agent
 
     def test_retry_reports_missing_device_and_does_not_rerun(self):
@@ -796,6 +852,98 @@ class FriendlyFailureAndRetryContractTest(unittest.TestCase):
         self.assertEqual(
             agent._workflow.workflow.execution_status, "waiting"
         )
+
+    def test_retry_preflight_forwards_identity_to_probe(self):
+        """A discovery hit must forward its identity into probe_device.
+
+        (V6 regression: a connected PlutoSDR was discovered as usb:2.4.5 —
+        identity at the TOP LEVEL, ``devices`` empty — yet probe_device was
+        called without device_args, the IIO guard rejected it, and the user
+        was told "No SDR was detected" while the device sat on the bus.)
+        """
+        agent = self._waiting_agent("retry-identity")
+        workflow = agent._workflow.workflow
+        self.assertEqual(workflow.execution_status, "waiting")
+        results = {
+            "discover_devices": {
+                "ok": True,
+                "device_found": True,
+                "devices": [],
+                "device_type": "pluto",
+                "device_identity": "usb:2.4.5",
+                "driver_family": "iio",
+            },
+            "probe_device": {
+                "ok": True,
+                "device_probed": True,
+                "device_type": "pluto",
+                "device_identity": "usb:2.4.5",
+            },
+        }
+
+        def fake_call(name, args, ctx):
+            if name in results:
+                return dict(results[name])
+            # The stage re-run may call builders; let them succeed so the
+            # retry itself is not blocked by the mock.
+            return {"ok": True}
+
+        with mock.patch(
+            "grc.agent.tools.registry.call", side_effect=fake_call
+        ) as called:
+            reply = agent.step_command({"action": "retry_stage"})
+        # The intent's hardware choice still reaches discovery (V5).
+        self.assertEqual(
+            called.call_args_list[0].args[1].get("device_type"), "pluto"
+        )
+        # V6 contract: probe_device receives the exact identity through its
+        # ``device_args`` parameter — not ``uri``, not nothing.
+        probe_calls = [
+            call for call in called.call_args_list
+            if call.args[0] == "probe_device"
+        ]
+        self.assertTrue(probe_calls, "probe_device was never invoked")
+        probe_args = probe_calls[0].args[1]
+        self.assertEqual(probe_args.get("device_args"), "usb:2.4.5")
+        self.assertNotIn("uri", probe_args)
+        # No "device vanished" message while discovery just succeeded.
+        self.assertNotIn("No SDR was detected", reply.text)
+
+    def test_retry_reports_discovery_hit_with_failed_probe(self):
+        """Discovery hit + failed probe must not claim the device is absent.
+
+        Physical presence is decided by discovery; a probe failure is a
+        driver-level issue and the note must say so honestly.
+        """
+        agent = self._waiting_agent("retry-probe-fail")
+        results = {
+            "discover_devices": {
+                "ok": True,
+                "device_found": True,
+                "devices": [],
+                "device_type": "pluto",
+                "device_identity": "usb:2.4.5",
+                "driver_family": "iio",
+            },
+            "probe_device": {
+                "ok": False,
+                "device_probed": False,
+                "error": "iio context create failed",
+            },
+        }
+
+        def fake_call(name, args, ctx):
+            if name in results:
+                return dict(results[name])
+            return {"ok": True}
+
+        with mock.patch(
+            "grc.agent.tools.registry.call", side_effect=fake_call
+        ):
+            reply = agent.step_command({"action": "retry_stage"})
+        self.assertNotIn("No SDR was detected", reply.text)
+        self.assertIn("usb:2.4.5", reply.text)
+        self.assertIn("probe command did not complete", reply.text)
 
     def test_repeated_hardware_failure_escalates_to_llm_diagnosis(self):
         """After two consecutive misses the retry note gains an LLM diagnosis.
@@ -1042,7 +1190,7 @@ class UsrpRxSpectrumContractTest(unittest.TestCase):
         self.assertEqual(workflow.intent.missing_slots, [])
         self.assertEqual(workflow.current_stage, "rx_build_and_verify")
         self.assertIn("realtime_sink_present", workflow.stage("rx_build_and_verify").completion)
-        self.assertEqual(workflow.stages[-1].id, "rf_plan_confirmation")
+        self.assertEqual(workflow.stages[-1].id, "flowgraph_confirmation")
         self.assertIn(
             "stop_runtime",
             [item.get("id") for item in workflow.deferred_plan],
@@ -1090,15 +1238,17 @@ class UsrpRxSpectrumContractTest(unittest.TestCase):
             reply = agent.step(
                 "使用usrpb210构建接收机，在2.402GHz绘制出实时的频谱图"
             )
+            self.assertEqual(reply.pending.get("kind"), "intent_confirmation")
+            reply = agent.step("确认")
             events = Path(store.session_root("rx-spectrum-svc")) / "events.jsonl"
             event_text = events.read_text(encoding="utf-8")
         self.assertEqual(reply.workflow_digest["task_type"], "RX_BUILD")
         self.assertTrue(Path(reply.artifacts["grc_path"]).is_file())
         self.assertIn("uhd_usrp_source", Path(reply.artifacts["grc_path"]).read_text())
         self.assertEqual(
-            reply.workflow_digest["current_stage"], "discover_and_probe_hardware"
+            reply.workflow_digest["current_stage"], "flowgraph_confirmation"
         )
-        self.assertEqual(reply.workflow_digest["wait_kind"], "recovery")
+        self.assertEqual(reply.workflow_digest["wait_kind"], "approval")
         self.assertTrue(reply.workflow_digest.get("timeline"))
         self.assertNotIn('"start_flowgraph"', event_text)
 
@@ -1205,6 +1355,71 @@ class B210HilGateTest(unittest.TestCase):
 
 
 class RuntimeQualityProjectionTest(unittest.TestCase):
+    def test_host_preflight_and_failed_discovery_do_not_claim_device(self):
+        from grc.agent.schema import AgentReply, ToolInvocation
+        from grc.agent.service.result_projector import project_tool_results
+
+        state = SharedState(session_id="physical-evidence")
+        state.project.config["observed_device"] = {
+            "type": "pluto", "identity": "stale",
+        }
+        reply = AgentReply(tool_invocations=[
+            ToolInvocation(name="hardware_preflight", result={
+                "ok": True,
+                "readiness_scope": "host_environment",
+                "physical_device_checked": False,
+            }),
+            ToolInvocation(name="discover_devices", result={
+                "ok": False, "device_found": False,
+            }),
+        ])
+        recorded = []
+        project_tool_results(
+            state,
+            reply,
+            record_claim=lambda *args, **kwargs: recorded.append((args, kwargs)),
+            semantic_hash=lambda _path: "",
+        )
+        self.assertNotIn("observed_device", state.project.config)
+        self.assertFalse(any(
+            args and args[0] == "hardware_device_probed"
+            for args, _kwargs in recorded
+        ))
+
+    def test_successful_probe_preserves_nonfatal_driver_warnings(self):
+        from grc.agent.schema import AgentReply, ToolInvocation
+        from grc.agent.service.result_projector import project_tool_results
+
+        state = SharedState(session_id="probe-warning")
+        reply = AgentReply(tool_invocations=[
+            ToolInvocation(name="discover_devices", result={
+                "device_found": True,
+                "device_type": "pluto",
+                "device_identity": "usb:test",
+            }),
+            ToolInvocation(name="probe_device", result={
+                "device_probed": True,
+                "device_type": "pluto",
+                "device_identity": "usb:test",
+                "health": {
+                    "identity_ok": True,
+                    "core_ready": True,
+                    "warnings": ["optional attribute not supported"],
+                    "fatal_errors": [],
+                },
+            }),
+        ])
+        project_tool_results(
+            state,
+            reply,
+            record_claim=lambda *_args, **_kwargs: None,
+            semantic_hash=lambda _path: "",
+        )
+        self.assertEqual(state.runtime.quality, "warning")
+        self.assertEqual(
+            state.runtime.warnings[0]["code"], "device_probe_warning"
+        )
+
     def test_structured_stream_counters_raise_visible_warning(self):
         from grc.agent.schema import AgentReply, ToolInvocation
         from grc.agent.service.result_projector import project_tool_results

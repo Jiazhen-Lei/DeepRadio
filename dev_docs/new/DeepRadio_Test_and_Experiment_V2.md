@@ -1,11 +1,28 @@
 # DeepRadio 测试与实验 V2
 
-> 更新日期：2026-08-30<br>
-> 当前证据：当前工作区代码全量自动回归（agent tests `234 passed, 1 skipped`）与 2026-08-30 PlutoSDR 真机冒烟；`local/agent_sessions/0827|0828` 历史目录仅作版本基线<br>
+> 更新日期：2026-08-31<br>
+> 当前证据：当前工作区代码全量自动回归（agent tests `250 passed, 1 skipped`；GUI tests `20 passed`）与 2026-08-30 PlutoSDR 真机冒烟；`local/agent_sessions/0827|0828` 历史目录仅作版本基线<br>
 > 环境：所有自动测试和 GUI/HIL 实验均使用 `gnuradio` Conda 环境<br>
 > 原则：历史实验保留为版本基线；代码发生行为相关修改后，必须在新目录重跑，不能覆盖旧记录。
 
 ---
+
+## 0. 2026-08-31 V6 泛化链路验收
+
+新增/更新的自动契约覆盖：
+
+- 等价 TurnIR 不依赖用户原句；活动自然语言轮次只调用一次 semantic LLM，并在同一结果中携带 relation 与参数增量。
+- completed preview 后带 operation 的 follow-up 建立 deploy Workflow；无 checkpoint 的纯 confirmation 保持安全拒绝。
+- planner proposal 不得改写已有 Stage 的 producer/dependency/completion，不得提高 effect；未知 action、悬空 transition、缺 probe/grant/stop 的 RF plan 必须拒绝或无损回退。
+- host preflight 成功但 discovery 失败时，不得产生 detected/probed/configured 物理设备事实；RF start 依赖 discovery + probe + grant，OTA 事实绑定同一 run id。
+- presenter 边界的默认可见文本必须为英文，且不包含 `workflow_id/task_type/stage_id/revision/completion` 或日志式 `Intent:/Completed:` 字段。
+
+执行分层：
+
+1. 无头核心：`python -m unittest grc.agent.tests.test_plan_p12 grc.agent.tests.test_workflow`
+2. 完整 GNU Radio block library：`grc.agent.tests.test_hardware/test_ble/test_seven_tasks`
+3. GTK 环境（需 PyGObject `gi`）：`grc.gui.tests.test_workflow_presenter`
+4. HIL：连接目标 SDR 后验证 identity mismatch、probe failure、RF disabled、bounded start/stop 与独立 OTA observation。
 
 ## 0. 2026-08-30 V5 增量：硬件意图对齐与探测链路回归
 

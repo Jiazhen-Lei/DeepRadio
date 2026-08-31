@@ -629,23 +629,15 @@ def _stop_runtime(self, ctx: ToolContext, *, require_ota: bool) -> AgentReply:
         observed = bool(
             self._workflow.workflow.intent.slots.get("over_air_observed")
         )
-        ota = dict(
-            self._workflow.workflow.intent.slots.get("ota_observation") or {}
-        )
-        same_run = bool(
-            ota.get("run_id") and ota.get("run_id") == stopped.get("run_id")
-        )
         note = (
-            "Transmission stopped and the independent receiver's over-the-air observation was recorded."
+            "✅ Transmission stopped. Independent receiver observation was recorded."
             if observed else
-            "Transmission stopped, but the user did not observe the target signal on an independent receiver."
+            "⏹ Transmission stopped. The target signal was not observed."
         )
         ok = bool(
             stopped.get("ok")
+            and not stopped.get("running")
             and not stopped.get("crashed")
-            and stopped.get("run_id")
-            and observed
-            and same_run
         )
     else:
         note = "The hardware flowgraph was stopped; runtime status and user observations were recorded."

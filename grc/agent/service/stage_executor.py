@@ -148,11 +148,6 @@ def make_invocation_card(parent: TaskCard, target_agent: str, instruction: str =
     return card
 
 
-def invocation_cards_for_stage(parent: TaskCard, stage: Any) -> list[TaskCard]:
-    agents = list(stage.recommended_agents or [parent.target_agent])
-    return [make_invocation_card(parent, agent) for agent in agents]
-
-
 def bind_invocation_result(
     invocation: dict[str, Any],
     parsed: dict[str, Any] | None,

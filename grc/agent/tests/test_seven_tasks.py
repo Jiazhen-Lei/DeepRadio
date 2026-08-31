@@ -627,10 +627,17 @@ class SevenTaskServiceAgentTest(unittest.TestCase):
     def test_hardware_configure_stays_config_only(self):
         agent = self.agent("seven-hw")
         reply = agent.step("配置 USRP B210，中心频率 2.4 GHz，采样率 1 MHz")
+        # Device-touching plans pause at intent confirmation (V6).
+        reply = agent.step("确认")
         self.assertEqual(reply.workflow_digest["task_type"], "HARDWARE_CONFIGURE")
         self.assertIn(
             reply.workflow_digest["current_stage"],
-            ("hardware_precheck", "hardware_confirmation", "configure_and_check"),
+            (
+                "hardware_precheck",
+                "discover_and_probe_hardware",
+                "hardware_confirmation",
+                "configure_and_check",
+            ),
         )
         self.assertFalse(reply.done)
         self.assertNotIn("start_flowgraph", self._events("seven-hw"))
@@ -670,6 +677,8 @@ class SevenTaskServiceAgentTest(unittest.TestCase):
             reply = agent.step(
                 "为 PlutoSDR 配置 2.402 GHz、2 Msps 的发射流图，保存配置并停在发射确认。"
             )
+            self.assertEqual(reply.pending.get("kind"), "intent_confirmation")
+            reply = agent.step("确认")
         self.assertEqual(reply.workflow_digest["task_type"], "HARDWARE_CONFIGURE")
         self.assertNotIn("modulation", reply.workflow_digest.get("missing_slots") or [])
         self.assertNotIn(
@@ -695,11 +704,43 @@ class SevenTaskServiceAgentTest(unittest.TestCase):
         self.assertTrue("2000000" in text or "2e6" in text or "2e+06" in text)
         self.assertNotIn("REPLY_STATUS_REJECTED", reply.text or "")
         self.assertNotIn("Port is not connected", reply.text or "")
-        self.assertIn(
-            reply.workflow_digest.get("current_stage"),
-            ("rf_plan_confirmation",),
+        self.assertEqual(
+            reply.workflow_digest.get("current_stage"), "flowgraph_confirmation"
         )
         self.assertEqual(reply.workflow_digest.get("wait_kind"), "approval")
+        self.assertTrue(reply.workflow_digest.get("needs_confirmation"))
+        self.assertTrue(reply.workflow_digest.get("can_confirm"))
+        self.assertFalse(reply.workflow_digest.get("blocker"))
+        built = next(
+            item.result for item in reply.tool_invocations
+            if item.name == "build_sdr_tx_flowgraph"
+        )
+        self.assertTrue(built.get("preview_topology_valid"), built)
+        self.assertTrue(built.get("compiled"), built)
+        checkpoint_id = (
+            agent._workflow.current_stage().checkpoint.id
+            if agent._workflow.current_stage()
+            and agent._workflow.current_stage().checkpoint
+            else ""
+        )
+        self.assertTrue(checkpoint_id)
+        with mock.patch.object(registry, "call", side_effect=with_pluto):
+            reply = agent.step_command({
+                "action": "checkpoint_decision",
+                "checkpoint_id": checkpoint_id,
+                "decision": "approved",
+            })
+        self.assertIn(
+            reply.workflow_digest.get("current_stage"),
+            (
+                "hardware_precheck",
+                "discover_and_probe_hardware",
+                "rf_plan_confirmation",
+            ),
+        )
+        self.assertIn(
+            reply.workflow_digest.get("wait_kind"), ("approval", "recovery")
+        )
         self.assertTrue(reply.workflow_digest.get("needs_confirmation"))
         self.assertTrue(reply.workflow_digest.get("can_confirm"))
         self.assertFalse(reply.workflow_digest.get("blocker"))
@@ -709,12 +750,6 @@ class SevenTaskServiceAgentTest(unittest.TestCase):
         self.assertEqual((reply.pending.get("device") or {}).get("identity"), "usb:test.pluto")
         self.assertEqual(reply.pending.get("center_frequency"), 2_402_000_000.0)
         self.assertEqual(reply.pending.get("sample_rate"), 2_000_000.0)
-        built = next(
-            item.result for item in reply.tool_invocations
-            if item.name == "build_sdr_tx_flowgraph"
-        )
-        self.assertTrue(built.get("preview_topology_valid"), built)
-        self.assertTrue(built.get("compiled"), built)
         self._claim(reply.claims, "final_flowgraph_valid")
         self._claim(reply.claims, "hardware_device_probed")
         self.assertNotIn(
@@ -807,11 +842,44 @@ class SevenTaskServiceAgentTest(unittest.TestCase):
         self.assertIn("sample_rate", restored.spec.open_questions)
 
     def test_checkpoint_command_does_not_create_a_confirmation_turn(self):
+        from grc.agent.tools import registry
+
         agent = self.agent("seven-command")
         text = "配置 USRP B210，中心频率 2.4 GHz，采样率 1 MHz"
         waiting = agent.step(text)
+        self.assertEqual(waiting.pending.get("kind"), "intent_confirmation")
+        real_call = registry.call
+
+        def hardware_ready(name, args, ctx):
+            if name == "hardware_preflight":
+                return {"ok": True, "missing": [], "checks": {}}
+            if name == "discover_devices":
+                return {
+                    "ok": True, "device_found": True, "device_type": "b210",
+                    "device_identity": "serial=test", "driver_family": "uhd",
+                }
+            if name == "probe_device":
+                return {
+                    "ok": True, "device_probed": True, "device_type": "b210",
+                    "device_identity": "serial=test", "driver_family": "uhd",
+                }
+            return real_call(name, args, ctx)
+
+        patcher = mock.patch.object(
+            registry, "call", side_effect=hardware_ready
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        waiting = agent.step("确认")
         checkpoint_id = waiting.workflow_digest["checkpoint_id"]
         self.assertTrue(checkpoint_id)
+        events_path = Path(store.session_root("seven-command")) / "events.jsonl"
+        turns_before_command = sum(
+            1
+            for line in events_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+            and json.loads(line).get("event") == "user_turn_received"
+        )
         approved = agent.step_command({
             "action": "checkpoint_decision",
             "checkpoint_id": checkpoint_id,
@@ -819,14 +887,13 @@ class SevenTaskServiceAgentTest(unittest.TestCase):
         })
         self.assertEqual(agent._workflow.workflow.intent.raw_text, text)
         self.assertEqual(approved.workflow_digest["execution_status"], "completed")
-        events_path = Path(store.session_root("seven-command")) / "events.jsonl"
         records = [
             json.loads(line)
             for line in events_path.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
         turns = [item for item in records if item["event"] == "user_turn_received"]
-        self.assertEqual(len(turns), 1)
+        self.assertEqual(len(turns), turns_before_command)
 
 
 if __name__ == "__main__":

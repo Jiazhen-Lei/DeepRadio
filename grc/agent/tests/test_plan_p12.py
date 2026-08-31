@@ -16,7 +16,9 @@ from grc.agent.tools.state_tools import (
     expand_patch_operations,
 )
 from grc.agent.workflow.plan_compiler import (
+    PlanCoverageError,
     compile_stages,
+    plan_needs_proposal,
     replan_tail,
     tail_needs_replan_proposal,
     validate_proposal,
@@ -161,6 +163,149 @@ class PlanCompilerContractTest(unittest.TestCase):
         intent.slots["operation"] = "deploy"
         compile_stages(intent, [])
         self.assertEqual(intent.slots.get("duration_seconds"), 30.0)
+
+    def test_deploy_intent_requires_an_rf_execution_stage(self):
+        intent = type("Intent", (), {
+            "slots": {"operation": "deploy"},
+            "context": {"execution_mode": "deploy"},
+            "capabilities": ["deploy", "hardware_runtime"],
+        })()
+        with self.assertRaisesRegex(PlanCoverageError, "no non-finalizer RF_RUN"):
+            compile_stages(intent, [Stage.from_dict({
+                "id": "hardware_precheck",
+                "effect_level": "DEVICE_READ",
+                "completion": ["hardware_precheck_completed"],
+                "on": {"passed": "completed"},
+            })])
+
+    def test_successful_execution_cycle_is_rejected(self):
+        stages = [
+            Stage.from_dict({
+                "id": "first",
+                "on": {"passed": "second"},
+            }),
+            Stage.from_dict({
+                "id": "second",
+                "on": {"passed": "first"},
+            }),
+        ]
+        with self.assertRaisesRegex(PlanCoverageError, "execution cycle"):
+            compile_stages(object(), stages)
+
+    def test_planner_additions_precede_higher_effect_and_cannot_loop_back(self):
+        stages = [
+            Stage.from_dict({
+                "id": "tx_build",
+                "effect_level": "ARTIFACT_WRITE",
+                "completion": ["flowgraph_saved"],
+                "on": {"passed": "hardware_precheck"},
+            }),
+            Stage.from_dict({
+                "id": "hardware_precheck",
+                "effect_level": "DEVICE_READ",
+                "on": {"passed": "hardware_confirmation"},
+            }),
+            Stage.from_dict({
+                "id": "hardware_confirmation",
+                "interaction": "checkpoint",
+                "on": {"approved": "completed"},
+            }),
+        ]
+        catalog = {"task_candidates": {"ANY": {"stages": [
+            {
+                "id": "protocol_build",
+                "effect_level": "ARTIFACT_WRITE",
+                "completion": ["protocol_artifact"],
+                "on": {"passed": "protocol_verify"},
+            },
+            {
+                "id": "protocol_verify",
+                "depends_on": ["project.flowgraph"],
+                "on": {"passed": "hardware_precheck"},
+            },
+        ]}}}
+        compiled, _nodes, _rejected, _unbound = compile_stages(
+            object(),
+            stages,
+            catalog=catalog,
+            proposal=[
+                {"id": "protocol_build"},
+                {"id": "protocol_verify"},
+            ],
+        )
+        self.assertEqual(
+            [stage.id for stage in compiled],
+            [
+                "tx_build", "protocol_build", "protocol_verify",
+                "hardware_precheck", "hardware_confirmation",
+            ],
+        )
+        self.assertEqual(
+            compiled[2].transitions["passed"], "hardware_precheck"
+        )
+
+    def test_proposal_cannot_rewrite_catalog_completion_facts(self):
+        stage = Stage.from_dict({
+            "id": "inspect_and_measure",
+            "completion": ["measurement_completed"],
+        })
+        compile_stages(
+            object(),
+            [stage],
+            catalog={"task_candidates": {"OBSERVE": {"stages": [
+                {"id": "inspect_and_measure"},
+            ]}}},
+            proposal=[{
+                "id": "inspect_and_measure",
+                "produces": ["device_probed"],
+                "requires": ["invented_fact"],
+            }],
+        )
+        self.assertEqual(stage.completion, ["measurement_completed"])
+        self.assertNotIn("device_probed", stage.produces)
+        self.assertNotIn("invented_fact", stage.requires)
+
+    def test_effect_contract_rejects_rf_without_probe_grant_and_stop(self):
+        with self.assertRaises(PlanCoverageError):
+            compile_stages(object(), [Stage.from_dict({
+                "id": "transmit_bounded",
+                "effect_level": "RF_RUN",
+                "completion": ["transmit_started"],
+            })])
+
+    def test_planner_runs_only_for_concrete_coverage_gap(self):
+        stage = Stage.from_dict({
+            "id": "inspect_and_measure",
+            "completion": ["measurement_completed"],
+        })
+        covered = type("Intent", (), {
+            "capabilities": ["observe"],
+            "requested_operations": ["observe"],
+            "desired_artifacts": ["measurement_completed"],
+        })()
+        gap = type("Intent", (), {
+            "capabilities": ["observe"],
+            "requested_operations": ["observe", "probe_device"],
+            "desired_artifacts": [],
+        })()
+        self.assertFalse(plan_needs_proposal(covered, [stage]))
+        self.assertTrue(plan_needs_proposal(gap, [stage]))
+
+    def test_free_form_artifact_wording_does_not_force_planner(self):
+        stages = [
+            Stage.from_dict({
+                "id": "transmit_bounded",
+                "effect_level": "RF_RUN",
+                "completion": ["transmit_started"],
+            }),
+        ]
+        intent = type("Intent", (), {
+            "capabilities": ["deploy", "hardware_runtime"],
+            "requested_operations": ["deploy"],
+            "desired_artifacts": ["ble_rf_transmission"],
+            "evidence_requirements": ["rf_transmission_active"],
+        })()
+        self.assertFalse(plan_needs_proposal(intent, stages))
 
 
 class WorkflowPlannerCompatTest(unittest.TestCase):

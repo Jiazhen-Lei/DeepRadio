@@ -27,6 +27,7 @@ import time
 import uuid
 from typing import Any, Dict, List
 
+from ..runtime_config import rf_runtime_enabled
 logger = logging.getLogger(__name__)
 
 #: 会话虚拟路径前缀约定(与 backend 一致)。
@@ -51,7 +52,13 @@ def sessions_root() -> str:
     """返回会话根目录 ``<project_root>/local/agent_sessions``(自动创建)。
 
     project_root 由本文件位置推算:grc/agent/service/session_store.py -> 上四级。
+    ``GRC_AGENT_SESSIONS_ROOT`` 环境变量可覆盖,用于测试隔离与部署重定向,
+    防止跨运行的会话残留(例如 hw_retry_failures 计数)污染新会话。
     """
+    override = os.environ.get("GRC_AGENT_SESSIONS_ROOT", "").strip()
+    if override:
+        os.makedirs(override, exist_ok=True)
+        return override
     path = os.path.join(project_root(), "local", "agent_sessions")
     os.makedirs(path, exist_ok=True)
     return path
@@ -73,11 +80,6 @@ def session_root(session_id: str) -> str:
 
 def state_path(session_id: str) -> str:
     return os.path.join(session_root(session_id), "state.json")
-
-
-def radio_specification_path(session_id: str) -> str:
-    """Read-only materialized projection written alongside SharedState."""
-    return os.path.join(session_root(session_id), "radio_specification.json")
 
 
 def workflow_path(session_id: str) -> str:
@@ -129,7 +131,7 @@ def ensure_run_metadata(session_id: str) -> str:
         "gnuradio": gnuradio_version,
         "conda_environment": str(os.environ.get("CONDA_DEFAULT_ENV") or ""),
         "platform": runtime_platform.platform(),
-        "rf_enabled": os.environ.get("GRC_AGENT_ENABLE_RF") == "1",
+        "rf_enabled": rf_runtime_enabled(),
     }
     environment_hash = _stable_hash(environment)
     payload = {
@@ -217,44 +219,6 @@ def _export_mode() -> str:
     return value if value in {"display", "reproducible"} else "display"
 
 
-def archive_session(session_id: str, destination: str) -> str:
-    """Copy a session tree and rewrite leftover absolute session paths."""
-    source = os.path.abspath(session_root(session_id))
-    dest = os.path.abspath(destination)
-    if os.path.isdir(dest) and os.path.isfile(os.path.join(dest, "state.json")):
-        raise ValueError(f"归档目标已存在会话文件: {dest}")
-    if os.path.isdir(dest):
-        dest = os.path.join(dest, _safe_component(session_id))
-    if os.path.exists(dest):
-        raise ValueError(f"归档目标已存在: {dest}")
-    shutil.copytree(source, dest)
-    from ..state.shared_state import relativize_tree_paths, rewrite_root_prefix
-
-    for current_root, dirnames, names in os.walk(dest):
-        dirnames[:] = [name for name in dirnames if name != "__pycache__"]
-        for name in names:
-            path = os.path.join(current_root, name)
-            if name.endswith(".jsonl"):
-                _rewrite_jsonl_session_paths(path, source, dest)
-                continue
-            if not name.endswith((".json", ".yaml", ".yml")):
-                continue
-            try:
-                with open(path, "r", encoding="utf-8") as handle:
-                    payload = json.load(handle)
-            except (OSError, json.JSONDecodeError, TypeError):
-                continue
-            rewritten = relativize_tree_paths(
-                dest, rewrite_root_prefix(payload, source, dest)
-            )
-            tmp = f"{path}.tmp"
-            with open(tmp, "w", encoding="utf-8") as handle:
-                json.dump(rewritten, handle, ensure_ascii=False, indent=2)
-            os.replace(tmp, path)
-    append_session_event(session_id, "session_archived", {"destination": dest})
-    return dest
-
-
 def _rewrite_jsonl_session_paths(path: str, old_root: str, new_root: str) -> None:
     from ..state.shared_state import relativize_tree_paths, rewrite_root_prefix
 
@@ -328,45 +292,6 @@ def snapshots_dir(session_id: str) -> str:
     path = os.path.join(session_root(session_id), "snapshots")
     os.makedirs(path, exist_ok=True)
     return path
-
-
-def export_spec(session_id: str, destination: str) -> str:
-    """Export only RadioSpec for explicit cross-session reuse."""
-    from ..state import SharedState
-
-    state = SharedState.load(state_path(session_id), session_id=session_id)
-    payload = {"schema_version": 1, "spec": state.spec_digest()}
-    parent = os.path.dirname(os.path.abspath(destination))
-    os.makedirs(parent, exist_ok=True)
-    tmp = f"{destination}.tmp"
-    with open(tmp, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
-    os.replace(tmp, destination)
-    append_session_event(session_id, "spec_export", {"path": destination})
-    return destination
-
-
-def import_spec(session_id: str, source: str) -> None:
-    """Import a validated RadioSpec without carrying project or claim state."""
-    from ..state import Decision, RadioSpec, SharedState
-
-    with open(source, "r", encoding="utf-8") as handle:
-        payload = json.load(handle)
-    if payload.get("schema_version") != 1 or not isinstance(
-        payload.get("spec"), dict
-    ):
-        raise ValueError("不支持的 Spec 文件格式")
-    data = payload["spec"]
-    state = SharedState.load(state_path(session_id), session_id=session_id)
-    state.spec = RadioSpec(
-        goals=list(data.get("goals") or []),
-        success_conditions=list(data.get("success_conditions") or []),
-        constraints=dict(data.get("constraints") or {}),
-        decisions=[Decision(**item) for item in data.get("decisions") or []],
-        open_questions=list(data.get("open_questions") or []),
-    )
-    state.save(state_path(session_id))
-    append_session_event(session_id, "spec_import", {"path": source})
 
 
 def _safe_component(name: str) -> str:
@@ -929,3 +854,41 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_jsonable(v) for v in value]
     return str(value)
+
+
+def archive_session(session_id: str, destination: str) -> str:
+    """Copy a session tree and rewrite leftover absolute session paths."""
+    source = os.path.abspath(session_root(session_id))
+    dest = os.path.abspath(destination)
+    if os.path.isdir(dest) and os.path.isfile(os.path.join(dest, "state.json")):
+        raise ValueError(f"归档目标已存在会话文件: {dest}")
+    if os.path.isdir(dest):
+        dest = os.path.join(dest, _safe_component(session_id))
+    if os.path.exists(dest):
+        raise ValueError(f"归档目标已存在: {dest}")
+    shutil.copytree(source, dest)
+    from ..state.shared_state import relativize_tree_paths, rewrite_root_prefix
+
+    for current_root, dirnames, names in os.walk(dest):
+        dirnames[:] = [name for name in dirnames if name != "__pycache__"]
+        for name in names:
+            path = os.path.join(current_root, name)
+            if name.endswith(".jsonl"):
+                _rewrite_jsonl_session_paths(path, source, dest)
+                continue
+            if not name.endswith((".json", ".yaml", ".yml")):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    payload = json.load(handle)
+            except (OSError, json.JSONDecodeError, TypeError):
+                continue
+            rewritten = relativize_tree_paths(
+                dest, rewrite_root_prefix(payload, source, dest)
+            )
+            tmp = f"{path}.tmp"
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump(rewritten, handle, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+    append_session_event(session_id, "session_archived", {"destination": dest})
+    return dest

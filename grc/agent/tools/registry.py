@@ -175,22 +175,6 @@ def runtime_of(name: str) -> str:
     return spec.runtime if spec else ""
 
 
-def action_metadata(name: str) -> Dict[str, Any]:
-    """Return planner-facing metadata without exposing the callable."""
-    spec = _REGISTRY.get(name)
-    if spec is None:
-        return {}
-    return {
-        "name": spec.name,
-        "description": spec.description,
-        "group": spec.group,
-        "effect_level": spec.effect_level,
-        "idempotent": spec.idempotent,
-        "requires": list(spec.requires),
-        "parameters": dict(spec.parameters),
-    }
-
-
 # ---------------------------------------------------------------------------
 # 导出: OpenAI function-calling schema(主)
 # ---------------------------------------------------------------------------
@@ -270,17 +254,22 @@ def call(name: str, arguments: Dict[str, Any],
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
-def call_from_llm_toolcall(tool_call: Dict[str, Any],
-                           ctx: ToolContext) -> Dict[str, Any]:
-    """从 OpenAI 风格的 tool_call 对象直接调用(参数是 JSON 字符串)。
+def action_metadata(name: str) -> Dict[str, Any]:
+    """Return planner-facing metadata without exposing the callable."""
+    spec = _REGISTRY.get(name)
+    if spec is None:
+        return {}
+    return {
+        "name": spec.name,
+        "description": spec.description,
+        "group": spec.group,
+        "effect_level": spec.effect_level,
+        "idempotent": spec.idempotent,
+        "requires": list(spec.requires),
+        "parameters": dict(spec.parameters),
+    }
 
-    ``tool_call`` 形如 ``{"function": {"name": ..., "arguments": "{...}"}}``。
-    """
-    fn = (tool_call or {}).get("function", {})
-    name = fn.get("name", "")
-    raw = fn.get("arguments", "{}")
-    try:
-        args = json.loads(raw) if isinstance(raw, str) else (raw or {})
-    except json.JSONDecodeError as exc:
-        return {"ok": False, "error": f"arguments 不是合法 JSON: {exc}"}
-    return call(name, args, ctx)
+
+# ---------------------------------------------------------------------------
+# 导出: OpenAI function-calling schema(主)
+# ---------------------------------------------------------------------------

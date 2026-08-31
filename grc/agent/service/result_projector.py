@@ -32,6 +32,16 @@ def project_control(workflow_engine: Any, state: Any) -> None:
     state.runtime.status = _RUNTIME_STATUS.get(
         str(digest.get("execution_status") or "pending"), "planned"
     )
+    if (
+        str(digest.get("execution_status") or "") == "completed"
+        and not any(
+            str(getattr(item, "effect_level", "") or "") == "RF_RUN"
+            and not bool(getattr(item, "safety_finalizer", False))
+            for item in (getattr(workflow_engine.workflow, "stages", None) or [])
+        )
+    ):
+        # Completing design/configuration work is not runtime success.
+        state.runtime.status = "not_started"
     state.runtime.requested_effect = str(
         getattr(checkpoint, "requested_effect", "")
         or getattr(stage, "effect_level", "READ")
@@ -98,8 +108,14 @@ def project_tool_results(
             None,
         )
 
+    discovery_attempted = bool(results.get("discover_devices"))
+    probe_attempted = bool(results.get("probe_device"))
     discovered = latest("discover_devices", lambda item: item.get("device_found"))
     probed = latest("probe_device", lambda item: item.get("device_probed"))
+    if (discovery_attempted or probe_attempted) and not (discovered and probed):
+        # Never carry a physical-device success fact across a failed fresh
+        # observation. Structural endpoints remain separate structure claims.
+        state.project.config.pop("observed_device", None)
     if discovered and probed:
         state.project.config["observed_device"] = {
             "type": probed.get("device_type") or discovered.get("device_type"),
@@ -122,6 +138,24 @@ def project_tool_results(
                 probed.get("report_path") or discovered.get("report_path") or ""
             ),
         )
+        probe_warnings = list(
+            dict(probed.get("health") or {}).get("warnings") or []
+        )
+        state.runtime.warnings = [
+            item for item in state.runtime.warnings
+            if item.get("code") != "device_probe_warning"
+        ]
+        if probe_warnings:
+            if state.runtime.quality != "failed":
+                state.runtime.quality = "warning"
+            state.runtime.warnings.append({
+                "code": "device_probe_warning",
+                "message": (
+                    "The device identity and core probe passed, but optional "
+                    "driver attributes reported warnings."
+                ),
+                "details": probe_warnings,
+            })
     built_tx = latest(
         "build_sdr_tx_flowgraph",
         lambda item: item.get("ok") and item.get("valid") and item.get("compiled"),

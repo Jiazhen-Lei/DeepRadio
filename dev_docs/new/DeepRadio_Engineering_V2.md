@@ -1,11 +1,23 @@
 # DeepRadio 工程方案 V2
 
-> 更新日期：2026-08-30<br>
-> 当前证据：当前工作区代码与全量自动回归（agent tests `234 passed, 1 skipped`）、2026-08-30 PlutoSDR 真机冒烟；`local/agent_sessions/0827|0828` 历史目录仅作版本基线<br>
+> 更新日期：2026-08-31<br>
+> 当前证据：当前工作区代码与全量自动回归（agent tests `250 passed, 1 skipped`；GUI tests `20 passed`）、2026-08-30 PlutoSDR 真机冒烟；`local/agent_sessions/0827|0828` 历史目录仅作版本基线<br>
 > 状态口径：实验已暴露但尚未由修改后全量回归证明关闭的问题，统一视为活动问题或待回归问题。<br>
 > 约束：不替换现有框架，不引入第二套编排器，不把系统改成纯 LLM 执行。
 
 ---
+
+## 2026-08-31 V6 增量：泛化链路修复
+
+本次修改保持 `Alignment → Intent → Plan → Workflow → Evidence → UI` 架构不变，收紧各边界：
+
+1. `WorkflowEngine` 的活动轮次 LLM 一次返回 relation 与 `intent_patch`；`ServiceAgent` 不再把同一 alignment confirmation 二次送入 Workflow。初始 idle intent 仍进入 Alignment，已确认/已完成状态的新目标进入 Workflow。
+2. `plan_needs_proposal` 先比较 IntentIR 的具体 operation/artifact 与既有 Stage evidence coverage；无 gap 不调用 planner。proposal 对已有 Stage 只可更新 objective/unbound metadata，不可覆盖 requires/produces/completion。
+3. Catalog 的设备链统一为 `hardware_precheck → discover_and_probe_hardware → checkpoint → configure/runtime`。Compiler 对 DEVICE_CONFIG/RF_RUN 执行 evidence/effect/finalizer 不变量校验。
+4. `hardware_preflight` 输出 `readiness_scope=host_environment` 与 `physical_device_checked=false`。`result_projector` 只有在 discover 与 probe 同轮成功后写入 physical device claim；新探测失败会移除 stale observed device。
+5. GTK 默认界面只渲染 `workflow_presenter.present()` 生成的英文 label/message。Claims 默认详情不再展开 raw evidence JSON；规格卡不显示 revision/status 日志标题；回复不再附加 `Completed:` 工具事件列表。
+
+自动回归以无硬件/无完整 GNU Radio block library 的当前环境执行：Plan/Workflow 契约测试通过；需要完整 GNU Radio runtime、GTK `gi` 或 HIL 的套件按环境条件单独验收。
 
 ## 2026-08-30 V5 增量：硬件意图对齐与探测链路修复（P0～P2 已实施）
 

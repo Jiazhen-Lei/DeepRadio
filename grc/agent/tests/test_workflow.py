@@ -204,6 +204,9 @@ class PlanCoverageAndRelationContractTest(unittest.TestCase):
             "grc.agent.workflow.llm_planner.propose_plan",
             return_value=[{"id": "dummy_action"}],
         ), mock.patch(
+            "grc.agent.workflow.engine.plan_needs_proposal",
+            return_value=True,
+        ), mock.patch(
             "grc.agent.workflow.plan_compiler.validate_proposal",
             return_value=([node], []),
         ), mock.patch(
@@ -221,28 +224,76 @@ class PlanCoverageAndRelationContractTest(unittest.TestCase):
 
         def chat_side_effect(messages, *args, **kwargs):
             system = str(messages[0].get("content") or "")
-            if "会话关系判定器" in system:
+            if "会话语义解析器" in system:
                 return json.dumps(
-                    {"relation": "adjustment", "reason": "parameter supplement"}
+                    {
+                        "relation": "adjustment",
+                        "reason": "parameter supplement",
+                        "intent_patch": {
+                            "slots": {"local_name": "cindysha"},
+                            "capabilities": [],
+                        },
+                    }
                 )
-            return json.dumps({
-                "task_type": workflow.task_type,
-                "confidence": 0.95,
-                "capabilities": list(workflow.intent.capabilities),
-                "slots": {"local_name": "cindysha"},
-            })
+            raise AssertionError("The turn must use exactly one semantic LLM call")
 
         with mock.patch(
             "grc.agent.llm.is_configured", return_value=True
         ), mock.patch(
             "grc.agent.llm.chat", side_effect=chat_side_effect,
-        ):
+        ) as chat:
             engine.consume_turn(
                 "The local name of the signal ble must be 'cindysha'.", state
             )
+        self.assertEqual(chat.call_count, 1)
         self.assertEqual(engine.workflow.workflow_id, original_id)
         self.assertEqual(
             engine.workflow.intent.slots.get("local_name"), "cindysha"
+        )
+
+    def test_relation_llm_receives_checkpoint_state_for_transmit_confirmation(self):
+        from grc.agent.workflow.schema import Checkpoint, Stage, Workflow
+
+        engine = self.engine()
+        stage = Stage(
+            id="rf_plan_confirmation",
+            interaction="checkpoint",
+            execution_status="waiting",
+            checkpoint=Checkpoint(
+                id="cp-rf-plan",
+                reason="Approve bounded RF transmission",
+                requested_effect="RF_RUN",
+            ),
+            transitions={"approved": "completed", "rejected": "cancelled"},
+        )
+        engine.workflow = Workflow(
+            workflow_id="wf-confirm",
+            task_type="HARDWARE_CONFIGURE",
+            intent=WorkflowIntent(raw_text="Transmit BLE"),
+            stages=[stage],
+            execution_status="waiting",
+            current_stage=stage.id,
+        )
+        response = json.dumps({
+            "relation": "approval",
+            "reason": "The user approves the current RF checkpoint",
+            "turn_semantics": {
+                "read_only": False,
+                "confirmation_decision": "approved",
+                "recipe_switch_target": "",
+            },
+        })
+        with mock.patch(
+            "grc.agent.llm.is_configured", return_value=True
+        ), mock.patch(
+            "grc.agent.llm.chat", return_value=response
+        ) as chat:
+            relation = engine._turn_relation_llm("confirm to transmit")
+        self.assertEqual(relation, "approval")
+        payload = json.loads(chat.call_args.args[0][1]["content"])
+        self.assertTrue(payload["current_workflow"]["has_checkpoint"])
+        self.assertEqual(
+            payload["current_workflow"]["stage_status"], "waiting"
         )
 
     def test_llm_unreachable_raises_instead_of_rule_fallback(self):
@@ -662,11 +713,12 @@ class DynamicWorkflowV2ContractTest(unittest.TestCase):
                 "completion": {name: False for name in stage.completion},
             }
         )
-        resumed = engine.consume_turn(
-            "使用 USRP B210，中心频率 2.4 GHz，采样率 1 Msps", state
-        )
+        with mock.patch.object(engine, "_turn_relation", return_value="answer"):
+            resumed = engine.consume_turn(
+                "使用 USRP B210，中心频率 2.4 GHz，采样率 1 Msps", state
+            )
         self.assertEqual(resumed.workflow_id, workflow_id)
-        self.assertEqual(resumed.intent.turn_relation, "feedback")
+        self.assertEqual(resumed.intent.turn_relation, "answer")
         self.assertEqual(resumed.intent.missing_slots, [])
         self.assertEqual(resumed.intent.raw_text, "配置 SDR 硬件")
 
@@ -948,7 +1000,7 @@ class WorkflowCapabilityCompositionTest(unittest.TestCase):
             "completion": {name: True for name in stage.completion},
         }
         engine.accept_result(result)
-        self.assertEqual(workflow.current_stage, "hardware_precheck")
+        self.assertEqual(workflow.current_stage, "flowgraph_confirmation")
         self.assertNotEqual(workflow.execution_status, "completed")
 
     def test_realtime_capability_adds_bounded_runtime_safety_chain(self):
@@ -958,17 +1010,18 @@ class WorkflowCapabilityCompositionTest(unittest.TestCase):
         ids = [stage.id for stage in workflow.stages]
         self.assertEqual(ids, [
             "rx_build_and_verify",
-            "hardware_precheck",
-            "discover_and_probe_hardware",
-            "rf_plan_confirmation",
+            "flowgraph_confirmation",
         ])
         self.assertEqual(
             [item.get("id") for item in workflow.deferred_plan],
             [
-                "configure_device",
-                "run_bounded",
-                "runtime_observation",
-                "stop_runtime",
+            "hardware_precheck",
+            "discover_and_probe_hardware",
+            "rf_plan_confirmation",
+            "configure_device",
+            "run_bounded",
+            "runtime_observation",
+            "stop_runtime",
             ],
         )
 
@@ -979,7 +1032,8 @@ class WorkflowCapabilityCompositionTest(unittest.TestCase):
         )
         ids = [stage.id for stage in workflow.stages]
         self.assertEqual(ids, [
-            "hardware_precheck", "hardware_confirmation"
+            "hardware_precheck", "discover_and_probe_hardware",
+            "hardware_confirmation",
         ])
         self.assertEqual(
             [item.get("id") for item in workflow.deferred_plan],
@@ -1002,15 +1056,17 @@ class WorkflowCapabilityCompositionTest(unittest.TestCase):
         self.assertNotIn("terminal_checkpoint", workflow.intent.slots)
         self.assertIn("hardware_runtime", workflow.intent.capabilities)
         ids = [stage.id for stage in workflow.stages]
-        self.assertIn("discover_and_probe_hardware", ids)
-        self.assertIn("rf_plan_confirmation", ids)
+        deferred = [item.get("id") for item in workflow.deferred_plan]
+        self.assertEqual(ids, ["tx_build_and_validate", "flowgraph_confirmation"])
+        self.assertIn("discover_and_probe_hardware", deferred)
+        self.assertIn("rf_plan_confirmation", deferred)
         self.assertNotIn("configure_device", ids)
         self.assertNotIn("run_bounded", ids)
         self.assertNotIn("duration_seconds", workflow.intent.slots)
         self.assertNotIn("max_duration_seconds", workflow.intent.slots)
         self.assertLess(
-            ids.index("discover_and_probe_hardware"),
-            ids.index("rf_plan_confirmation"),
+            deferred.index("discover_and_probe_hardware"),
+            deferred.index("rf_plan_confirmation"),
         )
 
     def test_do_not_transmit_remains_configuration_only(self):
@@ -1048,6 +1104,7 @@ class WorkflowCapabilityCompositionTest(unittest.TestCase):
                 SharedState(),
             )
             self.assertNotIn("configure_device", [stage.id for stage in workflow.stages])
+            engine.ensure_stage("rf_plan_confirmation")
             workflow.current_stage = "rf_plan_confirmation"
             engine._activate_current()
             digest = engine.digest()
@@ -1083,6 +1140,7 @@ class WorkflowCapabilityCompositionTest(unittest.TestCase):
                 "用 plutosdr 发射 ble 信号，local name 为 loveu",
                 SharedState(),
             )
+            engine.ensure_stage("rf_plan_confirmation")
             workflow.current_stage = "rf_plan_confirmation"
             engine._activate_current()
             with mock.patch(
@@ -1100,9 +1158,19 @@ class WorkflowCapabilityCompositionTest(unittest.TestCase):
         self.assertTrue(
             workflow.stage("rf_plan_confirmation").result["completion"]["rf_plan_approved"]
         )
+        # The deploy template now uses the unified runtime-stage id (V6:
+        # legacy ``discover_and_probe_device`` duplicate removed), so the
+        # LLM's off-script additions — not the base chain — must be the ones
+        # filtered out here.
         self.assertNotIn(
-            "discover_and_probe_hardware",
+            "discover_and_probe_device",
             [stage.id for stage in workflow.stages],
+        )
+        self.assertLess(
+            [stage.id for stage in workflow.stages].index("hardware_precheck"),
+            [stage.id for stage in workflow.stages].index(
+                "discover_and_probe_hardware"
+            ),
         )
 
     def test_rf_grant_skips_llm_replan_when_only_stop_remains(self):
@@ -1118,6 +1186,7 @@ class WorkflowCapabilityCompositionTest(unittest.TestCase):
                     SharedState(),
                 )
                 planner.reset_mock()
+                engine.ensure_stage("rf_plan_confirmation")
                 workflow.current_stage = "rf_plan_confirmation"
                 engine._activate_current()
                 engine.resolve_checkpoint("approved")
@@ -1136,6 +1205,7 @@ class WorkflowCapabilityCompositionTest(unittest.TestCase):
             SharedState(),
         )
         self.assertIn("stop_at_decision_boundary", workflow.intent.stop_conditions)
+        engine.ensure_stage("rf_plan_confirmation")
         workflow.current_stage = "rf_plan_confirmation"
         engine._activate_current()
         digest = engine.digest()
@@ -1182,6 +1252,7 @@ class WorkflowCapabilityCompositionTest(unittest.TestCase):
             "保存配置并停在发射确认。",
             state,
         )
+        engine.ensure_stage("rf_plan_confirmation")
         workflow.current_stage = "rf_plan_confirmation"
         engine._activate_current()
         engine.resolve_checkpoint("approved")
@@ -1205,6 +1276,7 @@ class WorkflowCapabilityCompositionTest(unittest.TestCase):
             self.assertEqual(follow.intent.slot_sources.get("hardware"), "current_project")
             self.assertNotIn("stop_at_decision_boundary", follow.intent.stop_conditions)
             self.assertIn("hardware_runtime", follow.intent.capabilities)
+            engine.ensure_stage("rf_plan_confirmation")
             follow.current_stage = "rf_plan_confirmation"
             engine._activate_current()
             digest = engine.digest()
@@ -1320,6 +1392,11 @@ class WorkflowCapabilityCompositionTest(unittest.TestCase):
         blocked = engine.start_stage()
         self.assertEqual(blocked.execution_status, "waiting")
         self.assertEqual(engine.workflow.execution_status, "waiting")
+        digest = engine.digest()
+        self.assertEqual(
+            digest["blocker"]["code"], "ATTEMPT_LIMIT_REACHED"
+        )
+        self.assertIn("attempt limit", digest["waiting_reason"])
 
     def test_device_range_validation_blocks_invalid_frequency(self):
         workflow = self.engine().consume_turn(
@@ -1345,6 +1422,14 @@ class WorkflowCapabilityCompositionTest(unittest.TestCase):
             self.hardware_rx_text(with_rate=True), state
         )
         stage = workflow.stage("rx_build_and_verify")
+        # Build stages no longer require the endpoint predicate as a
+        # completion (physical presence belongs to the discover stage, V6),
+        # but the predicate itself must still judge flowgraph structure
+        # correctly wherever it is used — so evaluate it explicitly.
+        if "hardware_endpoint_present" not in stage.completion:
+            stage.completion = list(stage.completion) + [
+                "hardware_endpoint_present"
+            ]
         reply = AgentReply(
             stage="FINAL",
             artifacts={"grc_path": str(path)},
@@ -1398,7 +1483,7 @@ class IntentLlmTest(unittest.TestCase):
         rules = WorkflowIntent(
             raw_text="Build something with QPSK",
             task_type="END_TO_END_SIM",
-            slots={"modulation": "qpsk", "direction": "transceiver"},
+            slots={"modulation": "qpsk", "direction": "sim"},
             slot_sources={"modulation": "rules", "direction": "rules"},
         )
         with mock.patch("grc.agent.llm.is_configured", return_value=False), mock.patch(
@@ -1412,7 +1497,7 @@ class IntentLlmTest(unittest.TestCase):
         rules = engine.classify(
             "Build a QPSK baseband transmit chain, simulation only.", SharedState()
         )
-        self.assertEqual(rules.slots["direction"], "transceiver")
+        self.assertEqual(rules.slots["direction"], "sim")
         payload = {
             "task_type": "TX_BUILD",
             "confidence": 0.98,
@@ -1425,6 +1510,137 @@ class IntentLlmTest(unittest.TestCase):
             completed = complete_intent(rules, rules.raw_text, SharedState())
         self.assertEqual(completed.slots["direction"], "tx")
         self.assertEqual(completed.slot_sources["direction"], "llm")
+
+    def test_v3_transmit_request_compiles_the_complete_rf_chain(self):
+        text = "I want to use plutosdr to transmit a ble signal."
+        rules = WorkflowIntent(
+            raw_text=text,
+            task_type="END_TO_END_SIM",
+        )
+        payload = {
+            "task_type": "TX_BUILD",
+            "execution_mode": "deploy",
+            "confidence": 0.98,
+            "capabilities": [
+                "build_tx", "protocol", "hardware_configure",
+            ],
+            "slots": {
+                "hardware": "plutosdr",
+                "protocol": "ble",
+                "direction": "tx",
+            },
+        }
+        with mock.patch(
+            "grc.agent.llm.is_configured", return_value=True
+        ), mock.patch(
+            "grc.agent.llm.chat", return_value=json.dumps(payload)
+        ):
+            intent = complete_intent(rules, text, SharedState())
+        self.assertEqual(intent.slots["operation"], "deploy")
+        self.assertIn("hardware_runtime", intent.capabilities)
+        self.assertIn("deploy", intent.capabilities)
+
+        with tempfile.TemporaryDirectory() as root:
+            engine = WorkflowEngine(str(Path(root) / "workflow.json"))
+            workflow = engine.instantiate(intent, SharedState())
+            ids = [node["stage_id"] for node in workflow.compiled_plan]
+            self.assertEqual(
+                ids,
+                [
+                    "build_ble_advertiser",
+                    "offline_protocol_verify",
+                    "flowgraph_confirmation",
+                    "hardware_precheck",
+                    "discover_and_probe_hardware",
+                    "rf_plan_confirmation",
+                    "configure_device",
+                    "transmit_bounded",
+                    "over_air_verification",
+                    "stop_and_finalize",
+                ],
+            )
+
+            visited = []
+            with mock.patch.dict(
+                os.environ, {"GRC_AGENT_ENABLE_RF": "1"}
+            ), mock.patch(
+                "grc.agent.workflow.llm_planner.propose_plan",
+                return_value=None,
+            ):
+                while workflow.execution_status != "completed":
+                    stage = engine.current_stage()
+                    self.assertIsNotNone(stage)
+                    visited.append(stage.id)
+                    if "checkpoint" in stage.interaction:
+                        engine.resolve_checkpoint("approved")
+                        continue
+                    running = engine.start_stage()
+                    self.assertEqual(running.execution_status, "running")
+                    engine.accept_result({
+                        "ok": True,
+                        "outcome": "passed",
+                        "stage_id": stage.id,
+                        "workflow_revision": workflow.revision,
+                        "base_project_version": workflow.base_project_version,
+                        "completion": {
+                            name: True for name in stage.completion
+                        },
+                    })
+            self.assertEqual(visited, ids)
+            self.assertEqual(workflow.outcome, "passed")
+
+    def test_production_intent_rejects_missing_execution_mode(self):
+        rules = WorkflowIntent(raw_text="ambiguous", task_type="TX_BUILD")
+        payload = {
+            "task_type": "TX_BUILD",
+            "confidence": 0.9,
+            "capabilities": ["build_tx"],
+            "slots": {"direction": "tx"},
+        }
+        with mock.patch(
+            "grc.agent.llm.is_configured", return_value=True
+        ), mock.patch(
+            "grc.agent.llm.intent_test_bypass_enabled", return_value=False
+        ), mock.patch(
+            "grc.agent.llm.chat", return_value=json.dumps(payload)
+        ):
+            with self.assertRaisesRegex(Exception, "semantic understanding"):
+                complete_intent(rules, rules.raw_text, SharedState())
+
+    def test_hardware_tx_design_ambiguity_gets_llm_effect_adjudication(self):
+        text = "Use the attached radio to transmit the requested signal."
+        initial = {
+            "task_type": "TX_BUILD",
+            "execution_mode": "design",
+            "confidence": 0.9,
+            "capabilities": ["build_tx", "protocol"],
+            "slots": {
+                "hardware": "generic_sdr",
+                "protocol": "custom",
+                "direction": "tx",
+            },
+        }
+        adjudicated = {
+            "execution_mode": "deploy",
+            "reason": "The user requests actual transmission on hardware.",
+        }
+        with mock.patch(
+            "grc.agent.llm.is_configured", return_value=True
+        ), mock.patch(
+            "grc.agent.llm.intent_test_bypass_enabled", return_value=False
+        ), mock.patch(
+            "grc.agent.llm.chat",
+            side_effect=[json.dumps(initial), json.dumps(adjudicated)],
+        ) as chat:
+            intent = complete_intent(
+                WorkflowIntent(raw_text=text, task_type="END_TO_END_SIM"),
+                text,
+                SharedState(),
+            )
+        self.assertEqual(chat.call_count, 2)
+        self.assertEqual(intent.context["execution_mode"], "deploy")
+        self.assertEqual(intent.slots["operation"], "deploy")
+        self.assertIn("hardware_runtime", intent.capabilities)
 
     def test_llm_extraction_is_authoritative_over_regex_user_guesses(self):
         """The LLM reading of the user's text is the user's voice.
@@ -1538,8 +1754,8 @@ class IntentLlmTest(unittest.TestCase):
         self.assertEqual(completed.slot_sources.get("hardware"), "llm")
         self.assertNotIn("device", completed.slots)
 
-    def test_seed_hardware_survives_llm_omission_with_literal_evidence(self):
-        """Stated-in-text hardware must survive an LLM extraction omission."""
+    def test_llm_omission_does_not_restore_rule_hardware(self):
+        """A rule candidate never gets a second vote over the intent LLM."""
         rules = WorkflowIntent(
             raw_text="I want to use plutosdr to transmit ble signal.",
             task_type="HARDWARE_CONFIGURE",
@@ -1558,15 +1774,34 @@ class IntentLlmTest(unittest.TestCase):
             "grc.agent.llm.chat", return_value=json.dumps(payload)
         ):
             completed = complete_intent(rules, rules.raw_text, SharedState())
-        self.assertEqual(completed.slots.get("hardware"), "pluto")
-        self.assertEqual(completed.slot_sources.get("hardware"), "rules")
-        self.assertEqual(completed.slots.get("protocol"), "ble")
+        self.assertNotIn("hardware", completed.slots)
+        self.assertNotIn("protocol", completed.slots)
         engine = WorkflowEngine(tempfile.mktemp(suffix=".json"))
         missing = engine._missing_slots(
             "HARDWARE_CONFIGURE", completed.slots, SharedState(),
             completed.capabilities,
         )
-        self.assertNotIn("hardware", missing)
+        self.assertIn("hardware", missing)
+
+    def test_production_classify_has_no_rule_derived_semantics(self):
+        engine = WorkflowEngine(tempfile.mktemp(suffix=".json"))
+        state = SharedState(session_id="semantic-seed")
+        state.project.grc_path = "/tmp/existing.grc"
+        state.project.config.update({
+            "hardware": "pluto", "carrier_frequency": 2_402_000_000.0,
+        })
+        with mock.patch(
+            "grc.agent.llm.intent_test_bypass_enabled", return_value=False
+        ):
+            seed = engine.classify(
+                "confirm to transmit a BLE signal with PlutoSDR", state
+            )
+        self.assertEqual(seed.slots, {})
+        self.assertEqual(seed.capabilities, [])
+        self.assertEqual(seed.task_type, "END_TO_END_SIM")
+        self.assertEqual(
+            seed.context["current_project"]["hardware"], "pluto"
+        )
 
     def test_llm_answer_still_wins_over_seed_fallback(self):
         rules = WorkflowIntent(
@@ -1730,7 +1965,7 @@ class IntentLlmTest(unittest.TestCase):
             )
         self.assertEqual(workflow.task_type, "HARDWARE_CONFIGURE")
         self.assertGreater(len(workflow.stages), 0)
-        self.assertEqual(workflow.stages[-1].id, "rf_plan_confirmation")
+        self.assertEqual(workflow.stages[-1].id, "flowgraph_confirmation")
         self.assertEqual(
             [item.get("id") for item in workflow.deferred_plan][-1],
             "stop_and_finalize",
@@ -2201,10 +2436,18 @@ class MutationAndExportContractTest(unittest.TestCase):
         state = SharedState(session_id="dump")
         ctx = ToolContext(extra={"state": state})
         dump = "TaskCard USER DECISIONS\n" + ("x" * 80)
-        commit_intent(ctx, dump)
+        result = commit_intent(ctx, dump)
+        self.assertFalse(result["ok"])
         self.assertEqual(state.spec.goals, [])
-        commit_intent(ctx, "把当前 BPSK 改成 QPSK")
+        state.intent = SharedIntent.new("把当前 BPSK 改成 QPSK")
+        state.intent.status = "confirmed"
+        state.intent.goals = ["把当前 BPSK 改成 QPSK"]
+        state.intent.parameters = {"modulation": "qpsk"}
+        state.intent.parameter_sources = {"modulation": "llm"}
+        committed = commit_intent(ctx, "this raw text must not be interpreted")
+        self.assertTrue(committed["ok"])
         self.assertEqual(state.spec.goals, ["把当前 BPSK 改成 QPSK"])
+        self.assertEqual(state.spec.decisions[0].value, "qpsk")
 
 
 class RecipeIndexAndSpecHygieneTest(unittest.TestCase):
@@ -2233,10 +2476,15 @@ class RecipeIndexAndSpecHygieneTest(unittest.TestCase):
         self.assertEqual(state.spec.goals, [])
         self.assertEqual(state.spec.decisions, [])
         self.assertFalse(result["complete"])
-        self.assertIn("使用哪种调制方式？", result["open_questions"])
+        self.assertIn("LLM intent alignment", result["open_questions"][0])
 
-        state.project.config["recipe"] = "bpsk_awgn"
-        state.project.config["modulation"] = "bpsk"
+        state.intent = SharedIntent.new("诊断当前链路")
+        state.intent.status = "awaiting_input"
+        state.intent.missing_fields = ["modulation"]
+        waiting = spec_clarify(ctx, "ignored")
+        self.assertEqual(waiting["open_questions"], ["modulation"])
+        state.intent.status = "confirmed"
+        state.intent.missing_fields = []
         filled = spec_clarify(ctx, "诊断当前链路的 EVM，先保持工程不变。")
         self.assertEqual(state.spec.goals, [])
         self.assertTrue(filled["complete"])
@@ -2370,6 +2618,35 @@ class IntentAlignmentContractTest(unittest.TestCase):
         self.assertFalse(outcome.pending)
         self.assertEqual(self.state.intent.status, "confirmed")
 
+    def test_orphan_confirmation_preserves_existing_shared_intent(self):
+        """A control turn cannot become a new underspecified radio request."""
+        existing = SharedIntent.new("Transmit the configured BLE signal")
+        existing.status = "confirmed"
+        existing.parameters = {
+            "hardware": "pluto", "protocol": "ble", "direction": "tx",
+            "duration_seconds": 30.0,
+        }
+        self.state.intent = existing
+        semantic = WorkflowIntent(
+            raw_text="confirm to transmit",
+            task_type="HARDWARE_CONFIGURE",
+            capabilities=["deploy", "hardware_runtime"],
+            context={"turn_semantics": {
+                "confirmation_decision": "approved", "read_only": False,
+                "recipe_switch_target": "",
+            }},
+        )
+        with mock.patch.object(
+            self.engine, "classify", return_value=semantic
+        ), mock.patch.object(
+            self.engine, "_reconcile_intent", return_value=semantic
+        ):
+            outcome = self.alignment.consume_text("confirm to transmit")
+        self.assertTrue(outcome.pending)
+        self.assertIn("no pending confirmation", outcome.message.lower())
+        self.assertIs(self.state.intent, existing)
+        self.assertEqual(self.state.intent.parameters["hardware"], "pluto")
+
     def test_confirmation_parameter_update_is_extracted_in_same_llm_call(self):
         self.alignment.consume_text("我要用硬件发射一段ble信号")
         self.alignment.consume_text(
@@ -2459,7 +2736,7 @@ class IntentAlignmentContractTest(unittest.TestCase):
 
     def test_partial_natural_reply_only_reasks_unanswered_required_fields(self):
         self.alignment.consume_text("我要用硬件发射一段 BLE 信号")
-        self.alignment.consume_text("硬件用 PlutoSDR")
+        outcome = self.alignment.consume_text("硬件用 PlutoSDR")
         self.assertEqual(
             self.state.intent.missing_fields,
             ["duration_seconds", "success_conditions"],
@@ -2468,6 +2745,17 @@ class IntentAlignmentContractTest(unittest.TestCase):
             self.state.intent.interaction["fields"],
             ["duration_seconds", "success_conditions"],
         )
+        self.assertNotIn("Proposed radio specification", outcome.message)
+
+    def test_confirmation_reply_does_not_repeat_specification_card(self):
+        self.alignment.consume_text("我要用硬件发射一段 BLE 信号")
+        outcome = self.alignment.consume_text(
+            "硬件用 PlutoSDR，最多20秒，成功条件是独立接收端观察到目标信号"
+        )
+        self.assertEqual(self.state.intent.status, "awaiting_confirmation")
+        self.assertIn("Specification is complete", outcome.message)
+        self.assertNotIn("Proposed radio specification", outcome.message)
+        self.assertNotIn("PlutoSDR", outcome.message)
 
     def test_optional_catalog_and_teaching_do_not_confirm_or_mutate_values(self):
         self.alignment.consume_text("我要用硬件发射一段 BLE 信号")
@@ -2544,6 +2832,49 @@ class IntentAlignmentContractTest(unittest.TestCase):
             field for field in spec.fields if field.key == "hardware"
         )
         self.assertEqual(hardware_field.value, "plutosdr")
+
+    def test_modulation_and_direction_are_required_spec_fields(self):
+        from grc.agent.knowledge.spec_requirements import resolve_specification
+
+        spec = resolve_specification(
+            task_type="HARDWARE_CONFIGURE",
+            capabilities=["build_tx", "protocol", "deploy", "hardware_runtime"],
+            slots={
+                "hardware": "pluto",
+                "protocol": "ble",
+                "direction": "tx",
+                "modulation": "gfsk",
+                "operation": "deploy",
+            },
+            slot_sources={
+                "hardware": "llm",
+                "protocol": "llm",
+                "direction": "llm",
+                "modulation": "protocol_default",
+                "operation": "llm",
+            },
+            missing_fields=[],
+            validation_errors=[],
+        )
+        rows = {field.key: field for field in spec.fields}
+        self.assertEqual(rows["modulation"].requirement, "required")
+        self.assertEqual(rows["direction"].requirement, "required")
+        self.assertEqual(rows["direction"].value, "tx")
+
+    def test_direction_transceiver_alias_normalizes_to_sim(self):
+        from grc.agent.knowledge.spec_requirements import resolve_specification
+
+        spec = resolve_specification(
+            task_type="TX_BUILD",
+            capabilities=["build_tx"],
+            slots={"modulation": "qpsk", "direction": "transceiver"},
+            slot_sources={"modulation": "llm", "direction": "llm"},
+            missing_fields=[],
+            validation_errors=[],
+        )
+        rows = {field.key: field for field in spec.fields}
+        self.assertEqual(rows["direction"].value, "sim")
+        self.assertEqual(rows["direction"].requirement, "required")
 
     def test_protocol_profiles_are_composed_without_task_sentence_branches(self):
         from grc.agent.knowledge.spec_requirements import resolve_specification
@@ -2696,6 +3027,232 @@ class IntentAlignmentContractTest(unittest.TestCase):
         self.assertEqual(finding["status"], "unknown")
         self.assertTrue(finding["requires_human"])
         self.assertTrue(Path(result["report_path"]).is_file())
+
+
+class PlannerRewiringContractTest(unittest.TestCase):
+    """V6 P0-2: planner-materialized stages must not be dead code."""
+
+    @staticmethod
+    def _stage(sid, passed, interaction="autonomous"):
+        from grc.agent.workflow.schema import Stage
+
+        return Stage(
+            id=sid,
+            interaction=interaction,
+            transitions={
+                "passed": passed, "failed": "waiting_user", "errored": "stop"
+            },
+        )
+
+    def test_rewire_inserted_chain_relinks_transitions(self):
+        from grc.agent.workflow.plan_compiler import _rewire_inserted_chain
+
+        stages = [
+            self._stage("tx_build_and_validate", "hardware_precheck"),
+            self._stage("hardware_precheck", "hardware_confirmation"),
+            self._stage(
+                "hardware_confirmation",
+                "configure_and_check",
+                interaction="checkpoint",
+            ),
+            self._stage("configure_and_check", "completed"),
+        ]
+        additions = [
+            # Runtime-template fragment whose passed target only exists in
+            # the runtime chain — a dangling id in this plan.
+            self._stage("discover_and_probe_hardware", "rf_plan_confirmation"),
+            self._stage("build_ble_advertiser", "offline_protocol_verify"),
+            # Deploy-template fragment pointing at the legacy catalog id.
+            self._stage("offline_protocol_verify", "discover_and_probe_device"),
+        ]
+        insert_at = 2
+        successor_id = "hardware_confirmation"
+        merged = stages[:insert_at] + additions + stages[insert_at:]
+        _rewire_inserted_chain(merged, additions, insert_at, successor_id)
+
+        by_id = {stage.id: stage for stage in merged}
+        # Nothing may bypass the inserted chain.
+        self.assertEqual(
+            by_id["hardware_precheck"].transitions["passed"],
+            "discover_and_probe_hardware",
+        )
+        # Dangling template targets follow the chain, then return to the
+        # original successor.
+        self.assertEqual(
+            by_id["discover_and_probe_hardware"].transitions["passed"],
+            "build_ble_advertiser",
+        )
+        self.assertEqual(
+            by_id["offline_protocol_verify"].transitions["passed"],
+            "hardware_confirmation",
+        )
+        # Valid in-chain targets are preserved.
+        self.assertEqual(
+            by_id["build_ble_advertiser"].transitions["passed"],
+            "offline_protocol_verify",
+        )
+
+    def test_inserted_terminal_fragment_continues_to_successor(self):
+        from grc.agent.workflow.plan_compiler import _rewire_inserted_chain
+
+        predecessor = self._stage("build_ble_advertiser", "rf_plan_confirmation")
+        inserted = self._stage("generic_builder", "completed")
+        checkpoint = self._stage(
+            "rf_plan_confirmation", "configure_device", interaction="checkpoint"
+        )
+        stages = [predecessor, inserted, checkpoint]
+        _rewire_inserted_chain(stages, [inserted], 1, checkpoint.id)
+        self.assertEqual(
+            predecessor.transitions["passed"], "generic_builder"
+        )
+        self.assertEqual(
+            inserted.transitions["passed"], "rf_plan_confirmation"
+        )
+
+    def test_protocol_builder_covers_generic_builder_by_predicates(self):
+        from grc.agent.workflow.plan_compiler import compile_stages
+
+        engine = WorkflowEngine(tempfile.mktemp(suffix=".json"))
+        intent = WorkflowIntent(
+            raw_text="Transmit a BLE advertisement with PlutoSDR",
+            task_type="HARDWARE_CONFIGURE",
+            capabilities=[
+                "build_tx", "protocol", "hardware_configure",
+                "hardware_runtime", "deploy",
+            ],
+            slots={
+                "protocol": "ble", "hardware": "pluto", "direction": "tx",
+                "operation": "deploy", "carrier_frequency": 2_402_000_000.0,
+                "sample_rate": 2_000_000.0, "duration_seconds": 30.0,
+            },
+        )
+        candidate = engine.catalog["task_candidates"]["HARDWARE_CONFIGURE"]
+        stages = engine._compose_stages(intent, candidate)
+        proposal = [
+            {
+                "id": "tx_build_and_validate",
+                "stage_id": "tx_build_and_validate",
+                "produces": [
+                    "flowgraph_saved", "structural_validation_completed",
+                ],
+                "success_predicates": [
+                    "flowgraph_saved", "structural_validation_completed",
+                ],
+            },
+            {
+                "id": "hardware_precheck",
+                "stage_id": "hardware_precheck",
+                "produces": ["hardware_precheck_completed"],
+                "success_predicates": ["hardware_precheck_completed"],
+            },
+        ]
+        compiled, _nodes, rejected, unbound = compile_stages(
+            intent, stages, catalog=engine.catalog, proposal=proposal
+        )
+        ids = [stage.id for stage in compiled]
+        self.assertEqual(rejected, [])
+        self.assertEqual(unbound, [])
+        self.assertNotIn("tx_build_and_validate", ids)
+        self.assertIn("hardware_precheck", ids)
+        by_id = {stage.id: stage for stage in compiled}
+        self.assertEqual(
+            by_id["discover_and_probe_hardware"].transitions["passed"],
+            "rf_plan_confirmation",
+        )
+        self.assertEqual(
+            by_id["hardware_precheck"].transitions["passed"],
+            "discover_and_probe_hardware",
+        )
+
+    def test_runtime_guard_prevents_completion_with_deferred_work(self):
+        from grc.agent.workflow.schema import Workflow
+
+        engine = WorkflowEngine(tempfile.mktemp(suffix=".json"))
+        finished = self._stage("first", "completed")
+        finished.execution_status = "completed"
+        finished.outcome = "passed"
+        pending = self._stage("hardware_precheck", "completed")
+        engine.workflow = Workflow(
+            workflow_id="wf-guard",
+            task_type="HARDWARE_CONFIGURE",
+            intent=WorkflowIntent(raw_text="deploy"),
+            stages=[finished, pending],
+            current_stage="first",
+            deferred_plan=[{"id": "rf_plan_confirmation"}],
+        )
+        engine._transition("completed")
+        self.assertEqual(engine.workflow.execution_status, "pending")
+        self.assertEqual(engine.workflow.current_stage, "hardware_precheck")
+        self.assertEqual(engine.workflow.outcome, "")
+
+    def test_reload_repairs_persisted_premature_completion(self):
+        from grc.agent.workflow.schema import Workflow
+
+        path = tempfile.mktemp(suffix=".json")
+        engine = WorkflowEngine(path)
+        finished = self._stage("generic_builder", "completed")
+        finished.execution_status = "completed"
+        finished.outcome = "passed"
+        pending = self._stage("hardware_precheck", "rf_plan_confirmation")
+        engine.workflow = Workflow(
+            workflow_id="wf-reload-guard",
+            task_type="HARDWARE_CONFIGURE",
+            intent=WorkflowIntent(raw_text="deploy"),
+            stages=[finished, pending],
+            execution_status="completed",
+            outcome="passed",
+            current_stage=finished.id,
+            deferred_plan=[{"id": "rf_plan_confirmation"}],
+        )
+        engine.save()
+        restored = WorkflowEngine(path)
+        self.assertEqual(restored.workflow.execution_status, "pending")
+        self.assertEqual(restored.workflow.current_stage, "hardware_precheck")
+        self.assertEqual(restored.workflow.outcome, "")
+
+    def test_repair_dangling_transitions_redirects_illegal_targets(self):
+        from grc.agent.workflow.plan_compiler import (
+            _repair_dangling_transitions,
+        )
+
+        stages = [
+            self._stage("build", "ghost_stage"),
+            self._stage("verify", "another_ghost"),
+        ]
+        repairs = _repair_dangling_transitions(stages)
+        self.assertEqual(stages[0].transitions["passed"], "verify")
+        self.assertEqual(stages[1].transitions["passed"], "completed")
+        self.assertEqual(len(repairs), 2)
+
+
+class RequestedOperationsNormalizationTest(unittest.TestCase):
+    """V6 P2-7: LLM operation objects must flatten to comparable strings."""
+
+    def test_flattens_dicts_and_preserves_order(self):
+        from grc.agent.workflow.engine import _normalize_requested_operations
+
+        self.assertEqual(
+            _normalize_requested_operations(
+                [
+                    {"operation": "deploy", "capability": "protocol"},
+                    "save",
+                    {"tool": "build_ble_1m_waveform"},
+                ]
+            ),
+            ["deploy", "save", "build_ble_1m_waveform"],
+        )
+
+    def test_non_list_and_duplicates_are_safe(self):
+        from grc.agent.workflow.engine import _normalize_requested_operations
+
+        self.assertEqual(_normalize_requested_operations("junk"), [])
+        self.assertEqual(_normalize_requested_operations(None), [])
+        self.assertEqual(
+            _normalize_requested_operations(
+                [{"operation": "deploy"}, {"operation": "deploy"}]
+            ),
+            ["deploy"],
+        )
 
 
 if __name__ == "__main__":

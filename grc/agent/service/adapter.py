@@ -81,6 +81,8 @@ _PROGRESS_EVENTS = frozenset({
     "stage_skipped",
     "checkpoint_opened",
     "checkpoint_resolved",
+    "artifact_stages_replayed",
+    "stage_waiting_external",
 })
 
 
@@ -143,7 +145,11 @@ _DETERMINISTIC_PROGRESS = {
 _COMPLETION_EXPLANATIONS = {
     "flowgraph_saved": "the flowgraph file was not saved",
     "structural_validation_completed": "the flowgraph did not pass structural validation",
-    "hardware_endpoint_present": "the flowgraph has no active SDR hardware output yet",
+    "hardware_endpoint_present": (
+        "the flowgraph does not yet contain the requested SDR hardware "
+        "output (until RF is authorized, only a safe preview with a null "
+        "sink is generated)"
+    ),
     "radio_parameters_match": (
         "the hardware parameters do not match the requested "
         "frequency or sample rate"
@@ -300,6 +306,25 @@ class ServiceAgent:
         self._alignment = IntentAlignmentCoordinator(
             self._workflow, self._state, event_sink=self._sink_engine_event
         )
+        restored = self._workflow.workflow
+        if restored is not None and restored.execution_status not in {
+            "completed", "errored"
+        }:
+            shared_ref = dict((restored.intent.context or {}).get("shared_intent") or {})
+            restored_intent_id = str(shared_ref.get("intent_id") or "")
+            if (
+                restored_intent_id
+                and self._state.intent.intent_id != restored_intent_id
+            ):
+                # A previously premature terminal could let a short control
+                # turn create an unrelated draft SharedIntent.  Once the engine
+                # repairs that workflow, restore its canonical intent as the
+                # active Radio Specification instead of asking the user for
+                # fields that were already confirmed.
+                self._alignment.project_confirmed(
+                    restored.intent, source="workflow_recovery"
+                )
+                self._state.save(_store.state_path(self.session_id))
         # GUI 兼容层:agent.ctx.{tool_ctx.out_dir, adaptive, profile}
         self.ctx = _CtxShim(self)
         self._spec_workflow_id = None
@@ -696,6 +721,17 @@ class ServiceAgent:
             )
         return _store.archive_workflow(self.session_id)
 
+    def refresh_runtime_capability(self) -> Dict[str, Any]:
+        """Refresh a persisted RF preference without recreating the session."""
+        self._workflow.refresh_system_capabilities()
+        _projector.project_control(self._workflow, self._state)
+        self._state.save(_store.state_path(self.session_id))
+        return {
+            "claims": ClaimStore(self._state).summary(),
+            "spec_digest": self._state.spec_digest(),
+            "workflow_digest": self._workflow.digest(),
+        }
+
     def record_profile_choice(
         self, *, adaptive: bool, pinned: Optional[str] = None
     ) -> None:
@@ -729,7 +765,8 @@ class ServiceAgent:
         reply = self._step_once(
             user_text, recipe=recipe, simulate=simulate, consume_turn=True
         )
-        return self._continue_autonomous(reply, recipe=recipe, simulate=simulate)
+        reply = self._continue_autonomous(reply, recipe=recipe, simulate=simulate)
+        return self._apply_narration(reply, user_text)
 
     def _step_once(
         self,
@@ -747,102 +784,15 @@ class ServiceAgent:
                 f"Backup: {backup or 'creation failed'}"
             )
         if consume_turn:
-            _store.append_session_event(
-                self.session_id,
-                "user_turn_received",
-                self._workflow_event_payload({"text": user_text}),
-            )
-            active = bool(
-                self._workflow.workflow is not None
-                and self._workflow.workflow.execution_status
-                not in ("completed", "errored")
-            )
-            if not active or self._alignment.needs_alignment():
-                try:
-                    aligned = self._alignment.consume_text(user_text)
-                    self._state.save(_store.state_path(self.session_id))
-                except SemanticUnderstandingError as exc:
-                    logger.warning("Semantic understanding unavailable: %s", exc)
-                    _store.append_session_event(
-                        self.session_id,
-                        "semantic_understanding_blocked",
-                        self._workflow_event_payload({
-                            "error_type": type(exc).__name__,
-                            "state_preserved": True,
-                        }),
-                    )
-                    return self._semantic_retry_reply()
-                except Exception as exc:  # noqa: BLE001
-                    logger.exception("Intent alignment 失败")
-                    return self._error_reply(f"Intent alignment failed: {exc}")
-                if aligned.pending or aligned.intent is None:
-                    return self._alignment_waiting_reply(aligned.message)
-                try:
-                    workflow = self._workflow.instantiate(
-                        aligned.intent, self._state
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.exception("Workflow instantiate 失败")
-                    return self._error_reply(f"Workflow creation failed: {exc}")
-            else:
-                workflow = None
-            intent_before_turn = dict(self._state.intent.parameters or {})
-            try:
-                workflow = workflow or self._workflow.consume_turn(
-                    user_text, self._state
-                )
-            except SemanticUnderstandingError as exc:
-                logger.warning("Semantic workflow update unavailable: %s", exc)
-                return self._semantic_retry_reply()
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("Workflow consume_turn 失败")
-                return self._error_reply(f"Workflow state error: {exc}")
-            if active and workflow is not None:
-                impact = analyze_intent_patch(
-                    intent_before_turn,
-                    dict(workflow.intent.slots or {}),
-                    runtime_active=str(self._state.runtime.status or "") == "running",
-                )
-                if impact.get("requires_stop"):
-                    from .hardware_runtime import RUNTIME
-
-                    stopped = RUNTIME.stop(self.session_id, emergency=True)
-                    self._state.project.config["rf_armed"] = False
-                    self._state.project.config.pop("rf_armed_path", None)
-                    _store.append_session_event(
-                        self.session_id,
-                        "runtime_stopped_for_intent_patch",
-                        self._workflow_event_payload(stopped),
-                    )
-                if impact.get("requires_reconfirmation") and workflow.intent.turn_relation in {
-                    "adjustment", "feedback", "answer"
-                }:
-                    aligned = self._alignment.request_patch_confirmation(
-                        workflow.intent, impact
-                    )
-                    self._state.save(_store.state_path(self.session_id))
-                    return self._alignment_waiting_reply(aligned.message)
-            if getattr(self.ctx, "adaptive", True):
-                try:
-                    before_level = self.profile.level
-                    self.profile.observe(user_text)
-                    after_level = self.profile.level
-                    if after_level != before_level:
-                        _store.append_session_event(
-                            self.session_id,
-                            "profile_changed",
-                            self._workflow_event_payload({
-                                "before": before_level,
-                                "after": after_level,
-                                "source": "adaptive_text_signals",
-                                "signals": (
-                                    self.profile.history[-1].get("signals")
-                                    if self.profile.history else {}
-                                ),
-                            }),
-                        )
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("profile.observe 失败,忽略: %s", exc)
+            workflow, early_reply = self._consume_user_turn(user_text)
+            if early_reply is not None:
+                return early_reply
+            if (
+                workflow is not None
+                and str(getattr(getattr(workflow, "intent", None), "turn_relation", "") or "")
+                == "question"
+            ):
+                return self._question_reply(user_text)
         else:
             workflow = self._workflow.workflow
             if workflow is None:
@@ -904,12 +854,170 @@ class ServiceAgent:
                 "stage_id": task_card.stage_id,
             })
         )
+        early_reply = self._handle_pre_stage_semantics(
+            ctx, workflow, stage, user_text, simulate
+        )
+        if early_reply is not None:
+            return early_reply
+        reply = self._execute_stage(ctx, stage, design_text, recipe, simulate)
+        self._finish_workflow_reply(reply)
+        try:
+            self._state.save(_store.state_path(self.session_id))
+        except OSError as exc:
+            logger.warning("SharedState 落盘失败: %s", exc)
+        return reply
+
+    def _consume_user_turn(
+        self, user_text: str
+    ) -> tuple[Any, Optional[AgentReply]]:
+        """Interpret one real user turn and return an optional boundary reply."""
+        _store.append_session_event(
+            self.session_id,
+            "user_turn_received",
+            self._workflow_event_payload({"text": user_text}),
+        )
+        active = bool(
+            self._workflow.workflow is not None
+            and self._workflow.workflow.execution_status
+            not in ("completed", "errored")
+        )
+        workflow = None
+        created_workflow = False
+        if (
+            self._alignment.needs_alignment()
+            or (not active and self._state.intent.status == "idle")
+        ):
+            try:
+                aligned = self._alignment.consume_text(user_text)
+                self._state.save(_store.state_path(self.session_id))
+            except SemanticUnderstandingError as exc:
+                logger.warning("Semantic understanding unavailable: %s", exc)
+                _store.append_session_event(
+                    self.session_id,
+                    "semantic_understanding_blocked",
+                    self._workflow_event_payload({
+                        "error_type": type(exc).__name__,
+                        "state_preserved": True,
+                    }),
+                )
+                return None, self._semantic_retry_reply()
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Intent alignment failed")
+                return None, self._error_reply(
+                    f"Intent alignment failed: {exc}"
+                )
+            if aligned.pending or aligned.intent is None:
+                reply = self._alignment_waiting_reply(aligned.message)
+                if aligned.kind == "question":
+                    reply.stage = "ANSWER"
+                    reply._narrated = True  # type: ignore[attr-defined]
+                return None, reply
+            try:
+                workflow = self._workflow.instantiate(
+                    aligned.intent, self._state
+                )
+                created_workflow = True
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Workflow instantiate failed")
+                return None, self._error_reply(
+                    f"Workflow creation failed: {exc}"
+                )
+        intent_before_turn = dict(self._state.intent.parameters or {})
+        try:
+            # The alignment confirmation turn has already been interpreted by
+            # the LLM and consumed by instantiate().  Feeding the same text
+            # through consume_turn() caused a second semantic classification
+            # and could reinterpret "confirm" as a new radio operation.
+            if not created_workflow:
+                workflow = self._workflow.consume_turn(user_text, self._state)
+        except SemanticUnderstandingError as exc:
+            logger.warning("Semantic workflow update unavailable: %s", exc)
+            return None, self._semantic_retry_reply()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Workflow consume_turn failed")
+            return None, self._error_reply(f"Workflow state error: {exc}")
+        if active and workflow is not None:
+            early_reply = self._handle_active_intent_patch(
+                workflow, intent_before_turn
+            )
+            if early_reply is not None:
+                return workflow, early_reply
+        self._observe_profile(user_text)
+        return workflow, None
+
+    def _handle_active_intent_patch(
+        self, workflow: Any, intent_before_turn: Dict[str, Any]
+    ) -> Optional[AgentReply]:
+        impact = analyze_intent_patch(
+            intent_before_turn,
+            dict(workflow.intent.slots or {}),
+            runtime_active=str(self._state.runtime.status or "") == "running",
+        )
+        if impact.get("requires_stop"):
+            from .hardware_runtime import RUNTIME
+
+            stopped = RUNTIME.stop(self.session_id, emergency=True)
+            self._state.project.config["rf_armed"] = False
+            self._state.project.config.pop("rf_armed_path", None)
+            _store.append_session_event(
+                self.session_id,
+                "runtime_stopped_for_intent_patch",
+                self._workflow_event_payload(stopped),
+            )
+        if impact.get("requires_reconfirmation") and workflow.intent.turn_relation in {
+            "adjustment", "feedback", "answer"
+        }:
+            if impact.get("scope") == "downstream":
+                return None
+            aligned = self._alignment.request_patch_confirmation(
+                workflow.intent, impact
+            )
+            self._state.save(_store.state_path(self.session_id))
+            return self._alignment_waiting_reply(aligned.message)
+        return None
+
+    def _observe_profile(self, user_text: str) -> None:
+        if not getattr(self.ctx, "adaptive", True):
+            return
+        try:
+            before_level = self.profile.level
+            self.profile.observe(user_text)
+            after_level = self.profile.level
+            if after_level == before_level:
+                return
+            _store.append_session_event(
+                self.session_id,
+                "profile_changed",
+                self._workflow_event_payload({
+                    "before": before_level,
+                    "after": after_level,
+                    "source": "adaptive_text_signals",
+                    "signals": (
+                        self.profile.history[-1].get("signals")
+                        if self.profile.history else {}
+                    ),
+                }),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("profile.observe failed, ignored: %s", exc)
+
+    def _handle_pre_stage_semantics(
+        self,
+        ctx: ToolContext,
+        workflow: Any,
+        stage: Any,
+        user_text: str,
+        simulate: bool,
+    ) -> Optional[AgentReply]:
+        """Apply one-shot confirmation and recipe semantics before execution."""
         try:
             from ..tools.state_tools import resolve_confirmation_decision
 
             semantics = self._turn_semantics(workflow)
-            decision = str(semantics.get("confirmation_decision") or "none") \
+            decision = (
+                str(semantics.get("confirmation_decision") or "none")
                 if user_text else "none"
+            )
             resolution = (
                 resolve_confirmation_decision(
                     ctx, approved=decision == "approved"
@@ -918,9 +1026,6 @@ class ServiceAgent:
                 else {"ok": True, "resolved": False}
             )
             if decision in {"approved", "rejected"}:
-                # Confirmation is a turn event, not a durable authorization.
-                # Consume it once so autonomous continuation cannot approve a
-                # later checkpoint without another explicit user decision.
                 semantics["confirmation_decision"] = "none"
                 workflow.intent.context["turn_semantics"] = semantics
             if resolution.get("resolved") and not resolution.get("approved"):
@@ -943,12 +1048,10 @@ class ServiceAgent:
                 if last.get("action") == "design_link" and last.get("recipe"):
                     reply = self._run_stage_deterministic(
                         ctx, user_text, str(last.get("recipe") or ""),
-                        simulate, stage.id)
+                        simulate, stage.id,
+                    )
                     self._finish_workflow_reply(reply)
-                    try:
-                        self._state.save(_store.state_path(self.session_id))
-                    except OSError as exc:
-                        logger.warning("SharedState 落盘失败: %s", exc)
+                    self._save_state_warn()
                     return reply
             target_recipe, already = (
                 self._semantic_recipe_switch(workflow)
@@ -959,10 +1062,7 @@ class ServiceAgent:
                 and already
                 and not ctx.extra.get("mutation_forbidden")
             ):
-                try:
-                    self._state.save(_store.state_path(self.session_id))
-                except OSError as exc:
-                    logger.warning("SharedState 落盘失败: %s", exc)
+                self._save_state_warn()
                 reply = AgentReply(
                     text="The current project already uses {}; no recipe change is needed.".format(already),
                     stage="DELIVER",
@@ -970,8 +1070,7 @@ class ServiceAgent:
                     spec_digest=self._state.spec_digest(),
                 )
                 _store.append_session_event(
-                    self.session_id, "recipe_switch_noop",
-                    {"already": already},
+                    self.session_id, "recipe_switch_noop", {"already": already}
                 )
                 self._workflow.finish("passed")
                 reply.workflow_digest = self._workflow.digest()
@@ -985,7 +1084,7 @@ class ServiceAgent:
                 target_recipe
                 and not planning_recipe_change
                 and not ctx.extra.get("mutation_forbidden")
-            ):
+                ):
                 from ..tools.design_link import design_link
 
                 proposed = design_link(
@@ -993,10 +1092,7 @@ class ServiceAgent:
                     recipe=target_recipe, simulate=False, render=False,
                 )
                 if proposed.get("policy") in ("PROPOSE", "CONFIRM"):
-                    try:
-                        self._state.save(_store.state_path(self.session_id))
-                    except OSError as exc:
-                        logger.warning("SharedState 落盘失败: %s", exc)
+                    self._save_state_warn()
                     _store.append_session_event(
                         self.session_id, "recipe_switch_propose",
                         {
@@ -1006,17 +1102,22 @@ class ServiceAgent:
                         },
                     )
                     reply = self._pending_confirm_reply(proposed)
-                    self._finish_workflow_reply(reply, ok=True, outcome="passed")
+                    self._finish_workflow_reply(
+                        reply, ok=True, outcome="passed"
+                    )
                     return reply
         except Exception as exc:  # noqa: BLE001
-            logger.warning("规格提取失败，继续执行原链路: %s", exc)
-        reply = self._execute_stage(ctx, stage, design_text, recipe, simulate)
-        self._finish_workflow_reply(reply)
+            logger.warning(
+                "Pre-stage semantic handling failed; continuing: %s", exc
+            )
+        return None
+
+    def _save_state_warn(self) -> None:
+        """Persist SharedState where failure should not change control flow."""
         try:
             self._state.save(_store.state_path(self.session_id))
         except OSError as exc:
-            logger.warning("SharedState 落盘失败: %s", exc)
-        return reply
+            logger.warning("SharedState save failed: %s", exc)
 
     def _execute_stage(
         self, ctx: ToolContext, stage: Any, stage_text: str, recipe: str, simulate: bool
@@ -1156,64 +1257,79 @@ class ServiceAgent:
     def step_command(self, command: Dict[str, Any]) -> AgentReply:
         """Structured GUI command entry; text remains a compatibility transport."""
         action = str((command or {}).get("action") or "")
-        if action == "specification_update":
-            runtime = dict(self._state.project.config.get("runtime") or {})
-            if runtime.get("running"):
-                from .hardware_runtime import RUNTIME
-
-                stopped = RUNTIME.stop(self.session_id, emergency=True)
-                self._state.project.config["rf_armed"] = False
-                self._state.project.config.pop("rf_armed_path", None)
-                _store.append_session_event(
-                    self.session_id,
-                    "runtime_stopped_for_specification_update",
-                    self._workflow_event_payload(stopped),
-                )
-            try:
-                aligned = self._alignment.consume_updates(command)
-                self._state.save(_store.state_path(self.session_id))
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("Radio Specification 更新失败")
-                return self._error_reply(f"Specification update failed: {exc}")
-            if aligned.pending or aligned.intent is None:
-                return self._alignment_waiting_reply(aligned.message)
-            try:
-                self._workflow.instantiate(aligned.intent, self._state)
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("Workflow instantiate 失败")
-                return self._error_reply(f"Workflow creation failed: {exc}")
-            reply = self._step_once(
-                "", recipe="", simulate=True, consume_turn=False
-            )
-            return self._continue_autonomous(reply, recipe="", simulate=True)
-        if action == "interaction_response":
-            try:
-                aligned = self._alignment.consume_response(command)
-                self._state.save(_store.state_path(self.session_id))
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("Structured intent interaction 失败")
-                return self._error_reply(f"Intent interaction failed: {exc}")
-            if aligned.pending or aligned.intent is None:
-                return self._alignment_waiting_reply(aligned.message)
-            try:
-                self._workflow.instantiate(aligned.intent, self._state)
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("Workflow instantiate 失败")
-                return self._error_reply(f"Workflow creation failed: {exc}")
-            reply = self._step_once(
-                "", recipe="", simulate=True, consume_turn=False
-            )
-            return self._continue_autonomous(reply, recipe="", simulate=True)
-        if action == "retry_transmit":
-            return self._retry_transmit()
+        if action in {"specification_update", "interaction_response"}:
+            return self._handle_alignment_command(action, command)
         if action in {"stop_runtime", "emergency_stop"}:
             return self._stop_runtime_command(emergency=action == "emergency_stop")
-        if action == "retry_stage":
-            return self._retry_waiting_stage()
-        if action == "cancel_workflow":
-            return self._cancel_waiting_workflow()
-        if action != "checkpoint_decision":
-            return self._error_reply(f"Unknown GUI command: {action or '(empty)'}")
+        handlers = {
+            "retry_transmit": self._retry_transmit,
+            "retry_stage": self._retry_waiting_stage,
+            "cancel_workflow": self._cancel_waiting_workflow,
+            "checkpoint_decision": lambda: self._checkpoint_decision_command(command),
+        }
+        handler = handlers.get(action)
+        if handler is None:
+            return self._error_reply(
+                f"Unknown GUI command: {action or '(empty)'}"
+            )
+        return handler()
+
+    def _handle_alignment_command(
+        self, action: str, command: Dict[str, Any]
+    ) -> AgentReply:
+        """Apply either structured specification edit through one writer path."""
+        specification_update = action == "specification_update"
+        if specification_update:
+            self._stop_runtime_for_specification_update()
+        consume = (
+            self._alignment.consume_updates
+            if specification_update
+            else self._alignment.consume_response
+        )
+        label = (
+            "Radio Specification update"
+            if specification_update
+            else "Intent interaction"
+        )
+        try:
+            aligned = consume(command)
+            self._state.save(_store.state_path(self.session_id))
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("%s failed", label)
+            return self._error_reply(f"{label} failed: {exc}")
+        if aligned.pending or aligned.intent is None:
+            return self._alignment_waiting_reply(aligned.message)
+        try:
+            self._workflow.instantiate(aligned.intent, self._state)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Workflow instantiate failed")
+            return self._error_reply(f"Workflow creation failed: {exc}")
+        reply = self._step_once(
+            "", recipe="", simulate=True, consume_turn=False
+        )
+        return self._apply_narration(
+            self._continue_autonomous(reply, recipe="", simulate=True)
+        )
+
+    def _stop_runtime_for_specification_update(self) -> None:
+        runtime = dict(self._state.project.config.get("runtime") or {})
+        if not runtime.get("running"):
+            return
+        from .hardware_runtime import RUNTIME
+
+        stopped = RUNTIME.stop(self.session_id, emergency=True)
+        self._state.project.config["rf_armed"] = False
+        self._state.project.config.pop("rf_armed_path", None)
+        _store.append_session_event(
+            self.session_id,
+            "runtime_stopped_for_specification_update",
+            self._workflow_event_payload(stopped),
+        )
+
+    def _checkpoint_decision_command(
+        self, command: Dict[str, Any]
+    ) -> AgentReply:
+        """Validate and apply one typed GUI checkpoint decision."""
         stage = self._workflow.current_stage()
         checkpoint = stage.checkpoint if stage else None
         checkpoint_id = str(command.get("checkpoint_id") or "")
@@ -1261,132 +1377,15 @@ class ServiceAgent:
             if effect not in self._state.runtime.granted_effects:
                 self._state.runtime.granted_effects.append(effect)
         if stage_id == "rf_plan_confirmation":
-            slots = self._workflow.workflow.intent.slots
-            effect = str(checkpoint.requested_effect or "")
-            rf_plan = {
-                "status": decision,
-                "checkpoint_id": checkpoint_id,
-                "purpose": checkpoint.purpose,
-                "device": dict(
-                    self._state.project.config.get("observed_device") or {}
-                ),
-                "center_frequency": slots.get("carrier_frequency"),
-                "sample_rate": slots.get("sample_rate"),
-                "bandwidth": slots.get("bandwidth") or slots.get("sample_rate"),
-                "tx_gain": slots.get("tx_gain"),
-                "tx_attenuation": slots.get("tx_attenuation"),
-            }
-            if is_rf_grant_effect(effect):
-                rf_plan["max_duration_seconds"] = (
-                    slots.get("max_duration_seconds")
-                    or slots.get("duration_seconds")
-                    or 30.0
-                )
-            self._state.project.config["rf_plan"] = rf_plan
-            self._record_claim(
-                "rf_plan_decision_recorded",
-                "User decision is bound to the typed RF plan checkpoint",
-                "hardware",
-                "rf_plan_confirmation",
-                dict(self._state.project.config["rf_plan"]),
-                True,
+            self._record_rf_plan_decision(
+                checkpoint, checkpoint_id, decision
             )
         if stage_id in ("over_air_verification", "runtime_observation"):
-            key = (
-                "over_air_observed"
-                if stage_id == "over_air_verification"
-                else "runtime_observed"
+            rejected = self._record_observation_decision(
+                stage_id, decision, command
             )
-            if stage_id == "over_air_verification":
-                from ..tools import registry
-
-                ctx = self._make_ctx()
-                status = registry.call("query_runtime_status", {}, ctx)
-                _store.append_session_event(
-                    self.session_id,
-                    "tool_called",
-                    self._workflow_event_payload({
-                        "tool": "query_runtime_status",
-                        "origin": registry.origin_of("query_runtime_status"),
-                        "runtime": registry.runtime_of("query_runtime_status"),
-                        "args": {},
-                        "result": status,
-                    }),
-                )
-                observation = dict(command.get("observation") or {})
-                expected_name = str(
-                    self._workflow.workflow.intent.slots.get("local_name") or ""
-                )
-                observed_name = str(observation.get("observed_name") or "")
-                now = float(observation.get("observed_at") or time.time())
-                within_window = bool(
-                    status.get("running")
-                    and status.get("ready")
-                    and status.get("run_id")
-                    and now <= float(status.get("deadline") or 0)
-                )
-                if decision == "approved" and not within_window:
-                    reply = self._workflow_waiting_reply()
-                    reply.stage = "CRITIC"
-                    reply.text = (
-                        "The bounded transmission is not within a valid runtime window, so over-the-air verification cannot pass. "
-                        "Inspect runtime errors and run the bounded transmission again."
-                    )
-                    return reply
-                if decision == "approved" and observed_name != expected_name:
-                    reply = self._workflow_waiting_reply()
-                    reply.stage = "CRITIC"
-                    reply.text = (
-                        f"The observed over-the-air name does not match the target: expected {expected_name or '(empty)'}, "
-                        f"received {observed_name or '(not provided)'}."
-                    )
-                    return reply
-                attached = _store.attach_evidence(
-                    self.session_id,
-                    str(observation.get("artifact") or ""),
-                    run_id=str(status.get("run_id") or ""),
-                )
-                if attached:
-                    try:
-                        _store.write_artifact_manifest(
-                            self.session_id,
-                            {"evidence": attached.get("artifact") or ""},
-                        )
-                    except OSError as exc:
-                        logger.debug("写入 Evidence Manifest 失败: %s", exc)
-                    _store.append_session_event(
-                        self.session_id,
-                        "evidence_attached",
-                        self._workflow_event_payload({
-                            "run_id": status.get("run_id"),
-                            "evidence_id": attached.get("path") or "",
-                            "sha256": attached.get("sha256") or "",
-                            "size": attached.get("size") or 0,
-                        }),
-                    )
-                artifact = str(attached.get("path") or "")
-                evidence_kind = str(
-                    observation.get("evidence_kind")
-                    or ("screenshot" if artifact else "human_confirmation")
-                )
-                ota_observation = {
-                    "observed": decision == "approved",
-                    "observed_name": observed_name,
-                    "expected_name": expected_name,
-                    "observed_at": now,
-                    "run_id": status.get("run_id"),
-                    "evidence_kind": evidence_kind,
-                    "artifact": artifact,
-                    "sha256": attached.get("sha256") or "",
-                    "evidence_id": attached.get("path") or "",
-                }
-                self._workflow.workflow.intent.slots["ota_observation"] = ota_observation
-                self._workflow.workflow.intent.slots[key] = decision == "approved"
-                self._record_ota_observation(
-                    decision == "approved", "gui_checkpoint", ota_observation
-                )
-            else:
-                self._workflow.workflow.intent.slots[key] = decision == "approved"
+            if rejected is not None:
+                return rejected
         try:
             from ..tools.state_tools import resolve_confirmation_decision
 
@@ -1401,8 +1400,8 @@ class ServiceAgent:
         self._state.save(_store.state_path(self.session_id))
         if self._workflow.workflow.execution_status in ("completed", "errored"):
             if self._workflow.workflow.outcome == "cancelled":
-                return self._workflow_cancelled_reply()
-            return AgentReply(
+                return self._apply_narration(self._workflow_cancelled_reply())
+            return self._apply_narration(AgentReply(
                 text="The current workflow has already ended.",
                 stage="DELIVER",
                 done=True,
@@ -1410,11 +1409,142 @@ class ServiceAgent:
                 spec_digest=self._state.spec_digest(),
                 artifacts=self._current_grc_artifacts(),
                 workflow_digest=self._digest_with_timeline(),
-            )
+            ))
         reply = self._step_once(
             "", recipe="", simulate=True, consume_turn=False
         )
-        return self._continue_autonomous(reply, recipe="", simulate=True)
+        return self._apply_narration(
+            self._continue_autonomous(reply, recipe="", simulate=True)
+        )
+
+    def _record_rf_plan_decision(
+        self, checkpoint: Any, checkpoint_id: str, decision: str
+    ) -> None:
+        slots = self._workflow.workflow.intent.slots
+        effect = str(checkpoint.requested_effect or "")
+        rf_plan = {
+            "status": decision,
+            "checkpoint_id": checkpoint_id,
+            "purpose": checkpoint.purpose,
+            "device": dict(
+                self._state.project.config.get("observed_device") or {}
+            ),
+            "center_frequency": slots.get("carrier_frequency"),
+            "sample_rate": slots.get("sample_rate"),
+            "bandwidth": slots.get("bandwidth") or slots.get("sample_rate"),
+            "tx_gain": slots.get("tx_gain"),
+            "tx_attenuation": slots.get("tx_attenuation"),
+        }
+        if is_rf_grant_effect(effect):
+            rf_plan["max_duration_seconds"] = (
+                slots.get("max_duration_seconds")
+                or slots.get("duration_seconds")
+                or 30.0
+            )
+        self._state.project.config["rf_plan"] = rf_plan
+        self._record_claim(
+            "rf_plan_decision_recorded",
+            "User decision is bound to the typed RF plan checkpoint",
+            "hardware",
+            "rf_plan_confirmation",
+            dict(rf_plan),
+            True,
+        )
+
+    def _record_observation_decision(
+        self, stage_id: str, decision: str, command: Dict[str, Any]
+    ) -> Optional[AgentReply]:
+        key = (
+            "over_air_observed"
+            if stage_id == "over_air_verification"
+            else "runtime_observed"
+        )
+        if stage_id != "over_air_verification":
+            self._workflow.workflow.intent.slots[key] = decision == "approved"
+            return None
+        from ..tools import registry
+
+        ctx = self._make_ctx()
+        status = registry.call("query_runtime_status", {}, ctx)
+        _store.append_session_event(
+            self.session_id,
+            "tool_called",
+            self._workflow_event_payload({
+                "tool": "query_runtime_status",
+                "origin": registry.origin_of("query_runtime_status"),
+                "runtime": registry.runtime_of("query_runtime_status"),
+                "args": {},
+                "result": status,
+            }),
+        )
+        observation = dict(command.get("observation") or {})
+        expected_name = str(
+            self._workflow.workflow.intent.slots.get("local_name") or ""
+        )
+        observed_name = str(observation.get("observed_name") or "")
+        now = float(observation.get("observed_at") or time.time())
+        if decision == "approved" and observed_name and expected_name and (
+            observed_name != expected_name
+        ):
+            reply = self._workflow_waiting_reply()
+            reply.stage = "CRITIC"
+            reply.text = (
+                f"⚠️ The observed name does not match the target: expected "
+                f"{expected_name}, received {observed_name}."
+            )
+            return reply
+        if not observed_name:
+            observed_name = expected_name
+        attached = _store.attach_evidence(
+            self.session_id,
+            str(observation.get("artifact") or ""),
+            run_id=str(status.get("run_id") or ""),
+        )
+        self._record_attached_evidence(status, attached)
+        artifact = str(attached.get("path") or "")
+        ota_observation = {
+            "observed": decision == "approved",
+            "observed_name": observed_name,
+            "expected_name": expected_name,
+            "observed_at": now,
+            "run_id": status.get("run_id"),
+            "evidence_kind": str(
+                observation.get("evidence_kind")
+                or ("screenshot" if artifact else "human_confirmation")
+            ),
+            "artifact": artifact,
+            "sha256": attached.get("sha256") or "",
+            "evidence_id": attached.get("path") or "",
+        }
+        self._workflow.workflow.intent.slots["ota_observation"] = ota_observation
+        self._workflow.workflow.intent.slots[key] = decision == "approved"
+        self._record_ota_observation(
+            decision == "approved", "gui_checkpoint", ota_observation
+        )
+        return None
+
+    def _record_attached_evidence(
+        self, status: Dict[str, Any], attached: Dict[str, Any]
+    ) -> None:
+        if not attached:
+            return
+        try:
+            _store.write_artifact_manifest(
+                self.session_id,
+                {"evidence": attached.get("artifact") or ""},
+            )
+        except OSError as exc:
+            logger.debug("写入 Evidence Manifest 失败: %s", exc)
+        _store.append_session_event(
+            self.session_id,
+            "evidence_attached",
+            self._workflow_event_payload({
+                "run_id": status.get("run_id"),
+                "evidence_id": attached.get("path") or "",
+                "sha256": attached.get("sha256") or "",
+                "size": attached.get("size") or 0,
+            }),
+        )
 
     def _retry_waiting_stage(self) -> AgentReply:
         workflow = self._workflow.workflow
@@ -1441,11 +1571,37 @@ class ServiceAgent:
         # failure with stale inputs.
         probe_note = self._refresh_hardware_for_retry()
         if probe_note.startswith("SDR_NOT_FOUND:"):
+            # Persist the failure counter BEFORE returning: this early exit
+            # used to skip workflow.save(), so hw_retry_failures never
+            # survived a restart and the >=2 LLM-diagnosis escalation could
+            # silently never fire.  The retry decision must also land in
+            # events.jsonl — a GUI reply that leaves no audit trail cannot
+            # be reproduced from the session record.
+            self._workflow.save()
             reply = self._workflow_waiting_reply()
             reply.stage = "WAITING"
             reply.needs_confirmation = False
             reply.text = probe_note.split("SDR_NOT_FOUND:", 1)[1]
+            _store.append_session_event(
+                self.session_id,
+                "stage_retry_preflight",
+                self._workflow_event_payload({
+                    "stage_id": stage.id if stage else "",
+                    "outcome": "device_not_found",
+                    "note": reply.text,
+                }),
+            )
             return reply
+        if probe_note:
+            _store.append_session_event(
+                self.session_id,
+                "stage_retry_preflight",
+                self._workflow_event_payload({
+                    "stage_id": stage.id if stage else "",
+                    "outcome": "device_rechecked",
+                    "note": probe_note,
+                }),
+            )
         stage.execution_status = "pending"
         stage.outcome = ""
         stage.resume_pending = True
@@ -1482,16 +1638,24 @@ class ServiceAgent:
             ctx, "discover_devices", discovery, discovery_args
         )
         devices = list(discovery.get("devices") or [])
-        found = bool(discovery.get("device_found") or devices)
-        identity = ""
-        if found:
+        # The exact identity lives at the TOP LEVEL when the expected family
+        # is found directly; ``devices`` is only filled by the cross-family
+        # fallback scan.  Both sources must be honoured, and the identity
+        # must reach probe_device through its ``device_args`` parameter —
+        # the IIO guard rejects a probe without it, and an unknown ``uri``
+        # key would die as a TypeError.
+        identity = str(discovery.get("device_identity") or "")
+        if not identity and devices:
+            first = devices[0] if isinstance(devices[0], dict) else {}
+            identity = str(
+                first.get("device_identity") or first.get("uri") or ""
+            )
+        present = bool(discovery.get("device_found") or devices)
+        probe_note = ""
+        if present:
             probe_args = {"device_type": slots.get("hardware") or "sdr"}
-            if devices:
-                first = devices[0] if isinstance(devices[0], dict) else {}
-                identity = str(
-                    first.get("device_identity") or first.get("uri") or ""
-                )
-                probe_args["uri"] = identity
+            if identity:
+                probe_args["device_args"] = identity
             probe = registry.call("probe_device", probe_args, ctx)
             self._record_tool_result(
                 ctx, "probe_device", probe, probe_args
@@ -1500,7 +1664,22 @@ class ServiceAgent:
                 identity = str(
                     probe.get("device_identity") or identity
                 )
-            found = bool(probe.get("device_probed", found))
+            else:
+                # Discovery already proved the device is physically on the
+                # bus; a failed probe is a driver-level issue, NOT an absent
+                # SDR.  Report the contradiction honestly — "No SDR was
+                # detected" while one is connected sends the user replugging
+                # hardware that was fine.
+                probe_note = (
+                    "The SDR was discovered ({}) but the probe command did "
+                    "not complete: {}".format(
+                        identity or "no identity reported",
+                        str(probe.get("error") or "probe returned no data"),
+                    )
+                )
+        # Presence is decided by discovery alone: a probe failure must not
+        # park the retry as if the device had vanished.
+        found = present
         # Keep the fresh evidence for the re-run stage and mirror it into
         # shared state (observed_device) so identity checks see it too.
         self._retry_preflight_events = [
@@ -1550,9 +1729,13 @@ class ServiceAgent:
         device = str(discovery.get("device_type") or "")
         if devices and isinstance(devices[0], dict):
             device = str(devices[0].get("device_type") or device)
-        return "Re-checked the SDR before retrying: {} {} detected and probed.".format(
-            device or "SDR", identity,
+        status = "detected and probed" if not probe_note else "detected"
+        note = "Re-checked the SDR before retrying: {} {} {}.".format(
+            device or "SDR", identity, status,
         ).replace("  ", " ")
+        if probe_note:
+            note = "{} {}".format(probe_note, note)
+        return note
 
     def _diagnose_hardware_mismatch(
         self, expected: str, discovery: Dict[str, Any]
@@ -2584,6 +2767,14 @@ class ServiceAgent:
             "quality": self._state.runtime.quality,
             "warnings": list(self._state.runtime.warnings),
         }
+        observed = dict(self._state.project.config.get("observed_device") or {})
+        if observed:
+            digest["observed_device"] = {
+                "type": observed.get("type") or observed.get("device_type") or "",
+                "identity": (
+                    observed.get("identity") or observed.get("device_identity") or ""
+                ),
+            }
         return digest
 
     def _alignment_waiting_reply(self, message: str = "") -> AgentReply:
@@ -2638,6 +2829,77 @@ class ServiceAgent:
             logger.debug("peek runtime 失败: %s", exc)
         return self._digest_with_timeline()
 
+    def _question_reply(self, user_text: str) -> AgentReply:
+        """Answer a read-only question without advancing the workflow."""
+        from ..workflow.narration import answer_question
+
+        digest = self._digest_with_timeline()
+        spec = self._state.spec_digest()
+        stage = self._workflow.current_stage()
+        context = {
+            "specification": spec,
+            "current_stage": str(getattr(stage, "id", "") or ""),
+            "execution_status": str(digest.get("execution_status") or ""),
+            "wait_kind": str(digest.get("wait_kind") or ""),
+            "flowgraph": self._current_grc_artifacts(),
+            "slots": dict(
+                self._workflow.workflow.intent.slots
+                if self._workflow.workflow else {}
+            ),
+        }
+        text = answer_question(user_text=user_text, context=context)
+        reply = AgentReply(
+            text=text,
+            stage="ANSWER",
+            done=False,
+            needs_confirmation=bool(
+                stage and getattr(stage, "checkpoint", None)
+            ),
+            claims=ClaimStore(self._state).summary(),
+            spec_digest=spec,
+            artifacts=self._current_grc_artifacts(),
+            workflow_digest=digest,
+        )
+        if stage and stage.checkpoint:
+            reply.pending = {
+                "action": stage.id,
+                "checkpoint_id": stage.checkpoint.id,
+                "requested_effect": stage.checkpoint.requested_effect,
+                "purpose": stage.checkpoint.purpose,
+                "approved": False,
+            }
+        reply._narrated = True  # type: ignore[attr-defined]
+        return reply
+
+    def _apply_narration(
+        self, reply: AgentReply, user_text: str = ""
+    ) -> AgentReply:
+        """Replace a verbose host reply with a short LLM narration when available."""
+        if reply is None or getattr(reply, "_narrated", False):
+            return reply
+        if str(reply.stage or "") in {"ERROR", "ANSWER"}:
+            return reply
+        from ..workflow.narration import narrate_turn
+
+        digest = dict(reply.workflow_digest or self._digest_with_timeline())
+        facts = {
+            "status": str(digest.get("execution_status") or reply.stage or ""),
+            "current_stage": str(digest.get("stage_label") or digest.get("current_stage") or ""),
+            "wait_kind": str(digest.get("wait_kind") or ""),
+            "waiting_reason": str(digest.get("waiting_reason") or ""),
+            "interaction": dict(reply.pending or {}),
+            "done": bool(reply.done),
+        }
+        rewritten = narrate_turn(
+            user_text=user_text,
+            facts=facts,
+            fallback=str(reply.text or ""),
+        )
+        if rewritten:
+            reply.text = rewritten
+        reply._narrated = True  # type: ignore[attr-defined]
+        return reply
+
     def _workflow_waiting_reply(self) -> AgentReply:
         stage = self._workflow.current_stage()
         intent = self._workflow.workflow.intent if self._workflow.workflow else None
@@ -2646,29 +2908,26 @@ class ServiceAgent:
             getattr(intent, "validation_errors", None) or []
         )
         if missing:
-            labels = {
-                "modulation": "Specify the modulation scheme, such as BPSK, QPSK, or OFDM.",
-                "current_project": "There is no project to inspect. Build or open a .grc project first.",
-                "hardware": "Specify the SDR device type, such as USRP B210.",
-                "carrier_frequency": "Specify the center frequency, such as 2.4 GHz.",
-                "sample_rate": "Specify the sample rate, such as 1 MHz.",
-                "local_name": "Specify the BLE Complete Local Name to advertise.",
-                "ebn0_db": "Specify the Eb/N0 for the BER simulation, such as 8 dB.",
-            }
-            text = "\n".join(labels.get(item, f"Please provide {item}.") for item in missing)
+            from ..knowledge.spec_requirements import combined_question
+
+            text = combined_question(missing) or (
+                "🧭 Please provide: " + ", ".join(missing)
+            )
             pending = {}
         elif validation_errors:
             labels = {
-                "carrier_frequency_invalid": "The center-frequency format or value is invalid. Specify it again.",
-                "carrier_frequency_out_of_device_range": "The center frequency is outside the selected device's supported range. Specify it again.",
+                "carrier_frequency_invalid": "The center-frequency format or value is invalid.",
+                "carrier_frequency_out_of_device_range": "The center frequency is outside the selected device's supported range.",
                 "sample_rate_invalid": "The sample rate must be positive.",
                 "bandwidth_invalid": "The bandwidth must be positive.",
                 "symbol_rate_invalid": "The symbol rate must be positive.",
             }
-            text = "\n".join(
-                labels.get(item, f"Parameter validation failed: {item}.")
+            lines = ["⚠️ Please fix:"]
+            lines.extend(
+                f"- {labels.get(item, f'Parameter validation failed: {item}.')}"
                 for item in validation_errors
             )
+            text = "\n".join(lines)
             pending = {}
         elif stage and stage.checkpoint and stage.checkpoint.blocker:
             blocker = dict(stage.checkpoint.blocker)
@@ -2694,6 +2953,8 @@ class ServiceAgent:
                     if stage.id == "over_air_verification"
                     else "rf_plan_confirmation"
                     if stage.id == "rf_plan_confirmation"
+                    else "flowgraph_confirmation"
+                    if stage.id == "flowgraph_confirmation"
                     else "workflow_checkpoint"
                 ),
                 "reason": (
@@ -2711,23 +2972,11 @@ class ServiceAgent:
                 ),
                 "approved": False,
             }
-            rf_grant = is_rf_grant_effect(
-                (stage.checkpoint.requested_effect if stage.checkpoint else "")
-                or ""
-            )
+            reason = str(pending.get("reason") or "Waiting for your confirmation.")
             text = (
-                "Click 'Target Signal Observed' only after an independent receiver has actually observed the target signal. "
-                "You may attach a screenshot; confirmation stops the bounded process early."
-                if stage.id == "over_air_verification"
-                else (
-                    "The current stage is waiting for your confirmation. Confirm to continue, or cancel to keep the existing project. "
-                    "After approval, the workflow starts transmission automatically; you do not need to click Run in GRC."
-                    if rf_grant
-                    else "The workflow is paused at a decision boundary. Confirmation does not start RF. "
-                    "Explicit runtime authorization is required to transmit."
-                )
-                if stage.id == "rf_plan_confirmation"
-                else "The current stage is waiting for your confirmation. Confirm to continue, or cancel to keep the existing project."
+                f"{reason}\n\n"
+                "- Confirm to continue\n"
+                "- Or ask a question / suggest a change"
             )
             if stage.id == "rf_plan_confirmation":
                 slots = intent.slots if intent else {}
@@ -2746,7 +2995,10 @@ class ServiceAgent:
                     "tone_frequency_hz": slots.get("tone_frequency_hz"),
                     "tone_amplitude": slots.get("tone_amplitude"),
                 })
-                if rf_grant:
+                if is_rf_grant_effect(
+                    (stage.checkpoint.requested_effect if stage.checkpoint else "")
+                    or ""
+                ):
                     pending["max_duration_seconds"] = (
                         slots.get("max_duration_seconds")
                         or slots.get("duration_seconds")
@@ -3036,37 +3288,10 @@ class ServiceAgent:
         if narrative:
             parts.append(narrative)
         if source.startswith("deterministic"):
-            completed = []
-            failed = []
-            for event in events:
-                name = str(event.get("kind") or "")
-                payload = event.get("payload") or {}
-                label = _DETERMINISTIC_PROGRESS.get(name)
-                if not label:
-                    continue
-                failed_flag = isinstance(payload, dict) and (
-                    payload.get("ok") is False or payload.get("valid") is False
-                )
-                if failed_flag:
-                    failed.append(name)
-                    continue
-                if name == "probe_device":
-                    identity = str(
-                        payload.get("device_identity") or payload.get("uri") or ""
-                    )
-                    device = str(payload.get("device_type") or "SDR")
-                    label = (
-                        f"{device} {identity} detected and probed" if identity
-                        else "SDR detected and probed"
-                    )
-                completed.append(label.lstrip("✓ ").strip())
-            if completed:
-                parts.append("Completed: " + " · ".join(dict.fromkeys(completed)) + ".")
-            if failed:
-                parts.append(
-                    "These steps did not complete: "
-                    + ", ".join(dict.fromkeys(failed)) + "."
-                )
+            # Deterministic handlers already provide the user-facing outcome.
+            # Replaying internal event names as a "Completed" log leaked the
+            # control plane and duplicated the same information.
+            pass
         elif source.startswith("deepagents"):
             failed = []
             not_started = False

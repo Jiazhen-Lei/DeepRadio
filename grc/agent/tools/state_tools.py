@@ -9,6 +9,7 @@ import shutil
 from typing import Any, Dict, List, Optional
 
 from ..knowledge import recipes
+from ..runtime_config import rf_runtime_enabled
 from ..state import (
     ALLOW,
     CONFIRM,
@@ -22,139 +23,11 @@ from ..state import (
 )
 from .registry import ToolContext, tool
 
-_CONFIRM_TEXTS = frozenset({"确认", "同意", "继续", "approve", "确认执行", "确认修改", "同意修改", "继续执行"})
-_CANCEL_HINTS = (
-    "取消修改", "拒绝修改", "不要执行", "不要继续", "不确认", "不同意", "cancel",
-)
-_READ_ONLY_HINTS = (
-    "先不要修改", "先不要改", "不要修改", "不要改图", "只诊断", "只分析", "先别改",
-    "保持工程不变", "先保持工程不变", "工程不变", "只观察", "不修改",
-)
-
-
 def _state(ctx: ToolContext):
     state = ctx.extra.get("state")
     if state is None:
-        raise RuntimeError("ToolContext 未挂载 SharedState")
+        raise RuntimeError("ToolContext has no SharedState attached")
     return state
-
-
-def is_confirmation_utterance(text: str) -> bool:
-    normalized = (text or "").strip().lower()
-    return normalized in _CONFIRM_TEXTS or any(
-        hint in (text or "") for hint in _CANCEL_HINTS
-    )
-
-
-def is_read_only_request(text: str) -> bool:
-    raw = text or ""
-    return any(hint in raw for hint in _READ_ONLY_HINTS)
-
-
-def _uttered_modulation(text: str) -> str:
-    lowered = (text or "").lower()
-    return next((name for name in ("ofdm", "qpsk", "bpsk") if name in lowered), "")
-
-
-def _known_spec_modulation(state) -> str:
-    return next(
-        (
-            str(item.value)
-            for item in reversed(state.spec.decisions)
-            if item.key == "modulation"
-        ),
-        "",
-    )
-
-
-_SWITCH_RE = re.compile(
-    r"(?:改成|换成|改为|change\s+(?:it\s+)?to|switch\s+(?:it\s+)?to)\s*"
-    r"([A-Za-z0-9_\u4e00-\u9fff]+)",
-    flags=re.IGNORECASE,
-)
-_MOD_TO_RECIPE = {
-    "qpsk": "qpsk_awgn",
-    "bpsk": "bpsk_awgn",
-    "ofdm": "ofdm_awgn",
-}
-
-
-def _parse_switch_target(text: str) -> Optional[str]:
-    """从「改成/换成 …」里解析目标 recipe；解析不到则返回 None。"""
-    match = _SWITCH_RE.search(text or "")
-    if not match:
-        return None
-    token = match.group(1).lower().strip("，。,. ")
-    if token in recipes.RECIPES:
-        return token
-    for key, name in _MOD_TO_RECIPE.items():
-        if key in token:
-            return name
-    return None
-
-
-def detect_recipe_switch(state, text: str) -> Optional[str]:
-    """若用户明确要求把当前工程换成另一配方，返回新 recipe 名。"""
-    if not (state.project.grc_path or state.project.config.get("recipe")):
-        return None
-    target = _parse_switch_target(text)
-    if not target:
-        return None
-    current = str(state.project.config.get("recipe") or "")
-    current_mod = str(
-        state.project.config.get("modulation") or recipes.guess_modulation(current)
-    )
-    target_mod = recipes.guess_modulation(target)
-    if target == current:
-        return None
-    if target_mod and current_mod and target_mod == current_mod:
-        return None
-    return target
-
-
-def redundant_recipe_switch(state, text: str) -> Optional[str]:
-    """用户要换成的调制/配方已是当前工程时，返回给用户看的名称。"""
-    target = _parse_switch_target(text)
-    if not target:
-        return None
-    current = str(state.project.config.get("recipe") or "")
-    current_mod = str(
-        state.project.config.get("modulation") or recipes.guess_modulation(current)
-    )
-    target_mod = recipes.guess_modulation(target)
-    if target == current or (
-        target_mod and current_mod and target_mod == current_mod
-    ):
-        return (current_mod or target).upper()
-    return None
-
-
-def resolve_confirmation(ctx: ToolContext, text: str) -> Dict[str, Any]:
-    normalized = (text or "").strip().lower()
-    reject = any(
-        phrase in normalized
-        for phrase in (
-            "取消修改",
-            "拒绝修改",
-            "不要执行",
-            "不要继续",
-            "不确认",
-            "不同意",
-            "cancel",
-        )
-    )
-    affirm = not reject and (
-        normalized in ("确认", "同意", "继续", "approve")
-        or any(
-            phrase in normalized
-            for phrase in ("确认执行", "确认修改", "同意修改", "继续执行")
-        )
-    )
-    if affirm:
-        return resolve_confirmation_decision(ctx, approved=True)
-    if reject:
-        return resolve_confirmation_decision(ctx, approved=False)
-    return {"ok": True, "resolved": False}
 
 
 def resolve_confirmation_decision(
@@ -230,71 +103,48 @@ def ensure_success_condition_claims(
 
 
 def commit_intent(ctx: ToolContext, text: str) -> Dict[str, Any]:
-    """Deterministically extract the minimum traceable radio specification."""
+    """Project the canonical LLM-owned SharedIntent into the legacy Spec view.
+
+    This tool deliberately performs no text interpretation.  Natural-language
+    understanding belongs to ``IntentAlignmentCoordinator``; accepting raw
+    text here used to create a second rule-derived intent that could disagree
+    with the shared intent and mistake confirmation turns for new goals.
+    """
     state = _state(ctx)
-    if is_confirmation_utterance(text):
+    shared = state.intent
+    if shared.status == "idle" or not shared.intent_id:
         return {
-            "ok": True,
+            "ok": False,
             "decisions": [],
             "rejected_locked": [],
             "claims": [],
             "open_questions": list(state.spec.open_questions),
-            "skipped": "confirmation",
+            "error": "No canonical SharedIntent is available; run LLM intent alignment first",
         }
-    lowered = text.lower()
-    modulation = _uttered_modulation(text)
-    known_modulation = _known_spec_modulation(state)
-    current_mod = str(
-        state.project.config.get("modulation")
-        or known_modulation
-        or recipes.guess_modulation(str(state.project.config.get("recipe") or ""))
-        or ""
-    )
-    channel = "awgn" if "awgn" in lowered or "噪声" in text else ""
-    decisions = []
-    proposed = []
-    if modulation:
-        decision = Decision("modulation", modulation, "user")
-        if current_mod and current_mod != modulation:
-            proposed.append(decision)
-        else:
-            decisions.append(decision)
-    if channel:
-        decisions.append(Decision("channel", channel, "user"))
-    rejected = []
-    for decision in decisions:
-        existing = next(
-            (d for d in state.spec.decisions if d.key == decision.key), None
-        )
-        if (
-            existing
-            and decision.key in state.coordination.locked_constraints
-            and existing.value != decision.value
-        ):
-            rejected.append(decision.key)
+    for goal in shared.goals or ([shared.raw_text] if shared.raw_text else []):
+        if goal and goal not in state.spec.goals and not looks_like_task_dump(goal):
+            state.spec.goals.append(str(goal))
+    changed = []
+    for key, value in dict(shared.parameters or {}).items():
+        if value in (None, "", []):
             continue
-        if existing:
-            existing.value = decision.value
-            existing.source = decision.source
+        source = str(shared.parameter_sources.get(key) or "shared_intent")
+        existing = next((item for item in state.spec.decisions if item.key == key), None)
+        if existing is None:
+            state.spec.decisions.append(Decision(key, value, source))
         else:
-            state.spec.decisions.append(decision)
-    if text and text not in state.spec.goals and not looks_like_task_dump(text):
-        state.spec.goals.append(text)
-    if proposed:
-        ctx.extra["proposed_decisions"] = [
-            {"key": d.key, "value": d.value, "source": d.source}
-            for d in proposed
-        ]
-
-    claim_ids = ensure_success_condition_claims(state, [lowered], keep_verbatim=False)
-    state.spec.open_questions = []
-    if not (modulation or known_modulation):
-        state.spec.open_questions.append("使用哪种调制方式？")
+            existing.value = value
+            existing.source = source
+        changed.append(key)
+    claim_ids = ensure_success_condition_claims(
+        state, list(shared.success_criteria or []), keep_verbatim=True
+    )
+    state.spec.open_questions = list(shared.missing_fields or [])
     return {
         "ok": True,
-        "decisions": [d.key for d in decisions],
-        "proposed": [d.key for d in proposed],
-        "rejected_locked": rejected,
+        "decisions": changed,
+        "proposed": [],
+        "rejected_locked": [],
         "claims": claim_ids,
         "open_questions": list(state.spec.open_questions),
     }
@@ -375,13 +225,10 @@ def verify_state_claims(ctx: ToolContext, metrics: Dict[str, Any]) -> Dict[str, 
 )
 def spec_clarify(ctx: ToolContext, text: str = ""):
     state = _state(ctx)
-    known = (
-        _uttered_modulation(text)
-        or _known_spec_modulation(state)
-        or str(state.project.config.get("modulation") or "")
-        or recipes.guess_modulation(str(state.project.config.get("recipe") or ""))
-    )
-    open_questions = [] if known else ["使用哪种调制方式？"]
+    shared = state.intent
+    open_questions = list(shared.missing_fields or []) if shared.status != "idle" else [
+        "Run LLM intent alignment before inspecting missing fields."
+    ]
     return {
         "ok": True,
         "open_questions": open_questions,
@@ -420,7 +267,7 @@ def select_recipe(ctx: ToolContext, intent: str = "", recipe: str = ""):
     intent = (intent or "").strip() or str(ctx.extra.get("user_text") or "")
     selected = recipes.resolve_recipe(intent=intent, recipe=recipe)
     if selected is None:
-        return {"ok": False, "error": f"未知配方: {recipe}"}
+        return {"ok": False, "error": f"Unknown recipe: {recipe}"}
     return {"ok": True, "recipe": selected.name, "title": selected.title}
 
 
@@ -461,14 +308,14 @@ def configure_sdr(
     if ctx.extra.get("mutation_forbidden"):
         return {
             "ok": False,
-            "error": "本轮禁止改图（用户要求只诊断/先不要修改）",
+            "error": "Flowgraph changes are disabled for this read-only request.",
             "policy": "DENY",
         }
     if center_freq is None or sample_rate is None:
         return {
             "ok": False,
             "outcome": "failed",
-            "error": "SDR 配置需要中心频率和采样率",
+            "error": "SDR configuration requires center frequency and sample rate.",
         }
     state = _state(ctx)
     policy = gate(
@@ -506,7 +353,11 @@ def configure_sdr(
 
 @tool(
     name="hardware_preflight",
-    description="Read-only SDR configuration and local-driver precheck. Never starts a flowgraph or transmits RF.",
+    description=(
+        "Check host-side SDR prerequisites: requested parameters, local driver "
+        "CLI availability, and RF feature enablement. This does not discover "
+        "or probe a physical device."
+    ),
     parameters={
         "type": "object",
         "properties": {"device_type": {"type": "string"}},
@@ -541,7 +392,7 @@ def hardware_preflight(ctx: ToolContext, device_type: str = ""):
         "center_frequency_present": center_freq is not None,
         "sample_rate_present": sample_rate is not None,
         "real_hardware_actions_enabled": (
-            os.environ.get("GRC_AGENT_ENABLE_RF") == "1"
+            rf_runtime_enabled()
         ),
     }
     complete = all(
@@ -557,19 +408,22 @@ def hardware_preflight(ctx: ToolContext, device_type: str = ""):
         "ok": complete,
         "outcome": "passed" if complete else "failed",
         "device_type": requested,
+        "readiness_scope": "host_environment",
+        "physical_device_checked": False,
         "checks": checks,
         "system_capabilities": {
             "rf_runtime": {
                 "available": checks["real_hardware_actions_enabled"],
-                "requires_restart": not checks["real_hardware_actions_enabled"],
+                "requires_restart": False,
                 "environment_key": "GRC_AGENT_ENABLE_RF",
+                "persistent_preference": "rf_runtime_enabled",
             }
         },
         "missing": [name for name, value in checks.items() if not value and name != "real_hardware_actions_enabled"],
         "note": (
-            "配置与驱动只读预检完成；RF 运行功能已由系统管理员启用。"
+            "Host configuration and driver readiness checks passed; RF runtime is enabled."
             if checks["real_hardware_actions_enabled"]
-            else "配置与驱动只读预检完成；RF 运行功能尚未启用。"
+            else "Host configuration and driver readiness checks passed; RF runtime is not enabled."
         ),
     }
 
@@ -603,7 +457,7 @@ def apply_grc_diff(
     from . import registry
 
     if ctx.extra.get("mutation_forbidden"):
-        return {"ok": False, "error": "本轮禁止改图"}
+        return {"ok": False, "error": "Flowgraph changes are disabled for this request."}
     state = _state(ctx)
     policy = gate(
         {
@@ -684,7 +538,7 @@ def apply_flowgraph_patch(
     from . import registry
 
     if ctx.extra.get("mutation_forbidden"):
-        return {"ok": False, "error": "本轮禁止改图"}
+        return {"ok": False, "error": "Flowgraph changes are disabled for this request."}
     if ctx.flow_graph is None:
         return {"ok": False, "error": "当前 session 没有已加载的流图"}
     expanded, expand_error = expand_patch_operations(operations)
@@ -775,7 +629,7 @@ def apply_flowgraph_patch(
             restore_graph()
             return {
                 "ok": False,
-                "error": f"patch 第 {index + 1} 项失败: {result.get('error')}",
+                "error": f"Patch item {index + 1} failed: {result.get('error')}",
                 "rolled_back": True,
             }
         applied.append({"op": op, "result": result})
@@ -785,7 +639,7 @@ def apply_flowgraph_patch(
         restore_graph()
         return {
             "ok": False,
-            "error": "patch 后结构校验失败",
+            "error": "Structural validation failed after applying the patch.",
             "errors": validation.get("errors") or [],
             "rolled_back": True,
         }
@@ -803,7 +657,7 @@ def apply_flowgraph_patch(
         restore_graph()
         if os.path.isfile(temp):
             os.unlink(temp)
-        return {"ok": False, "error": f"patch 存盘失败: {exc}", "rolled_back": True}
+        return {"ok": False, "error": f"Failed to save the patch: {exc}", "rolled_back": True}
 
     state.project.grc_path = target
     state.project.flowgraph_version += 1
@@ -920,7 +774,7 @@ def _resimulate_and_verify(ctx: ToolContext, state) -> Dict[str, Any]:
 
     sim = registry.call("run_simulation", {}, ctx)
     if not sim.get("ok"):
-        return {"ok": False, "error": sim.get("error") or "重仿真失败"}
+        return {"ok": False, "error": sim.get("error") or "The verification simulation failed."}
     ctx.extra.setdefault("artifacts", {})
     if sim.get("out_dir"):
         ctx.extra["artifacts"]["out_dir"] = sim["out_dir"]

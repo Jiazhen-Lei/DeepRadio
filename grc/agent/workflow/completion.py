@@ -105,6 +105,7 @@ KNOWN_COMPLETIONS = frozenset(
         "runtime_started",
         "runtime_observation_recorded",
         "runtime_stopped",
+        "flowgraph_decision_recorded",
     }
 )
 
@@ -129,7 +130,8 @@ EXTERNAL_PRECONDITION_COMPLETIONS = frozenset({
 #: User-facing explanations for the predicates above.
 EXTERNAL_PRECONDITION_NOTES = {
     "hardware_endpoint_present": (
-        "the flowgraph has no active SDR hardware output yet"
+        "the flowgraph does not yet contain the requested SDR hardware "
+        "output (safe preview mode uses a null sink until RF is authorized)"
     ),
     "radio_parameters_match": (
         "the hardware parameters do not match the requested "
@@ -137,7 +139,10 @@ EXTERNAL_PRECONDITION_NOTES = {
     ),
     "realtime_sink_present": "no live spectrum display is present yet",
     "device_discovered": "no SDR device was discovered",
-    "device_probed": "the SDR device could not be probed",
+    "device_probed": (
+        "the SDR was found but its probe command did not complete "
+        "(usually a driver issue — the device may still be connected)"
+    ),
     "device_identity_matched": (
         "the connected device does not match the requested SDR model"
     ),
@@ -441,6 +446,7 @@ def evaluate(stage: Any, workflow: Any, state: Any, reply: Any) -> Dict[str, boo
             )
         ),
         "change_decision_recorded": True,
+        "flowgraph_decision_recorded": True,
         "measurement_completed": requested_measurements(),
         "hardware_precheck_completed": checked("hardware_preflight"),
         "hardware_decision_recorded": True,

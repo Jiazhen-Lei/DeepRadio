@@ -33,7 +33,7 @@ class BleDeployContractTest(unittest.TestCase):
         self.assertEqual(workflow.intent.slots["protocol"], "ble")
         self.assertEqual(workflow.intent.slots["local_name"], "deepradio")
         self.assertEqual(workflow.stages[0].id, "build_ble_advertiser")
-        self.assertEqual(workflow.stages[-1].id, "rf_plan_confirmation")
+        self.assertEqual(workflow.stages[-1].id, "flowgraph_confirmation")
         self.assertIn(
             "stop_and_finalize",
             [item.get("id") for item in workflow.deferred_plan],
@@ -132,9 +132,16 @@ class BleDeployContractTest(unittest.TestCase):
                 "用plutosdr发射一段2.402GHz的ble信号，local name为deepradio，"
                 "发射30秒，成功条件为LightBlue观察到deepradio"
             )
+            self.assertEqual(built.pending.get("kind"), "intent_confirmation")
+            built = agent.step("确认")
             self.assertIn(
                 built.workflow_digest["current_stage"],
-                ("discover_and_probe_device", "rf_plan_confirmation"),
+                (
+                    "flowgraph_confirmation",
+                    "hardware_precheck",
+                    "discover_and_probe_hardware",
+                    "rf_plan_confirmation",
+                ),
             )
             self.assertTrue(Path(built.artifacts["grc_path"]).is_file())
             text = Path(built.artifacts["grc_path"]).read_text(encoding="utf-8")
@@ -150,8 +157,10 @@ class BleDeployContractTest(unittest.TestCase):
             )
 
     def test_rf_start_is_disabled_by_default(self):
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("GRC_AGENT_ENABLE_RF", None)
+        with mock.patch(
+            "grc.agent.tools.hardware_tools.rf_runtime_enabled",
+            return_value=False,
+        ):
             result = registry.call(
                 "start_flowgraph", {"grc_path": str(self.root / "unused.grc")}, self.ctx
             )
@@ -190,6 +199,9 @@ class BleDeployContractTest(unittest.TestCase):
                 "用 HackRF 发射 BLE 信号，local name 为 deepradio，发射30秒，"
                 "成功条件为独立接收端观察到deepradio，直接部署"
             )
+            # Hardware-stakes plans require an explicit confirmation turn
+            # before any stage executes (V6 safety contract).
+            reply = agent.step("确认")
             self.assertEqual(reply.workflow_digest["current_stage"],
                              "build_ble_advertiser")
             self.assertIn("No BLE TX builder", reply.text)
@@ -219,13 +231,20 @@ class BleDeployContractTest(unittest.TestCase):
                 "用 B210 发射 BLE 信号，localname 为 deepradio，发射30秒，"
                 "成功条件为LightBlue收到deepradio"
             )
-            self.assertEqual(
-                built.workflow_digest["current_stage"], "discover_and_probe_device"
-            )
-            self.assertTrue(Path(built.artifacts["grc_path"]).is_file())
-            self.assertFalse(built.done)
-            self.assertEqual(built.workflow_digest["wait_kind"], "recovery")
-            self.assertFalse(built.needs_confirmation)
+            # Explicit confirmation turn required before hardware stages (V6).
+            built = agent.step("确认")
+        self.assertIn(
+            built.workflow_digest["current_stage"],
+            (
+                "flowgraph_confirmation",
+                "hardware_precheck",
+                "discover_and_probe_hardware",
+            ),
+        )
+        self.assertTrue(Path(built.artifacts["grc_path"]).is_file())
+        self.assertFalse(built.done)
+        self.assertIn(built.workflow_digest["wait_kind"], ("approval", "recovery"))
+        self.assertTrue(built.needs_confirmation)
 
 
 # --- test_ble_protocol_safety.py ---
@@ -397,6 +416,103 @@ class BleProtocolSafetyTest(unittest.TestCase):
         text = Path(armed["grc_path"]).read_text(encoding="utf-8")
         self.assertIn("state: enabled", text)
         self.assertIn("serial=variable-serial", text)
+
+
+class V5InteractionChainTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_deploy_pauses_for_flowgraph_review_question_and_channel_change(self):
+        if "iio_pluto_sink" not in env.make_platform().blocks:
+            self.skipTest("gr-iio Pluto sink not installed")
+        sessions = self.root / "sessions"
+        with mock.patch(
+            "grc.agent.service.session_store.sessions_root", return_value=str(sessions)
+        ), mock.patch(
+            "grc.agent.service.orchestrator.build_agent", return_value=None
+        ):
+            agent = ServiceAgent(session_id="v5-chain")
+            first = agent.step("I want to use plutosdr to transmit ble signal.")
+            self.assertTrue(first.needs_confirmation)
+            second = agent.step(
+                "1. Up to 30 seconds. 2. Observed by an independent receiver. "
+                "Also I need the local name of this signal to be 'deepradio27'."
+            )
+            if second.pending.get("kind") != "intent_confirmation":
+                second = agent.step("confirm")
+            else:
+                second = agent.step("confirm")
+            self.assertEqual(
+                second.workflow_digest.get("current_stage"),
+                "flowgraph_confirmation",
+            )
+            self.assertEqual(second.workflow_digest.get("wait_kind"), "approval")
+            self.assertTrue(Path(second.artifacts.get("grc_path") or "").is_file())
+            with mock.patch.object(
+                agent._workflow, "_turn_relation", return_value="question"
+            ), mock.patch(
+                "grc.agent.workflow.narration._chat",
+                return_value=(
+                    "📡 **2.402 GHz** is advertising channel **37**. "
+                    "BLE has **40** channels (0–36 data, 37–39 advertising)."
+                ),
+            ):
+                asked = agent.step(
+                    "Which BLE channel is 2.402 GHz? How many BLE channels are there?"
+                )
+            self.assertEqual(asked.stage, "ANSWER")
+            self.assertIn("37", asked.text)
+            self.assertIn("40", asked.text)
+            self.assertEqual(
+                asked.workflow_digest.get("current_stage"),
+                "flowgraph_confirmation",
+            )
+            self.assertEqual(
+                agent._workflow.workflow.intent.slots.get("advertising_channels"),
+                [37],
+            )
+            changed = agent.step(
+                "Channel 37 is currently occupied. Please switch transmission to channel 38."
+            )
+            self.assertEqual(
+                agent._workflow.workflow.intent.slots.get("advertising_channels"),
+                [38],
+            )
+            self.assertEqual(
+                changed.workflow_digest.get("current_stage"),
+                "flowgraph_confirmation",
+            )
+            self.assertNotEqual(
+                changed.workflow_digest.get("current_stage"),
+                "hardware_precheck",
+            )
+            checkpoint_id = (
+                agent._workflow.current_stage().checkpoint.id
+                if agent._workflow.current_stage()
+                and agent._workflow.current_stage().checkpoint
+                else ""
+            )
+            self.assertTrue(checkpoint_id)
+            reviewed = agent.step_command({
+                "action": "checkpoint_decision",
+                "checkpoint_id": checkpoint_id,
+                "decision": "approved",
+            })
+            self.assertIn(
+                reviewed.workflow_digest.get("current_stage"),
+                (
+                    "hardware_precheck",
+                    "discover_and_probe_hardware",
+                    "rf_plan_confirmation",
+                ),
+            )
+            self.assertNotEqual(
+                reviewed.workflow_digest.get("execution_status"), "completed"
+            )
 
 
 if __name__ == "__main__":

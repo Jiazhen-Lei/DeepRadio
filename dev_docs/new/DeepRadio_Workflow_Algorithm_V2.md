@@ -1,10 +1,21 @@
 # DeepRadio Workflow 算法 V2
 
-> 更新日期：2026-08-30<br>
+> 更新日期：2026-08-31<br>
 > 读者：算法、Agent、Workflow 和评测开发人员<br>
 > 约束：保留当前 WorkflowEngine、IntentIR、Catalog、Plan Compiler、SharedState、Completion 和执行器，只优化其输入输出契约与决策规则。
 
 ---
+
+## 0. 2026-08-31 增量：泛化链路硬化（V6，已实施）
+
+- 自然语言轮次由单一 LLM 语义入口生成 relation、confirmation decision 和增量 intent patch；同一句输入不再被 Alignment 与 Workflow 重复分类。携带 checkpoint id 与 decision 的按钮命令仍走确定性命令入口。
+- 已确认或已结束 Workflow 后的 action-bearing 文本重新进入 WorkflowEngine，由 TurnIR 决定 continuation/new task/deploy；只有“纯确认且无 action/参数”的孤立确认会被安全拒绝。
+- LLM planner 仅在具体 operation/evidence 存在 coverage gap 时调用。Compiler 允许补齐 Registry/Catalog 可绑定动作，但禁止提高 effect、改写既有 producer/dependency/completion、删除已授权 RF tail 或安全 finalizer。
+- Effect ≥ DEVICE_CONFIG 的执行必须在前序证据中同时具备 host readiness、physical discovery、exact probe 和 explicit grant；任何非 finalizer RF_RUN 后必须存在 RF_RUN safety finalizer。
+- `hardware_preflight` 只证明 host/environment readiness，明确不证明设备存在。设备事实只能由 `discover_devices + probe_device` 建立；失败的新探测会清除旧 observed-device 投影。
+- `workflow_presenter.py` 是默认 GTK 的英文展示边界。按钮文案、等待说明、Stage/Task label 和状态文案在 presenter 中生成；raw ids、revision、completion map 和 evidence JSON 不进入默认用户界面。
+
+以下 V5 章节保留为历史演进记录；其中“生产路径使用规则/正则语义兜底”的描述已被本节取代。
 
 ## 0. 2026-08-30 增量：槽位规范化与硬件探测路由算法（V5，已实施）
 

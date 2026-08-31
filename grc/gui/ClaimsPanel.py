@@ -47,6 +47,14 @@ _STAGE_STYLES["invalidated"] = _STAGE_STYLES["pending"]
 # upcoming steps instead of disappearing from the monitor.
 _STAGE_STYLES["deferred"] = dict(_STAGE_STYLES["pending"])
 
+_HW_STATE_STYLES = {
+    "not_started": {"marker": "○", "text": "#98A2B3"},
+    "detected": {"marker": "✓", "text": "#2E9E5B"},
+    "not_found": {"marker": "–", "text": "#C45B08"},
+    "failed": {"marker": "✕", "text": "#C43E3E"},
+    "not_applicable": {"marker": "·", "text": "#B0B7C3"},
+}
+
 #: Current-stage status word shown beside the label.
 _STAGE_STATUS_WORDS = {
     "running": "Running…",
@@ -82,7 +90,7 @@ class ClaimsPanel(Gtk.Frame):
 
     def __init__(self):
         Gtk.Frame.__init__(self, label="Workflow Monitor")
-        self.set_size_request(-1, 170)
+        self.set_size_request(-1, 280)
         root = Gtk.VBox(spacing=4)
         panel_scroll = Gtk.ScrolledWindow()
         panel_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -99,11 +107,6 @@ class ClaimsPanel(Gtk.Frame):
 
         root.pack_start(self._build_activity_bar(), False, False, 2)
         root.pack_start(self._build_metrics_row(), False, False, 0)
-
-        self._claim_summary = Gtk.Label(label="Claims: No verifiable claims yet")
-        self._claim_summary.set_halign(Gtk.Align.START)
-        self._claim_summary.set_xalign(0.0)
-        self._claim_summary.set_margin_start(4)
 
         self._store = Gtk.ListStore(str, str, str, int)
         self._view = Gtk.TreeView(model=self._store)
@@ -134,20 +137,38 @@ class ClaimsPanel(Gtk.Frame):
         scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scroll.set_min_content_height(48)
         scroll.add(self._view)
-        claims_expander = Gtk.Expander(label="Claim Evidence Details")
-        claims_expander.add(scroll)
-        self._claims_expander = claims_expander
-        monitor_body = Gtk.VBox(spacing=4)
+
         self._workflow_steps = Gtk.VBox(spacing=3)
-        monitor_body.pack_start(self._workflow_steps, False, False, 0)
-        monitor_body.pack_start(self._claim_summary, False, False, 0)
-        monitor_body.pack_start(claims_expander, False, False, 0)
-        self._workflow_monitor = Gtk.Expander(
-            label="No Active Workflow"
-        )
-        self._workflow_monitor.set_expanded(True)
-        self._workflow_monitor.add(monitor_body)
+        self._workflow_monitor = Gtk.Frame(label="Workflow")
+        self._workflow_monitor.set_margin_start(2)
+        self._workflow_monitor.set_margin_end(2)
+        self._workflow_monitor.add(self._workflow_steps)
         root.pack_start(self._workflow_monitor, False, False, 0)
+
+        self._claim_summary = Gtk.Label(label="No verifiable claims yet")
+        self._claim_summary.set_halign(Gtk.Align.START)
+        self._claim_summary.set_xalign(0.0)
+        self._claim_summary.set_margin_start(6)
+        claims_expander = Gtk.Expander(label="Claim details")
+        claims_body = Gtk.VBox(spacing=2)
+        claims_body.pack_start(self._claim_summary, False, False, 0)
+        claims_body.pack_start(scroll, False, False, 0)
+        claims_expander.add(claims_body)
+        self._claims_expander = claims_expander
+        self._claims_frame = Gtk.Frame(label="Claims")
+        claims_box = Gtk.VBox(spacing=2)
+        claims_box.pack_start(claims_expander, False, False, 0)
+        self._claims_frame.add(claims_box)
+        self._claims_frame.set_margin_start(2)
+        self._claims_frame.set_margin_end(2)
+        root.pack_start(self._claims_frame, False, False, 0)
+
+        self._hardware_rows = Gtk.VBox(spacing=2)
+        self._hardware_frame = Gtk.Frame(label="Hardware Detection")
+        self._hardware_frame.set_margin_start(2)
+        self._hardware_frame.set_margin_end(2)
+        self._hardware_frame.add(self._hardware_rows)
+        root.pack_start(self._hardware_frame, False, False, 0)
 
         self._hint = Gtk.Label(
             label="After you describe a request, the current design, simulation, or diagnosis stage will appear here."
@@ -228,7 +249,6 @@ class ClaimsPanel(Gtk.Frame):
         # window-wide show_all() reveal an empty confirm/cancel pair.
         pending_row.set_no_show_all(True)
         self._pending_row = pending_row
-        box.pack_start(pending_row, False, False, 0)
         self._set_pending({})
         return box
 
@@ -264,7 +284,8 @@ class ClaimsPanel(Gtk.Frame):
             self._runtime_label,
             self._claim_summary,
         ):
-            widget.override_font(small)
+            if widget is not None:
+                widget.override_font(small)
 
     def update_data(self, claims, spec_digest, pending=None,
                     metrics=None, activity=None, workflow=None):
@@ -274,10 +295,11 @@ class ClaimsPanel(Gtk.Frame):
         self._last_spec = spec
         workflow_view = workflow or {}
         view_model = present(
-            spec=spec, workflow=workflow_view, claims=raw_claims
+            spec=spec, workflow=workflow_view, claims=raw_claims,
+            pending=dict(pending or {}),
         )
         self._claims = list(
-            (view_model.get("claims") or {}).get("details") or []
+            (view_model.get("claims") or {}).get("rows") or []
         )
         self._store.clear()
         for claim in self._claims:
@@ -293,53 +315,7 @@ class ClaimsPanel(Gtk.Frame):
         self._last_workflow = workflow_view
         self._set_activity(activity or {}, self._last_workflow)
         self._set_metrics(metrics, self._claims)
-        pending_view = dict(pending or {})
-        wait = str(workflow_view.get("wait_kind") or "")
-        if pending_view.get("action") == "intent_alignment":
-            # Intent choices live in the conversation Radio Specification card.
-            pending_view = {}
-        elif wait == "approval":
-            pending_view.setdefault(
-                "requested_effect", workflow_view.get("requested_effect") or ""
-            )
-            pending_view.setdefault(
-                "purpose", workflow_view.get("checkpoint_purpose") or ""
-            )
-            if not pending_view.get("checkpoint_id") and workflow_view.get("checkpoint_id"):
-                pending_view = {
-                    "action": workflow_view.get("current_stage") or "workflow_checkpoint",
-                    "reason": workflow_view.get("waiting_reason") or "Continue the Current Workflow",
-                    "checkpoint_id": workflow_view.get("checkpoint_id"),
-                    "requested_effect": workflow_view.get("requested_effect") or "",
-                    "purpose": workflow_view.get("checkpoint_purpose") or "",
-                    "approved": False,
-                }
-        elif wait == "recovery":
-            pending_view = pending_view or {
-                "action": "stage_recovery",
-                "reason": workflow_view.get("waiting_reason") or "The Current Stage Did Not Pass",
-                "approved": False,
-            }
-        elif wait == "capability":
-            blocker = dict(workflow_view.get("blocker") or {})
-            pending_view = pending_view or {
-                "action": "capability_blocker",
-                "reason": blocker.get("message")
-                or workflow_view.get("waiting_reason")
-                or "The Required System Capability Is Not Ready",
-                "blocker": blocker,
-                "can_confirm": False,
-                "can_retry": bool(blocker.get("retryable", False)),
-                "approved": False,
-            }
-        elif wait != "intent":
-            pending_view = {}
-        if pending_view:
-            pending_view["can_retry"] = bool(
-                pending_view.get("can_retry")
-                or ((workflow_view.get("runtime") or {}).get("can_retry"))
-            )
-        self._set_pending(pending_view)
+        self._set_pending(dict(view_model.get("interaction") or {}))
         self._sync_expanders(workflow_view, self._claims)
         empty = (
             not self._claims
@@ -356,7 +332,7 @@ class ClaimsPanel(Gtk.Frame):
         self._updating = True
         self._claims = []
         self._store.clear()
-        self._claim_summary.set_text("Claims: No verifiable claims yet")
+        self._claim_summary.set_text("No verifiable claims yet")
         self._set_runtime_line({})
         self.evidence_path = ""
         self._set_metrics({}, [])
@@ -364,6 +340,7 @@ class ClaimsPanel(Gtk.Frame):
         self._set_pending({})
         self._last_spec = {}
         self._set_workflow_monitor({})
+        self._set_hardware_detection({})
         self._hint.set_visible(True)
         if hasattr(self, "_claims_expander"):
             self._claims_expander.set_expanded(False)
@@ -380,34 +357,71 @@ class ClaimsPanel(Gtk.Frame):
             )
             self._claim_summary.set_text("Claims: " + summary)
         else:
-            self._claim_summary.set_text("Claims: No verifiable claims yet")
+            self._claim_summary.set_text("No verifiable claims yet")
         self._set_workflow_monitor(dict(view_model.get("workflow") or {}))
+        self._set_hardware_detection(dict(view_model.get("hardware_detection") or {}))
 
     def _set_workflow_monitor(self, workflow):
         for child in self._workflow_steps.get_children():
             self._workflow_steps.remove(child)
         if not workflow.get("visible"):
-            self._workflow_monitor.set_label("No Active Workflow")
-            # Nothing to expand; stay collapsed instead of reserving space.
-            self._workflow_monitor.set_expanded(False)
+            self._workflow_monitor.set_label("Workflow")
+            empty = _stage_label()
+            empty.set_markup(
+                "<span foreground='#98A2B3'>No active workflow yet</span>"
+            )
+            empty.set_margin_start(8)
+            self._workflow_steps.pack_start(empty, False, False, 4)
+            self._workflow_steps.show_all()
             return
-        self._workflow_monitor.set_expanded(True)
         stages = list(workflow.get("stages") or [])
-        status = str(
-            workflow.get("outcome") or workflow.get("execution_status") or "pending"
-        )
+        status = str(workflow.get("state_label") or "Planned")
         self._workflow_monitor.set_label(
-            "{} · Step {}/{} · {}".format(
+            "Workflow · {} · Step {}/{} · {}".format(
                 workflow.get("title") or "Workflow",
                 workflow.get("stage_index") or 0,
                 workflow.get("stage_total") or len(stages),
-                status.title(),
+                status,
             )
         )
-        for stage in stages:
+        completed = list(workflow.get("completed") or [])
+        current = list(workflow.get("current") or [])
+        pending = list(workflow.get("pending") or [])
+        if not (completed or current or pending):
+            current = [item for item in stages if item.get("current")]
+            completed = [
+                item for item in stages
+                if str(item.get("status") or "") in {"passed", "completed"}
+                and not item.get("current")
+            ]
+            pending = [
+                item for item in stages
+                if item not in completed and item not in current
+            ]
+        if completed:
+            expander = Gtk.Expander(
+                label="Completed ({})".format(len(completed))
+            )
+            expander.set_expanded(False)
+            box = Gtk.VBox(spacing=2)
+            for stage in completed:
+                box.pack_start(self._build_stage_row(stage), False, False, 0)
+            expander.add(box)
+            self._workflow_steps.pack_start(expander, False, False, 0)
+        for stage in current:
             self._workflow_steps.pack_start(
                 self._build_stage_row(stage), False, False, 0
             )
+        if pending:
+            expander = Gtk.Expander(
+                label="Upcoming ({})".format(len(pending))
+            )
+            expander.set_expanded(False)
+            box = Gtk.VBox(spacing=2)
+            for stage in pending:
+                box.pack_start(self._build_stage_row(stage), False, False, 0)
+            expander.add(box)
+            self._workflow_steps.pack_start(expander, False, False, 0)
         transition = dict(workflow.get("transition") or {})
         if transition:
             marker = "↩" if transition.get("kind") == "back" else "→"
@@ -428,6 +442,32 @@ class ClaimsPanel(Gtk.Frame):
                 self._build_previous_attempt_line(attempt), False, False, 0
             )
         self._workflow_steps.show_all()
+
+    def _set_hardware_detection(self, detection):
+        for child in self._hardware_rows.get_children():
+            self._hardware_rows.remove(child)
+        state = str((detection or {}).get("state") or "not_started")
+        style = _HW_STATE_STYLES.get(state, _HW_STATE_STYLES["not_started"])
+        label = _stage_label(wrap=True)
+        label.set_markup(
+            "<span foreground='{color}'>{state}</span>".format(
+                color=style["text"],
+                state=_escape(state),
+            )
+        )
+        label.set_margin_start(8)
+        label.override_font(self._font_desc(0))
+        self._hardware_rows.pack_start(label, False, False, 2)
+        error = str((detection or {}).get("error") or "").strip()
+        if error and state in {"failed", "not_found"}:
+            err = _stage_label(wrap=True)
+            err.set_markup(
+                "<span foreground='#C43E3E'>{}</span>".format(_escape(error))
+            )
+            err.set_margin_start(8)
+            err.override_font(self._font_desc(-1))
+            self._hardware_rows.pack_start(err, False, False, 0)
+        self._hardware_rows.show_all()
 
     def _build_previous_attempt_line(self, attempt):
         """Dim summary of a superseded workflow (Previous Attempt)."""
@@ -724,133 +764,23 @@ class ClaimsPanel(Gtk.Frame):
     def _set_pending(self, pending):
         pending = pending or {}
         action = str(pending.get("action") or "")
-        purpose = str(pending.get("purpose") or "")
-        if not purpose and str(pending.get("requested_effect") or "") == "RF_RUN":
-            purpose = "rf_authorization"
-        recipe = str(pending.get("recipe") or "")
-        from_recipe = str(pending.get("from_recipe") or "")
-        visible = bool(action) and not pending.get("approved")
+        visible = bool(pending.get("visible"))
         interaction_combo = getattr(self, "_interaction_combo", None)
         interaction_entry = getattr(self, "_interaction_entry", None)
         if interaction_combo is not None:
             interaction_combo.remove_all()
         if interaction_entry is not None:
             interaction_entry.set_text("")
-        self._interaction_choices = list(pending.get("choices") or [])
-        for choice in self._interaction_choices:
-            if interaction_combo is not None:
-                interaction_combo.append_text(str(choice.get("label") or choice.get("id") or "Option"))
-        if self._interaction_choices and interaction_combo is not None:
-            interaction_combo.set_active(0)
-        is_intent = visible and action == "intent_alignment"
-        ask_intent = is_intent and pending.get("kind") == "ask_user_question"
+        self._interaction_choices = []
+        ask_intent = False
         if interaction_combo is not None:
-            interaction_combo.set_visible(ask_intent and bool(self._interaction_choices))
+            interaction_combo.set_visible(False)
         if interaction_entry is not None:
-            interaction_entry.set_visible(ask_intent and bool(pending.get("allow_custom")))
+            interaction_entry.set_visible(False)
         if visible:
-            if action == "intent_alignment":
-                text = str(pending.get("prompt") or pending.get("reason") or "Please provide the missing intent information.")
-                if pending.get("kind") == "intent_confirmation" and pending.get("summary"):
-                    text += "  " + str(pending.get("summary"))
-            elif action == "design_link" and recipe:
-                text = "Pending confirmation: {} → {}".format(
-                    from_recipe or "Current Project", recipe)
-            elif action == "over_air_verification":
-                extra = ""
-                if self.evidence_path:
-                    extra = "  ·  Selected {}".format(
-                        os.path.basename(self.evidence_path)
-                    )
-                else:
-                    extra = " Human confirmation required; no attachment selected."
-                text = (
-                    "Over-the-air verification: confirm that an independent receiver actually observed the target signal. "
-                    "You may attach a screenshot.{}".format(extra)
-                )
-            elif action == "rf_plan_confirmation":
-                duration = pending.get("max_duration_seconds")
-                device = dict(pending.get("device") or {})
-                identity = str(device.get("identity") or "Unbound")
-                device_type = str(device.get("type") or "SDR")
-                frequency = self._format_si(
-                    pending.get("center_frequency"), "Hz"
-                )
-                sample_rate = self._format_si(
-                    pending.get("sample_rate"), "sps"
-                )
-                bandwidth = self._format_si(pending.get("bandwidth"), "Hz")
-                level = (
-                    "Attenuation {} dB".format(pending.get("tx_attenuation"))
-                    if pending.get("tx_attenuation") is not None
-                    else "Gain {} dB".format(pending.get("tx_gain"))
-                    if pending.get("tx_gain") is not None
-                    else "Power parameter not set"
-                )
-                if purpose == "rf_authorization":
-                    text = (
-                        "RF safety confirmation: {} [{}] · {} · {} · BW {} · {}. "
-                        "Approval starts a bounded transmission for up to {} seconds; "
-                        "OTA confirmation or cancellation stops it early. Do not click Run in GRC."
-                    ).format(
-                        device_type, identity, frequency or "Frequency?",
-                        sample_rate or "Sample rate?", bandwidth or "?", level,
-                        duration or 30,
-                    )
-                else:
-                    text = (
-                        "Configuration confirmation: {} [{}] · {} · {} · BW {} · {}. "
-                        "Confirmation saves the configuration without starting RF. "
-                        "Explicit runtime authorization is required to transmit."
-                    ).format(
-                        device_type, identity, frequency or "Frequency?",
-                        sample_rate or "Sample rate?", bandwidth or "?", level,
-                    )
-            elif action == "stage_recovery":
-                text = "Stage did not pass: {}".format(
-                    pending.get("reason") or "Retry this stage or cancel the task"
-                )
-            elif action == "capability_blocker":
-                blocker = dict(pending.get("blocker") or {})
-                text = "Required capability not ready: {}".format(
-                    pending.get("reason") or "The current operation cannot be performed"
-                )
-                if blocker.get("remediation"):
-                    text += "  " + str(blocker["remediation"])
-            elif action == "workflow_checkpoint":
-                text = "Pending confirmation: {}".format(
-                    pending.get("reason") or "Continue the current workflow"
-                )
-            else:
-                text = "Pending confirmation: {}".format(action)
-            self._pending_label.set_text(text)
-            if action == "intent_alignment":
-                if pending.get("kind") == "intent_confirmation":
-                    self._confirm_btn.set_label("Confirm and Create Workflow")
-                    self._cancel_btn.set_label("Continue Revising")
-                else:
-                    self._confirm_btn.set_label("Submit Answer")
-                    self._cancel_btn.set_label("")
-            elif action == "over_air_verification":
-                self._confirm_btn.set_label("Target Signal Observed")
-                self._cancel_btn.set_label("Not Observed")
-            elif action == "rf_plan_confirmation":
-                if purpose == "rf_authorization":
-                    self._confirm_btn.set_label("Approve Bounded Transmission")
-                elif purpose == "config_handoff":
-                    self._confirm_btn.set_label("Confirm Saved Configuration")
-                else:
-                    self._confirm_btn.set_label("Confirm Configuration")
-                self._cancel_btn.set_label("Cancel")
-            elif action == "stage_recovery":
-                self._confirm_btn.set_label("Retry This Stage")
-                self._cancel_btn.set_label("Cancel Task")
-            elif action == "capability_blocker":
-                self._confirm_btn.set_label("Cannot Confirm This Operation")
-                self._cancel_btn.set_label("Cancel Task")
-            else:
-                self._confirm_btn.set_label("Confirm")
-                self._cancel_btn.set_label("Cancel")
+            self._pending_label.set_text(str(pending.get("message") or ""))
+            self._confirm_btn.set_label(str(pending.get("confirm_label") or "Confirm"))
+            self._cancel_btn.set_label(str(pending.get("cancel_label") or "Cancel"))
         else:
             self._pending_label.set_text("")
             self._confirm_btn.set_label("")
@@ -861,10 +791,8 @@ class ClaimsPanel(Gtk.Frame):
         self._confirm_btn.set_visible(visible and can_confirm)
         self._confirm_btn.set_sensitive(visible and can_confirm)
         self._cancel_btn.set_sensitive(visible)
-        self._cancel_btn.set_visible(
-            visible and not (ask_intent and pending.get("kind") != "intent_confirmation")
-        )
-        ota = visible and action == "over_air_verification"
+        self._cancel_btn.set_visible(visible)
+        ota = visible and bool(pending.get("show_evidence"))
         self._evidence_btn.set_visible(ota)
         self._evidence_btn.set_sensitive(ota)
         retry = bool(pending.get("can_retry"))
@@ -909,13 +837,11 @@ class ClaimsPanel(Gtk.Frame):
         if index >= len(self._claims):
             return
         claim = self._claims[index]
-        evidence = claim.get("evidence") or []
-        text = "{}\nCategory: {}\nStatus: {}\nVersion: {}\n{}".format(
+        text = "{}\nCategory: {}\nStatus: {}\nEvidence source: {}".format(
             claim.get("statement", ""),
             layer_label(claim.get("layer", "")),
             claim.get("status", ""),
-            claim.get("project_version", 0),
-            json.dumps(evidence, ensure_ascii=False, indent=2),
+            claim.get("producer") or "Not available",
         )
         self._set_details(text)
 

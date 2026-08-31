@@ -111,10 +111,14 @@
     },
     "direction": {
       "label": "Direction",
-      "prompt": "Specify transmit, receive, or transceiver operation.",
-      "choices": [],
-      "allow_custom": true,
-      "teaching": "Direction determines whether the flowgraph uses a signal source, a receiver, or a complete transceiver chain."
+      "prompt": "Specify transmit (tx), receive (rx), or simulation (sim).",
+      "choices": [
+        {"id": "tx", "label": "Transmit (tx)", "value": "tx"},
+        {"id": "rx", "label": "Receive (rx)", "value": "rx"},
+        {"id": "sim", "label": "Simulation (sim)", "value": "sim"}
+      ],
+      "allow_custom": false,
+      "teaching": "Direction is one of three classes: tx for a transmit chain, rx for a receive chain, and sim for an offline simulation that does not drive physical RF."
     },
     "operation": {
       "label": "Operation",
