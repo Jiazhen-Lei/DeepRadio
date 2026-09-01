@@ -14,7 +14,7 @@
     "change_confirmation": {"execution_mode": "checkpoint", "allowed_tools": []},
     "apply_and_verify": {"execution_mode": "hybrid", "allowed_tools": ["design_flowgraph", "apply_grc_diff", "apply_flowgraph_patch", "validate_flowgraph", "run_simulation", "read_metric", "plot_spectrum", "plot_constellation", "plot_eye", "verify_claims", "explain_error"]},
     "inspect_and_measure": {"execution_mode": "deterministic", "allowed_tools": ["inspect_flowgraph", "validate_flowgraph", "run_simulation", "read_metric", "plot_spectrum", "plot_constellation", "plot_eye", "verify_claims"]},
-    "hardware_precheck": {"execution_mode": "deterministic", "allowed_tools": ["hardware_preflight"]},
+    "hardware_precheck": {"execution_mode": "deterministic", "allowed_tools": ["hardware_preflight", "discover_devices", "inspect_flowgraph"]},
     "discover_and_probe_device": {"execution_mode": "deterministic", "allowed_tools": ["discover_devices", "probe_device"]},
     "discover_and_probe_hardware": {"execution_mode": "deterministic", "allowed_tools": ["discover_devices", "probe_device"]},
     "hardware_confirmation": {"execution_mode": "checkpoint", "allowed_tools": []},

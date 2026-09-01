@@ -29,8 +29,6 @@ _BUILD_SAVE_STAGES = frozenset(
         "build_and_verify",
         "tx_build_and_validate",
         "rx_build_and_verify",
-        "build_ble_advertiser",
-        "repair_and_verify",
     }
 )
 

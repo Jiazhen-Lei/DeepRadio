@@ -208,9 +208,7 @@ def call(name: str, arguments: Dict[str, Any],
             result.update({"enabled": False, "running": False})
         if name == "arm_hardware_flowgraph":
             result["armed"] = False
-        _record_gateway_decision(ctx, spec, "DENY", denial)
         return result
-    _record_gateway_decision(ctx, spec, "ALLOW", "")
     marker = object()
     previous_parent = ctx.extra.get("_gateway_parent_tool", marker)
     ctx.extra["_gateway_parent_tool"] = spec.name
@@ -231,22 +229,6 @@ def call(name: str, arguments: Dict[str, Any],
             ctx.extra.pop("_gateway_parent_tool", None)
         else:
             ctx.extra["_gateway_parent_tool"] = previous_parent
-
-
-def _record_gateway_decision(
-    ctx: ToolContext, spec: ToolSpec, decision: str, reason: str
-) -> None:
-    extra = getattr(ctx, "extra", None)
-    if not isinstance(extra, dict):
-        return
-    extra.setdefault("events", []).append({
-        "kind": "execution_gateway",
-        "decision": decision,
-        "tool": spec.name,
-        "effect_level": spec.effect_level,
-        "stage_id": extra.get("stage_id") or "",
-        "reason": reason,
-    })
 
 
 def _execution_denial(

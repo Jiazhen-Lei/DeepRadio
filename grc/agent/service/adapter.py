@@ -76,23 +76,17 @@ def _resolved_stage_mode(stage: Any) -> str:
     if override == "deepagents":
         return "agentic"
     if declared == "hybrid":
-        return "agentic" if _hybrid_has_repair_evidence(stage) else "deterministic"
+        result = dict(getattr(stage, "result", None) or {})
+        history = list(getattr(stage, "result_history", None) or [])
+        improvement = bool(
+            result.get("improvement_available")
+            or any(
+                isinstance(item, dict) and item.get("improvement_available")
+                for item in history
+            )
+        )
+        return "agentic" if improvement else "deterministic"
     return "agentic"
-
-
-def _hybrid_has_repair_evidence(stage: Any) -> bool:
-    """True after a failed Hybrid attempt that left a usable repair delta."""
-    records = [dict(getattr(stage, "result", None) or {})]
-    records.extend(
-        item
-        for item in list(getattr(stage, "result_history", None) or [])
-        if isinstance(item, dict)
-    )
-    for item in records:
-        failed = item.get("outcome") == "failed" or item.get("ok") is False
-        if failed or item.get("improvement_available") or item.get("missing_completion"):
-            return True
-    return False
 
 
 # User-facing observation channel: omit routing/tool bookkeeping so a fast
@@ -1170,9 +1164,6 @@ class ServiceAgent:
             return self._workflow_waiting_reply()
         mode = _resolved_stage_mode(stage)
         ctx.extra["stage_execution_mode"] = mode
-        ctx.extra["declared_execution_mode"] = str(
-            getattr(stage, "execution_mode", "") or ""
-        )
         if mode != "agentic":
             ctx.extra["execution_mode"] = "deterministic"
             return self._run_stage_deterministic(
@@ -1185,16 +1176,6 @@ class ServiceAgent:
             logger.warning("组装 deepagents 失败,改走确定性骨架: %s", exc)
         try:
             if agent is not None:
-                _store.append_session_event(
-                    self.session_id,
-                    "stage_routed",
-                    self._workflow_event_payload({
-                        "stage_id": stage.id,
-                        "declared_mode": getattr(stage, "execution_mode", ""),
-                        "resolved_mode": mode,
-                        "executor": "deepagents",
-                    }),
-                )
                 return self._run_deep(agent, ctx, stage_text)
             return self._run_stage_deterministic(
                 ctx, stage_text, recipe, simulate, stage.id

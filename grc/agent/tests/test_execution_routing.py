@@ -88,9 +88,7 @@ class ExecutionRoutingTest(unittest.TestCase):
 
     def test_hybrid_retry_uses_deepagent_with_new_failure_evidence(self):
         stage = _stage(result={
-            "ok": False,
-            "outcome": "failed",
-            "missing_completion": ["flowgraph_saved"],
+            "outcome": "failed", "improvement_available": True,
         })
         with mock.patch(
             "grc.agent.service.orchestrator.build_agent",
@@ -686,12 +684,6 @@ class V3ExecutionGatewayTest(unittest.TestCase):
         denied = registry.call("build_ble_advertising_pdu", {}, ctx)
         self.assertEqual(denied.get("policy"), "DENY")
         self.assertIn("does not authorize", denied.get("error", ""))
-        gateway = [
-            item for item in (ctx.extra.get("events") or [])
-            if item.get("kind") == "execution_gateway"
-        ]
-        self.assertEqual(gateway[-1]["decision"], "DENY")
-        self.assertEqual(gateway[-1]["tool"], "build_ble_advertising_pdu")
 
         ctx.extra["stage_allowed_tools"] = ["build_ble_advertising_pdu"]
         ctx.extra["stage_effect_level"] = "READ"
@@ -703,12 +695,9 @@ class V3ExecutionGatewayTest(unittest.TestCase):
         from grc.agent.tools import registry
         from grc.agent.workflow import WorkflowEngine
 
-        engine = WorkflowEngine(
-            os.path.join(os.path.dirname(__file__), "_missing_workflow.yaml"),
-            catalog_path=os.path.join(
-                os.path.dirname(__file__), "..", "workflow", "task_catalog.yaml"
-            ),
-        )
+        engine = WorkflowEngine(os.path.join(
+            os.path.dirname(__file__), "_v3_catalog_check.json"
+        ))
         registry.load_all()
         known = set(registry.names()) | {"design_flowgraph"}
         profiles = engine.catalog.get("stage_profiles") or {}

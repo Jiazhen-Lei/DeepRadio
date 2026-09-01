@@ -56,9 +56,6 @@ def _emit_route_events(self, stage_id: str) -> None:
     payload = self._workflow_event_payload({
         "target_agent": active.target_agent if active else "stage_handler",
         "stage_id": stage_id,
-        "declared_mode": getattr(self._workflow.current_stage(), "execution_mode", "")
-        if self._workflow.current_stage() else "",
-        "resolved_mode": "deterministic",
         "mode": "deterministic",
         "executor": "deterministic_stage_handler",
     })

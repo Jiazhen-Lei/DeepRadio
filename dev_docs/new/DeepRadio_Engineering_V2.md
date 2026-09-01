@@ -111,10 +111,11 @@ Main Agent 只持有 `task` 委派能力；有 Subagent 时不直接持有业务
 3. Tool effect 不高于 `stage_effect_level`。
 4. `requires` 全部满足；未知 requirement fail closed。
 5. 工具参数与 JSON schema 一致。
-6. Policy / checkpoint grant 满足；allow/deny 写入 `ctx.extra["events"]`。
-7. 执行并返回 dict receipt。
+6. 执行并返回 dict receipt。
 
 当前必须支持的 requirements：`rf_runtime`、`device_probed`、`flowgraph_armed`、`user_effect_grant`。硬件工具内部保留相同底线检查，防止未来旁路 Gateway。
+
+后续将 Gateway 的 allow/deny 也写入 events，而不只记录成功调用。
 
 ## 7. Result 与 Completion
 
