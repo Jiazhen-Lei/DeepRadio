@@ -184,7 +184,7 @@ def _leave_hardware_sink_unarmed(ctx: ToolContext, block_id: str) -> None:
     group="ble",
     origin="deepradio_protocol",
     runtime="deepradio",
-    effect_level="ARTIFACT_WRITE",
+    permission="project.write",
 )
 def build_ble_advertising_pdu(
     ctx: ToolContext, local_name: str = "", channel: int = 37
@@ -261,7 +261,7 @@ def _gaussian_taps(samples_per_symbol: int, bt: float = 0.5, span: int = 4) -> n
     group="ble",
     origin="deepradio_protocol",
     runtime="deepradio",
-    effect_level="ARTIFACT_WRITE",
+    permission="project.write",
 )
 def generate_ble_1m_waveform(
     ctx: ToolContext,
@@ -499,7 +499,7 @@ def _verify_waveform_loopback(ctx: ToolContext, air_packet: bytes) -> Dict[str, 
     group="ble",
     origin="deepradio_compose",
     runtime="gnuradio_blocks",
-    effect_level="ARTIFACT_WRITE",
+    permission="project.write",
 )
 def build_ble_uhd_tx_flowgraph(
     ctx: ToolContext,
@@ -608,7 +608,7 @@ def build_ble_uhd_tx_flowgraph(
     group="ble",
     origin="deepradio_compose",
     runtime="gnuradio_blocks",
-    effect_level="ARTIFACT_WRITE",
+    permission="project.write",
 )
 def build_ble_pluto_tx_flowgraph(
     ctx: ToolContext,

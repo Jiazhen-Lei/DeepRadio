@@ -12,44 +12,6 @@ from typing import Any
 from ..state import ArtifactRecord
 
 
-_RUNTIME_STATUS = {
-    "pending": "planned",
-    "running": "active",
-    "waiting": "waiting",
-    "completed": "succeeded",
-    "errored": "failed",
-    "invalidated": "planned",
-}
-
-
-def project_control(workflow_engine: Any, state: Any) -> None:
-    digest = workflow_engine.digest()
-    if not digest:
-        return
-    stage = workflow_engine.current_stage()
-    checkpoint = stage.checkpoint if stage else None
-    state.runtime.current_node = str(digest.get("current_stage") or "")
-    state.runtime.status = _RUNTIME_STATUS.get(
-        str(digest.get("execution_status") or "pending"), "planned"
-    )
-    if (
-        str(digest.get("execution_status") or "") == "completed"
-        and not any(
-            str(getattr(item, "effect_level", "") or "") == "RF_RUN"
-            and not bool(getattr(item, "safety_finalizer", False))
-            for item in (getattr(workflow_engine.workflow, "stages", None) or [])
-        )
-    ):
-        # Completing design/configuration work is not runtime success.
-        state.runtime.status = "not_started"
-    state.runtime.requested_effect = str(
-        getattr(checkpoint, "requested_effect", "")
-        or getattr(stage, "effect_level", "READ")
-        or "READ"
-    )
-    state.runtime.blocker = dict(digest.get("blocker") or {})
-
-
 def project_artifact_index(
     state: Any, manifest_path: str, *, workflow: Any = None
 ) -> None:

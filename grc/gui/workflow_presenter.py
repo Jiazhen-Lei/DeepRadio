@@ -112,7 +112,9 @@ def phase_view(workflow: Dict[str, Any]) -> Dict[str, str]:
     effect = str(workflow.get("requested_effect") or "")
     purpose = str(workflow.get("checkpoint_purpose") or "")
     if purpose in {"proposal", "flowgraph_proposal", "flowgraph_review"} or (
-        wait == "approval" and effect in {"ARTIFACT_WRITE", "PROJECT_WRITE"}
+        wait == "approval" and effect in {
+            "ARTIFACT_WRITE", "PROJECT_WRITE", "project.write"
+        }
     ):
         return {"id": "co_construct", "label": "CO-CONSTRUCT"}
     if any(token in current for token in ("build", "proposal", "apply", "flowgraph")):
@@ -517,7 +519,11 @@ def interaction_view(
             "attach a screenshot."
         )
         confirm_label, cancel_label = "Target Signal Observed", "Not Observed"
-    elif action == "rf_plan_confirmation":
+    elif (
+        action == "rf_plan_confirmation"
+        or purpose == "rf_authorization"
+        or effect in {"RF_RUN", "rf.start"}
+    ):
         device = dict(item.get("device") or {})
         name = str(device.get("type") or "SDR")
         identity = str(device.get("identity") or "not detected")
@@ -532,7 +538,7 @@ def interaction_view(
             if item.get("tx_gain") is not None
             else "power not set"
         )
-        if purpose == "rf_authorization" or effect == "RF_RUN":
+        if purpose == "rf_authorization" or effect in {"RF_RUN", "rf.start"}:
             message = (
                 f"Authorize a bounded RF run on {name} [{identity}] at "
                 f"{frequency}, {sample_rate}, bandwidth {bandwidth}, {level}, "

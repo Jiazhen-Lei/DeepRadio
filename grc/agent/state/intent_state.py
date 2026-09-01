@@ -87,9 +87,8 @@ class RadioSpecification:
 class SharedIntent:
     """Canonical intent contract.
 
-    The host alignment coordinator is the sole writer.  Main/subagents and
-    skills receive a snapshot and may propose an IntentPatch, but they never
-    mutate this object directly.
+    MainAgent is the semantic owner. The host persists its structured update
+    and exposes a read-only snapshot to SubAgents and the GUI.
     """
 
     intent_id: str = ""

@@ -265,7 +265,7 @@ def _write_report(
     group="sim",
     origin="deepradio_runtime",
     runtime="gnuradio",
-    effect_level="ARTIFACT_WRITE",
+    permission="project.write",
     idempotent=True,
 )
 def run_diagnosis_experiment(

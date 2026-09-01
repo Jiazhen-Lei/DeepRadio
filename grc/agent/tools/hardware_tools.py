@@ -188,40 +188,61 @@ def _project_runtime_state(ctx: ToolContext, result: Dict[str, Any]) -> None:
 
 
 def _rf_approved(ctx: ToolContext) -> bool:
-    """Check a typed effect grant; checkpoint names are not policy facts."""
-    ranks = {
-        "READ": 0,
-        "ARTIFACT_WRITE": 1,
-        "DEVICE_READ": 2,
-        "DEVICE_CONFIG": 3,
-        "RF_RUN": 4,
-    }
+    """Check the host-recorded RF permission; Agent text is not a grant."""
     state = ctx.extra.get("state")
     runtime = getattr(state, "runtime", None)
-    grants = list(getattr(runtime, "granted_effects", None) or [])
-    if any(ranks.get(str(effect).upper(), 0) >= ranks["RF_RUN"] for effect in grants):
-        return True
-    workflow = ctx.extra.get("workflow") or {}
-    return any(
-        (stage.get("checkpoint") or {}).get("decision_status") == "approved"
-        and ranks.get(
-            str((stage.get("checkpoint") or {}).get("requested_effect") or "").upper(),
-            -1,
-        ) >= ranks["RF_RUN"]
-        for stage in workflow.get("stages") or []
-        if isinstance(stage, dict)
+    grants = {
+        str(item)
+        for item in getattr(runtime, "granted_permissions", None) or []
+    }
+    if not ({"rf.start", "RF_RUN"} & grants):
+        return False
+    project = getattr(state, "project", None)
+    binding = dict(
+        (getattr(project, "config", {}) or {}).get("rf_permission_grant") or {}
+    )
+    workflow = dict(ctx.extra.get("workflow") or {})
+    return bool(
+        binding.get("workflow_id")
+        and binding.get("workflow_id") == workflow.get("workflow_id")
+        and int(binding.get("project_version", -1))
+        == int(getattr(project, "flowgraph_version", 0))
     )
 
 
 def _completion_satisfied(ctx: ToolContext, predicate: str) -> bool:
     """Resolve a stable completion fact without depending on Stage names."""
     state = ctx.extra.get("state")
+    claim_aliases = {
+        "device_probed": {"device_probed", "hardware_device_probed"},
+        "ble_packet_valid": {"ble_packet_valid", "ble_offline_protocol_valid"},
+    }
+    accepted_ids = claim_aliases.get(predicate, {predicate})
     for claim in list(getattr(state, "claims", None) or []):
         if (
-            str(getattr(claim, "id", "") or "") == predicate
+            str(getattr(claim, "id", "") or "") in accepted_ids
             and str(getattr(claim, "status", "") or "").lower() in {"pass", "passed"}
         ):
             return True
+    if predicate == "device_probed":
+        observed = dict(
+            getattr(getattr(state, "project", None), "config", {}).get(
+                "observed_device"
+            ) or {}
+        )
+        if observed.get("identity"):
+            return True
+    event_contracts = {
+        "device_probed": ("probe_device", "device_probed"),
+        "ble_packet_valid": ("verify_ble_packet_bits", "valid"),
+    }
+    kind, key = event_contracts.get(predicate, ("", ""))
+    if kind and any(
+        event.get("kind") == kind
+        and bool((event.get("payload") or {}).get(key))
+        for event in (ctx.extra.get("events") or [])
+    ):
+        return True
     workflow = ctx.extra.get("workflow") or {}
     return any(
         stage.get("execution_status") == "completed"
@@ -343,7 +364,7 @@ def _scan_other_families(skip_family: str) -> list[Dict[str, Any]]:
     group="hardware",
     origin="vendor_cli",
     runtime="uhd_iio",
-    effect_level="DEVICE_READ",
+    permission="device.read",
 )
 def discover_devices(
     ctx: ToolContext, device_args: str = "", device_type: str = "b210"
@@ -419,7 +440,7 @@ def discover_devices(
     group="hardware",
     origin="vendor_cli",
     runtime="uhd_iio",
-    effect_level="DEVICE_READ",
+    permission="device.read",
 )
 def probe_device(
     ctx: ToolContext, device_args: str = "", device_type: str = "b210"
@@ -483,7 +504,7 @@ def probe_device(
     group="hardware",
     origin="deepradio_runtime",
     runtime="grc_rewrite",
-    effect_level="DEVICE_CONFIG",
+    permission="device.configure",
     requires=["rf_runtime", "device_probed", "user_effect_grant"],
 )
 def arm_hardware_flowgraph(
@@ -501,7 +522,7 @@ def arm_hardware_flowgraph(
     if not _completion_satisfied(ctx, "device_probed"):
         return {"ok": False, "armed": False, "error": "Hardware discovery and probing have not passed"}
     if not _rf_approved(ctx):
-        return {"ok": False, "armed": False, "error": "RF_RUN user authorization is missing"}
+        return {"ok": False, "armed": False, "error": "rf.start user authorization is missing"}
     source = _resolve_work_path(ctx, grc_path)
     out_dir = Path(ctx.out_dir or "").resolve()
     if not source.is_file() or out_dir not in source.parents:
@@ -603,7 +624,7 @@ def arm_hardware_flowgraph(
     group="hardware",
     origin="deepradio_runtime",
     runtime="grcc",
-    effect_level="RF_RUN",
+    permission="rf.start",
     idempotent=False,
     requires=["rf_runtime", "flowgraph_armed", "user_effect_grant"],
 )
@@ -635,7 +656,7 @@ def start_flowgraph(
             "error": "Physical RF is disabled; enable the persistent Physical RF preference before authorizing this run",
         }
     if not _rf_approved(ctx):
-        return {"ok": False, "requires_confirmation": True, "error": "RF_RUN user authorization is missing"}
+        return {"ok": False, "requires_confirmation": True, "error": "rf.start user authorization is missing"}
     if _is_ble_deploy(ctx) and not _completion_satisfied(ctx, "ble_packet_valid"):
         return {"ok": False, "error": "Offline protocol verification has not passed; refusing to start RF"}
     if not _completion_satisfied(ctx, "device_probed"):
@@ -692,7 +713,7 @@ def start_flowgraph(
     group="hardware",
     origin="deepradio_runtime",
     runtime="hardware_runtime",
-    effect_level="DEVICE_READ",
+    permission="device.read",
 )
 def query_runtime_status(ctx: ToolContext) -> Dict[str, Any]:
     return _persist_runtime_result(ctx, RUNTIME.status(_session_id(ctx)))
@@ -705,7 +726,7 @@ def query_runtime_status(ctx: ToolContext) -> Dict[str, Any]:
     group="hardware",
     origin="deepradio_runtime",
     runtime="hardware_runtime",
-    effect_level="RF_RUN",
+    permission="rf.stop",
 )
 def stop_flowgraph(ctx: ToolContext) -> Dict[str, Any]:
     return _persist_runtime_result(ctx, RUNTIME.stop(_session_id(ctx)))
@@ -718,7 +739,7 @@ def stop_flowgraph(ctx: ToolContext) -> Dict[str, Any]:
     group="hardware",
     origin="deepradio_runtime",
     runtime="hardware_runtime",
-    effect_level="RF_RUN",
+    permission="rf.stop",
 )
 def emergency_stop(ctx: ToolContext) -> Dict[str, Any]:
     return _persist_runtime_result(
@@ -873,7 +894,7 @@ def _sdr_tx_sink_candidates(
     group="hardware",
     origin="deepradio_compose",
     runtime="gnuradio_blocks",
-    effect_level="ARTIFACT_WRITE",
+    permission="project.write",
 )
 def build_sdr_tx_flowgraph(
     ctx: ToolContext,
@@ -1096,7 +1117,7 @@ def build_sdr_tx_flowgraph(
     group="hardware",
     origin="deepradio_compose",
     runtime="gnuradio_blocks",
-    effect_level="ARTIFACT_WRITE",
+    permission="project.write",
 )
 def build_usrp_rx_spectrum_flowgraph(
     ctx: ToolContext,
@@ -1232,7 +1253,7 @@ def build_usrp_rx_spectrum_flowgraph(
     group="hardware",
     origin="deepradio_compose",
     runtime="gnuradio_blocks",
-    effect_level="ARTIFACT_WRITE",
+    permission="project.write",
 )
 def build_sdr_rx_spectrum_flowgraph(
     ctx: ToolContext,

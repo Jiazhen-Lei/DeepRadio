@@ -44,7 +44,7 @@ class WorkflowDecision:
     key: str
     value: Any
     source: str
-    effect_level: str = "READ"
+    permission: str = "project.read"
     workflow_id: str = ""
     stage_id: str = ""
     ts: float = field(default_factory=time.time)
@@ -54,8 +54,8 @@ class WorkflowDecision:
 class RuntimeState:
     current_node: str = ""
     status: str = "planned"
-    requested_effect: str = "READ"
-    granted_effects: List[str] = field(default_factory=list)
+    requested_permission: str = "project.read"
+    granted_permissions: List[str] = field(default_factory=list)
     blocker: Dict[str, Any] = field(default_factory=dict)
     operations: List[Dict[str, Any]] = field(default_factory=list)
     quality: str = "clean"
@@ -127,67 +127,7 @@ class DiagnosisSnapshot:
 
 
 @dataclass
-class TaskCard:
-    task_id: str
-    loop_mode: str
-    target_agent: str
-    instruction: str
-    inputs: Dict[str, Any] = field(default_factory=dict)
-    expected_claims: List[str] = field(default_factory=list)
-    expected_results: List[str] = field(default_factory=list)
-    workflow_id: str = ""
-    stage_id: str = ""
-    workflow_revision: int = 0
-    base_project_version: int = 0
-    intent_id: str = ""
-    intent_revision: int = 0
-    intent_hash: str = ""
-
-    def validate(self) -> None:
-        if not all((self.task_id, self.workflow_id, self.stage_id, self.target_agent)):
-            raise ValueError("TaskCard 缺少 task/workflow/stage/agent 标识")
-        if self.workflow_revision < 1 or self.base_project_version < 0:
-            raise ValueError("TaskCard Workflow/Project 版本非法")
-
-
-@dataclass
-class ResultEnvelope:
-    task_id: str
-    ok: bool
-    produced_claims: List[str] = field(default_factory=list)
-    proposed_changes: List[Dict[str, Any]] = field(default_factory=list)
-    artifacts: Dict[str, Any] = field(default_factory=dict)
-    note: str = ""
-    outcome: str = ""
-    quality: str = "clean"
-    evidence_grade: str = ""
-    workflow_id: str = ""
-    stage_id: str = ""
-    workflow_revision: int = 0
-    base_project_version: int = 0
-    completion: Dict[str, bool] = field(default_factory=dict)
-    invocations: List[Dict[str, Any]] = field(default_factory=list)
-    acceptance: Dict[str, Any] = field(default_factory=dict)
-    intent_id: str = ""
-    intent_revision: int = 0
-    intent_hash: str = ""
-
-    def validate(self) -> None:
-        if not all((self.task_id, self.workflow_id, self.stage_id)):
-            raise ValueError("ResultEnvelope 缺少 task/workflow/stage 标识")
-        if self.outcome not in ("passed", "failed", "inconclusive"):
-            raise ValueError(f"ResultEnvelope outcome 非法: {self.outcome}")
-        if self.quality not in ("clean", "warning", "failed"):
-            raise ValueError(f"ResultEnvelope quality 非法: {self.quality}")
-        if self.workflow_revision < 1 or self.base_project_version < 0:
-            raise ValueError("ResultEnvelope Workflow/Project 版本非法")
-        if any(not isinstance(value, bool) for value in self.completion.values()):
-            raise ValueError("ResultEnvelope completion 必须为布尔映射")
-
-
-@dataclass
 class Coordination:
-    active_task: Optional[TaskCard] = None
     locked_constraints: List[str] = field(default_factory=list)
     pending_confirmations: List[Dict[str, Any]] = field(default_factory=list)
     snapshots: List[str] = field(default_factory=list)
@@ -526,7 +466,6 @@ def _from_dict(data: Dict[str, Any]) -> SharedState:
     project_data = data.get("project") or {}
     coord_data = data.get("coordination") or {}
     runtime_data = data.get("runtime") or {}
-    active_data = coord_data.get("active_task")
     spec = RadioSpec(
         goals=list(spec_data.get("goals") or []),
         success_conditions=list(spec_data.get("success_conditions") or []),
@@ -567,7 +506,6 @@ def _from_dict(data: Dict[str, Any]) -> SharedState:
             )
         )
     coordination = Coordination(
-        active_task=TaskCard(**active_data) if active_data else None,
         locked_constraints=list(coord_data.get("locked_constraints") or []),
         pending_confirmations=list(
             coord_data.get("pending_confirmations") or []
@@ -586,17 +524,36 @@ def _from_dict(data: Dict[str, Any]) -> SharedState:
         claims=claims,
         coordination=coordination,
         decisions=[
-            WorkflowDecision(**item)
+            WorkflowDecision(
+                decision_id=str(item.get("decision_id") or ""),
+                key=str(item.get("key") or ""),
+                value=item.get("value"),
+                source=str(item.get("source") or ""),
+                permission=str(
+                    item.get("permission")
+                    or item.get("effect_level")
+                    or "project.read"
+                ),
+                workflow_id=str(item.get("workflow_id") or ""),
+                stage_id=str(item.get("stage_id") or ""),
+                ts=float(item.get("ts") or time.time()),
+            )
             for item in data.get("decisions") or []
             if isinstance(item, dict) and item.get("decision_id")
         ],
         runtime=RuntimeState(
             current_node=str(runtime_data.get("current_node") or ""),
             status=str(runtime_data.get("status") or "planned"),
-            requested_effect=str(
-                runtime_data.get("requested_effect") or "READ"
+            requested_permission=str(
+                runtime_data.get("requested_permission")
+                or runtime_data.get("requested_effect")
+                or "project.read"
             ),
-            granted_effects=list(runtime_data.get("granted_effects") or []),
+            granted_permissions=list(
+                runtime_data.get("granted_permissions")
+                or runtime_data.get("granted_effects")
+                or []
+            ),
             blocker=dict(runtime_data.get("blocker") or {}),
             operations=list(runtime_data.get("operations") or []),
             quality=str(runtime_data.get("quality") or "clean"),

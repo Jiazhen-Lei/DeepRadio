@@ -1,12 +1,15 @@
-"""Dynamic Workflow public API."""
+"""MainAgent-owned dynamic Workflow public API."""
 
-from .engine import WorkflowEngine
-from .schema import Checkpoint, Stage, Workflow, WorkflowIntent
+from .dynamic import (
+    DynamicIntent,
+    DynamicStage,
+    DynamicWorkflow,
+    DynamicWorkflowStore,
+)
 
 __all__ = [
-    "Checkpoint",
-    "Stage",
-    "Workflow",
-    "WorkflowEngine",
-    "WorkflowIntent",
+    "DynamicIntent",
+    "DynamicStage",
+    "DynamicWorkflow",
+    "DynamicWorkflowStore",
 ]

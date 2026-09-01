@@ -53,7 +53,7 @@ def _finding(
     group="diagnosis",
     origin="deepradio_control_plane",
     runtime="host_and_vendor_cli",
-    effect_level="DEVICE_READ",
+    permission="device.read",
 )
 def run_diagnosis_checks(
     ctx: ToolContext,

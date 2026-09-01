@@ -1,0 +1,57 @@
+schema_version: 1
+
+stages:
+  clarify_spec:
+    objective: Clarify and record the radio requirements.
+    target_agent: spec_agent
+    expected_evidence: [spec_commit]
+
+  select_design:
+    objective: Select GNU Radio blocks or a suitable recipe.
+    target_agent: radio_design_agent
+    expected_evidence: [select_recipe]
+
+  design_flowgraph:
+    objective: Create or modify the requested GNU Radio flowgraph.
+    target_agent: flowgraph_agent
+    expected_evidence: ["artifact:grc_path"]
+
+  validate_flowgraph:
+    objective: Validate the current flowgraph structure.
+    target_agent: verification_agent
+    expected_evidence: [validate_flowgraph]
+
+  simulate_measure:
+    objective: Simulate the current flowgraph and collect requested metrics.
+    target_agent: verification_agent
+    expected_evidence: [run_simulation]
+
+  diagnose:
+    objective: Diagnose a failure from reproducible evidence.
+    target_agent: diagnosis_agent
+    expected_evidence: [debug_by_metric]
+
+  build_protocol:
+    objective: Build and offline-verify the requested protocol data and waveform.
+    target_agent: protocol_agent
+    expected_evidence: [verify_ble_packet_bits]
+
+  hardware_prepare:
+    objective: Discover and probe the selected SDR without starting RF.
+    target_agent: hardware_agent
+    expected_evidence: [discover_devices, probe_device]
+
+  hardware_arm:
+    objective: Validate and arm the session-owned hardware flowgraph.
+    target_agent: hardware_agent
+    expected_evidence: [arm_hardware_flowgraph]
+
+  hardware_run:
+    objective: Start a bounded RF runtime after explicit user approval.
+    target_agent: hardware_agent
+    expected_evidence: [start_flowgraph]
+
+  hardware_stop:
+    objective: Stop the RF runtime and verify its terminal state.
+    target_agent: hardware_agent
+    expected_evidence: [stop_flowgraph]

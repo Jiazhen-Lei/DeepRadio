@@ -135,7 +135,8 @@ def _activity_from_reply(reply):
                 str(pending.get("purpose") or "") == "rf_authorization"
                 or (
                     not pending.get("purpose")
-                    and str(pending.get("requested_effect") or "") == "RF_RUN"
+                    and str(pending.get("requested_effect") or "")
+                    in {"RF_RUN", "rf.start"}
                 )
             )
             return {

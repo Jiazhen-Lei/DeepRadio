@@ -117,7 +117,7 @@ def _pick_integer_bits(res, probe_id: str = ""):
         },
     },
     group="sim",
-    effect_level="ARTIFACT_WRITE",
+    permission="project.write",
 )
 def run_simulation(ctx: ToolContext, probes: dict = None, timeout: float = 30.0):
     fg = ctx.flow_graph
@@ -171,7 +171,7 @@ def run_simulation(ctx: ToolContext, probes: dict = None, timeout: float = 30.0)
         "required": ["kind"],
     },
     group="sim",
-    effect_level="ARTIFACT_WRITE",
+    permission="project.write",
 )
 def read_metric(ctx: ToolContext, kind: str, probe_id: str = "",
                 modulation: str = "bpsk", sps: int = 4,
@@ -293,7 +293,7 @@ def read_metric(ctx: ToolContext, kind: str, probe_id: str = "",
         },
     },
     group="sim",
-    effect_level="ARTIFACT_WRITE",
+    permission="project.write",
 )
 def plot_constellation(ctx: ToolContext, probe_id: str = "",
                        sps: int = 1, path: str = "", modulation: str = ""):
@@ -327,7 +327,7 @@ def plot_constellation(ctx: ToolContext, probe_id: str = "",
         },
     },
     group="sim",
-    effect_level="ARTIFACT_WRITE",
+    permission="project.write",
 )
 def plot_spectrum(ctx: ToolContext, probe_id: str = "",
                   samp_rate: float = 1.0, path: str = ""):
@@ -359,7 +359,7 @@ def plot_spectrum(ctx: ToolContext, probe_id: str = "",
         },
     },
     group="sim",
-    effect_level="ARTIFACT_WRITE",
+    permission="project.write",
 )
 def plot_eye(ctx: ToolContext, probe_id: str = "", sps: int = 4, path: str = ""):
     _, err = _require_samples(ctx, probe_id)

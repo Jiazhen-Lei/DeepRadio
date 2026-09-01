@@ -70,7 +70,7 @@ class ToolSpec:
     group: str = "misc"
     origin: str = ""
     runtime: str = ""
-    effect_level: str = "READ"
+    permission: str = "project.read"
     idempotent: bool = True
     requires: List[str] = field(default_factory=list)
 
@@ -80,14 +80,6 @@ _REGISTRY: Dict[str, ToolSpec] = {}
 
 #: 已加载过工具模块的标记,避免重复 import
 _LOADED = False
-
-_EFFECT_RANK = {
-    "READ": 0,
-    "ARTIFACT_WRITE": 1,
-    "DEVICE_READ": 2,
-    "DEVICE_CONFIG": 3,
-    "RF_RUN": 4,
-}
 
 #: 各工具模块(相对本包),load_all 时依次 import 触发 @tool 注册
 _TOOL_MODULES = (
@@ -110,7 +102,7 @@ def tool(name: str, description: str,
          group: str = "misc",
          origin: str = "",
          runtime: str = "",
-         effect_level: str = "READ",
+         permission: str = "project.read",
          idempotent: bool = True,
          requires: Optional[List[str]] = None):
     """把一个函数注册为工具。
@@ -135,7 +127,7 @@ def tool(name: str, description: str,
         _REGISTRY[name] = ToolSpec(
             name=name, fn=fn, description=description,
             parameters=schema, group=group, origin=origin, runtime=runtime,
-            effect_level=str(effect_level or "READ").upper(),
+            permission=str(permission or "project.read"),
             idempotent=bool(idempotent),
             requires=list(requires or []))
         return fn
@@ -202,7 +194,7 @@ def call(name: str, arguments: Dict[str, Any],
             "policy": "DENY",
             "error": denial,
             "tool": name,
-            "effect_level": spec.effect_level,
+            "permission": spec.permission,
         }
         if name == "start_flowgraph":
             result.update({"enabled": False, "running": False})
@@ -234,21 +226,13 @@ def call(name: str, arguments: Dict[str, Any],
 def _execution_denial(
     spec: ToolSpec, ctx: ToolContext, arguments: Dict[str, Any]
 ) -> str:
-    """Central execution gateway shared by Agent and deterministic routes."""
+    """Central execution gateway shared by all tool callers."""
     extra = getattr(ctx, "extra", {}) or {}
-    if "stage_allowed_tools" in extra:
-        allowed = set(extra.get("stage_allowed_tools") or [])
-        parent = str(extra.get("_gateway_parent_tool") or "")
-        if spec.name not in allowed and parent not in allowed:
-            return "Stage {} does not authorize tool {}".format(
-                extra.get("stage_id") or "(unknown)", spec.name
-            )
-    ceiling = str(extra.get("stage_effect_level") or "").upper()
-    if ceiling and _EFFECT_RANK.get(spec.effect_level, 0) > _EFFECT_RANK.get(ceiling, 0):
-        return (
-            f"Tool effect {spec.effect_level} exceeds the current Stage "
-            f"effect ceiling {ceiling}"
-        )
+    forbidden = set(extra.get("forbidden_permissions") or [])
+    if spec.permission in forbidden and spec.permission != "rf.stop":
+        return f"Permission {spec.permission} is forbidden for this user request"
+    if spec.permission == "project.write" and extra.get("mutation_forbidden"):
+        return "The current user request is read-only"
     missing = [
         name
         for name in spec.requires
@@ -279,9 +263,9 @@ def _requirement_satisfied(
 
             return bool(_rf_approved(ctx))
         except Exception:  # noqa: BLE001
-            return "RF_RUN" in set(
-                getattr(runtime, "granted_effects", None) or []
-            )
+            return bool({"rf.start", "RF_RUN"} & set(
+                getattr(runtime, "granted_permissions", None) or []
+            ))
     if name == "flowgraph_armed":
         try:
             from .hardware_tools import _rf_armed
@@ -290,6 +274,13 @@ def _requirement_satisfied(
         except Exception:  # noqa: BLE001
             return bool((getattr(project, "config", None) or {}).get("rf_armed"))
     if name == "device_probed":
+        observed = dict(
+            getattr(getattr(state, "project", None), "config", {}).get(
+                "observed_device"
+            ) or {}
+        )
+        if observed.get("identity"):
+            return True
         try:
             from .hardware_tools import _completion_satisfied
 
@@ -319,7 +310,7 @@ def action_metadata(name: str) -> Dict[str, Any]:
         "name": spec.name,
         "description": spec.description,
         "group": spec.group,
-        "effect_level": spec.effect_level,
+        "permission": spec.permission,
         "idempotent": spec.idempotent,
         "requires": list(spec.requires),
         "parameters": dict(spec.parameters),

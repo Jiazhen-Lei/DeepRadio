@@ -1,18 +1,17 @@
-"""orchestrator:用 deepagents ``create_deep_agent`` 组装 DeepRadio 主 Agent。
+"""Assemble the MainAgent-owned DeepRadio control plane.
 
 这是本层的核心 —— 严格按 ``local/docs/agent_architecture_deepagents.md``,
 用 deepagents **现成库**装配真正的深度代理,不再自研编排器:
 
 * ``model``   —— ``build_chat_model`` 把 ``llm.get_config()`` 封成 ``ChatOpenAI``;
-* ``tools``   —— :func:`service.tools_lc.build_grc_tools` 桥接的确定性建图工具;
+* ``tools``   —— MainAgent-only Workflow control tools;
 * ``subagents`` —— :func:`service.subagents.build_grc_subagents` 的 ``SubAgent`` 列表;
 * ``skills``  —— ``skills`` 目录(deepagents 渐进式披露 SKILL);
 * ``backend`` —— ``build_backend`` 的 ``CompositeBackend``;
 * ``checkpointer`` —— ``InMemorySaver``(会话内断点续跑)。
 
-**降级红线**(文档红线 4):未装 deepagents 或未配置 LLM 时,``build_agent``
-返回 ``None``,由 :mod:`service.adapter` 走确定性 ``design_link`` 骨架 —— 保证
-无 LLM 也能建图(论文 baseline)。
+未装 deepagents 或未配置 LLM 时返回 ``None``。生产链路不会静默切换到另一套
+Workflow；确定性能力只作为 SubAgent 调用的工具存在。
 """
 
 from __future__ import annotations
@@ -50,11 +49,6 @@ def release_checkpointer(session_id: str) -> None:
     """会话结束时显式释放其消息历史。"""
     if _CHECKPOINTERS.pop(session_id, None) is not None:
         logger.info("已释放会话 checkpointer: %s", session_id)
-
-
-def stage_tool_names(stage: Any) -> set[str]:
-    """Return the Catalog-owned allowlist for one materialized Stage."""
-    return set(getattr(stage, "allowed_tools", None) or [])
 
 
 def deepagents_available() -> bool:
@@ -146,8 +140,7 @@ def _main_agent_middleware() -> list:
 
     上下文压缩不在这里做:``create_deep_agent`` 已经自带
     ``SummarizationMiddleware``,再挂一个会被 langchain 判为
-    "duplicate middleware instances" 而导致整个图组装失败、静默降级到确定性
-    骨架。``_run_deep`` 的 thread_id 也已按 Stage 隔离历史。
+    "duplicate middleware instances" 而导致整个图组装失败。
     """
     _sub_model, _sub_tool, main_model = _call_limits()
     stack = _limit_middleware(main_model, 0)
@@ -156,9 +149,7 @@ def _main_agent_middleware() -> list:
     return stack
 
 
-def build_agent(
-    ctx: ToolContext, *, stage: Any = None, temperature: float = 0.2
-) -> Optional[Any]:
+def build_agent(ctx: ToolContext, *, temperature: float = 0.2) -> Optional[Any]:
     """组装并返回一个 deepagents 深度代理(``CompiledStateGraph``)。
 
     Args:
@@ -166,14 +157,13 @@ def build_agent(
         temperature: 主 Agent 采样温度。
 
     Returns:
-        编译好的 deepagents 图;若缺 deepagents 或未配置 LLM 则返回 ``None``
-        (调用方据此降级到确定性骨架)。
+        编译好的 deepagents 图；若缺 deepagents 或未配置 LLM 则返回 ``None``。
     """
     if not deepagents_available():
-        logger.info("未安装 deepagents,主 Agent 降级到确定性骨架。")
+        logger.info("未安装 deepagents，MainAgent 不可用。")
         return None
     if not is_available():
-        logger.info("未配置 LLM(GRC_AGENT_*)或缺 langchain_openai,降级到确定性骨架。")
+        logger.info("未配置 LLM(GRC_AGENT_*)或缺 langchain_openai，MainAgent 不可用。")
         return None
 
     from deepagents import create_deep_agent
@@ -187,32 +177,20 @@ def build_agent(
         checkpointer = None
 
     chat = build_chat_model(temperature=temperature)
-    agent_names = list(getattr(stage, "recommended_agents", None) or [])
-    agent_tools = set(_subagents.tool_names_for_agents(agent_names))
-    stage_tools = stage_tool_names(stage)
-    tool_names = sorted(agent_tools & stage_tools)
-    subs = _apply_sub_limits(
-        _subagents.build_grc_subagents(ctx, agent_names, tool_names))
-    # 有可委派 subagent 时,主 Agent 不直接持有业务工具(deepagents 会自动
-    # 注册 task 工具),TaskCard 的 target_agent 才真正生效;否则 LLM 会走
-    # 捷径直调工具,委派形同虚设。
-    tools: list = [] if subs else _import_tools(ctx, tool_names)
+    agent_names = _subagents.subagent_names()
+    subs = _apply_sub_limits(_subagents.build_grc_subagents(ctx))
+    workflow_store = ctx.extra.get("workflow_store")
+    if workflow_store is None:
+        raise ValueError("ToolContext is missing the dynamic Workflow store")
+    from .workflow_tools import build_workflow_tools
+
+    # MainAgent never receives domain tools. DeepAgents adds ``task`` for
+    # delegation; these two tools are its only host-side mutation authority.
+    tools = build_workflow_tools(ctx, workflow_store)
     be = build_backend()
     style_prompt = _resolve_style_prompt(ctx)
     orch_prompt = _subagents.build_orchestrator_prompt(
         agent_names or _subagents.subagent_names(), style_prompt=style_prompt)
-    if stage is not None:
-        workflow_data = dict(ctx.extra.get("workflow") or {})
-        intent_data = dict(workflow_data.get("intent") or {})
-        orch_prompt += (
-            "\n【当前 Workflow Stage】\n"
-            f"stage_id={stage.id}; completion={stage.completion}; "
-            f"必须通过 task 工具把 TaskCard 委派给以下 subagent 之一执行: "
-            f"{', '.join(agent_names)};禁止直接调用业务工具完成任务。\n"
-            f"capabilities={intent_data.get('capabilities') or []}; "
-            f"slot_sources={intent_data.get('slot_sources') or {}}。"
-            "raw_text 是目标原文；context 只能作为待验证背景，不能覆盖用户本轮参数。\n"
-        )
 
     agent_kwargs: dict[str, Any] = {}
     main_mw = _main_agent_middleware()
@@ -230,14 +208,8 @@ def build_agent(
         **agent_kwargs,
     )
     logger.info("deepagents 主 Agent 组装完成: %d tools, %d subagents",
-                len(tools), len(subs))
+        len(tools), len(subs))
     return agent
-
-
-def _import_tools(ctx: ToolContext, allowed: list[str] | None = None) -> list:
-    """主 Agent 也持有建图工具(可不委派直接建简单图)。"""
-    from . import tools_lc
-    return tools_lc.build_grc_tools(ctx, allowed=allowed)
 
 
 def _resolve_style_prompt(ctx: ToolContext) -> str:

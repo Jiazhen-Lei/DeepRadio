@@ -106,9 +106,8 @@ def commit_intent(ctx: ToolContext, text: str) -> Dict[str, Any]:
     """Project the canonical LLM-owned SharedIntent into the legacy Spec view.
 
     This tool deliberately performs no text interpretation.  Natural-language
-    understanding belongs to ``IntentAlignmentCoordinator``; accepting raw
-    text here used to create a second rule-derived intent that could disagree
-    with the shared intent and mistake confirmation turns for new goals.
+    understanding belongs to MainAgent; accepting raw text here would create
+    a second intent source that could disagree with the active Workflow.
     """
     state = _state(ctx)
     shared = state.intent
@@ -245,7 +244,7 @@ def spec_clarify(ctx: ToolContext, text: str = ""):
         "required": ["text"],
     },
     group="state",
-    effect_level="ARTIFACT_WRITE",
+    permission="project.write",
 )
 def spec_commit(ctx: ToolContext, text: str):
     return commit_intent(ctx, text)
@@ -291,7 +290,7 @@ def select_recipe(ctx: ToolContext, intent: str = "", recipe: str = ""):
     description="Bind current simulation metrics to pending claims.",
     parameters={"type": "object", "properties": {}},
     group="state",
-    effect_level="ARTIFACT_WRITE",
+    permission="project.write",
 )
 def verify_claims(ctx: ToolContext):
     return verify_state_claims(ctx, ctx.extra.get("metrics", {}))
@@ -312,7 +311,7 @@ def verify_claims(ctx: ToolContext):
     group="hardware",
     origin="deepradio_state",
     runtime="shared_state",
-    effect_level="ARTIFACT_WRITE",
+    permission="project.write",
 )
 def configure_sdr(
     ctx: ToolContext,
@@ -380,7 +379,7 @@ def configure_sdr(
     group="hardware",
     origin="deepradio_state",
     runtime="shared_state",
-    effect_level="DEVICE_READ",
+    permission="device.read",
 )
 def hardware_preflight(ctx: ToolContext, device_type: str = ""):
     state = _state(ctx)
@@ -460,7 +459,7 @@ def hardware_preflight(ctx: ToolContext, device_type: str = ""):
         "required": ["block_id", "parameter", "value"],
     },
     group="build",
-    effect_level="ARTIFACT_WRITE",
+    permission="project.write",
 )
 def apply_grc_diff(
     ctx: ToolContext,
@@ -542,7 +541,7 @@ def apply_grc_diff(
         "required": ["operations"],
     },
     group="build",
-    effect_level="ARTIFACT_WRITE",
+    permission="project.write",
 )
 def apply_flowgraph_patch(
     ctx: ToolContext,

@@ -14,7 +14,7 @@ graph **while the hardware sink is enabled**, then disable it. Host
 re-validation uses `arm_disabled_rf` so a later critic pass on that unarmed
 graph is not a Stage failure — GNU Radio reports `Port is not connected` for
 disabled sinks. RF start is disabled
-by default and requires the dedicated Workflow checkpoint,
+by default and requires an explicit MainAgent user-decision request,
 `GRC_AGENT_ENABLE_RF=1`, a session-owned `.grc`, bounded duration, and a
 verified stop. Realtime spectrum appears in the GNU Radio QT window, not as a
 PNG in chat. `stop_flowgraph` and `emergency_stop` are always allowed. Never

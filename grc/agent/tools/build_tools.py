@@ -23,7 +23,7 @@ from .registry import ToolContext, tool
     group="build",
     origin="deepradio_compose",
     runtime="gnuradio_blocks",
-    effect_level="ARTIFACT_WRITE",
+    permission="project.write",
 )
 def init_flow_graph(
     ctx: ToolContext, flowgraph_id: str, generate_options: str = "no_gui"
@@ -58,7 +58,7 @@ def init_flow_graph(
     group="build",
     origin="deepradio_compose",
     runtime="gnuradio_blocks",
-    effect_level="ARTIFACT_WRITE",
+    permission="project.write",
 )
 def add_block(
     ctx: ToolContext, key: str, id: str, params: Optional[dict] = None
@@ -103,7 +103,7 @@ def add_block(
     group="build",
     origin="deepradio_compose",
     runtime="gnuradio_blocks",
-    effect_level="ARTIFACT_WRITE",
+    permission="project.write",
 )
 def set_param(ctx: ToolContext, id: str, name: str, value):
     block = ctx.blocks.get(id)
@@ -139,7 +139,7 @@ def set_param(ctx: ToolContext, id: str, name: str, value):
     group="build",
     origin="deepradio_compose",
     runtime="gnuradio_blocks",
-    effect_level="ARTIFACT_WRITE",
+    permission="project.write",
 )
 def connect(
     ctx: ToolContext,
@@ -191,7 +191,7 @@ def connect(
     group="build",
     origin="deepradio_compose",
     runtime="gnuradio_blocks",
-    effect_level="ARTIFACT_WRITE",
+    permission="project.write",
 )
 def render_grc(ctx: ToolContext, path: str = ""):
     flow_graph = ctx.flow_graph

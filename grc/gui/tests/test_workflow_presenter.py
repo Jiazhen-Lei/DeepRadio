@@ -593,6 +593,25 @@ class WorkflowPresenterTest(unittest.TestCase):
         self.assertEqual([item["id"] for item in monitor["pending"]], ["hardware_precheck"])
         self.assertEqual(len(monitor["stages"]), 3)
 
+    def test_dynamic_rf_permission_keeps_existing_confirmation_ui(self):
+        view = interaction_view(
+            {
+                "wait_kind": "approval",
+                "current_stage": "hardware_run",
+                "checkpoint_id": "checkpoint-1",
+                "checkpoint_purpose": "rf_authorization",
+                "requested_effect": "rf.start",
+            },
+            {
+                "action": "hardware_run",
+                "checkpoint_id": "checkpoint-1",
+                "purpose": "rf_authorization",
+                "requested_effect": "rf.start",
+            },
+        )
+        self.assertTrue(view["visible"])
+        self.assertEqual(view["confirm_label"], "Approve Bounded Transmission")
+
 
 if __name__ == "__main__":
     unittest.main()

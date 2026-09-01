@@ -2,11 +2,10 @@
 
 FlowgraphAgent 完成后返回紧凑 JSON：
 
-- `task_id`：原样复制 TaskCard 的任务 ID。
-- `ok`：仅当确定性建图和校验都成功时为 true。
-- `produced_claims`：本轮创建或更新的结构 Claim。
-- `proposed_changes`：被 PolicyGateway 暂停、等待确认的改动。
+- `workflow_id`、`revision`、`base_project_version`、`stage_id`：原样复制 TaskCard。
+- `outcome`：`passed`、`failed` 或 `inconclusive`。
 - `artifacts`：生成的 `.grc` 和相关产物路径。
+- `evidence`：本轮成功工具结果对应的证据名称。
 - `note`：配方、块数、校验结论与剩余风险。
 
 约束：

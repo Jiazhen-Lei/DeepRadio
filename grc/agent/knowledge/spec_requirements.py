@@ -23,17 +23,15 @@ _DEFAULT_SOURCES = frozenset({
     "safe_preview_default", "derived", "rules", "",
 })
 
-# Slot-key synonyms merged onto canonical keys before rendering so the card
-# never shows two rows for the same fact (e.g. `device` + `hardware`).  Keep
-# in sync with workflow/engine.py::_SLOT_ALIASES.
+_SLOT_ALIASES = {
+    "device": "hardware",
+    "sdr": "hardware",
+    "radio": "hardware",
+}
+
+
 def _slot_alias_canon() -> Dict[str, str]:
-    """槽位同义键映射,复用 ``workflow.engine`` 的单一定义。
-
-    以前这里维护了一份手抄副本并靠注释提醒"保持同步",两份一旦走样就会出现
-    ``device`` 与 ``hardware`` 两行重复事实。惰性导入避免模块级循环依赖。
-    """
-    from ..workflow.engine import _SLOT_ALIASES
-
+    """Return the canonical slot aliases used by specification rendering."""
     return dict(_SLOT_ALIASES)
 
 

@@ -18,17 +18,10 @@ logger = logging.getLogger(__name__)
 
 def build_common_constraints() -> str:
     return (
-        "All user-facing narrative, summaries, questions, labels, errors, and recommendations must be written in English, even when the user writes in another language.\n"
-        "面向用户的叙述要友好、简洁：先说完成了什么，再给带单位的关键结果，最后说下一步；"
-        "不要出现工具名、工具调用成功与否、内部字段、JSON 或日志式列表。\n"
-        "专职子代理，不与用户对话。产物只写 /session/work/<你的域>/，禁止写 /session/final/。\n"
-        "按需读 SKILL.md。向主 Agent 回报：做了什么、artifacts 路径、风险。\n"
-        "工具调用要收敛：同一目标已返回 ok 的工具（validate/inspect/design 等）"
-        "不要重复调用；无新信息就返回 ResultEnvelope 结束。"
-        "相互独立的工具调用放在同一轮并行发出，减少往返轮次。\n"
-        "每轮输出要短：工具调用轮只写必要参数，不复述计划；"
-        "回报 ResultEnvelope 时正文控制在 120 字以内，不逐条罗列已完成步骤。\n"
-        "artifacts 在宿主机上，GUI 会展示；不要用 read_file / ls / glob 确认是否存在。\n"
+        "你是领域执行 Agent，不与用户交互。"
+        "执行 TaskCard 并保留其中的 Workflow、Stage 和工程版本，遵循指定 Skill，调用已绑定工具。"
+        "返回简短的结构化结果和 Evidence，不修改 Workflow，不扩大任务范围。"
+        "宿主机 artifact 由 GUI 展示，不用文件工具重复确认。\n"
     )
 
 
@@ -37,29 +30,13 @@ def build_orchestrator_prompt(subagent_names: Iterable[str],
     names = ", ".join(subagent_names)
     style_section = f"\n【STYLE】{style_prompt}\n" if style_prompt else ""
     return (
-        "All user-facing output must be in English, including questions, confirmations, progress summaries, errors, and recommendations. "
-        "最终面向用户的答复必须是友好的叙述：先说完成了什么，再给带单位的关键结果，最后说下一步或需要用户决定什么；"
-        "禁止罗列工具名、工具调用成功与否、内部字段或 JSON；禁止日志式列表。\n"
-        "你是 DeepRadio 主编排：只做路由、分派 TaskCard、汇总冲突、面向用户交付。"
-        "领域工作委派给子代理，工程变更只能走已绑定工具。\n"
-        f"可委派：{names}\n"
-        "每次委派传完整 TaskCard JSON，不得改版本字段；按当前 Stage 的 "
-        "recommended_agents 选能完成 completion 的最小集合。"
-        "遇 DENY / CONFIRM、失败 Claim 或待确认项则停止并告知用户。\n"
-        "停止并直接答复：design_flowgraph 已 ok+valid 且指标满足；"
-        "或连续两次工具无新信息。同一目标不要重复 design_flowgraph / run_simulation"
-        " / validate_flowgraph（结果 ok 后不再复验）"
-        "（simulate=True 已含仿真和绘图）。artifacts 在宿主机，不要用文件工具确认。\n"
-        "遵守 raw_text、IntentIR goals/constraints/stop_conditions、capabilities、"
-        "forbidden_capabilities、slot_sources、completion；"
-        "forbidden_capabilities 禁止调度对应硬件/部署工具。"
-        "Task Type 仅是兼容/评测标签，不得用标签改写目标；"
-        "按产物、证据和下一决策边界组织最短可执行计划。"
-        "context 是背景，不得把硬件或实时观测改写成离线仿真。"
-        "配方必须覆盖全部 capabilities，否则按块构建或报缺口，禁止近义顶替。\n"
-        "换调制用 design_flowgraph 等确认，禁止 apply_grc_diff 改星座；"
-        "用户说「确认」后运行时会重建，不必再选型。"
-        "「只诊断 / 先不要改」禁止 design_flowgraph、apply_grc_diff。\n"
+        "你是 DeepRadio 的唯一用户接口和 Workflow 负责人。"
+        "读取 grc-orchestration Skill，理解用户目标并维护最短 Workflow。"
+        "领域任务必须通过 task 委派给 SubAgent，不直接调用领域工具。"
+        "根据宿主验证的 Evidence 决定继续、重试、重新编排或结束。"
+        "缺少信息或涉及物理 RF 执行时，用 request_user_decision 询问用户。"
+        "最终使用用户当前语言简洁回复，不输出内部字段、JSON 或工具日志。"
+        f"可委派：{names}。\n"
         + style_section
     )
 
@@ -68,9 +45,7 @@ def _domain_prompt(role: str, skill: str, duties: str) -> str:
     return (
         build_common_constraints()
         + f"角色：{role}。SKILL：{skill}。\n{duties}\n"
-        "输入 TaskCard；返回 ResultEnvelope JSON"
-        "（保留版本字段；outcome=passed|failed|inconclusive；"
-        "completion 为 expected_results→bool）。不得绕过工具或 PolicyGateway。\n"
+        "输入 TaskCard；返回包含 outcome、artifacts 和 evidence 的 JSON。\n"
     )
 
 
@@ -214,8 +189,6 @@ _SUBAGENT_DEFS = [
 
 def build_grc_subagents(
     ctx: ToolContext,
-    allowed_agents: List[str] | None = None,
-    allowed_tools: List[str] | None = None,
 ) -> List[Dict[str, Any]]:
     """按共享 ctx 生成 deepagents ``SubAgent`` 列表。
 
@@ -227,10 +200,7 @@ def build_grc_subagents(
     """
     subagents: List[Dict[str, Any]] = []
     seen = set()
-    allowed = set(allowed_agents or ())
     for name, desc, prompt_builder, skills, tool_names in _SUBAGENT_DEFS:
-        if allowed and name not in allowed:
-            continue
         if name in seen:
             raise ValueError(f"subagent 名称重复: {name}")
         seen.add(name)
@@ -241,9 +211,7 @@ def build_grc_subagents(
             "system_prompt": prompt_builder(),
             "skills": [f"/workspace/skills/{skill}/" for skill in skills],
         }
-        stage_tools = set(allowed_tools or ())
-        names = [name for name in tool_names if not stage_tools or name in stage_tools]
-        bound = tools_lc.build_grc_tools(ctx, allowed=names) if names else []
+        bound = tools_lc.build_grc_tools(ctx, allowed=tool_names) if tool_names else []
         if bound:
             sub["tools"] = bound
         subagents.append(sub)
@@ -254,13 +222,3 @@ def build_grc_subagents(
 def subagent_names() -> List[str]:
     """返回已注册 subagent 名称。"""
     return [d[0] for d in _SUBAGENT_DEFS]
-
-
-def tool_names_for_agents(agent_names: List[str]) -> List[str]:
-    wanted = set(agent_names or [])
-    return sorted({
-        tool_name
-        for name, _desc, _prompt, _skills, tool_names in _SUBAGENT_DEFS
-        if not wanted or name in wanted
-        for tool_name in tool_names
-    })
