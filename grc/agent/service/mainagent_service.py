@@ -257,17 +257,34 @@ class ServiceAgent:
             "Read grc-orchestration. Maintain the Workflow with update_workflow, "
             "delegate domain work through task, and use only verified evidence."
         )
+        from .trace import build_trace_callback
+
+        trace = build_trace_callback(
+            session_id=self.session_id,
+            context=lambda: {
+                "workflow_id": self._workflow.workflow.workflow_id,
+                "revision": self._workflow.workflow.revision,
+                "stage_id": self._workflow.workflow.current_stage,
+            } if self._workflow.workflow else {},
+        )
+        if trace:
+            trace.start()
         try:
             result = agent.invoke(
                 {"messages": [{"role": "user", "content": prompt}]},
                 {
                     "configurable": {"thread_id": self.session_id},
                     "recursion_limit": _recursion_limit(),
+                    "callbacks": [trace] if trace else [],
                 },
             )
         except Exception as exc:  # noqa: BLE001
+            if trace:
+                trace.finish(exc)
             logger.exception("MainAgent execution failed")
             return self._error_reply(f"MainAgent execution failed: {type(exc).__name__}: {exc}")
+        if trace:
+            trace.finish()
         narrative = self._extract_final_text(result)
         self._record_delegations(result)
         reply = self._fold(ctx, narrative, ok=True)
