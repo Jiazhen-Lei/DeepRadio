@@ -422,21 +422,6 @@ class ClaimsPanel(Gtk.Frame):
                 box.pack_start(self._build_stage_row(stage), False, False, 0)
             expander.add(box)
             self._workflow_steps.pack_start(expander, False, False, 0)
-        transition = dict(workflow.get("transition") or {})
-        if transition:
-            marker = "↩" if transition.get("kind") == "back" else "→"
-            text = "{} {} → {} ({})".format(
-                marker,
-                transition.get("from") or "—",
-                transition.get("to") or "—",
-                transition.get("reason") or "state transition",
-            )
-            label = _stage_label()
-            label.set_markup("<span foreground='#98A2B3'>{}</span>".format(
-                _escape(text)))
-            label.set_margin_top(3)
-            label.override_font(self._font_desc(-2))
-            self._workflow_steps.pack_start(label, False, False, 0)
         for attempt in workflow.get("previous_workflows") or []:
             self._workflow_steps.pack_start(
                 self._build_previous_attempt_line(attempt), False, False, 0

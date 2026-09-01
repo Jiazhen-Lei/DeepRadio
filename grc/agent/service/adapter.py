@@ -1,7 +1,9 @@
-"""adapter: GUI 守门 —— ServiceAgent.step -> AgentReply / .grc。
+"""GUI/API adapter for the bounded-hybrid DeepAgent control plane.
 
-主路径: WorkflowEngine 驱动 Stage；主机控制面执行 BLE/硬件门；
-可选 deepagents。未装 LLM 时走确定性 handler / design_link。
+WorkflowEngine owns transitions and acceptance.  Catalog ``execution_mode``
+selects bounded DeepAgent coordination only where semantic reasoning adds
+value; fixed verification, checkpoint, hardware and safety-finalizer stages
+remain host controlled.  Policy and tool invariants apply to every route.
 """
 
 from __future__ import annotations
@@ -33,7 +35,12 @@ from ..workflow.completion import (
     external_waiting_note,
 )
 from ..workflow.intent_alignment import IntentAlignmentCoordinator
-from ..workflow.planning import is_rf_grant_effect, stage_display_label
+from ..workflow.planning import (
+    EffectLevel,
+    is_rf_grant_effect,
+    normalize_effect,
+    stage_display_label,
+)
 from ..workflow.revision import analyze_intent_patch
 from . import orchestrator as _orch
 from . import session_store as _store
@@ -45,22 +52,48 @@ logger = logging.getLogger(__name__)
 DEFAULT_RECURSION_LIMIT = 150
 MAX_AUTONOMOUS_STAGES_PER_TURN = 16
 
-# Safety-critical and deterministic protocol stages are executed by the host
-# control plane.  The LLM still creates/routs the Workflow, but cannot omit,
-# reorder, or duplicate hardware gates by choosing tools opportunistically.
-_HOST_CONTROLLED_STAGES = frozenset({
-    "hardware_precheck",
-    "configure_and_check",
-    "build_ble_advertiser",
-    "offline_protocol_verify",
-    "discover_and_probe_device",
-    "discover_and_probe_hardware",
-    "configure_device",
-    "transmit_bounded",
-    "run_bounded",
-    "stop_and_finalize",
-    "stop_runtime",
-})
+def _execution_override() -> str:
+    """Optional experiment override; safety-owned stages are never agentic."""
+    mode = (os.environ.get("DEEPRADIO_EXECUTION_MODE") or "").strip().lower()
+    return mode if mode in {"deterministic", "deepagents"} else "auto"
+
+
+def _resolved_stage_mode(stage: Any) -> str:
+    """Resolve Catalog mode plus bounded experiment override.
+
+    Hybrid stages use the deterministic fast path on their first attempt and
+    invoke DeepAgent only after a failed attempt supplies new evidence.  An
+    explicit ``deepagents`` override is useful for ablation experiments, but
+    cannot move checkpoints, hardware actions, or safety finalizers out of the
+    host control plane.
+    """
+    declared = str(getattr(stage, "execution_mode", "hybrid") or "hybrid")
+    if declared in {"checkpoint", "deterministic", "safety_finalizer"}:
+        return declared
+    override = _execution_override()
+    if override == "deterministic":
+        return "deterministic"
+    if override == "deepagents":
+        return "agentic"
+    if declared == "hybrid":
+        return "agentic" if _hybrid_has_repair_evidence(stage) else "deterministic"
+    return "agentic"
+
+
+def _hybrid_has_repair_evidence(stage: Any) -> bool:
+    """True after a failed Hybrid attempt that left a usable repair delta."""
+    records = [dict(getattr(stage, "result", None) or {})]
+    records.extend(
+        item
+        for item in list(getattr(stage, "result_history", None) or [])
+        if isinstance(item, dict)
+    )
+    for item in records:
+        failed = item.get("outcome") == "failed" or item.get("ok") is False
+        if failed or item.get("improvement_available") or item.get("missing_completion"):
+            return True
+    return False
+
 
 # User-facing observation channel: omit routing/tool bookkeeping so a fast
 # deterministic stage does not flood GTK with log-like redraws.
@@ -842,6 +875,12 @@ class ServiceAgent:
             return self._workflow_waiting_reply()
         ctx.extra["workflow"] = workflow.to_dict()
         ctx.extra["stage_id"] = stage.id
+        ctx.extra["stage_allowed_tools"] = list(
+            getattr(stage, "allowed_tools", None) or []
+        )
+        ctx.extra["stage_effect_level"] = str(
+            getattr(stage, "effect_level", "READ") or "READ"
+        )
         task_card = _stage_executor.make_task_card(
             workflow, stage, self._state, stage_text
         )
@@ -1129,25 +1168,15 @@ class ServiceAgent:
             if stage.execution_status != "waiting":
                 self._workflow._activate_current()
             return self._workflow_waiting_reply()
-        if stage.id in _HOST_CONTROLLED_STAGES or self._prefer_host_stage(stage, recipe):
+        mode = _resolved_stage_mode(stage)
+        ctx.extra["stage_execution_mode"] = mode
+        ctx.extra["declared_execution_mode"] = str(
+            getattr(stage, "execution_mode", "") or ""
+        )
+        if mode != "agentic":
+            ctx.extra["execution_mode"] = "deterministic"
             return self._run_stage_deterministic(
                 ctx, stage_text, recipe, simulate, stage.id
-            )
-        covering = None
-        if "flowgraph_saved" in (stage.completion or []):
-            from ..knowledge.recipes import covering_recipe
-
-            covering = covering_recipe(
-                stage_text,
-                list(
-                    self._workflow.workflow.intent.capabilities
-                    if self._workflow.workflow else []
-                ),
-                recipe,
-            )
-        if covering is not None:
-            return self._run_stage_deterministic(
-                ctx, stage_text, covering.name, simulate, stage.id
             )
         agent = None
         try:
@@ -1156,6 +1185,16 @@ class ServiceAgent:
             logger.warning("组装 deepagents 失败,改走确定性骨架: %s", exc)
         try:
             if agent is not None:
+                _store.append_session_event(
+                    self.session_id,
+                    "stage_routed",
+                    self._workflow_event_payload({
+                        "stage_id": stage.id,
+                        "declared_mode": getattr(stage, "execution_mode", ""),
+                        "resolved_mode": mode,
+                        "executor": "deepagents",
+                    }),
+                )
                 return self._run_deep(agent, ctx, stage_text)
             return self._run_stage_deterministic(
                 ctx, stage_text, recipe, simulate, stage.id
@@ -1168,40 +1207,6 @@ class ServiceAgent:
             return self._error_reply(
                 f"Orchestration error: {type(exc).__name__}: {exc}"
             )
-
-    def _prefer_host_stage(self, stage: Any, recipe: str) -> bool:
-        """Host handlers win for inspect/diagnose/measure and known recipe apply."""
-        capabilities = set(
-            self._workflow.workflow.intent.capabilities
-            if self._workflow.workflow else []
-        )
-        # A hardware artifact is a hard contract, not a suggestion to the LLM.
-        # Keep build/change stages on the deterministic control plane so a
-        # failed SDR builder cannot be "recovered" with a File-Sink recipe.
-        if (
-            "hardware_configure" in capabilities
-            and stage.id in {
-                "build_and_verify", "tx_build_and_validate",
-                "rx_build_and_verify", "apply_and_verify",
-            }
-        ):
-            return True
-        if stage.id in {
-            "inspect_and_plan",
-            "inspect_and_diagnose",
-            "inspect_and_measure",
-        }:
-            return True
-        if stage.id != "apply_and_verify":
-            return False
-        from ..knowledge.recipes import get_recipe
-
-        slots = (
-            self._workflow.workflow.intent.slots
-            if self._workflow.workflow else {}
-        )
-        target = str(slots.get("target_recipe") or recipe or "")
-        return get_recipe(target) is not None
 
     def _continue_autonomous(
         self, first: AgentReply, *, recipe: str, simulate: bool
@@ -1556,7 +1561,16 @@ class ServiceAgent:
         ):
             return self._error_reply("There is no stage available to retry.")
         blocker = dict(self._state.runtime.blocker or {})
-        if blocker and not blocker.get("retryable", False):
+        # Retry effects are Stage-local.  A future hardware tail must not make
+        # an offline protocol verifier scan or block on an SDR.
+        hardware_stage = normalize_effect(
+            getattr(stage, "effect_level", "READ")
+        ) >= EffectLevel.DEVICE_READ
+        if (
+            blocker
+            and not blocker.get("retryable", False)
+            and not hardware_stage
+        ):
             reply = self._workflow_waiting_reply()
             reply.needs_confirmation = False
             reply.text = "{}{}".format(
@@ -1569,7 +1583,7 @@ class ServiceAgent:
         # involves hardware, re-discover and re-probe the device first so a
         # reconnected SDR is actually picked up instead of replaying the old
         # failure with stale inputs.
-        probe_note = self._refresh_hardware_for_retry()
+        probe_note = self._refresh_hardware_for_retry(stage)
         if probe_note.startswith("SDR_NOT_FOUND:"):
             # Persist the failure counter BEFORE returning: this early exit
             # used to skip workflow.save(), so hw_retry_failures never
@@ -1613,7 +1627,7 @@ class ServiceAgent:
             reply.text = "{}\n{}".format(reply.text, probe_note).strip()
         return reply
 
-    def _refresh_hardware_for_retry(self) -> str:
+    def _refresh_hardware_for_retry(self, stage: Any = None) -> str:
         """Re-check the SDR before a retry; stash evidence for the next stage.
 
         Returns an empty string when the workflow does not involve hardware,
@@ -1623,8 +1637,10 @@ class ServiceAgent:
         workflow = self._workflow.workflow
         if workflow is None:
             return ""
-        capabilities = set(workflow.intent.capabilities or [])
-        if not capabilities & {"hardware_configure", "deploy", "hardware_runtime"}:
+        active = stage or self._workflow.current_stage()
+        if active is None or normalize_effect(
+            getattr(active, "effect_level", "READ")
+        ) < EffectLevel.DEVICE_READ:
             return ""
         from ..tools import registry
 
@@ -1857,7 +1873,11 @@ class ServiceAgent:
                   user_text: str) -> AgentReply:
         ctx.extra["execution_mode"] = "deepagents"
         workflow = dict(ctx.extra.get("workflow") or {})
-        task_card = dict(ctx.extra.get("task_card") or {})
+        # thread 粒度到 Stage,不含 task_id:``make_task_card`` 每次都生成新
+        # task_id,把它放进 thread_id 会让同一 Stage 的第 2 次尝试丢掉第 1 次
+        # 的历史(不知道试过什么、错在哪),只能从头再试。保留 revision,
+        # 这样 intent 变更时自动换新 thread,旧历史不会与新意图打架。
+        # 跨 Stage 仍然隔离,避免上下文无限膨胀。
         thread_id = ":".join(
             str(item)
             for item in (
@@ -1865,7 +1885,6 @@ class ServiceAgent:
                 workflow.get("workflow_id") or "workflow",
                 workflow.get("revision") or 0,
                 ctx.extra.get("stage_id") or "stage",
-                task_card.get("task_id") or "attempt",
             )
         )
         config = {"configurable": {"thread_id": thread_id},

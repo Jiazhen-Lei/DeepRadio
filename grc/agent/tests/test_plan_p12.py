@@ -113,6 +113,7 @@ class PlanCompilerContractTest(unittest.TestCase):
         stage = Stage.from_dict({
             "id": "apply_and_verify",
             "effect_level": "READ",
+            "allowed_tools": ["apply_grc_diff"],
         })
         compile_stages(object(), [stage])
         self.assertEqual(stage.effect_level, "ARTIFACT_WRITE")

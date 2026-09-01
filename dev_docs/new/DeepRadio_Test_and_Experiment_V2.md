@@ -1,56 +1,23 @@
-# DeepRadio 测试与实验 V2
+# DeepRadio 测试与实验（V3 架构基线）
 
-> 更新日期：2026-08-31<br>
-> 当前证据：当前工作区代码全量自动回归（agent tests `250 passed, 1 skipped`；GUI tests `20 passed`）与 2026-08-30 PlutoSDR 真机冒烟；`local/agent_sessions/0827|0828` 历史目录仅作版本基线<br>
-> 环境：所有自动测试和 GUI/HIL 实验均使用 `gnuradio` Conda 环境<br>
-> 原则：历史实验保留为版本基线；代码发生行为相关修改后，必须在新目录重跑，不能覆盖旧记录。
+> 日期：2026-09-01
+> 本文保留兼容文件名 `V2`，内容只描述当前 V3 验收；`local/agent_sessions/0827|0828|0830|0831` 仅作历史基线，不得覆盖。
+> 环境：所有自动测试和 GUI/HIL 实验均使用 `gnuradio` Conda 环境。
+> 原则：软件通过、HIL-ready、设备可见、RF 运行通过、空口已观察必须分开记录；没有真实设备不得写成 PlutoSDR RF passed。
 
 ---
 
-## 0. 2026-08-31 V6 泛化链路验收
+## 0. 当前证据等级
 
-新增/更新的自动契约覆盖：
-
-- 等价 TurnIR 不依赖用户原句；活动自然语言轮次只调用一次 semantic LLM，并在同一结果中携带 relation 与参数增量。
-- completed preview 后带 operation 的 follow-up 建立 deploy Workflow；无 checkpoint 的纯 confirmation 保持安全拒绝。
-- planner proposal 不得改写已有 Stage 的 producer/dependency/completion，不得提高 effect；未知 action、悬空 transition、缺 probe/grant/stop 的 RF plan 必须拒绝或无损回退。
-- host preflight 成功但 discovery 失败时，不得产生 detected/probed/configured 物理设备事实；RF start 依赖 discovery + probe + grant，OTA 事实绑定同一 run id。
-- presenter 边界的默认可见文本必须为英文，且不包含 `workflow_id/task_type/stage_id/revision/completion` 或日志式 `Intent:/Completed:` 字段。
-
-执行分层：
-
-1. 无头核心：`python -m unittest grc.agent.tests.test_plan_p12 grc.agent.tests.test_workflow`
-2. 完整 GNU Radio block library：`grc.agent.tests.test_hardware/test_ble/test_seven_tasks`
-3. GTK 环境（需 PyGObject `gi`）：`grc.gui.tests.test_workflow_presenter`
-4. HIL：连接目标 SDR 后验证 identity mismatch、probe failure、RF disabled、bounded start/stop 与独立 OTA observation。
-
-## 0. 2026-08-30 V5 增量：硬件意图对齐与探测链路回归
-
-### 0.1 新增契约测试
-
-| 位置 | 测试 | 验证内容 |
+| 等级 | 状态 | 证据 |
 |---|---|---|
-| `test_workflow.py` | `test_llm_device_alias_merges_onto_hardware` | LLM 用 `device` 键回答时归一到 `hardware`，source=llm，不残留 `device` 键 |
-| `test_workflow.py` | `test_seed_hardware_survives_llm_omission_with_literal_evidence` | LLM 漏提取时，有字面证据的 hardware/protocol 种子存活，missing 判定不再追问 |
-| `test_workflow.py` | `test_llm_answer_still_wins_over_seed_fallback` | LLM 显式回答始终优先于种子兜底 |
-| `test_workflow.py` | `test_specification_merges_device_alias_into_single_hardware_row` | 规格卡对 `device`+`hardware` 只渲染一行 `hardware` |
-| `test_hardware.py` | `CrossFamilyDiscoveryTest.test_b210_miss_reports_a_present_pluto` | 期望 B210 未找到时跨家族扫描发现 Pluto，返回 `devices` + `mismatch_hint` |
-| `test_hardware.py` | `CrossFamilyDiscoveryTest.test_hit_on_expected_family_skips_cross_scan` | 期望家族命中时不做任何额外扫描（零开销） |
-| `test_hardware.py` | `test_repeated_hardware_failure_escalates_to_llm_diagnosis` | 连续两次失败后重试提示附加 `Diagnosis:` 行，LLM 恰好调用一次 |
-| `test_hardware.py` | `test_successful_recheck_resets_failure_counter` | 发现设备后 `hw_retry_failures` 清零 |
-| `test_hardware.py` | `test_retry_reports_missing_device_and_does_not_rerun`（升级） | 重试预检把 intent 的 `device_type=pluto` 传入 `discover_devices` |
+| `software_passed` | 本轮目标 | Catalog/Gateway/Hybrid 路由、Completion、GUI waiting 动作；GNU Radio 全量单测 |
+| `hil_ready` | 软件链已具备 | Pluto BLE PDU / 波形 / disabled `.grc` / `grcc`；RF-disabled 拒绝 arm/start |
+| `device_detected` | 以当次扫描为准 | `iio_info -S usb` 无 context 时不得宣称 detected |
+| `rf_runtime_passed` | 未宣称 | 需要匹配设备、绑定 grant、时长上限、run id、受控 stop |
+| `ota_verified` | 未宣称 | 需要独立接收证据 |
 
-同时保留 V4 回归守护 `test_llm_omission_drops_nonconflicting_rule_candidates`：无字面证据的 regex 猜测不得因 LLM 漏提取而存活——种子兜底不得破坏该契约。
-
-### 0.2 回归与冒烟结果（2026-08-30，`gnuradio` Conda 环境）
-
-```bash
-python -m unittest discover -s grc/agent/tests -p 'test_*.py'
-```
-
-- agent tests：`234 passed, 1 skipped`（B210 HIL 条件跳过）。
-- 真机冒烟：`discover_devices(device_type="plutosdr")` → 执行 `iio_info -S usb` → `device_found=True, identity=usb:2.4.5`。对应 V5 会话中"3 次 `uhd_find_devices` 失败"的场景现在一次命中。
-- GUI 本轮未改动，沿用 `17 passed` 基线；GUI/HIL 人工实验（第 3、4 节）不因无头测试通过而免除。
+上一轮 V3 控制面落地后，确定性软件回归中的 GNU Radio `/var/tmp` 映射失败属于环境权限，不是算法失败。本轮继续补齐 Hybrid 失败证据路由、Gateway deny 事件、hardware_precheck 工具范围和 `flowgraph_saved` 写工具绑定。
 
 ---
 
@@ -101,7 +68,8 @@ PYTHONPATH=$PWD python -m unittest discover -s grc/gui/tests -t . -v
 
 | 测试位置 | 覆盖 |
 |---|---|
-| `grc/agent/tests/test_workflow.py` | LLM intent/plan trace；未配置与异常 fallback；`signal_source_scope`；checkpoint purpose；未知 predicate 不通过；槽位别名归一；字面证据种子兜底；LLM 优先级；规格卡去重（V5） |
+| `grc/agent/tests/test_execution_routing.py` | V3 Catalog profile、Hybrid fast path / 失败后 DeepAgent、Gateway scope/effect/deny 事件、离线 retry 不扫硬件 |
+| `grc/agent/tests/test_workflow.py` | LLM intent/plan trace；未配置与异常 fallback；checkpoint purpose；未知 predicate 不通过；槽位别名归一；字面证据种子兜底 |
 | `grc/agent/tests/test_plan_p12.py` | 工具 effect 上界；LLM 不得删除安全尾部；开放复合文本不被七类标签歪曲 |
 | `grc/agent/tests/test_seven_tasks.py` | 七类主路径；事实化回复；GraphPatch 优先；诊断报告；离线/实时来源 |
 | `grc/agent/tests/test_hardware.py` | 版本指纹；可复现导出；路径迁移；RF active/ever；underflow quality；三种 checkpoint；重试预检传参、跨家族扫描、LLM 失败诊断、计数复位（V5） |

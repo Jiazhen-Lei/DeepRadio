@@ -483,6 +483,17 @@ def interaction_view(
             "requested_effect": workflow.get("requested_effect"),
             "purpose": workflow.get("checkpoint_purpose"),
         }
+    elif not item and wait in {"recovery", "capability"}:
+        item = {
+            "action": (
+                "stage_recovery" if wait == "recovery" else "capability_blocker"
+            ),
+            "blocker": dict(workflow.get("blocker") or {}),
+            "can_retry": bool(
+                wait == "recovery"
+                or dict(workflow.get("blocker") or {}).get("retryable")
+            ),
+        }
     action = str(item.get("action") or "")
     if not action or item.get("approved"):
         return {"visible": False}
@@ -569,6 +580,15 @@ def interaction_view(
         "action": action,
         "purpose": purpose,
         "checkpoint_id": item.get("checkpoint_id"),
+        "allowed_actions": [
+            name
+            for name, enabled in (
+                ("confirm", can_confirm),
+                ("retry_stage", can_retry),
+                ("cancel_workflow", True),
+            )
+            if enabled
+        ],
     }
 
 

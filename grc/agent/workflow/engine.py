@@ -39,7 +39,13 @@ from .planning import (
     stops_at_boundary,
     system_capability_blocker,
 )
-from .schema import Checkpoint, Stage, Workflow, WorkflowIntent
+from .schema import (
+    STAGE_EXECUTION_MODES,
+    Checkpoint,
+    Stage,
+    Workflow,
+    WorkflowIntent,
+)
 from ..knowledge.spec_requirements import normalize_direction
 from ..tools.hardware_profiles import resolve_hardware_profile
 
@@ -295,19 +301,36 @@ def _task_type_from_capabilities(
     blocked = set(forbidden or [])
     caps = set(capabilities or [])
     slots = dict(slots or {})
-    if "diagnose" in caps:
+    # V2 §5.5: a compound request keeps the task candidate with the largest
+    # end-state scope.  "Build BPSK through AWGN with EVM below 10%" carries
+    # a diagnose capability only as the post-build verification step, so a
+    # build capability must outrank it.  A genuine diagnosis request has no
+    # build capability and still maps to DIAGNOSE below (previously the
+    # first rule here swallowed END_TO_END_SIM/RX_BUILD requests).
+    build_caps = caps & {"build_signal", "build_rx", "build_tx"}
+    # LLM 是语义权威:它明确判定 OBSERVE 且本轮带观测能力时,不能被 diagnose
+    # 规则吞掉。"查看频谱和星座图并报告主峰,只观察不修改"(手册 Task 6)会同时
+    # 带出 diagnose 能力(读指标),但终态产物是测量结果而非诊断结论。
+    observe_caps = caps & {"observe", "realtime_observe"}
+    if current == "OBSERVE" and observe_caps and not build_caps:
+        return "OBSERVE"
+    if "diagnose" in caps and not build_caps:
         return "DIAGNOSE"
+    # V2 §5.5: Task 类型按最终产物、验收方式和**安全边界**划分。
+    # operation=prepare 是 LLM 明确判定的执行效果边界("停在发射确认"),语义
+    # 强度高于 modify_project 这个附带的"保存配置"副作用能力;若让
+    # modify_project 先命中,手册 Task 7 就会丢掉硬件 Stage 与 RF 确认点。
+    if (
+        "hardware_configure" in caps
+        and slots.get("operation") == "prepare"
+        and "hardware_configure" not in blocked
+    ):
+        return "HARDWARE_CONFIGURE"
     if "modify_project" in caps:
         return "MODIFY_PROJECT"
     if (
         "protocol" in caps
         and slots.get("operation") == "deploy"
-        and "hardware_configure" not in blocked
-    ):
-        return "HARDWARE_CONFIGURE"
-    if (
-        "hardware_configure" in caps
-        and slots.get("operation") == "prepare"
         and "hardware_configure" not in blocked
     ):
         return "HARDWARE_CONFIGURE"
@@ -319,6 +342,12 @@ def _task_type_from_capabilities(
     )
     if hardware_primary:
         return "HARDWARE_CONFIGURE"
+    # V2 §5.5: 复合请求取终态范围最大的候选。端到端的判据是**发与收同时存在**
+    # (build_tx + build_rx);``build_signal`` 只是"要有激励信号"的辅助能力,
+    # 例如 "self-contained BPSK receiver"(手册 Task 3)会带 build_signal 生成
+    # 内部测试激励,但终态产物仍是接收机,必须落 RX_BUILD。
+    if {"build_tx", "build_rx"} <= caps:
+        return "END_TO_END_SIM"
     if "build_rx" in caps:
         return "RX_BUILD"
     if "build_tx" in caps:
@@ -334,6 +363,75 @@ def _task_type_from_capabilities(
     if current in _TASK_TYPES:
         return current
     return "END_TO_END_SIM"
+
+
+#: Task Type -> 该候选的 Stage 能真正承载的核心能力。
+#: 只列"必须由这个 Task 的 Stage 才能完成"的能力;像 observe / diagnose 这类
+#: 每个候选的验证 Stage 都能顺带完成的能力不在此列,否则会把普通仿真请求
+#: 误判成"无法承载"。
+_TASK_CORE_CAPABILITIES = {
+    "END_TO_END_SIM": {"build_signal", "build_tx", "build_rx"},
+    "TX_BUILD": {"build_tx", "build_signal"},
+    "RX_BUILD": {"build_rx", "build_signal"},
+    "DIAGNOSE": {"diagnose"},
+    "MODIFY_PROJECT": {"modify_project"},
+    "OBSERVE": {"observe", "realtime_observe", "signal_agnostic_observe"},
+    "HARDWARE_CONFIGURE": {
+        "hardware_configure", "hardware_runtime", "deploy", "protocol",
+    },
+}
+#: 需要独立 Stage 编排与安全边界的能力:LLM 选的候选若覆盖不了它们,
+#: 说明这个 task_type 执行不下去(会丢 Stage 或丢确认点),必须归一化。
+_STAGE_CRITICAL_CAPABILITIES = {
+    "build_tx", "build_rx", "build_signal", "modify_project",
+    "hardware_configure", "hardware_runtime", "deploy",
+}
+
+
+def _reconcile_task_type(
+    llm_task_type: str,
+    capabilities: list[str],
+    *,
+    slots: Dict[str, Any] | None = None,
+    forbidden: list[str] | None = None,
+) -> str:
+    """以 LLM 判定为准,仅在它无法承载自身 capabilities 时才归一化。
+
+    V2 §5.1 把 task_type 定义为"兼容标签",真正决定执行的是 capabilities 与
+    Stage 编排。因此这里的契约是:
+
+    1. LLM 给出的 task_type 只要能覆盖它自己列出的 stage-critical 能力,就
+       原样采纳 —— 语义权威属于 LLM,规则不得改写(这正是手册 Task 6 里
+       ``OBSERVE`` 曾被 ``diagnose`` 规则改成 ``DIAGNOSE`` 的问题)。
+    2. 只有当 LLM 的候选装不下它要求的能力时(例如判 ``END_TO_END_SIM`` 却
+       要求 ``hardware_configure`` + ``hardware_runtime``,而该候选没有硬件
+       Stage 与 RF 确认点),才交给确定性投影重选,避免执行阶段丢 Stage。
+
+    这样不额外增加一轮 LLM 调用,又消除了"规则无条件覆盖 LLM"。
+    """
+    caps = [name for name in (capabilities or []) if name in _CAPABILITIES]
+    slot_values = dict(slots or {})
+    if llm_task_type not in _TASK_TYPES:
+        return _task_type_from_capabilities(
+            caps, llm_task_type, slots=slot_values, forbidden=forbidden
+        )
+    # 单向链路有独立的验收契约:RX_BUILD 要 receive_quality_evaluated(BER),
+    # TX_BUILD 只做结构校验。LLM 把明确的单向请求判成 END_TO_END_SIM 时会丢掉
+    # 这个契约,而 direction 是它自己给出的槽位,足以判定,无需再问一轮。
+    direction = str(slot_values.get("direction") or "").lower()
+    if (
+        llm_task_type == "END_TO_END_SIM"
+        and direction in ("rx", "tx")
+        and not {"build_tx", "build_rx"} <= set(caps)
+    ):
+        return "RX_BUILD" if direction == "rx" else "TX_BUILD"
+    required = set(caps) & _STAGE_CRITICAL_CAPABILITIES
+    covered = _TASK_CORE_CAPABILITIES.get(llm_task_type, set())
+    if required <= covered:
+        return llm_task_type
+    return _task_type_from_capabilities(
+        caps, llm_task_type, slots=slot_values, forbidden=forbidden
+    )
 
 
 class WorkflowEngine:
@@ -360,8 +458,23 @@ class WorkflowEngine:
         with open(self.catalog_path, "r", encoding="utf-8") as handle:
             data = json.load(handle)
         candidates = data.get("task_candidates")
+        profiles = data.get("stage_profiles")
         if data.get("schema_version") != 1 or not isinstance(candidates, dict):
             raise ValueError("Unsupported Task Catalog")
+        if not isinstance(profiles, dict):
+            raise ValueError("Task Catalog is missing stage_profiles")
+        for stage_id, profile in profiles.items():
+            if not stage_id or not isinstance(profile, dict):
+                raise ValueError("Task Catalog contains an invalid stage profile")
+            mode = str(profile.get("execution_mode") or "")
+            if mode not in STAGE_EXECUTION_MODES:
+                raise ValueError(
+                    f"Stage profile {stage_id} has invalid execution_mode: {mode}"
+                )
+            if not isinstance(profile.get("allowed_tools"), list):
+                raise ValueError(
+                    f"Stage profile {stage_id} must declare allowed_tools"
+                )
         for task_type, candidate in candidates.items():
             stage_sets = [list(candidate.get("stages") or [])]
             if candidate.get("deploy_stages"):
@@ -369,7 +482,26 @@ class WorkflowEngine:
             if candidate.get("runtime_stages"):
                 stage_sets.append(list(candidate.get("runtime_stages") or []))
             for stages in stage_sets:
+                for stage in stages:
+                    stage_id = str(stage.get("id") or "")
+                    profile = profiles.get(stage_id)
+                    if profile is None:
+                        raise ValueError(
+                            f"Task {task_type} stage {stage_id} has no stage profile"
+                        )
+                    for key, value in profile.items():
+                        stage.setdefault(key, list(value) if isinstance(value, list) else value)
                 self._validate_catalog_stages(task_type, stages)
+        from ..tools import registry
+
+        registry.load_all()
+        known_tools = set(registry.names()) | {"design_flowgraph"}
+        for stage_id, profile in profiles.items():
+            unknown = set(profile.get("allowed_tools") or []) - known_tools
+            if unknown:
+                raise ValueError(
+                    f"Stage profile {stage_id} uses unknown tools: {sorted(unknown)}"
+                )
         return data
 
     @staticmethod
@@ -387,6 +519,10 @@ class WorkflowEngine:
             if unknown_completion:
                 raise ValueError(
                     f"Task {task_type} uses unknown completion conditions: {sorted(unknown_completion)}"
+                )
+            if stage.get("execution_mode") not in STAGE_EXECUTION_MODES:
+                raise ValueError(
+                    f"Task {task_type} stage {stage.get('id')} has invalid execution_mode"
                 )
             for target in (stage.get("on") or {}).values():
                 if target not in ids and target not in _TERMINAL_TARGETS:
@@ -646,6 +782,8 @@ relation 只能取:
 规则:
 - 补充参数和修改参数都是 adjustment,绝不是 new_task。例如 "the local name must be X" 是对当前发射任务的参数补充。
 - 询问事实、含义、为什么、有多少、哪一个信道等是 question,即使当前有确认点。question 不得推进工作流。
+- question 仅限"只用已有信息就能回答"的提问。要求系统**去做诊断/测量/观测**并产出结论、证据或建议(例如 "diagnose the EVM ... explain the cause and give a suggestion"、"查看当前频谱并报告主峰")的,是新目标 new_task,即使句中含 explain/why;这类请求需要新建 DIAGNOSE / OBSERVE 工作流,不能当成 question 只答不做。
+- 当前工作流已 completed 时,新一轮实质请求默认是 new_task,不要再判 adjustment/feedback。
 - 只有用户明确提出与当前工作流不同的新目标才是 new_task。
 - current_workflow 只是背景;不要因为文本里提到协议名或设备名就判定 new_task。
 - 当前没有确认点(stage_status 不是 waiting 或没有 checkpoint)时,不要输出 approval/rejection。
@@ -1141,9 +1279,9 @@ relation 只能取:
             if name not in set(intent.context.get("forbidden_capabilities") or ())
         ]
         llm_task_type = intent.task_type
-        intent.task_type = _task_type_from_capabilities(
+        intent.task_type = _reconcile_task_type(
+            llm_task_type,
             intent.capabilities,
-            intent.task_type,
             slots=intent.slots,
             forbidden=list(intent.context.get("forbidden_capabilities") or []),
         )
@@ -1152,7 +1290,7 @@ relation 只能取:
                 "llm_task_type": llm_task_type,
                 "normalized_task_type": intent.task_type,
                 "capabilities": list(intent.capabilities),
-                "reason": "capability_plan_compatibility",
+                "reason": "task_type_cannot_cover_capabilities",
             })
         intent.missing_slots = self._missing_slots(
             intent.task_type, intent.slots, shared_state, intent.capabilities
@@ -1524,7 +1662,16 @@ relation 只能取:
         )
         if task_type in {"DIAGNOSE", "MODIFY_PROJECT", "OBSERVE"} and not hardware_diagnosis:
             project = getattr(shared_state, "project", None)
-            if not (getattr(project, "grc_path", "") or getattr(project, "config", {}).get("recipe")):
+            project_ready = bool(
+                getattr(project, "grc_path", "")
+                or getattr(project, "config", {}).get("recipe")
+                # The user explicitly confirmed "the canvas project is the
+                # current project" through the sole-choice interaction, so
+                # the field is answered even if the host state has not yet
+                # registered the canvas file.
+                or slots.get("current_project") == "current_canvas"
+            )
+            if not project_ready:
                 missing.append("current_project")
         if task_type == "HARDWARE_CONFIGURE" or "hardware_configure" in capabilities:
             for key in ("hardware", "carrier_frequency", "sample_rate"):
@@ -1892,6 +2039,8 @@ relation 只能取:
                     Stage.from_dict({
                         "id": "flowgraph_confirmation",
                         "interaction": "checkpoint",
+                        "execution_mode": "checkpoint",
+                        "allowed_tools": [],
                         "recommended_agents": ["flowgraph_agent"],
                         "completion": ["flowgraph_decision_recorded"],
                         "depends_on": ["project.flowgraph"],
@@ -2476,6 +2625,7 @@ relation 只能取:
             "completion_result": dict(stage.result.get("completion") or {}),
             "quality": str(stage.result.get("quality") or "clean"),
             "unbound_predicates": list(stage.unbound_predicates),
+            "execution_mode": stage.execution_mode,
         }
 
     @staticmethod
@@ -2494,6 +2644,7 @@ relation 只能取:
             "completion_result": {},
             "quality": "clean",
             "unbound_predicates": list(item.get("unbound_predicates") or []),
+            "execution_mode": str(item.get("execution_mode") or "hybrid"),
         }
 
     def digest(self) -> Dict[str, Any]:
@@ -2541,7 +2692,18 @@ relation 只能取:
             "blocker": blocker,
             "interaction_request": (
                 {
+                    "id": (
+                        stage.checkpoint.id
+                        if stage and stage.checkpoint
+                        else "{}:{}:{}:{}".format(
+                            self.workflow.workflow_id,
+                            self.workflow.current_stage,
+                            self.workflow.revision,
+                            wait_kind,
+                        )
+                    ),
                     "kind": wait_kind,
+                    "status": "pending",
                     "purpose": (
                         stage.checkpoint.purpose
                         if stage and stage.checkpoint else ""
@@ -2551,6 +2713,15 @@ relation 只能取:
                         stage.checkpoint.id
                         if wait_kind == "approval" and stage and stage.checkpoint
                         else ""
+                    ),
+                    "allowed_actions": (
+                        ["checkpoint_decision", "cancel_workflow"]
+                        if wait_kind == "approval"
+                        else ["retry_stage", "cancel_workflow"]
+                        if wait_kind in {"recovery", "capability"}
+                        else ["interaction_response", "cancel_workflow"]
+                        if wait_kind in {"input", "intent"}
+                        else ["cancel_workflow"]
                     ),
                 }
                 if wait_kind
@@ -2971,11 +3142,18 @@ _CAPABILITIES = frozenset(
         "hardware_runtime",
     }
 )
+#: 槽位同义键 -> 规范键。``knowledge.spec_requirements`` 直接复用这一份,
+#: 避免两处手动同步走样。
 _SLOT_ALIASES = {
     "device": "hardware",
     "sdr": "hardware",
     "radio": "hardware",
 }
+#: 只有这三类来源是确定性事实(安全边界与当前工程),LLM 不得改写;
+#: 其余规则候选一律让位于 LLM 的原文解读(见 ``_merge``)。
+_DETERMINISTIC_SLOT_SOURCES = frozenset({
+    "safety_default", "safe_preview_default", "current_project",
+})
 _EXECUTION_MODES = frozenset({
     "design", "prepare", "configure", "deploy", "observe", "diagnose",
 })
@@ -3000,13 +3178,15 @@ _PROMPT = """你是 DeepRadio 的 Intent 语义解析器。只输出一个 JSON 
 - “使用/通过某个真实 SDR 发射或发送一个信号”描述的是实际 RF 行为，必须为 deploy；只有明确要求 build/create/configure/save a transmit chain/flowgraph 而没有要求信号实际发射时才是 design/configure。不得把 transmit a signal 改写成 build a transmit chain。
 - 已有未 arm 的硬件预览图时，「现在发射/运行 N 秒」是新一轮 deploy，复用当前工程参数，不要重建，也不要当成配置确认。
 - 目标是保存配置或停在下一决策、尚未授权射频: operation=prepare，deploy_permission=pending，stop_at_decision_boundary；仍做只读预检。
+- "configure ... for the <设备>, save the configuration, and stop at the transmission confirmation" 这类"给指定 SDR 配置并停在发射确认"的请求必须是 execution_mode=prepare、operation=prepare、deploy_permission=pending，并且要给出 hardware 槽位；不要判成 design 或纯粹的工程修改(modify_project)。
 - 「不要发射」才是 deploy_permission=forbidden；与「先停在确认」不是同一件事。
 - 配置/保存发射流图不是 TX_BUILD，也不是已经授权 RF_RUN。
 - 不得把实时硬件观察改写成离线仿真。
 - 不得因为载频像 2.4 GHz 就判定 BLE，除非用户说了 ble/蓝牙/广播。
-- "transmit chain" / "transmit-only" means direction=tx; "receive chain" means direction=rx.
+- "transmit chain" / "transmit-only" means direction=tx; "receive chain" means direction=rx; a baseband / end-to-end / loopback simulation link with no separate tx-only or rx-only target means direction=sim. direction 必须在 tx / rx / sim 三者中取值,不要省略。
 - slots must include every parameter explicitly stated in the current user text.
-- slots 只能用规范键名: hardware(设备型号, 如 plutosdr/b210/hackrf), protocol, direction, modulation, carrier_frequency, sample_rate, bandwidth, duration_seconds, local_name, ble_mode, advertising_channels, payload, success_conditions。设备型号必须写在 hardware 键下, 禁止用 device/sdr/radio 等同义键。
+- slots 只能用规范键名: hardware(设备型号, 如 plutosdr/b210/hackrf), protocol, direction, modulation, carrier_frequency, sample_rate, bandwidth, duration_seconds, local_name, ble_mode, advertising_channels, payload, success_conditions, diagnosis_dimensions。设备型号必须写在 hardware 键下, 禁止用 device/sdr/radio 等同义键。
+- 出现 diagnose 能力时必须给出 diagnosis_dimensions: 从 intent / environment / device / parameters / project / runtime / rf_path / signal 中选出本轮真正要排查的维度(数组)。判断依据是用户描述的现象,不要一次全选。
 - deterministic_context.preserved_slots 里 slot_sources 为 safety_default/safe_preview_default/current_project 的是确定性安全与工程事实，不得改写；其余 preserved 值若与用户原文冲突，以你从原文的提取为准。
 - 不得把 safety_default 时长改写成用户约束；用户没写时长就不要填 duration。prepare/配置确认不要写 30 秒。
 - 不要发明 local_name。
@@ -3054,16 +3234,13 @@ def complete_intent(
         raise SemanticUnderstandingError(
             "The language model is not configured. Your request was not interpreted."
         )
-    deterministic_sources = {
-        "safety_default", "safe_preview_default", "current_project",
-    }
     preserved_slots = {
         key: value for key, value in rules_intent.slots.items()
-        if rules_intent.slot_sources.get(key) in deterministic_sources
+        if rules_intent.slot_sources.get(key) in _DETERMINISTIC_SLOT_SOURCES
     }
     preserved_sources = {
         key: value for key, value in rules_intent.slot_sources.items()
-        if value in deterministic_sources
+        if value in _DETERMINISTIC_SLOT_SOURCES
     }
     payload = {
         "text": text,
@@ -3236,26 +3413,17 @@ def _merge(rules: WorkflowIntent, parsed: dict[str, Any]) -> WorkflowIntent:
     capabilities = [name for name in capabilities if name not in forbidden]
     # Production never promotes regex/keyword candidates to user facts.  Only
     # host-owned safety defaults and current-project facts survive before the
-    # LLM extraction is applied.
-    deterministic_sources = {
-        "safety_default", "safe_preview_default", "current_project",
-    }
+    # LLM extraction is applied: values the regex layer labelled
+    # "user"/"derived"/"protocol_default" are still guesses about the user's
+    # text, and the LLM extraction of that same text is the authoritative
+    # reading that must win on conflict.
     slots = {
         key: value for key, value in rules.slots.items()
-        if rules.slot_sources.get(key) in deterministic_sources
+        if rules.slot_sources.get(key) in _DETERMINISTIC_SLOT_SOURCES
     }
     sources = {
         key: value for key, value in rules.slot_sources.items()
-        if value in deterministic_sources
-    }
-    # Only deterministic safety bounds and current-project facts are locked.
-    # Values the regex layer labelled "user"/"derived"/"protocol_default" are
-    # still guesses about the user's text; the LLM extraction of that same
-    # text is the authoritative reading and must win on conflict.  This keeps
-    # the shared intent and the workflow intent in one transaction instead of
-    # two disagreeing projections.
-    locked = {
-        "safety_default", "safe_preview_default", "current_project",
+        if value in _DETERMINISTIC_SLOT_SOURCES
     }
     llm_slots = dict(parsed.get("slots") or {})
     # Normalize common synonyms onto canonical keys so a `device` answer
@@ -3271,7 +3439,7 @@ def _merge(rules: WorkflowIntent, parsed: dict[str, Any]) -> WorkflowIntent:
     for key, value in llm_slots.items():
         if value in (None, "", []):
             continue
-        if sources.get(key) in locked:
+        if sources.get(key) in _DETERMINISTIC_SLOT_SOURCES:
             continue
         slots[key] = value
         sources[key] = "llm"
@@ -3410,6 +3578,12 @@ def _apply_semantic_defaults(
     operation = str(slots.get("operation") or "").lower()
     if slots.get("direction") not in (None, "", []):
         slots["direction"] = normalize_direction(slots.get("direction"))
+    elif "build_signal" in capabilities and not slots.get("hardware"):
+        # V2 §6.1 把 direction 列为结构槽位,下游 recipe 选型和 spec 卡片都要读它。
+        # 这里只从 **LLM 自己给出的 capabilities** 派生,不复活正则猜测:
+        # 有 build_signal 又没有硬件,就是基带端到端仿真链路 => sim。
+        slots["direction"] = "sim"
+        sources["direction"] = "derived"
     current = dict(context.get("current_project") or {})
     if operation in {"deploy", "prepare"}:
         for key in (

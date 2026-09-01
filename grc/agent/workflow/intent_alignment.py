@@ -97,7 +97,17 @@ class IntentAlignmentCoordinator:
                 and str(semantic.get("intent_action") or "") == "question"
             ) or (semantic is None and _looks_like_question(text)):
                 return self._answer_question(text)
-            return self._answer_fields(text, source="user_text")
+            if (
+                semantic is not None
+                and str(semantic.get("intent_action") or "") == "confirm"
+                and not dict(semantic.get("updates") or {})
+            ):
+                # The user replied with a confirmation while a field was
+                # pending.  Dropping that turn re-asked the same question
+                # forever (observed: three consecutive alignment turns with
+                # intent_action=confirm, updated_fields=[], no progress).
+                return self._confirm_requested_fields()
+            return self._answer_fields(text, source="user_text", semantic=semantic)
         return self._start(text)
 
     def _consume_confirmation_test_bypass(self, text: str) -> AlignmentOutcome:
@@ -296,7 +306,13 @@ class IntentAlignmentCoordinator:
         self.event_sink("intent_draft_created", self._event_payload())
         return self._evaluate(intent, had_user_questions=False)
 
-    def _answer_fields(self, text: str, *, source: str) -> AlignmentOutcome:
+    def _answer_fields(
+        self,
+        text: str,
+        *,
+        source: str,
+        semantic: Optional[Dict[str, Any]] = None,
+    ) -> AlignmentOutcome:
         """Merge every reliably extracted answer from one natural-language turn."""
         interaction = dict(self.state.intent.interaction or {})
         fields = list(interaction.get("fields") or [])
@@ -305,7 +321,11 @@ class IntentAlignmentCoordinator:
             fields.insert(0, field)
         if not fields:
             return self._merge_free_text(text)
-        semantic_updates = self._alignment_updates_from_llm(text, fields)
+        semantic_updates = (
+            dict(semantic.get("updates") or {})
+            if semantic is not None
+            else self._alignment_updates_from_llm(text, fields)
+        )
         if semantic_updates is None:
             # Deterministic unit-test bypass only. Production never reaches
             # this branch, so a model outage cannot become a regex guess.
@@ -404,6 +424,54 @@ class IntentAlignmentCoordinator:
         self.event_sink(
             "interaction_answered",
             {**self._event_payload(), "fields": changed, "source": source},
+        )
+        return self._evaluate(
+            self._to_workflow_intent(shared), had_user_questions=True
+        )
+
+    def _confirm_requested_fields(self) -> AlignmentOutcome:
+        """Resolve an explicit confirmation received while fields are pending.
+
+        A pending field whose specification offers exactly one non-custom
+        choice (for example ``current_project``) is a default the user can
+        only accept or abandon; an explicit confirmation therefore accepts
+        it.  Fields without such a sole choice stay open and the coordinator
+        keeps waiting for a real answer instead of silently inventing one.
+        """
+        from ..knowledge.spec_requirements import load_requirements
+
+        shared = self.state.intent
+        requirements = load_requirements().get("fields") or {}
+        changed = []
+        for key in list(shared.missing_fields or []):
+            spec = requirements.get(key) or {}
+            choices = list(spec.get("choices") or [])
+            if len(choices) != 1 or spec.get("allow_custom"):
+                continue
+            value = choices[0].get("value")
+            if value in (None, "", []):
+                continue
+            shared.parameters[key] = value
+            shared.parameter_sources[key] = "user_choice"
+            changed.append(key)
+        if not changed:
+            return self._evaluate(
+                self._to_workflow_intent(shared), had_user_questions=True
+            )
+        shared.revision += 1
+        shared.record_patch(
+            changed_fields=changed,
+            scope="intent_only",
+            source="user_confirmation",
+            note="accepted sole-choice defaults: {}".format(changed),
+        )
+        self.event_sink(
+            "interaction_answered",
+            {
+                **self._event_payload(),
+                "fields": changed,
+                "source": "user_confirmation",
+            },
         )
         return self._evaluate(
             self._to_workflow_intent(shared), had_user_questions=True

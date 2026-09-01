@@ -1,12 +1,7 @@
 """工具注册表:统一的 ``@tool`` 装饰器 + JSON-Schema + 调度入口。
 
-设计目标(对应架构文档第 6 节的调度决策):
-
-* **function-calling 为主**: :func:`openai_schemas` 导出 OpenAI ``tools`` 数组,
-  每个工具带 JSON-Schema 参数描述,供模型可靠地选工具、填参数。
-* **ReAct 文本协议兜底**: :func:`react_tool_descriptions` 导出人类可读的
-  ``名称(参数): 说明`` 清单,用于不支持 function-calling 的接口/离线场景,
-  由 Agent 主循环解析 ``Action/Action Input``。
+工具由 :mod:`service.tools_lc` 桥接为 LangChain ``StructuredTool``,再经
+deepagents 的 function-calling 协议供主 Agent / Subagent 调度。
 
 工具签名统一为 ``fn(ctx, **kwargs) -> dict``:
 
@@ -85,6 +80,14 @@ _REGISTRY: Dict[str, ToolSpec] = {}
 
 #: 已加载过工具模块的标记,避免重复 import
 _LOADED = False
+
+_EFFECT_RANK = {
+    "READ": 0,
+    "ARTIFACT_WRITE": 1,
+    "DEVICE_READ": 2,
+    "DEVICE_CONFIG": 3,
+    "RF_RUN": 4,
+}
 
 #: 各工具模块(相对本包),load_all 时依次 import 触发 @tool 注册
 _TOOL_MODULES = (
@@ -176,54 +179,6 @@ def runtime_of(name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 导出: OpenAI function-calling schema(主)
-# ---------------------------------------------------------------------------
-def openai_schemas(groups: Optional[List[str]] = None) -> List[Dict[str, Any]]:
-    """导出 OpenAI ``tools`` 数组,直接放进 chat/completions 请求的 ``tools`` 字段。
-
-    Args:
-        groups: 只导出指定分组的工具(如 ["knowledge","build"]);None 导全部。
-    """
-    load_all()
-    out = []
-    for spec in _REGISTRY.values():
-        if groups and spec.group not in groups:
-            continue
-        out.append({
-            "type": "function",
-            "function": {
-                "name": spec.name,
-                "description": spec.description,
-                "parameters": spec.parameters,
-            },
-        })
-    return out
-
-
-# ---------------------------------------------------------------------------
-# 导出: ReAct 文本协议(兜底)
-# ---------------------------------------------------------------------------
-def react_tool_descriptions(groups: Optional[List[str]] = None) -> str:
-    """导出人类/模型可读的工具清单,用于 ReAct 文本协议提示词。
-
-    形如::
-
-        - search_blocks(query: string) : 语义检索可用块
-        - add_block(key: string, id: string) : 往流图添加一个块
-    """
-    load_all()
-    lines = []
-    for spec in _REGISTRY.values():
-        if groups and spec.group not in groups:
-            continue
-        props = spec.parameters.get("properties", {})
-        arg_str = ", ".join(
-            f"{k}: {v.get('type', 'any')}" for k, v in props.items())
-        lines.append(f"- {spec.name}({arg_str}) : {spec.description}")
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
 # 调度
 # ---------------------------------------------------------------------------
 def call(name: str, arguments: Dict[str, Any],
@@ -240,6 +195,25 @@ def call(name: str, arguments: Dict[str, Any],
     if spec is None:
         return {"ok": False, "error": f"未知工具: {name}",
                 "available": names()}
+    denial = _execution_denial(spec, ctx, arguments or {})
+    if denial:
+        result = {
+            "ok": False,
+            "policy": "DENY",
+            "error": denial,
+            "tool": name,
+            "effect_level": spec.effect_level,
+        }
+        if name == "start_flowgraph":
+            result.update({"enabled": False, "running": False})
+        if name == "arm_hardware_flowgraph":
+            result["armed"] = False
+        _record_gateway_decision(ctx, spec, "DENY", denial)
+        return result
+    _record_gateway_decision(ctx, spec, "ALLOW", "")
+    marker = object()
+    previous_parent = ctx.extra.get("_gateway_parent_tool", marker)
+    ctx.extra["_gateway_parent_tool"] = spec.name
     try:
         result = spec.fn(ctx, **(arguments or {}))
         if not isinstance(result, dict):
@@ -252,6 +226,106 @@ def call(name: str, arguments: Dict[str, Any],
     except Exception as exc:  # noqa: BLE001
         logger.exception("工具 %s 执行异常", name)
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        if previous_parent is marker:
+            ctx.extra.pop("_gateway_parent_tool", None)
+        else:
+            ctx.extra["_gateway_parent_tool"] = previous_parent
+
+
+def _record_gateway_decision(
+    ctx: ToolContext, spec: ToolSpec, decision: str, reason: str
+) -> None:
+    extra = getattr(ctx, "extra", None)
+    if not isinstance(extra, dict):
+        return
+    extra.setdefault("events", []).append({
+        "kind": "execution_gateway",
+        "decision": decision,
+        "tool": spec.name,
+        "effect_level": spec.effect_level,
+        "stage_id": extra.get("stage_id") or "",
+        "reason": reason,
+    })
+
+
+def _execution_denial(
+    spec: ToolSpec, ctx: ToolContext, arguments: Dict[str, Any]
+) -> str:
+    """Central execution gateway shared by Agent and deterministic routes."""
+    extra = getattr(ctx, "extra", {}) or {}
+    if "stage_allowed_tools" in extra:
+        allowed = set(extra.get("stage_allowed_tools") or [])
+        parent = str(extra.get("_gateway_parent_tool") or "")
+        if spec.name not in allowed and parent not in allowed:
+            return "Stage {} does not authorize tool {}".format(
+                extra.get("stage_id") or "(unknown)", spec.name
+            )
+    ceiling = str(extra.get("stage_effect_level") or "").upper()
+    if ceiling and _EFFECT_RANK.get(spec.effect_level, 0) > _EFFECT_RANK.get(ceiling, 0):
+        return (
+            f"Tool effect {spec.effect_level} exceeds the current Stage "
+            f"effect ceiling {ceiling}"
+        )
+    missing = [
+        name
+        for name in spec.requires
+        if not _requirement_satisfied(name, ctx, arguments)
+    ]
+    if missing:
+        return "Missing execution preconditions: {}".format(", ".join(missing))
+    return ""
+
+
+def _requirement_satisfied(
+    name: str, ctx: ToolContext, arguments: Dict[str, Any]
+) -> bool:
+    extra = getattr(ctx, "extra", {}) or {}
+    state = extra.get("state")
+    project = getattr(state, "project", None)
+    runtime = getattr(state, "runtime", None)
+    if name == "rf_runtime":
+        try:
+            from .hardware_tools import rf_runtime_enabled
+
+            return bool(rf_runtime_enabled())
+        except Exception:  # noqa: BLE001
+            return False
+    if name == "user_effect_grant":
+        try:
+            from .hardware_tools import _rf_approved
+
+            return bool(_rf_approved(ctx))
+        except Exception:  # noqa: BLE001
+            return "RF_RUN" in set(
+                getattr(runtime, "granted_effects", None) or []
+            )
+    if name == "flowgraph_armed":
+        try:
+            from .hardware_tools import _rf_armed
+
+            return bool(_rf_armed(ctx, str(arguments.get("grc_path") or "")))
+        except Exception:  # noqa: BLE001
+            return bool((getattr(project, "config", None) or {}).get("rf_armed"))
+    if name == "device_probed":
+        try:
+            from .hardware_tools import _completion_satisfied
+
+            return bool(_completion_satisfied(ctx, "device_probed"))
+        except Exception:  # noqa: BLE001
+            pass
+        workflow = dict(extra.get("workflow") or {})
+        for stage in workflow.get("stages") or []:
+            completion = dict((stage.get("result") or {}).get("completion") or {})
+            if completion.get("device_probed") is True:
+                return True
+        return any(
+            event.get("kind") == "probe_device"
+            and bool((event.get("payload") or {}).get("device_probed"))
+            for event in (extra.get("events") or [])
+        )
+    # Unknown requirements fail closed instead of silently becoming advisory.
+    return False
 
 
 def action_metadata(name: str) -> Dict[str, Any]:

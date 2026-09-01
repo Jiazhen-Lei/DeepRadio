@@ -156,7 +156,20 @@ def design_link(ctx, profile=None, intent: str = "",
     steps: List[dict] = []
 
     def _c(name, **kw):
-        r = registry.call(name, kw, ctx)
+        # ``design_flowgraph`` is the Stage-authorized macro.  Its primitive
+        # build/validate/sim calls remain Gateway checked for effect and
+        # requirements, but do not each need to be duplicated in every Stage
+        # profile.
+        marker = object()
+        previous = ctx.extra.get("_gateway_parent_tool", marker)
+        ctx.extra["_gateway_parent_tool"] = "design_flowgraph"
+        try:
+            r = registry.call(name, kw, ctx)
+        finally:
+            if previous is marker:
+                ctx.extra.pop("_gateway_parent_tool", None)
+            else:
+                ctx.extra["_gateway_parent_tool"] = previous
         steps.append({"tool": name, "args": kw, "ok": bool(r.get("ok")),
                       "detail": r.get("error") or r.get("warning") or ""})
         return r

@@ -256,6 +256,25 @@ class WorkflowPresenterTest(unittest.TestCase):
         self.assertEqual(self.panel._cancel_btn.label, "Cancel Workflow")
         self.assertTrue(self.panel._pending_row.visible)
 
+    def test_waiting_states_project_nonempty_allowed_actions(self):
+        recovery = interaction_view({"wait_kind": "recovery"}, {})
+        self.assertTrue(recovery["visible"])
+        self.assertIn("retry_stage", recovery["allowed_actions"])
+        self.assertIn("cancel_workflow", recovery["allowed_actions"])
+        capability = interaction_view(
+            {"wait_kind": "capability", "blocker": {"retryable": True}},
+            {},
+        )
+        self.assertTrue(capability["visible"])
+        self.assertTrue(capability["allowed_actions"])
+        approval = interaction_view(
+            {"wait_kind": "approval", "current_stage": "flowgraph_confirmation"},
+            {},
+        )
+        self.assertTrue(approval["visible"])
+        self.assertIn("confirm", approval["allowed_actions"])
+        self.assertIn("cancel_workflow", approval["allowed_actions"])
+
     def test_open_questions_use_one_compact_line(self):
         details = self.panel._default_details({
             "open_questions": ["Which device?", "How long may it run?"],

@@ -23,6 +23,11 @@ def build_common_constraints() -> str:
         "不要出现工具名、工具调用成功与否、内部字段、JSON 或日志式列表。\n"
         "专职子代理，不与用户对话。产物只写 /session/work/<你的域>/，禁止写 /session/final/。\n"
         "按需读 SKILL.md。向主 Agent 回报：做了什么、artifacts 路径、风险。\n"
+        "工具调用要收敛：同一目标已返回 ok 的工具（validate/inspect/design 等）"
+        "不要重复调用；无新信息就返回 ResultEnvelope 结束。"
+        "相互独立的工具调用放在同一轮并行发出，减少往返轮次。\n"
+        "每轮输出要短：工具调用轮只写必要参数，不复述计划；"
+        "回报 ResultEnvelope 时正文控制在 120 字以内，不逐条罗列已完成步骤。\n"
         "artifacts 在宿主机上，GUI 会展示；不要用 read_file / ls / glob 确认是否存在。\n"
     )
 
@@ -43,6 +48,7 @@ def build_orchestrator_prompt(subagent_names: Iterable[str],
         "遇 DENY / CONFIRM、失败 Claim 或待确认项则停止并告知用户。\n"
         "停止并直接答复：design_flowgraph 已 ok+valid 且指标满足；"
         "或连续两次工具无新信息。同一目标不要重复 design_flowgraph / run_simulation"
+        " / validate_flowgraph（结果 ok 后不再复验）"
         "（simulate=True 已含仿真和绘图）。artifacts 在宿主机，不要用文件工具确认。\n"
         "遵守 raw_text、IntentIR goals/constraints/stop_conditions、capabilities、"
         "forbidden_capabilities、slot_sources、completion；"
@@ -199,6 +205,7 @@ _SUBAGENT_DEFS = [
             "query_runtime_status", "stop_flowgraph", "emergency_stop",
             "arm_hardware_flowgraph",
             "inspect_flowgraph", "build_usrp_rx_spectrum_flowgraph",
+            "build_sdr_rx_spectrum_flowgraph",
             "build_sdr_tx_flowgraph",
         ],
     ),

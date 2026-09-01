@@ -824,6 +824,20 @@ class FriendlyFailureAndRetryContractTest(unittest.TestCase):
                     "checkpoint_id": current.checkpoint.id,
                     "decision": "approved",
                 })
+            # Retry behavior is Stage-local in V3.  Build a deterministic
+            # fixture at the DEVICE_READ stage instead of relying on the
+            # product workflow's current decision boundary.
+            target = agent._workflow.ensure_stage(
+                "discover_and_probe_hardware"
+            )
+            if target is not None:
+                target.execution_status = "waiting"
+                target.outcome = "failed"
+                target.result = {}
+                agent._workflow.workflow.current_stage = target.id
+                agent._workflow.workflow.execution_status = "waiting"
+                agent._state.runtime.blocker = {}
+                agent._workflow.save()
         return agent
 
     def test_retry_reports_missing_device_and_does_not_rerun(self):

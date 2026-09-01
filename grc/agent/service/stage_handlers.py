@@ -56,6 +56,9 @@ def _emit_route_events(self, stage_id: str) -> None:
     payload = self._workflow_event_payload({
         "target_agent": active.target_agent if active else "stage_handler",
         "stage_id": stage_id,
+        "declared_mode": getattr(self._workflow.current_stage(), "execution_mode", "")
+        if self._workflow.current_stage() else "",
+        "resolved_mode": "deterministic",
         "mode": "deterministic",
         "executor": "deterministic_stage_handler",
     })
@@ -690,30 +693,24 @@ def _handle_repair(self, ctx, user_text, recipe, simulate) -> AgentReply:
 
 
 def _diagnosis_dimensions(raw_text: str, slots: dict) -> list[str]:
-    """Infer a diagnosis scope without coupling it to catalog task names.
+    """Resolve the diagnosis scope; the LLM is the authority.
 
-    An LLM/planner may provide ``diagnosis_dimensions`` directly.  The lexical
-    fallback only maps domain nouns to reusable check dimensions; it never
-    selects a canned task result.
+    ``diagnosis_dimensions`` is part of the intent slot schema (see
+    ``workflow/engine.py::_PROMPT``), so the semantic layer normally decides
+    what to inspect.  The safe default below only runs when the slot is
+    absent (older sessions, or a model that skipped the field): it selects the
+    broad read-only dimension set rather than guessing from keywords, because
+    a keyword miss would silently narrow the diagnosis.
     """
     explicit = slots.get("diagnosis_dimensions") or []
     if isinstance(explicit, str):
         explicit = [explicit]
-    if explicit:
-        return list(dict.fromkeys(str(item) for item in explicit if item))
-    text = str(raw_text or "").lower()
-    groups = (
-        ("environment", ("驱动", "环境", "依赖", "driver", "uhd", "libiio")),
-        ("device", ("设备", "型号", "发现", "探测", "probe", "identity", "sdr")),
-        ("parameters", ("参数", "频率", "采样率", "带宽", "增益", "衰减")),
-        ("project", ("流图", "工程", ".grc", "block", "连接边")),
-        ("runtime", ("运行", "进程", "日志", "报错", "崩溃", "runtime")),
-        ("rf_path", ("接线", "线缆", "端口", "天线", "连接", "射频链路")),
-        ("signal", ("evm", "ber", "星座", "频谱", "波形", "信号质量")),
-    )
-    selected = [name for name, hints in groups if any(hint in text for hint in hints)]
+    selected = [str(item) for item in explicit if item]
     if not selected:
-        selected = ["intent", "environment", "device", "parameters", "runtime", "rf_path"]
+        selected = [
+            "intent", "environment", "device", "parameters", "runtime",
+            "rf_path",
+        ]
     elif "device" in selected and "intent" not in selected:
         selected.insert(0, "intent")
     return list(dict.fromkeys(selected))

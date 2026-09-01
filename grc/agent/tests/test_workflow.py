@@ -1697,7 +1697,14 @@ class IntentLlmTest(unittest.TestCase):
             "grc.agent.llm.chat", return_value=json.dumps(payload)
         ):
             completed = complete_intent(rules, rules.raw_text, SharedState())
-        self.assertEqual(completed.slots, {"modulation": "qpsk"})
+        # 正则猜测(protocol=ble / local_name=of)必须被丢弃。
+        self.assertNotIn("protocol", completed.slots)
+        self.assertNotIn("local_name", completed.slots)
+        self.assertEqual(completed.slots.get("modulation"), "qpsk")
+        # direction 由 LLM 自己给出的 capabilities 派生(build_signal 且无硬件
+        # => 基带仿真),不是从原文正则猜的,所以允许出现。
+        self.assertEqual(completed.slots.get("direction"), "sim")
+        self.assertEqual(completed.slot_sources.get("direction"), "derived")
         self.assertEqual(completed.capabilities, ["build_signal"])
         self.assertNotIn("rule-derived goal", completed.goals)
         self.assertNotIn("deploy", completed.requested_operations)
@@ -2089,7 +2096,10 @@ class ConstraintCoverageTest(unittest.TestCase):
                 path.write_text("<flow_graph/>", encoding="utf-8")
                 raise TimeoutError("APITimeoutError")
 
-        with _mock.patch.object(store, "sessions_root", return_value=str(sessions)), \
+        with _mock.patch.dict(
+                 os.environ, {"DEEPRADIO_EXECUTION_MODE": "deepagents"}
+             ), \
+             _mock.patch.object(store, "sessions_root", return_value=str(sessions)), \
              _mock.patch(
                  "grc.agent.knowledge.recipes.covering_recipe", return_value=None
              ), \
@@ -2117,7 +2127,7 @@ class Round2ContractTest(unittest.TestCase):
     def engine(self):
         return WorkflowEngine(str(self.root / "workflow.yaml"))
 
-    def test_host_completion_overrides_invalid_llm_envelope(self):
+    def test_host_completion_does_not_override_invalid_llm_envelope(self):
         path = self.root / "radio.grc"
         path.write_text("<flow_graph/>", encoding="utf-8")
         state = SharedState(session_id="protocol-host")
@@ -2169,9 +2179,9 @@ class Round2ContractTest(unittest.TestCase):
         envelope = make_result_envelope(
             workflow, stage, state, parent, reply, [bound]
         )
-        self.assertTrue(envelope.ok)
+        self.assertFalse(envelope.ok)
         self.assertTrue(envelope.completion.get("diagnosis_created"))
-        self.assertNotIn(
+        self.assertIn(
             "INVALID_EXECUTION_INVOCATION",
             envelope.acceptance.get("failure_codes") or [],
         )
@@ -2617,6 +2627,38 @@ class IntentAlignmentContractTest(unittest.TestCase):
             )
         self.assertFalse(outcome.pending)
         self.assertEqual(self.state.intent.status, "confirmed")
+
+    def test_confirmation_while_field_pending_accepts_sole_choice(self):
+        """A confirm reply during awaiting_input must not re-ask forever.
+
+        Session gui-2c67ce08: a DIAGNOSE intent waited on current_project
+        and three consecutive alignment turns returned intent_action=confirm
+        with empty updates; the turn was dropped and the same question
+        looped indefinitely.
+        """
+        self.alignment.consume_text("诊断当前链路的 EVM，先不要修改")
+        shared = self.state.intent
+        self.assertEqual(shared.status, "awaiting_input")
+        self.assertIn("current_project", shared.missing_fields)
+        payload = {"intent_action": "confirm", "updates": {}}
+        config = {
+            "base_url": "https://unused.invalid", "api_key": "test",
+            "model": "test-model", "timeout": 120, "max_messages": 20,
+        }
+        with mock.patch("grc.agent.llm.is_configured", return_value=True), mock.patch(
+            "grc.agent.llm.get_config", return_value=config
+        ), mock.patch(
+            "grc.agent.llm.chat", return_value=json.dumps(payload)
+        ):
+            outcome = self.alignment.consume_text("confirm")
+        self.assertTrue(outcome.pending)
+        self.assertEqual(shared.parameters.get("current_project"), "current_canvas")
+        self.assertNotEqual(shared.interaction.get("field"), "current_project")
+        self.assertNotEqual(
+            shared.status,
+            "awaiting_input",
+            "the sole-choice field must resolve instead of re-asking",
+        )
 
     def test_orphan_confirmation_preserves_existing_shared_intent(self):
         """A control turn cannot become a new underspecified radio request."""

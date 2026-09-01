@@ -8,6 +8,9 @@
     GRC_AGENT_MODEL        模型名, 如 glm-4.6
     GRC_AGENT_TIMEOUT      单次请求超时秒数(可选, 默认 120)
     GRC_AGENT_MAX_MESSAGES 送入的历史消息条数上限(可选, 默认 20)
+    GRC_AGENT_THINKING     思考模式: disabled|enabled|auto (可选, 默认 disabled)。
+                           GLM-5.x 默认深度思考, 结构化委派/建图轮次不需要;
+                           实测关闭后单轮延迟约降 45%。疑难诊断可设 enabled。
 
 接口约定为 OpenAI Chat Completions 兼容格式:
     POST {BASE_URL}/chat/completions
@@ -144,12 +147,25 @@ def get_config() -> dict:
     except ValueError:
         max_messages = 20
 
+    thinking = _env("GRC_AGENT_THINKING", "disabled").lower()
+    if thinking not in ("disabled", "enabled", "auto"):
+        thinking = "disabled"
+
+    try:
+        max_output_tokens = max(0, int(
+            _env("GRC_AGENT_MAX_OUTPUT_TOKENS", "1200")
+        ))
+    except ValueError:
+        max_output_tokens = 1200
+
     return {
         "base_url": base_url,
         "api_key": api_key,
         "model": model,
         "timeout": timeout,
         "max_messages": max(1, max_messages),
+        "thinking": thinking,
+        "max_output_tokens": max_output_tokens,
     }
 
 
@@ -282,6 +298,14 @@ def chat(messages, config: dict = None) -> str:
         "temperature": 0.2,
         "stream": False,
     }
+    # GLM-5.x: 结构化输出轮次关闭深度思考, 单轮延迟约降 45%。
+    if cfg.get("thinking") in ("disabled", "enabled"):
+        payload["thinking"] = {"type": cfg["thinking"]}
+    # 结构化解析只需要一个 JSON 对象,给个上限挡住偶发的长篇解释。
+    # 注意必须用 ``max_tokens``: bigmodel 忽略 OpenAI 的
+    # ``max_completion_tokens``(实测限 200 仍输出 1181 tok)。
+    if cfg.get("max_output_tokens"):
+        payload["max_tokens"] = cfg["max_output_tokens"]
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url,

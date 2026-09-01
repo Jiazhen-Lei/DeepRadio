@@ -95,7 +95,7 @@ def node_from_stage(stage: Stage) -> PlanNode:
             getattr(stage, "success_predicates", None) or stage.completion or []
         ),
         needs_user_decision="checkpoint" in interaction,
-        tools=list(getattr(stage, "recommended_agents", None) or []),
+        tools=list(getattr(stage, "allowed_tools", None) or []),
         stage_id=stage.id,
         unbound_predicates=list(getattr(stage, "unbound_predicates", None) or []),
     )
@@ -157,17 +157,16 @@ class PlanCoverageError(ValueError):
     """Raised when a required planner action cannot be compiled at all."""
 
 
-def _stage_tool_index() -> dict[str, set[str]]:
-    """Map stage ids to their host tool allowlists."""
-    try:
-        from ..service.orchestrator import _STAGE_TOOLS
-
-        return {
-            str(stage_id): set(tools or ())
-            for stage_id, tools in dict(_STAGE_TOOLS).items()
-        }
-    except Exception:  # noqa: BLE001
-        return {}
+def _stage_tool_index(
+    catalog: Mapping[str, Any] | None = None,
+) -> dict[str, set[str]]:
+    """Map Stage ids to the Catalog-owned executable tool scopes."""
+    profiles = dict((catalog or {}).get("stage_profiles") or {})
+    return {
+        str(stage_id): set((profile or {}).get("allowed_tools") or ())
+        for stage_id, profile in profiles.items()
+        if isinstance(profile, Mapping)
+    }
 
 
 def ensure_plan_coverage(
@@ -186,7 +185,7 @@ def ensure_plan_coverage(
     """
     if not accepted:
         return stages, [], []
-    tool_index = _stage_tool_index()
+    tool_index = _stage_tool_index(catalog)
     covered_stage_ids = {stage.id for stage in stages}
     covered_tools: set[str] = set()
     covered_predicates: set[str] = set()
@@ -587,13 +586,14 @@ def plan_needs_proposal(intent: Any, stages: Iterable[Stage]) -> bool:
 def _apply_tool_effect_floor(stage: Stage) -> None:
     """A Stage can never claim less effect than its executable tool allowlist."""
     try:
-        from ..service.orchestrator import stage_tool_names
         from ..tools import registry
 
         registry.load_all()
         effects = [normalize_effect(stage.effect_level)]
-        for name in stage_tool_names(stage.id):
-            spec = registry.get(name)
+        for name in list(getattr(stage, "allowed_tools", None) or []):
+            spec = registry.get(
+                "design_link" if name == "design_flowgraph" else name
+            )
             if spec is not None:
                 effects.append(normalize_effect(spec.effect_level))
         stage.effect_level = max(effects).name

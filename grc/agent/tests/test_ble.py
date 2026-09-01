@@ -178,6 +178,9 @@ class BleDeployContractTest(unittest.TestCase):
                     "grc.agent.tools.hardware_tools._completion_satisfied",
                     return_value=True,
                 ), mock.patch(
+                    "grc.agent.tools.hardware_tools._rf_armed",
+                    return_value=True,
+                ), mock.patch(
                     "grc.agent.tools.hardware_tools._run",
                     return_value={"ok": False, "output": "compile stopped"},
                 ) as run:

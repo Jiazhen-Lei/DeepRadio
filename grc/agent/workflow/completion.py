@@ -29,6 +29,8 @@ _BUILD_SAVE_STAGES = frozenset(
         "build_and_verify",
         "tx_build_and_validate",
         "rx_build_and_verify",
+        "build_ble_advertiser",
+        "repair_and_verify",
     }
 )
 
@@ -336,6 +338,16 @@ def evaluate(stage: Any, workflow: Any, state: Any, reply: Any) -> Dict[str, boo
             for item in (getattr(workflow, "stages", None) or [])
         )
 
+    def checkpoint_recorded(predicate: str) -> bool:
+        raw_result = getattr(stage, "result", None)
+        result = dict(raw_result) if isinstance(raw_result, dict) else {}
+        acceptance = dict(result.get("acceptance") or {})
+        return bool(
+            dict(result.get("completion") or {}).get(predicate) is True
+            and acceptance.get("decision") in {"approved", "rejected"}
+            and acceptance.get("checkpoint_id")
+        )
+
     def structural_validation() -> bool:
         results = tool_results.get("validate", []) + tool_results.get("validate_flowgraph", [])
         if any(
@@ -433,7 +445,9 @@ def evaluate(stage: Any, workflow: Any, state: Any, reply: Any) -> Dict[str, boo
             )
             or tool_names.intersection({"diagnose_by_metric", "explain_error"})
         ),
-        "repair_decision_recorded": True,
+        "repair_decision_recorded": checkpoint_recorded(
+            "repair_decision_recorded"
+        ),
         "repair_applied": _mutated_flowgraph(invocations),
         "change_plan_created": bool(
             checked("inspect_flowgraph")
@@ -445,11 +459,17 @@ def evaluate(stage: Any, workflow: Any, state: Any, reply: Any) -> Dict[str, boo
                 or pending
             )
         ),
-        "change_decision_recorded": True,
-        "flowgraph_decision_recorded": True,
+        "change_decision_recorded": checkpoint_recorded(
+            "change_decision_recorded"
+        ),
+        "flowgraph_decision_recorded": checkpoint_recorded(
+            "flowgraph_decision_recorded"
+        ),
         "measurement_completed": requested_measurements(),
         "hardware_precheck_completed": checked("hardware_preflight"),
-        "hardware_decision_recorded": True,
+        "hardware_decision_recorded": checkpoint_recorded(
+            "hardware_decision_recorded"
+        ),
         "configuration_recorded": bool(
             getattr(project, "config", {}).get("device")
         ),
@@ -502,7 +522,9 @@ def evaluate(stage: Any, workflow: Any, state: Any, reply: Any) -> Dict[str, boo
             runtime_start_accepted(item)
             for item in tool_results.get("start_flowgraph", [])
         ),
-        "runtime_observation_recorded": True,
+        "runtime_observation_recorded": checkpoint_recorded(
+            "runtime_observation_recorded"
+        ),
         "runtime_stopped": any(
             runtime_stop_accepted(item)
             for name in ("stop_flowgraph", "emergency_stop", "query_runtime_status")

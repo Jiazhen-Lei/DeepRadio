@@ -264,11 +264,26 @@ def spec_commit(ctx: ToolContext, text: str):
     group="knowledge",
 )
 def select_recipe(ctx: ToolContext, intent: str = "", recipe: str = ""):
-    intent = (intent or "").strip() or str(ctx.extra.get("user_text") or "")
+    """Resolve a catalog recipe from the caller's intent phrase.
+
+    The agent should pass ``intent`` (its own reading of the goal) or an
+    explicit ``recipe`` id.  Falling back to the raw user text keeps older
+    call sites working, but it is reported through ``intent_source`` so a
+    lexical match never looks like an LLM decision in the event stream.
+    """
+    supplied = (intent or "").strip()
+    intent = supplied or str(ctx.extra.get("user_text") or "")
     selected = recipes.resolve_recipe(intent=intent, recipe=recipe)
     if selected is None:
         return {"ok": False, "error": f"Unknown recipe: {recipe}"}
-    return {"ok": True, "recipe": selected.name, "title": selected.title}
+    return {
+        "ok": True,
+        "recipe": selected.name,
+        "title": selected.title,
+        "intent_source": (
+            "recipe_id" if recipe else ("agent" if supplied else "raw_user_text")
+        ),
+    }
 
 
 @tool(

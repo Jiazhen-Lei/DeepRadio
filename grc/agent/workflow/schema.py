@@ -21,6 +21,9 @@ EFFECT_LEVELS = frozenset(
     {"READ", "ARTIFACT_WRITE", "DEVICE_READ", "DEVICE_CONFIG", "RF_RUN"}
 )
 QUALITY_LEVELS = frozenset({"clean", "warning", "failed"})
+STAGE_EXECUTION_MODES = frozenset(
+    {"agentic", "hybrid", "deterministic", "checkpoint", "safety_finalizer"}
+)
 
 
 @dataclass
@@ -137,6 +140,8 @@ class Stage:
     produces: List[str] = field(default_factory=list)
     success_predicates: List[str] = field(default_factory=list)
     unbound_predicates: List[str] = field(default_factory=list)
+    execution_mode: str = "hybrid"
+    allowed_tools: List[str] = field(default_factory=list)
 
     def validate(self) -> None:
         if not self.id:
@@ -149,6 +154,8 @@ class Stage:
             raise ValueError("Stage attempt/max_attempts 非法")
         if self.effect_level not in EFFECT_LEVELS:
             raise ValueError(f"非法 Stage effect_level: {self.effect_level}")
+        if self.execution_mode not in STAGE_EXECUTION_MODES:
+            raise ValueError(f"非法 Stage execution_mode: {self.execution_mode}")
         if self.checkpoint:
             self.checkpoint.validate()
 
@@ -183,6 +190,8 @@ class Stage:
             produces=list(data.get("produces") or []),
             success_predicates=list(data.get("success_predicates") or []),
             unbound_predicates=list(data.get("unbound_predicates") or []),
+            execution_mode=str(data.get("execution_mode") or "hybrid"),
+            allowed_tools=list(data.get("allowed_tools") or []),
         )
         item.validate()
         return item

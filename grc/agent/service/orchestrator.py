@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections import OrderedDict
 from typing import Any, Optional
 
 from .. import llm
@@ -26,68 +27,34 @@ from ..tools.registry import ToolContext
 from . import subagents as _subagents
 
 logger = logging.getLogger(__name__)
-_CHECKPOINTERS = {}
-_STAGE_TOOLS = {
-    "spec_alignment": {"spec_clarify", "spec_commit"},
-    "rx_spec_alignment": {"spec_clarify", "spec_commit"},
-    "inspect_and_plan": {"inspect_flowgraph", "spec_clarify", "spec_commit"},
-    "inspect_and_diagnose": {
-        "inspect_flowgraph", "validate_flowgraph", "run_simulation", "read_metric",
-        "plot_spectrum", "plot_constellation", "debug_by_metric",
-        "explain_error",
-        "run_diagnosis_checks",
-    },
-    "inspect_and_measure": {
-        "inspect_flowgraph", "validate_flowgraph", "run_simulation", "read_metric",
-        "plot_spectrum", "plot_constellation", "plot_eye", "verify_claims",
-    },
-    "repair_and_verify": {
-        "apply_grc_diff", "apply_flowgraph_patch", "validate_flowgraph",
-        "run_simulation", "read_metric", "verify_claims", "explain_error",
-    },
-    "rx_build_and_verify": {
-        "select_recipe", "design_flowgraph", "build_usrp_rx_spectrum_flowgraph",
-        "build_sdr_rx_spectrum_flowgraph",
-        "validate_flowgraph", "inspect_flowgraph",
-    },
-    "tx_build_and_validate": {
-        "select_recipe", "design_flowgraph", "validate_flowgraph",
-        "build_sdr_tx_flowgraph",
-    },
-    "build_and_verify": {
-        "select_recipe", "design_flowgraph", "validate_flowgraph",
-        "run_simulation", "read_metric", "plot_spectrum",
-        "build_sdr_tx_flowgraph",
-    },
-    "apply_and_verify": {
-        "design_flowgraph", "apply_grc_diff", "apply_flowgraph_patch",
-        "validate_flowgraph", "run_simulation", "read_metric", "plot_spectrum",
-        "plot_constellation", "plot_eye", "verify_claims", "explain_error",
-    },
-    "hardware_precheck": {"hardware_preflight", "discover_devices", "inspect_flowgraph"},
-    "configure_and_check": {"configure_sdr", "hardware_preflight", "inspect_flowgraph"},
-    "protocol_spec_alignment": {"spec_clarify", "spec_commit"},
-    "build_ble_advertiser": {
-        "build_ble_advertising_pdu", "generate_ble_1m_waveform",
-        "build_ble_uhd_tx_flowgraph", "build_ble_pluto_tx_flowgraph",
-        "validate_flowgraph",
-    },
-    "offline_protocol_verify": {"verify_ble_packet_bits", "validate_flowgraph"},
-    "discover_and_probe_device": {"discover_devices", "probe_device"},
-    "discover_and_probe_hardware": {"discover_devices", "probe_device"},
-    "configure_device": {
-        "configure_sdr", "hardware_preflight", "arm_hardware_flowgraph",
-    },
-    "transmit_bounded": {"start_flowgraph", "query_runtime_status", "emergency_stop"},
-    "stop_and_finalize": {"stop_flowgraph", "emergency_stop", "query_runtime_status"},
-    "run_bounded": {"start_flowgraph", "query_runtime_status", "emergency_stop"},
-    "stop_runtime": {"stop_flowgraph", "emergency_stop", "query_runtime_status"},
-}
+#: session_id -> InMemorySaver。LRU 有上限:每个 saver 常驻该会话所有 Stage 的
+#: 消息历史,无上限时多开几个会话内存会悄悄涨上去。GRC 同时只有一个活动会话,
+#: 留几个槽位足够支撑"切回上一个会话继续"的场景。
+_CHECKPOINTERS: "OrderedDict[str, Any]" = OrderedDict()
+_CHECKPOINTER_LIMIT = 4
 
 
-def stage_tool_names(stage_id: str) -> set[str]:
-    """Return the host allowlist used by a Stage, without building an agent."""
-    return set(_STAGE_TOOLS.get(str(stage_id or ""), set()))
+def _resolve_checkpointer(session_id: str, factory: Any) -> Any:
+    """取回(或新建)该 session 的 checkpointer,并按 LRU 淘汰最旧的。"""
+    existing = _CHECKPOINTERS.pop(session_id, None)
+    saver = existing if existing is not None else factory()
+    _CHECKPOINTERS[session_id] = saver
+    while len(_CHECKPOINTERS) > max(1, _CHECKPOINTER_LIMIT):
+        evicted_id, _evicted = _CHECKPOINTERS.popitem(last=False)
+        logger.info("淘汰会话 checkpointer(超出 %s 个上限): %s",
+                    _CHECKPOINTER_LIMIT, evicted_id)
+    return saver
+
+
+def release_checkpointer(session_id: str) -> None:
+    """会话结束时显式释放其消息历史。"""
+    if _CHECKPOINTERS.pop(session_id, None) is not None:
+        logger.info("已释放会话 checkpointer: %s", session_id)
+
+
+def stage_tool_names(stage: Any) -> set[str]:
+    """Return the Catalog-owned allowlist for one materialized Stage."""
+    return set(getattr(stage, "allowed_tools", None) or [])
 
 
 def deepagents_available() -> bool:
@@ -97,6 +64,96 @@ def deepagents_available() -> bool:
         return True
     except ImportError:
         return False
+
+
+def _call_limits() -> tuple[int, int, int]:
+    """返回 (subagent LLM 轮上限, subagent 工具轮上限, 主 Agent LLM 轮上限)。
+
+    实测(scripts/verify_llm_calls.py)：一次 END_TO_END_SIM 无限制时发出 79 次
+    LLM 请求、耗时 273s,其中 95% 是 LLM 时间;单次请求只要 3.3s(44 tok/s,与
+    裸调用同速),所以慢点是**轮次爆炸**而非模型慢或上下文大。
+
+    阈值取值依据(实测逐轮日志)：成功一轮的单次委派需要 4~7 轮 LLM,主 Agent
+    共 20 轮。上限设成 4 会正好卡在临界值上,导致 subagent 刚起步就被截断、
+    一个工具都没调用就返回 ok=false(会话 gui-6f1b077a 的
+    ``INVALID_EXECUTION_INVOCATION`` + ``MISSING_COMPLETION``)。因此留出余量:
+    subagent 8 轮(> 实测峰值 7)、主 Agent 16 轮,仍远低于失控的 79 轮。
+
+    env 可调,设 0 表示该项不限制。
+    """
+    def _limit(name: str, default: int) -> int:
+        try:
+            return max(0, int(os.environ.get(name, "").strip() or default))
+        except ValueError:
+            return default
+
+    return (
+        _limit("GRC_AGENT_SUB_MODEL_CALLS", 8),
+        _limit("GRC_AGENT_SUB_TOOL_CALLS", 12),
+        _limit("GRC_AGENT_MAIN_MODEL_CALLS", 16),
+    )
+
+
+def _limit_middleware(model_calls: int, tool_calls: int) -> list:
+    """构造轮次限流中间件栈(模型本身不变,只截断失控的空转轮)。
+
+    ``exit_behavior`` 的选择直接决定失败模式：``"end"`` 达限即静默收尾,
+    若此时还没调用过工具就会交出空产物(gui-6f1b077a 的失败原因),所以上限
+    必须留足余量,只作为失控兜底,不参与正常收敛。
+    """
+    if not model_calls and not tool_calls:
+        return []
+    try:
+        from langchain.agents.middleware import (
+            ModelCallLimitMiddleware,
+            ToolCallLimitMiddleware,
+        )
+    except ImportError:
+        logger.info("langchain 缺 CallLimit 中间件,跳过轮次限流。")
+        return []
+    stack: list = []
+    if model_calls:
+        # "end": 达上限正常收尾而非抛错;阈值取实测峰值以上,仅兜底失控。
+        stack.append(ModelCallLimitMiddleware(
+            run_limit=model_calls, exit_behavior="end"))
+    if tool_calls:
+        # "continue": 只挡住超额工具调用,已完成的工具结果全部保留。
+        stack.append(ToolCallLimitMiddleware(
+            run_limit=tool_calls, exit_behavior="continue"))
+    return stack
+
+
+def _apply_sub_limits(subs: list) -> list:
+    """把轮次限流中间件挂到每个 subagent 上(不改模型)。"""
+    if not subs:
+        return subs
+    sub_model, sub_tool, _ = _call_limits()
+    stack = _limit_middleware(sub_model, sub_tool)
+    if not stack:
+        return subs
+    for sub in subs:
+        existing = list(sub.get("middleware") or [])
+        sub["middleware"] = existing + stack
+    logger.info("subagent 轮次上限: model=%s tool=%s", sub_model, sub_tool)
+    return subs
+
+
+def _main_agent_middleware() -> list:
+    """主 Agent 侧的 LLM 轮次上限,防止反复重新委派同一 Stage。
+
+    subagent 侧限流只约束单次委派内部;主 Agent 若不限,会在同一 Stage 内
+    重复发起委派(实测 8 次),总轮次仍然爆炸。
+
+    上下文压缩不在这里做:``create_deep_agent`` 已经自带
+    ``SummarizationMiddleware``,再挂一个会被 langchain 判为
+    "duplicate middleware instances" 而导致整个图组装失败、静默降级到确定性
+    骨架。``_run_deep`` 的 thread_id 也已按 Stage 隔离历史。
+    """
+    _sub_model, _sub_tool, main_model = _call_limits()
+    stack = _limit_middleware(main_model, 0)
+    if stack:
+        logger.info("主 Agent LLM 轮次上限: %s", main_model)
+    return stack
 
 
 def build_agent(
@@ -125,18 +182,21 @@ def build_agent(
         from langgraph.checkpoint.memory import InMemorySaver
         state = ctx.extra.get("state")
         session_id = getattr(state, "session_id", "") or "default"
-        checkpointer = _CHECKPOINTERS.setdefault(session_id, InMemorySaver())
+        checkpointer = _resolve_checkpointer(session_id, InMemorySaver)
     except ImportError:
         checkpointer = None
 
     chat = build_chat_model(temperature=temperature)
     agent_names = list(getattr(stage, "recommended_agents", None) or [])
-    tool_names = _subagents.tool_names_for_agents(agent_names)
-    allowed_stage_tools = _STAGE_TOOLS.get(getattr(stage, "id", ""))
-    if allowed_stage_tools is not None:
-        tool_names = [name for name in tool_names if name in allowed_stage_tools]
-    tools = _import_tools(ctx, tool_names)
-    subs = _subagents.build_grc_subagents(ctx, agent_names, tool_names)
+    agent_tools = set(_subagents.tool_names_for_agents(agent_names))
+    stage_tools = stage_tool_names(stage)
+    tool_names = sorted(agent_tools & stage_tools)
+    subs = _apply_sub_limits(
+        _subagents.build_grc_subagents(ctx, agent_names, tool_names))
+    # 有可委派 subagent 时,主 Agent 不直接持有业务工具(deepagents 会自动
+    # 注册 task 工具),TaskCard 的 target_agent 才真正生效;否则 LLM 会走
+    # 捷径直调工具,委派形同虚设。
+    tools: list = [] if subs else _import_tools(ctx, tool_names)
     be = build_backend()
     style_prompt = _resolve_style_prompt(ctx)
     orch_prompt = _subagents.build_orchestrator_prompt(
@@ -147,11 +207,17 @@ def build_agent(
         orch_prompt += (
             "\n【当前 Workflow Stage】\n"
             f"stage_id={stage.id}; completion={stage.completion}; "
-            f"只允许委派: {', '.join(agent_names)}。\n"
+            f"必须通过 task 工具把 TaskCard 委派给以下 subagent 之一执行: "
+            f"{', '.join(agent_names)};禁止直接调用业务工具完成任务。\n"
             f"capabilities={intent_data.get('capabilities') or []}; "
             f"slot_sources={intent_data.get('slot_sources') or {}}。"
             "raw_text 是目标原文；context 只能作为待验证背景，不能覆盖用户本轮参数。\n"
         )
+
+    agent_kwargs: dict[str, Any] = {}
+    main_mw = _main_agent_middleware()
+    if main_mw:
+        agent_kwargs["middleware"] = main_mw
 
     agent: Any = create_deep_agent(
         model=chat,
@@ -161,6 +227,7 @@ def build_agent(
         skills=[SKILLS_MOUNT],
         backend=be,
         checkpointer=checkpointer,
+        **agent_kwargs,
     )
     logger.info("deepagents 主 Agent 组装完成: %d tools, %d subagents",
                 len(tools), len(subs))
@@ -219,6 +286,22 @@ def build_chat_model(temperature: float = 0.2):
     """按 ``llm.get_config()`` 构造一个 LangChain ``ChatOpenAI``。"""
     cfg = llm.get_config()
     from langchain_openai import ChatOpenAI
+    extra_body: dict[str, Any] = {}
+    # GLM-5.x: 委派/建图轮次关闭深度思考(单轮约省 45%); env 可切 enabled/auto。
+    if cfg.get("thinking") in ("disabled", "enabled"):
+        extra_body["thinking"] = {"type": cfg["thinking"]}
+    # 单轮输出上限。实测同一个 Task 1 两次运行 115s vs 271s,差异几乎全部来自
+    # "长输出轮"(最大单次 41s / 2621 tok);工具调用轮只需要几十到几百 token,
+    # 最终答复也应是简短叙述,所以设一个足够宽但能挡住失控长文的上限。
+    #
+    # 必须走 extra_body: ChatOpenAI 会把 max_tokens(以及 model_kwargs 里的同名
+    # 参数)统一转成 OpenAI 新参数名 ``max_completion_tokens``,而 bigmodel(GLM)
+    # 只认 ``max_tokens`` —— 实测 max_completion_tokens=200 仍输出 1181 tok
+    # (18.5s),max_tokens=200 才真正截断到 200 tok(3.9s)。
+    max_tokens = _output_token_cap()
+    if max_tokens:
+        extra_body["max_tokens"] = max_tokens
+    kwargs: dict[str, Any] = {"extra_body": extra_body} if extra_body else {}
     model = ChatOpenAI(
         model=cfg["model"],
         base_url=f"{cfg['base_url']}/",
@@ -226,10 +309,21 @@ def build_chat_model(temperature: float = 0.2):
         temperature=temperature,
         timeout=cfg["timeout"],
         max_retries=1,
+        **kwargs,
     )
-    logger.info("已构造 ChatOpenAI: model=%s base_url=%s",
-                cfg["model"], cfg["base_url"])
+    logger.info("已构造 ChatOpenAI: model=%s base_url=%s max_tokens=%s",
+                cfg["model"], cfg["base_url"], max_tokens or "unset")
     return model
+
+
+def _output_token_cap() -> int:
+    """单轮 completion token 上限(``GRC_AGENT_MAX_OUTPUT_TOKENS``,0=不限)。"""
+    try:
+        return max(0, int(
+            os.environ.get("GRC_AGENT_MAX_OUTPUT_TOKENS", "").strip() or 1200
+        ))
+    except ValueError:
+        return 1200
 
 
 def is_available() -> bool:

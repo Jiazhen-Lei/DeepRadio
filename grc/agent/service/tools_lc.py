@@ -80,8 +80,48 @@ def _merge_artifacts(ctx: ToolContext, artifacts: Dict[str, Any]) -> None:
             store[key] = value
 
 
+#: 幂等只读/纯计算工具:同一 Stage 内相同入参重复调用必然得到相同结果,
+#: 直接回放首次结果并附提示,省掉一整轮"工具执行 + 大上下文 LLM"。
+#: 实测(local/agent_sessions/gui-f8262d88)一次 BLE 部署里
+#: ``build_ble_advertising_pdu`` 被连调 3 次、``generate_ble_1m_waveform`` 3 次,
+#: 每次之间夹一轮 LLM,白烧上百秒。写操作(部署/启动/打补丁)不在此列。
+_IDEMPOTENT_TOOLS = frozenset({
+    "build_ble_advertising_pdu",
+    "generate_ble_1m_waveform",
+    "verify_ble_packet_bits",
+    "validate_flowgraph",
+    "inspect_flowgraph",
+    "select_recipe",
+    "search_blocks",
+    "describe_block",
+    "list_examples",
+    "read_metric",
+    "hardware_preflight",
+    "discover_devices",
+})
+
+
+def _repeat_cache_key(name: str, arguments: Dict[str, Any]) -> str:
+    try:
+        args = json.dumps(arguments or {}, ensure_ascii=False, sort_keys=True)
+    except TypeError:
+        args = repr(sorted((arguments or {}).items()))
+    return f"{name}|{args}"
+
+
 def _call_registry(ctx: ToolContext, name: str, arguments: Dict[str, Any]) -> str:
     from ..tools import registry
+
+    cache = ctx.extra.setdefault("_idempotent_results", {})
+    cache_key = _repeat_cache_key(name, arguments)
+    if name in _IDEMPOTENT_TOOLS and cache_key in cache:
+        cached = dict(cache[cache_key])
+        cached["repeated_call"] = True
+        cached["note"] = (
+            "Identical call already completed in this stage; the previous "
+            "result is returned unchanged. Move on to the next step."
+        )
+        return json.dumps(cached, ensure_ascii=False)
 
     result = registry.call(name, arguments, ctx)
     kind = _EVENT_KIND.get(name, name)
@@ -93,6 +133,8 @@ def _call_registry(ctx: ToolContext, name: str, arguments: Dict[str, Any]) -> st
     plot_key = _PLOT_ARTIFACTS.get(name)
     if plot_key and result.get("path"):
         _merge_artifacts(ctx, {plot_key: result["path"]})
+    if name in _IDEMPOTENT_TOOLS and result.get("ok"):
+        cache[cache_key] = dict(result)
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -112,7 +154,13 @@ def _wrap_spec(spec: Any, ctx: ToolContext) -> Any:
     required = set((spec.parameters or {}).get("required") or [])
     parameters = []
     annotations: Dict[str, Any] = {}
-    for name, schema in props.items():
+    # Parameters without a default must precede defaulted ones, otherwise
+    # inspect.Signature raises "non-default argument follows default
+    # argument" whenever a tool spec lists an optional property first.
+    ordered_props = sorted(
+        props.items(), key=lambda kv: 0 if kv[0] in required else 1
+    )
+    for name, schema in ordered_props:
         schema = schema if isinstance(schema, dict) else {}
         annotation = _py_type(schema)
         if name not in required:
