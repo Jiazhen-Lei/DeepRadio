@@ -50,7 +50,7 @@ def design_link(ctx, profile=None, intent: str = "",
     state = ctx.extra.get("state")
     approved_pending = None
     if state is not None:
-        from ..state import ALLOW, create_snapshot, gate
+        from ..state import ALLOW, gate
 
         new_modulation = _recipes.guess_modulation(rc.name)
         old_modulation = str(state.project.config.get("modulation") or "")
@@ -145,11 +145,6 @@ def design_link(ctx, profile=None, intent: str = "",
                 "valid": False,
                 "requires_confirmation": decision in ("PROPOSE", "CONFIRM"),
             }
-        state_path = str(ctx.extra.get("state_path") or "")
-        snapshots_dir = str(ctx.extra.get("snapshots_dir") or "")
-        if state_path and snapshots_dir:
-            create_snapshot(state, snapshots_dir, state_path)
-
     if ctx.platform is None:
         return {"ok": False, "error": "Platform is missing; the flowgraph cannot be built"}
 

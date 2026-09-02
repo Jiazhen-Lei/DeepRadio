@@ -178,8 +178,8 @@ class ClaimsPanel(Gtk.Frame):
 
         self._details = Gtk.TextView()
         self._details.set_editable(False)
-        self._details.set_cursor_visible(True)
-        self._details.set_can_focus(True)
+        self._details.set_cursor_visible(False)
+        self._details.set_can_focus(False)
         self._details.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
         self._detail_scroll = Gtk.ScrolledWindow()
         self._detail_scroll.set_policy(
@@ -196,7 +196,6 @@ class ClaimsPanel(Gtk.Frame):
         self._runtime_label.set_line_wrap(True)
         self._runtime_label.set_xalign(0.0)
         self._runtime_label.set_margin_start(4)
-        self._runtime_label.set_selectable(True)
         self._runtime_label.set_no_show_all(True)
         box.pack_start(self._runtime_label, False, False, 0)
 

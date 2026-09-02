@@ -589,6 +589,24 @@ class WorkflowPresenterTest(unittest.TestCase):
         self.assertEqual([item["id"] for item in monitor["pending"]], ["hardware_precheck"])
         self.assertEqual(len(monitor["stages"]), 3)
 
+    def test_workflow_accepts_canonical_stage_status(self):
+        monitor = present(
+            spec={},
+            claims=[],
+            workflow={
+                "current_stage": "validate",
+                "execution_status": "running",
+                "stages": [
+                    {"id": "design", "status": "completed"},
+                    {"id": "validate", "status": "running"},
+                    {"id": "deliver", "status": "pending"},
+                ],
+            },
+        )["workflow"]
+        self.assertEqual([item["id"] for item in monitor["completed"]], ["design"])
+        self.assertEqual([item["id"] for item in monitor["current"]], ["validate"])
+        self.assertEqual([item["id"] for item in monitor["pending"]], ["deliver"])
+
     def test_dynamic_rf_permission_keeps_existing_confirmation_ui(self):
         view = interaction_view(
             {

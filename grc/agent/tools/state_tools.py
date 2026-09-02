@@ -17,7 +17,6 @@ from ..state import (
     ClaimStore,
     Decision,
     Evidence,
-    create_snapshot,
     gate,
 )
 from .registry import ToolContext, tool
@@ -481,10 +480,6 @@ def apply_grc_diff(
             "ok": False,
             "error": "当前 session 没有内存流图；请先构建或加载工程",
         }
-    state_path = str(ctx.extra.get("state_path") or "")
-    snapshots_dir = str(ctx.extra.get("snapshots_dir") or "")
-    if state_path and snapshots_dir:
-        create_snapshot(state, snapshots_dir, state_path)
     result = registry.call(
         "set_param",
         {"id": block_id, "name": parameter, "value": value},
@@ -575,10 +570,6 @@ def apply_flowgraph_patch(
             "error": "多块 patch 需要 Workflow Checkpoint 批准",
         }
     backup = copy.deepcopy(ctx.flow_graph.export_data())
-    state_path = str(ctx.extra.get("state_path") or "")
-    snapshots_dir = str(ctx.extra.get("snapshots_dir") or "")
-    if state_path and snapshots_dir:
-        create_snapshot(state, snapshots_dir, state_path)
 
     def restore_graph():
         restored = ctx.platform.make_flow_graph()

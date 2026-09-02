@@ -280,12 +280,10 @@ class AgentPanel(Gtk.VBox):
 
     对外发出信号:
         open_flow_graph(str): 请求 MainWindow 把给定路径的 .grc 刷到当前页。
-        reset_workspace(): 请求 MainWindow 关掉 DeepRadio 页并开空白画布。
     """
 
     __gsignals__ = {
         'open_flow_graph': (GObject.SignalFlags.RUN_FIRST, None, (str,)),
-        'reset_workspace': (GObject.SignalFlags.RUN_FIRST, None, ()),
     }
 
     def __init__(self, platform):
@@ -311,14 +309,6 @@ class AgentPanel(Gtk.VBox):
         self.level_combo.set_active(0)  # 默认"自适应"
         self.level_combo.connect('changed', self._on_level_changed)
         ctrl.pack_start(self.level_combo, False, False, 2)
-
-        self.reset_button = Gtk.Button(label="Reset")
-        self.reset_button.connect('clicked', self._on_reset)
-        ctrl.pack_end(self.reset_button, False, False, 2)
-
-        self.undo_button = Gtk.Button(label="Undo to Previous Version")
-        self.undo_button.connect('clicked', self._on_undo)
-        ctrl.pack_end(self.undo_button, False, False, 2)
 
         self.pack_start(ctrl, expand=False, fill=True, padding=2)
 
@@ -658,27 +648,6 @@ class AgentPanel(Gtk.VBox):
             for child in widget.get_children():
                 self._constrain_chat_bodies(child, body_w)
 
-    def _on_reset(self, _widget):
-        if self._busy:
-            return
-        if self._agent is not None:
-            if hasattr(self._agent, "unsubscribe_progress"):
-                self._agent.unsubscribe_progress(self._on_agent_progress_from_worker)
-            try:
-                self._agent.archive_workflow()
-            except OSError as exc:
-                log.warning("归档 Workflow 失败: %s", exc)
-        self._agent = None
-        self._canvas_path = ""
-        for child in self._log_box.get_children():
-            self._log_box.remove(child)
-        self._live_cards = []
-        self.claims_panel.clear()
-        self.emit('reset_workspace')
-        self._append("DeepRadio", "The session and canvas have been reset. Describe your new request.")
-        self._set_status("Ready")
-        self._stop_runtime_poll()
-
     def _on_send(self, _widget):
         if self._busy:
             return
@@ -824,58 +793,6 @@ class AgentPanel(Gtk.VBox):
         self._stop_runtime_poll()
         return False
 
-    def _on_undo(self, _widget):
-        if self._busy:
-            return
-        if self._agent is None:
-            self._append("DeepRadio", "There is no active session to undo.")
-            return
-        self._set_busy(True)
-        threading.Thread(target=self._handle_undo, daemon=True).start()
-
-    def _handle_undo(self):
-        try:
-            result = self._agent.restore_last_snapshot()
-            GLib.idle_add(self._on_undo_done, result)
-        except Exception as e:  # noqa: BLE001
-            log.exception("回滚快照失败")
-            GLib.idle_add(self._on_error, str(e))
-
-    def _on_undo_done(self, result):
-        result = result or {}
-        if not result.get("ok"):
-            self._append("DeepRadio", result.get("error") or "There is no snapshot to restore.")
-            self._set_busy(False)
-            return False
-        version = result.get("version")
-        self._append(
-            "DeepRadio",
-            "Restored project version {}.".format(version if version is not None else "?"),
-        )
-        self.claims_panel.update_data(
-            result.get("claims") or [],
-            result.get("spec_digest") or {},
-            activity={
-                "loop": "Revise",
-                "agent": "Flowgraph",
-                "action": "Restore Snapshot",
-                "status": "Previous Version Restored",
-            },
-            workflow=result.get("workflow_digest") or {},
-        )
-        self._replace_interaction_cards(
-            result.get("spec_digest") or {},
-            result.get("workflow_digest") or {},
-            result.get("claims") or [],
-            {},
-        )
-        grc_path = result.get("grc_path")
-        if grc_path and os.path.exists(grc_path):
-            self.emit('open_flow_graph', grc_path)
-        self._set_status("Restored to v{}".format(version if version is not None else "?"))
-        self._set_busy(False)
-        return False
-
     # ------------------------------------------------------------------ #
     # 辅助
     # ------------------------------------------------------------------ #
@@ -891,8 +808,6 @@ class AgentPanel(Gtk.VBox):
         self.entry.set_sensitive(not busy)
         self.send_button.set_sensitive(not busy)
         self.level_combo.set_sensitive(not busy)
-        self.reset_button.set_sensitive(not busy)
-        self.undo_button.set_sensitive(not busy)
         self.send_button.set_label("Processing…" if busy else "Send")
         if busy and self._runtime_poll_id is None:
             self._runtime_poll_id = GLib.timeout_add(1000, self._on_runtime_poll)
@@ -928,7 +843,6 @@ class AgentPanel(Gtk.VBox):
         bubble = _ChatBubble(theme["fill"], theme["border"])
 
         label = _FlowLabel()
-        label.set_selectable(True)
         label.set_margin_top(10)
         label.set_margin_bottom(10)
         label.set_margin_start(12)
@@ -1091,7 +1005,6 @@ class AgentPanel(Gtk.VBox):
             header.pack_end(badge, False, False, 0)
             row_box.pack_start(header, False, False, 0)
             value = _FlowLabel(label=str(row.get("value") or "?"))
-            value.set_selectable(True)
             row_box.pack_start(value, False, False, 0)
             item.add(row_box)
             content.pack_start(item, False, False, 0)

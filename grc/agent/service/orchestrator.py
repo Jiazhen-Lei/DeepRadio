@@ -1,18 +1,3 @@
-"""Assemble the MainAgent-owned DeepRadio control plane.
-
-这是本层的核心 —— 严格按 ``local/docs/agent_architecture_deepagents.md``,
-用 deepagents **现成库**装配真正的深度代理,不再自研编排器:
-
-* ``model``   —— ``build_chat_model`` 把 ``llm.get_config()`` 封成 ``ChatOpenAI``;
-* ``tools``   —— MainAgent-only Workflow control tools;
-* ``subagents`` —— :func:`service.subagents.build_grc_subagents` 的 ``SubAgent`` 列表;
-* ``skills``  —— ``skills`` 目录(deepagents 渐进式披露 SKILL);
-* ``backend`` —— ``build_backend`` 的 ``CompositeBackend``;
-
-未装 deepagents 或未配置 LLM 时返回 ``None``。生产链路不会静默切换到另一套
-Workflow；确定性能力只作为 SubAgent 调用的工具存在。
-"""
-
 from __future__ import annotations
 
 import logging

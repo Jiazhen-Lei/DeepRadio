@@ -151,7 +151,6 @@ class ServiceAgent:
                 "profile": self.profile,
                 "state": self._state,
                 "state_path": store.state_path(self.session_id),
-                "snapshots_dir": store.snapshots_dir(self.session_id),
                 "artifacts": {},
                 "events": [],
                 "metrics": {},
@@ -626,38 +625,6 @@ class ServiceAgent:
         self._state.project.config.pop("slot_source", None)
         self._tool_ctx = None
         self._state.save(store.state_path(self.session_id))
-
-    def restore_last_snapshot(self) -> Dict[str, Any]:
-        from ..state import restore_snapshot
-
-        snapshots = list(self._state.coordination.snapshots or [])
-        if not snapshots:
-            return {"ok": False, "error": "There is no snapshot to restore"}
-        restored = restore_snapshot(
-            snapshots[-1], store.state_path(self.session_id)
-        )
-        self._state = restored
-        self._tool_ctx = None
-        self._workflow.invalidate(restored.project.flowgraph_version)
-        return {
-            "ok": True,
-            "snapshot": snapshots[-1],
-            "grc_path": restored.project.grc_path,
-            "version": restored.project.flowgraph_version,
-            "claims": ClaimStore(restored).summary(),
-            "spec_digest": restored.spec_digest(),
-            "workflow_digest": self._digest(),
-        }
-
-    def archive_workflow(self) -> str:
-        from .hardware_runtime import RUNTIME
-
-        RUNTIME.stop(self.session_id, emergency=True)
-        self._state.project.config["rf_armed"] = False
-        self._state.project.config.pop("rf_armed_path", None)
-        self._clear_rf_grant()
-        self._state.save(store.state_path(self.session_id))
-        return store.archive_workflow(self.session_id)
 
     def refresh_runtime_capability(self) -> Dict[str, Any]:
         return {

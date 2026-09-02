@@ -18,7 +18,6 @@ from .shared_state import (
     attach_measurement,
     current_measurement_id,
 )
-from .snapshot import create_snapshot, restore_snapshot
 from .intent_state import (
     INTENT_STATUSES,
     RadioSpecification,
@@ -50,7 +49,5 @@ __all__ = [
     "WorkflowDecision",
     "attach_measurement",
     "current_measurement_id",
-    "create_snapshot",
     "gate",
-    "restore_snapshot",
 ]

@@ -130,7 +130,6 @@ class DiagnosisSnapshot:
 class Coordination:
     locked_constraints: List[str] = field(default_factory=list)
     pending_confirmations: List[Dict[str, Any]] = field(default_factory=list)
-    snapshots: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -510,7 +509,6 @@ def _from_dict(data: Dict[str, Any]) -> SharedState:
         pending_confirmations=list(
             coord_data.get("pending_confirmations") or []
         ),
-        snapshots=list(coord_data.get("snapshots") or []),
     )
     return SharedState(
         session_id=str(data.get("session_id") or ""),
@@ -614,7 +612,7 @@ _PATH_KEYS = frozenset(
         "runtime_status",
     }
 )
-_RELATIVE_PREFIXES = ("final/", "work/", "snapshots/", "final\\", "work\\", "snapshots\\")
+_RELATIVE_PREFIXES = ("final/", "work/", "final\\", "work\\")
 
 
 def is_path_key(key: str) -> bool:

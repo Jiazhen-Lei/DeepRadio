@@ -115,8 +115,6 @@ class MainWindow(Gtk.ApplicationWindow):
         self.agent_panel = AgentPanel(platform)
         self.agent_panel.connect(
             'open_flow_graph', self._on_agent_open_flow_graph)
-        self.agent_panel.connect(
-            'reset_workspace', self._on_agent_reset_workspace)
 
         # Figure out which place to put the variable editor
         self.left = Gtk.VPaned()  # orientation=Gtk.Orientation.VERTICAL)
@@ -194,10 +192,6 @@ class MainWindow(Gtk.ApplicationWindow):
     def _on_agent_open_flow_graph(self, _widget, file_path):
         """Refresh the current notebook page with a DeepRadio .grc (in place)."""
         self.load_flow_graph_in_place(file_path)
-
-    def _on_agent_reset_workspace(self, _widget):
-        """Close DeepRadio-generated pages and show a blank canvas."""
-        self.reset_agent_workspace()
 
     def _remove_block_from_current_flow_graph(self, widget, key):
         block = self.current_flow_graph.get_block(key)
@@ -379,24 +373,6 @@ class MainWindow(Gtk.ApplicationWindow):
             return
         self.vars.update_gui(page.flow_graph.blocks)
         self.update()
-
-    def reset_agent_workspace(self):
-        """Close DeepRadio session pages and leave a blank editor page."""
-        markers = ("/local/output/", "/local/agent_sessions/")
-        for page in list(self.get_pages()):
-            path = (page.file_path or "").replace("\\", "/")
-            is_agent = (not path) or any(marker in path for marker in markers)
-            if not is_agent:
-                continue
-            self.page_to_be_closed = page
-            page.saved = True
-            self.close_page(ensure=False)
-        remaining = self.current_page.file_path if self.current_page else ""
-        if remaining:
-            self.agent_panel.notify_canvas_opened(remaining)
-        else:
-            self.new_page()
-            self.agent_panel.notify_canvas_cleared()
 
     def close_pages(self):
         """

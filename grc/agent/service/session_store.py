@@ -273,25 +273,6 @@ def resolve_session_path(session_id: str, path: str) -> str:
     return to_abspath(session_root(session_id), path)
 
 
-def archive_workflow(session_id: str) -> str:
-    """Archive the active workflow without touching project facts/artifacts."""
-    source = workflow_path(session_id)
-    if not os.path.isfile(source):
-        return ""
-    destination = os.path.join(
-        session_root(session_id), f"workflow.archived.{int(time.time())}.yaml"
-    )
-    os.replace(source, destination)
-    append_session_event(session_id, "workflow_archived", {"path": destination})
-    return destination
-
-
-def snapshots_dir(session_id: str) -> str:
-    path = os.path.join(session_root(session_id), "snapshots")
-    os.makedirs(path, exist_ok=True)
-    return path
-
-
 def _safe_component(name: str) -> str:
     """把 session_id 收敛为安全的单层目录名。"""
     keep = [c if (c.isalnum() or c in "-_") else "_" for c in str(name)]

@@ -342,6 +342,25 @@ class DynamicWorkflowStore:
             candidate.checkpoint = {}
             for stage in candidate.stages[reopened_index:]:
                 stage.reset()
+        current_index = next(
+            (
+                index for index, stage in enumerate(candidate.stages)
+                if stage.id == candidate.current_stage
+            ),
+            None,
+        )
+        if current_index is not None:
+            incomplete = next(
+                (
+                    stage.id for stage in candidate.stages[:current_index]
+                    if stage.status != "completed"
+                ),
+                "",
+            )
+            if incomplete:
+                raise ValueError(
+                    f"Current Stage cannot advance past incomplete Stage {incomplete}"
+                )
         for stage in candidate.stages:
             if (
                 stage.status == "completed"
@@ -495,6 +514,7 @@ class DynamicWorkflowStore:
                         item.tasks[0].target_agent if len(item.tasks) == 1 else ""
                     ),
                     "tasks": [asdict(task) for task in item.tasks],
+                    "status": item.status,
                     "execution_status": item.status,
                     "completion": list(item.expected_evidence),
                     "result_refs": list(item.result_refs),

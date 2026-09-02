@@ -249,8 +249,16 @@ def workflow_view(
     for item in workflow.get("stages") or []:
         if not isinstance(item, dict):
             continue
-        outcome = str(item.get("outcome") or "")
-        execution = str(item.get("execution_status") or "pending")
+        outcome = str(item.get("outcome") or "").lower()
+        execution = str(
+            item.get("status") or item.get("execution_status") or "pending"
+        ).lower()
+        outcome = {"pass": "passed", "complete": "completed"}.get(
+            outcome, outcome
+        )
+        execution = {"pass": "passed", "complete": "completed"}.get(
+            execution, execution
+        )
         status = outcome or execution
         if outcome == "failed":
             status = "failed"
