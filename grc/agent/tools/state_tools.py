@@ -10,14 +10,10 @@ from typing import Any, Dict, List, Optional
 
 from ..knowledge import recipes
 from ..state import (
-    ALLOW,
-    CONFIRM,
-    PROPOSE,
     Claim,
     ClaimStore,
     Decision,
     Evidence,
-    gate,
 )
 from .registry import ToolContext, tool
 
@@ -330,29 +326,6 @@ def configure_sdr(
             "error": "SDR configuration requires center frequency and sample rate.",
         }
     state = _state(ctx)
-    policy = gate(
-        {
-            "target": "device",
-            "scope": "configuration",
-            "domain": "hardware",
-        },
-        state.coordination,
-    )
-    if policy != ALLOW and not _workflow_checkpoint_approved(
-        ctx, "hardware_confirmation", "rf_plan_confirmation"
-    ):
-        state.coordination.pending_confirmations.append(
-            {
-                "action": "configure_sdr",
-                "device_type": device_type,
-                "policy": policy,
-            }
-        )
-        return {
-            "ok": False,
-            "policy": policy,
-            "requires_confirmation": True,
-        }
     state.project.config["device"] = {
         "type": device_type,
         "center_freq": center_freq,
@@ -367,7 +340,7 @@ def configure_sdr(
     name="hardware_preflight",
     description=(
         "Check host-side SDR prerequisites: requested parameters, local driver "
-        "CLI availability, and RF feature enablement. This does not discover "
+        "CLI availability, and configuration readiness. This does not discover "
         "or probe a physical device."
     ),
     parameters={
@@ -427,17 +400,13 @@ def hardware_preflight(ctx: ToolContext, device_type: str = ""):
 
 @tool(
     name="apply_grc_diff",
-    description="Apply a single-block parameter change through deterministic tools. Modulation/constellation changes are rejected; use design_flowgraph with a new recipe instead.",
+    description="Apply and save one deterministic block-parameter change without simulation or verification.",
     parameters={
         "type": "object",
         "properties": {
             "block_id": {"type": "string"},
             "parameter": {"type": "string"},
             "value": {},
-            "resimulate": {
-                "type": "boolean",
-                "description": "改参成功后是否自动仿真并绑定 Claim,默认 true",
-            },
         },
         "required": ["block_id", "parameter", "value"],
     },
@@ -449,32 +418,12 @@ def apply_grc_diff(
     block_id: str,
     parameter: str,
     value: Any,
-    resimulate: bool = True,
 ):
     from . import registry
 
     if ctx.extra.get("mutation_forbidden"):
         return {"ok": False, "error": "Flowgraph changes are disabled for this request."}
     state = _state(ctx)
-    policy = gate(
-        {
-            "target": parameter,
-            "block_id": block_id,
-            "scope": "single_block_change",
-            "domain": "dsp",
-        },
-        state.coordination,
-    )
-    if policy != ALLOW:
-        return {
-            "ok": False,
-            "policy": policy,
-            "requires_confirmation": policy in (PROPOSE, CONFIRM),
-            "error": (
-                "调制/星座变更必须走 design_flowgraph 换 recipe,并等待用户确认;"
-                "禁止用 apply_grc_diff 改 const_points/type/sym_map。"
-            ),
-        }
     if ctx.flow_graph is None:
         return {
             "ok": False,
@@ -494,15 +443,15 @@ def apply_grc_diff(
         state.project.flowgraph_version += 1
         ClaimStore(state).invalidate_by_version(state.project.flowgraph_version)
         result["path"] = rendered.get("path")
+        result["grc_path"] = rendered.get("path")
         result["flowgraph_version"] = state.project.flowgraph_version
-        if resimulate:
-            result["reverify"] = _resimulate_and_verify(ctx, state)
+        ctx.extra.setdefault("artifacts", {})["grc_path"] = rendered.get("path")
     return result
 
 
 @tool(
     name="apply_flowgraph_patch",
-    description="Atomically apply add/remove/set/connect/disconnect operations, then validate and save; restore the in-memory graph on any failure.",
+    description="Atomically apply and save Flowgraph operations without simulation or Stage verification; restore the graph on an invalid patch.",
     parameters={
         "type": "object",
         "properties": {
@@ -515,7 +464,6 @@ def apply_grc_diff(
                 "type": "array",
                 "items": {},
             },
-            "resimulate": {"type": "boolean"},
         },
         "required": ["operations"],
     },
@@ -526,7 +474,6 @@ def apply_flowgraph_patch(
     ctx: ToolContext,
     operations: List[Dict[str, Any]],
     preconditions: Optional[List[Any]] = None,
-    resimulate: bool = True,
 ):
     from . import registry
 
@@ -549,26 +496,6 @@ def apply_flowgraph_patch(
         return {"ok": False, "error": pre_error}
 
     state = _state(ctx)
-    scope = (
-        "single_block_change"
-        if len(operations) == 1 and operations[0].get("op") == "set"
-        else "multi_block_change"
-    )
-    policy = gate(
-        {"target": "flowgraph", "scope": scope, "domain": "dsp"},
-        state.coordination,
-    )
-    if policy == "DENY":
-        return {"ok": False, "policy": policy, "error": "PolicyGateway 拒绝 patch"}
-    if policy != ALLOW and not _workflow_checkpoint_approved(
-        ctx, "change_confirmation", "repair_confirmation"
-    ):
-        return {
-            "ok": False,
-            "policy": policy,
-            "requires_confirmation": True,
-            "error": "多块 patch 需要 Workflow Checkpoint 批准",
-        }
     backup = copy.deepcopy(ctx.flow_graph.export_data())
 
     def restore_graph():
@@ -652,17 +579,14 @@ def apply_flowgraph_patch(
     state.project.flowgraph_version += 1
     state.project.config["canvas_dirty"] = False
     ClaimStore(state).invalidate_by_version(state.project.flowgraph_version)
-    reverify = _resimulate_and_verify(ctx, state) if resimulate else {
-        "ok": True, "skipped": True,
-    }
+    ctx.extra.setdefault("artifacts", {})["grc_path"] = target
     return {
         "ok": True,
         "outcome": "passed",
         "path": target,
+        "grc_path": target,
         "flowgraph_version": state.project.flowgraph_version,
         "applied": applied,
-        "reverify": reverify,
-        "affected_claims_evaluated": bool(reverify.get("ok")),
     }
 
 
@@ -746,71 +670,3 @@ def _disconnect_exact(ctx: ToolContext, operation: Dict[str, Any]) -> Dict[str, 
         return {"ok": False, "error": "指定连接不存在"}
     ctx.flow_graph.remove_element(match)
     return {"ok": True, "connection": f"{src_id}[{src_port}] -> {dst_id}[{dst_port}]"}
-
-
-def _workflow_checkpoint_approved(ctx: ToolContext, *stage_ids: str) -> bool:
-    workflow = ctx.extra.get("workflow") or {}
-    return any(
-        (stage.get("checkpoint") or {}).get("decision_status") == "approved"
-        for stage in workflow.get("stages") or []
-        if isinstance(stage, dict) and stage.get("id") in stage_ids
-    )
-
-
-def _resimulate_and_verify(ctx: ToolContext, state) -> Dict[str, Any]:
-    """改参后重跑仿真并把新指标绑到当前版本的 Claim。"""
-    from . import registry
-
-    sim = registry.call("run_simulation", {}, ctx)
-    if not sim.get("ok"):
-        return {"ok": False, "error": sim.get("error") or "The verification simulation failed."}
-    ctx.extra.setdefault("artifacts", {})
-    if sim.get("out_dir"):
-        ctx.extra["artifacts"]["out_dir"] = sim["out_dir"]
-    recipe_name = str(state.project.config.get("recipe") or "")
-    selected = recipes.get_recipe(recipe_name)
-    want_evm = selected is None or "evm" in (selected.metrics or [])
-    modulation = ""
-    for block in (ctx.blocks or {}).values():
-        params = getattr(block, "params", None) or {}
-        for name in ("type", "constellation"):
-            param = params.get(name)
-            try:
-                raw = str(param.get_value()).lower()
-            except AttributeError:
-                raw = ""
-            found = next(
-                (item for item in ("bpsk", "qpsk", "ofdm", "gfsk") if item in raw),
-                "",
-            )
-            if found:
-                modulation = found
-                break
-        if modulation:
-            break
-    modulation = modulation or str(state.project.config.get("modulation") or "bpsk")
-    notes = []
-    if want_evm:
-        metric = registry.call(
-            "read_metric",
-            {"kind": "evm", "modulation": modulation, "sps": 4},
-            ctx,
-        )
-        if metric.get("ok") and metric.get("value") is not None:
-            ctx.extra.setdefault("metrics", {})["evm_pct"] = metric["value"]
-            plot = registry.call("plot_constellation", {"sps": 4}, ctx)
-            if plot.get("ok") and plot.get("path"):
-                ctx.extra["artifacts"]["constellation_png"] = plot["path"]
-        else:
-            notes.append(metric.get("error") or "无 EVM")
-    bound = verify_state_claims(ctx, ctx.extra.get("metrics", {}))
-    out = {
-        "ok": True,
-        "evm_pct": (ctx.extra.get("metrics") or {}).get("evm_pct"),
-        "modulation": modulation,
-        "measurement_id": str(ctx.extra.get("measurement_id") or ""),
-        "claims": bound.get("updated", []),
-    }
-    if notes:
-        out["note"] = "; ".join(notes)
-    return out

@@ -84,7 +84,7 @@ class DynamicTask:
 
 @dataclass
 class DynamicStage:
-    """A user-visible phase containing one or more delegated tasks."""
+    """A user-visible phase delegated through exactly one Task."""
 
     id: str
     objective: str
@@ -103,6 +103,8 @@ class DynamicStage:
     def validate(self, known_agents: Iterable[str]) -> None:
         if not self.id or not self.objective or not self.tasks:
             raise ValueError("Stage requires id, objective and tasks")
+        if len(self.tasks) != 1:
+            raise ValueError("Stage requires exactly one Task")
         if self.status not in STAGE_STATUSES:
             raise ValueError(f"Invalid Stage status: {self.status}")
         for task in self.tasks:

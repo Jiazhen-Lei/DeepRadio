@@ -262,12 +262,8 @@ class ServiceAgent:
             f"CURRENT_WORKFLOW:\n{json.dumps(current, ensure_ascii=False)}\n\n"
             f"CURRENT_STAGE:\n{json.dumps(stage_payload, ensure_ascii=False)}\n\n"
             f"CURRENT_PROJECT:\n{json.dumps(project, ensure_ascii=False, default=str)}\n\n"
-            "Read grc-orchestration. If this is a status question or the user asks "
-            "for an answer only, answer without tools or Workflow changes. Otherwise "
-            "work only on CURRENT_STAGE, using its internal Tasks. You may revise the "
-            "plan when the user changes an earlier decision or requests a new future "
-            "Stage. Complete at most one user-visible Stage, then stop. Use only "
-            "verified evidence."
+            "请根据以上用户请求和当前状态，读取并遵循 grc-orchestration Skill "
+            "处理本轮请求。"
         )
         try:
             from .trace import build_trace_callback

@@ -184,6 +184,10 @@ def _project_runtime_state(ctx: ToolContext, result: Dict[str, Any]) -> None:
     if not result.get("running") and status in {"crashed", "stopped", "exited", "failed"}:
         project.config["rf_armed"] = False
         project.config.pop("rf_armed_path", None)
+        project.config.pop("rf_permission_grant", None)
+        granted = getattr(getattr(state, "runtime", None), "granted_permissions", None)
+        if isinstance(granted, list):
+            granted[:] = [item for item in granted if item not in {"rf.start", "RF_RUN"}]
 
 
 def _rf_approved(ctx: ToolContext) -> bool:
@@ -204,6 +208,7 @@ def _rf_approved(ctx: ToolContext) -> bool:
     return bool(
         binding.get("workflow_id")
         and binding.get("workflow_id") == workflow.get("workflow_id")
+        and binding.get("stage_id") == workflow.get("current_stage")
         and int(binding.get("project_version", -1))
         == int(getattr(project, "flowgraph_version", 0))
     )
@@ -489,8 +494,8 @@ def probe_device(
 @tool(
     name="arm_hardware_flowgraph",
     description=(
-        "Enable a disabled hardware sink only after offline verification, "
-        "device probing, and the RF checkpoint have passed. Never starts RF."
+        "Prepare the current session's hardware flowgraph after device probing. "
+        "This never starts RF."
     ),
     parameters={
         "type": "object",
@@ -504,17 +509,13 @@ def probe_device(
     origin="deepradio_runtime",
     runtime="grc_rewrite",
     permission="device.configure",
-    requires=["device_probed", "user_effect_grant"],
+    requires=["device_probed"],
 )
 def arm_hardware_flowgraph(
     ctx: ToolContext, grc_path: str, device_identity: str = ""
 ) -> Dict[str, Any]:
-    if _is_ble_deploy(ctx) and not _completion_satisfied(ctx, "ble_packet_valid"):
-        return {"ok": False, "armed": False, "error": "Offline protocol verification has not passed"}
     if not _completion_satisfied(ctx, "device_probed"):
         return {"ok": False, "armed": False, "error": "Hardware discovery and probing have not passed"}
-    if not _rf_approved(ctx):
-        return {"ok": False, "armed": False, "error": "rf.start user authorization is missing"}
     source = _resolve_work_path(ctx, grc_path)
     out_dir = Path(ctx.out_dir or "").resolve()
     if not source.is_file() or out_dir not in source.parents:
@@ -642,8 +643,6 @@ def start_flowgraph(
         return replay
     if not _rf_approved(ctx):
         return {"ok": False, "requires_confirmation": True, "error": "rf.start user authorization is missing"}
-    if _is_ble_deploy(ctx) and not _completion_satisfied(ctx, "ble_packet_valid"):
-        return {"ok": False, "error": "Offline protocol verification has not passed; refusing to start RF"}
     if not _completion_satisfied(ctx, "device_probed"):
         return {"ok": False, "error": "Hardware discovery and probing have not passed; refusing to start RF"}
     if _tx_requires_arming(ctx) and not _rf_armed(ctx, grc_path):

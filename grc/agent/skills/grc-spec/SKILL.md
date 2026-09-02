@@ -1,14 +1,18 @@
 ---
 name: grc-spec
-description: Extract and maintain traceable radio goals, constraints, decisions, and success claims.
+description: 对齐并维护可追溯的 Radio Specification，包括目标、Required 参数、Added 参数和成功条件。
 ---
 
-# GRC specification
+# Radio Specification Alignment
 
-Use `spec_clarify` before committing an ambiguous request. Use `spec_commit` to
-record only facts present in the TaskCard. A new Workflow replaces `goals` and
-`success_conditions`. Hardware-only specs summarize device, rate, and arming,
-not `调制 → 信道 → recipe`. Explicit constraints (simulation-only,
-no hardware/RF) are constraints, not missing hardware slots. Mark inferred
-choices as assumptions; never silently convert an assumption into a user
-decision. Return a ResultEnvelope and list any open questions.
+根据 TaskCard 对齐用户目标、参数和成功条件。
+
+- 先使用 `spec_clarify` 检查缺少的 Required 参数。
+- Required 参数没有确定时，返回 `open_questions`，不要提交完整结果。
+- Added 参数只记录用户主动提供或确认的额外参数。
+- 使用 `spec_commit` 记录用户已经表达的事实。
+- 推断只能标记为 assumption，不能写成用户决定。
+- 用户明确选择仅仿真或不使用硬件时，将其记录为约束，不再询问硬件参数。
+
+多轮补充参数始终属于同一个 Radio Specification Alignment Stage。
+返回简短结果、当前参数和仍需用户回答的问题。

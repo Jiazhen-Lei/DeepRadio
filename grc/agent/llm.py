@@ -148,7 +148,7 @@ def get_config() -> dict:
         max_messages = 20
 
     thinking = _env("GRC_AGENT_THINKING", "disabled").lower()
-    if thinking not in ("disabled", "enabled", "auto"):
+    if thinking not in ("disabled", "enabled", "auto", "low", "high", "max"):
         thinking = "disabled"
 
     try:
@@ -299,7 +299,7 @@ def chat(messages, config: dict = None) -> str:
         "stream": False,
     }
     # GLM-5.x: 结构化输出轮次关闭深度思考, 单轮延迟约降 45%。
-    if cfg.get("thinking") in ("disabled", "enabled"):
+    if cfg.get("thinking") in ("disabled", "enabled", "low", "high", "max"):
         payload["thinking"] = {"type": cfg["thinking"]}
     # 结构化解析只需要一个 JSON 对象,给个上限挡住偶发的长篇解释。
     # 注意必须用 ``max_tokens``: bigmodel 忽略 OpenAI 的

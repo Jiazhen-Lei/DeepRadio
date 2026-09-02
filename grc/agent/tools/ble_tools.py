@@ -212,7 +212,11 @@ def build_ble_advertising_pdu(
     )
     ctx.extra["ble_packet"] = packet
     ctx.extra.setdefault("artifacts", {}).update(
-        {"ble_packet": str(packet_path), "ble_metadata": str(metadata_path)}
+        {
+            "ble_packet": str(packet_path),
+            "ble_metadata": str(metadata_path),
+            "tx_data": str(packet_path),
+        }
     )
     return {
         "ok": True,
@@ -310,9 +314,22 @@ def generate_ble_1m_waveform(
         "bt": float(bt),
         "modulation_index": float(modulation_index),
         "digital_amplitude": float(digital_amplitude),
+        "channel": int(channel),
     }
-    ctx.extra.setdefault("artifacts", {})["ble_waveform"] = str(path)
+    manifest_path = _out_dir(ctx) / f"ble_adv_ch{channel}_waveform.json"
+    manifest_path.write_text(
+        json.dumps(ctx.extra["ble_waveform"], ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    ctx.extra.setdefault("artifacts", {}).update(
+        {
+            "ble_waveform": str(path),
+            "waveform_path": str(path),
+            "waveform_manifest": str(manifest_path),
+        }
+    )
     return {"ok": True, **ctx.extra["ble_waveform"], "channel": channel,
+            "manifest_path": str(manifest_path),
             "capability": "ble_advertising_single_channel",
             "unsupported_capabilities": [
                 "ble_advertising_three_channel",

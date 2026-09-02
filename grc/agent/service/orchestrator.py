@@ -113,9 +113,12 @@ def build_chat_model(temperature: float = 0.2):
     cfg = llm.get_config()
     from langchain_openai import ChatOpenAI
     extra_body: dict[str, Any] = {}
-    # GLM-5.x: 委派/建图轮次关闭深度思考(单轮约省 45%); env 可切 enabled/auto。
-    if cfg.get("thinking") in ("disabled", "enabled"):
-        extra_body["thinking"] = {"type": cfg["thinking"]}
+    thinking = cfg.get("thinking")
+    if thinking in ("disabled", "enabled"):
+        extra_body["thinking"] = {"type": thinking}
+    elif thinking in ("low", "high", "max"):
+        extra_body["thinking"] = {"type": "enabled"}
+        extra_body["reasoning_effort"] = thinking
     # 单轮输出上限。实测同一个 Task 1 两次运行 115s vs 271s,差异几乎全部来自
     # "长输出轮"(最大单次 41s / 2621 tok);工具调用轮只需要几十到几百 token,
     # 最终答复也应是简短叙述,所以设一个足够宽但能挡住失控长文的上限。

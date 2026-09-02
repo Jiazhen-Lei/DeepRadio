@@ -3,11 +3,61 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any, Dict, List
 
 from ..tools.registry import ToolContext
 from ..workflow.dynamic import DynamicWorkflowStore
 from . import session_store as store
+
+
+def _validate_stage_plan(stages: List[Dict[str, Any]]) -> List[str]:
+    """Validate fixed Stage-to-Task mappings from the maintained library."""
+    try:
+        from grc.core.io import yaml
+
+        path = (
+            Path(__file__).resolve().parents[1]
+            / "skills/grc-orchestration/references/stage_library.yaml"
+        )
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        catalog = dict(data.get("stages") or {})
+    except Exception as exc:  # noqa: BLE001 - surface a controlled tool error
+        raise ValueError(f"Stage library could not be loaded: {exc}") from exc
+    if not catalog:
+        raise ValueError("Stage library is empty")
+    if not stages:
+        raise ValueError("Workflow requires at least one Stage")
+
+    capabilities: List[str] = []
+    for stage in stages or []:
+        if not isinstance(stage, dict):
+            raise ValueError("Each Stage must be an object")
+        stage_id = str(stage.get("id") or "")
+        definition = catalog.get(stage_id)
+        if not isinstance(definition, dict):
+            raise ValueError(f"Unknown Stage: {stage_id or '(empty)'}")
+        tasks = [item for item in stage.get("tasks") or [] if isinstance(item, dict)]
+        if len(tasks) != 1:
+            raise ValueError(f"Stage {stage_id} requires exactly one Task")
+        task = tasks[0]
+        expected_task = dict(definition.get("task") or {})
+        if str(task.get("id") or "") != str(expected_task.get("id") or ""):
+            raise ValueError(f"Stage {stage_id} has an invalid Task id")
+        if str(task.get("target_agent") or "") != str(definition.get("target_agent") or ""):
+            raise ValueError(f"Stage {stage_id} has an invalid target_agent")
+        required_evidence = {
+            str(item) for item in expected_task.get("expected_evidence") or []
+        }
+        declared_evidence = {
+            str(item) for item in task.get("expected_evidence") or []
+        }
+        if not required_evidence.issubset(declared_evidence):
+            raise ValueError(f"Stage {stage_id} is missing required Evidence")
+        for capability in definition.get("capabilities") or []:
+            if capability not in capabilities:
+                capabilities.append(str(capability))
+    return capabilities
 
 
 def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> list[Any]:
@@ -26,11 +76,15 @@ def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> li
         """Create or update the complete ordered Workflow.
 
         MainAgent must call this before delegation and after verified results.
-        Stage fields: id, objective, status, result_refs, tasks. Each Task has
+        Stage fields: id, objective, status, result_refs, tasks. Each Stage has
+        exactly one Task. The Task has
         id, objective, target_agent, inputs, expected_evidence, status and
-        result_refs. A Stage is user-visible; its Tasks are internal delegated
-        work. Use the revision from CURRENT_WORKFLOW.
+        result_refs. Use the revision from CURRENT_WORKFLOW.
         """
+        try:
+            capabilities = _validate_stage_plan(stages)
+        except (TypeError, ValueError) as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
         state = ctx.extra.get("state")
         previous_status = {
             stage.id: stage.status
@@ -46,6 +100,18 @@ def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> li
             return json.dumps({
                 "ok": False,
                 "error": "Only one user-visible Stage may complete in one turn",
+            }, ensure_ascii=False)
+        if newly_completed and str(current_stage or "") != newly_completed[0]:
+            return json.dumps({
+                "ok": False,
+                "error": "Keep current_stage on the Stage completed this turn",
+            }, ensure_ascii=False)
+        if newly_completed and any(
+            str(stage.get("status") or "") == "running" for stage in stages
+        ):
+            return json.dumps({
+                "ok": False,
+                "error": "Do not start another Stage in the completion update",
             }, ensure_ascii=False)
         completed_this_turn = str(ctx.extra.get("completed_stage_this_turn") or "")
         if newly_completed and completed_this_turn not in {"", newly_completed[0]}:
@@ -76,18 +142,74 @@ def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> li
             result.execution_status = "pending"
             workflow.save()
         if state is not None:
+            from ..knowledge.spec_requirements import (
+                missing_profile_fields,
+                missing_required_fields,
+                resolve_specification,
+            )
             from ..state import ClaimStore, SharedIntent
 
             if not state.intent.intent_id:
                 state.intent = SharedIntent.new(result.intent.raw_text)
-            state.intent.status = "confirmed"
+            previous_parameters = dict(state.intent.parameters)
+            previous_sources = dict(state.intent.parameter_sources)
             state.intent.raw_text = result.intent.raw_text
             state.intent.task_type = result.task_type
+            state.intent.capabilities = capabilities
             state.intent.parameters = dict(result.intent.slots)
             state.intent.parameter_sources = {
-                key: "mainagent" for key in result.intent.slots
+                key: (
+                    previous_sources.get(key, "user_text")
+                    if previous_parameters.get(key) == value
+                    else "user_revision" if key in previous_parameters
+                    else "user_text"
+                )
+                for key, value in result.intent.slots.items()
             }
             state.intent.goals = [result.intent.summary] if result.intent.summary else []
+            criteria = result.intent.slots.get("success_conditions") or []
+            state.intent.success_criteria = (
+                [str(item) for item in criteria]
+                if isinstance(criteria, list)
+                else [str(criteria)]
+            )
+            missing = missing_required_fields(
+                capabilities=capabilities,
+                slots=state.intent.parameters,
+                slot_sources=state.intent.parameter_sources,
+            )
+            for field in missing_profile_fields(
+                task_type=result.task_type,
+                capabilities=capabilities,
+                slots=state.intent.parameters,
+                slot_sources=state.intent.parameter_sources,
+            ):
+                if field not in missing:
+                    missing.append(field)
+            state.intent.missing_fields = missing
+            aligned_stage = next(
+                (
+                    stage for stage in result.stages
+                    if stage.id == "radio_specification_alignment"
+                ),
+                None,
+            )
+            state.intent.status = (
+                "confirmed"
+                if aligned_stage and aligned_stage.status == "completed"
+                else "awaiting_input" if missing
+                else "draft"
+            )
+            state.intent.specification = resolve_specification(
+                task_type=result.task_type,
+                capabilities=capabilities,
+                slots=state.intent.parameters,
+                slot_sources=state.intent.parameter_sources,
+                missing_fields=missing,
+                validation_errors=state.intent.validation_errors,
+                goals=state.intent.goals,
+                raw_text=state.intent.raw_text,
+            )
             state.intent.revision = result.revision
             state.intent.refresh_hash()
             if workflow.reopened_from:

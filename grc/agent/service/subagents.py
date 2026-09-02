@@ -29,19 +29,18 @@ def build_orchestrator_prompt(subagent_names: Iterable[str],
                               style_prompt: str = "") -> str:
     names = ", ".join(subagent_names)
     style_section = f"\n【STYLE】{style_prompt}\n" if style_prompt else ""
-    return (
-        "你是 DeepRadio 的唯一用户接口和 Workflow 负责人。"
-        "读取 grc-orchestration Skill，将 Workflow 划分为用户可感知的 Stage，把技术工作放入 Stage 内部 Task。"
-        "每轮只推进 current_stage；可委派该 Stage 所需的多个 SubAgent Task，完成后回复并停止，不执行下一 Stage。"
-        "用户询问状态或要求只回答时，不更新 Workflow，不委派。"
-        "用户修改早期决定时，回到最早受影响 Stage；用户改变流程时，可插入、删除或重排后续 Stage。"
-        "领域 Task 必须通过 task 委派给 SubAgent，不直接调用领域工具。"
-        "只根据宿主验证的 Evidence 完成 Task 和 Stage。"
-        "缺少信息时用 kind=input 询问；真实 RF 执行前用 kind=approval 请求本次确认。"
-        "最终使用用户当前语言简洁回复，不输出内部字段、JSON 或工具日志。"
-        f"可委派：{names}。\n"
-        + style_section
-    )
+    prompt = """你是 DeepRadio 的 MainAgent，也是系统中唯一与用户交互的 Agent。
+
+DeepRadio 由 MainAgent、动态 Workflow 和多个 SubAgent 组成。你负责理解用户意图、维护 Workflow、委派当前 Stage，并向用户反馈结果。
+
+SubAgent 只执行收到的 Task，返回结果、Artifact、Measurement 和 Evidence。SubAgent 不与用户交互，不规划或修改 Workflow，也不扩大任务范围。
+
+处理涉及 Workflow 的请求时，必须读取并遵循 grc-orchestration Skill 及其引用的 Stage 候选库。Workflow 的规划、执行、推进和调整均以该 Skill 为准。
+
+不要直接执行 SubAgent 负责的领域任务。
+
+使用用户当前使用的语言回复。保持简洁明确，不展示内部 JSON、TaskCard、工具日志或状态字段。""".strip()
+    return prompt + f"\n\n可委派：{names}。\n" + style_section
 
 
 def _domain_prompt(role: str, skill: str, duties: str) -> str:
@@ -63,8 +62,10 @@ def build_spec_prompt() -> str:
 def build_radio_design_prompt() -> str:
     return _domain_prompt(
         "RadioDesignAgent",
-        "grc-block-rag",
-        "只选型、不改图。recipe 必须覆盖全部 capabilities，否则报缺口，禁止近义顶替。",
+        "grc-block-rag, grc-ble-advertising",
+        "根据 Radio Specification 生成发送数据和基带波形。"
+        "只使用与协议匹配的确定性工具；不构建、修改或运行 Flowgraph。"
+        "当前能力无法覆盖协议时，明确返回能力缺口。",
     )
 
 
@@ -72,8 +73,8 @@ def build_flowgraph_prompt() -> str:
     return _domain_prompt(
         "FlowgraphAgent",
         "grc-build",
-        "优先 design_flowgraph。换调制禁止 apply_grc_diff 改星座点；"
-        "改参后必须重仿真并 verify_claims。",
+        "根据 TaskCard 创建或修改 Flowgraph，并返回 .grc 产物。"
+        "只负责 Build，不执行 Verification 或 Simulation。",
     )
 
 
@@ -81,8 +82,9 @@ def build_verification_prompt() -> str:
     return _domain_prompt(
         "VerificationAgent",
         "grc-critic, grc-sim",
-        "先校验再仿真；失败则 explain_error。结论绑定 Evidence。"
-        "byte sink 只读 BER，勿对 uint8 算 EVM。",
+        "根据 stage_id 执行对应任务：flowgraph_verification 只校验，"
+        "simulation_and_measurement 只仿真并读取所需指标。"
+        "不修改 Flowgraph，结论必须绑定 Evidence。",
     )
 
 
@@ -90,7 +92,8 @@ def build_diagnosis_prompt() -> str:
     return _domain_prompt(
         "DiagnosisAgent",
         "grc-diagnosis",
-        "根据指标给最小可恢复的修复建议，不直接改图。",
+        "根据已有 Evidence 诊断原因并输出报告。可以提出修改建议，"
+        "但不修改 Flowgraph，也不重新验证。",
     )
 
 
@@ -98,17 +101,9 @@ def build_hardware_prompt() -> str:
     return _domain_prompt(
         "HardwareAgent",
         "grc-hardware",
-        "configure / discover / probe 只读。"
-        "仅在当前 Workflow 和流图版本获得本次用户确认后可有限时长启动，必须 stop。"
-        "建图不等于已发射。",
-    )
-
-
-def build_protocol_prompt() -> str:
-    return _domain_prompt(
-        "ProtocolAgent",
-        "grc-ble-advertising, grc-build, grc-critic",
-        "PDU / CRC / 白化 / GFSK 只用确定性工具；禁止口头声称协议或空口通过。",
+        "根据 stage_id 执行对应任务：hardware_preparation 只配置、发现、"
+        "探测和准备 Flowgraph，不启动 RF；physical_rf_execution 只在"
+        " MainAgent 已记录本次确认后启动有限时长运行，并记录停止结果。",
     )
 
 
@@ -123,17 +118,27 @@ _SUBAGENT_DEFS = [
     ),
     (
         "radio_design_agent",
-        "检索块知识并选择确定性通信配方。",
+        "根据 Radio Specification 生成发送数据和基带波形。",
         build_radio_design_prompt,
-        ["grc-block-rag"],
-        ["select_recipe", "search_blocks", "describe_block", "list_examples"],
+        ["grc-block-rag", "grc-ble-advertising"],
+        [
+            "select_recipe", "search_blocks", "describe_block", "list_examples",
+            "build_ble_advertising_pdu", "generate_ble_1m_waveform",
+            "verify_ble_packet_bits",
+        ],
     ),
     (
         "flowgraph_agent",
         "构建或增量修改 GNU Radio 流图。",
         build_flowgraph_prompt,
         ["grc-build", "grc-block-rag"],
-        ["design_flowgraph", "inspect_flowgraph", "apply_grc_diff", "apply_flowgraph_patch", "build_sdr_tx_flowgraph"],
+        [
+            "select_recipe", "search_blocks", "describe_block", "list_examples",
+            "init_flow_graph", "add_block", "set_param", "connect", "render_grc",
+            "inspect_flowgraph", "apply_grc_diff", "apply_flowgraph_patch",
+            "build_sdr_tx_flowgraph", "build_ble_uhd_tx_flowgraph",
+            "build_ble_pluto_tx_flowgraph",
+        ],
     ),
     (
         "verification_agent",
@@ -156,35 +161,18 @@ _SUBAGENT_DEFS = [
         "根据指标诊断并提出最小修复。",
         build_diagnosis_prompt,
         ["grc-diagnosis", "grc-critic"],
-        ["debug_by_metric", "explain_error"],
-    ),
-    (
-        "protocol_agent",
-        "构建并离线验证 BLE Advertising PDU、PHY 波形和 TX 流图（B210 或 PlutoSDR）。",
-        build_protocol_prompt,
-        ["grc-ble-advertising", "grc-build", "grc-critic"],
-        [
-            "build_ble_advertising_pdu",
-            "generate_ble_1m_waveform",
-            "verify_ble_packet_bits",
-            "build_ble_uhd_tx_flowgraph",
-            "build_ble_pluto_tx_flowgraph",
-            "validate_flowgraph",
-        ],
+        ["debug_by_metric", "explain_error", "run_diagnosis_checks"],
     ),
     (
         "hardware_agent",
-        "管理 SDR 配置、只读发现/探测，以及受控有限时长 RF。",
+        "准备 SDR 硬件，并执行用户已确认的有限时长 RF 任务。",
         build_hardware_prompt,
-        ["grc-hardware", "grc-build"],
+        ["grc-hardware"],
         [
             "hardware_preflight", "configure_sdr",
             "discover_devices", "probe_device", "start_flowgraph",
             "query_runtime_status", "stop_flowgraph", "emergency_stop",
             "arm_hardware_flowgraph",
-            "inspect_flowgraph", "build_usrp_rx_spectrum_flowgraph",
-            "build_sdr_rx_spectrum_flowgraph",
-            "build_sdr_tx_flowgraph",
         ],
     ),
 ]

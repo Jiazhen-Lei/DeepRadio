@@ -9,6 +9,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from ..tools.registry import ToolContext
@@ -80,6 +81,32 @@ def _merge_artifacts(ctx: ToolContext, artifacts: Dict[str, Any]) -> None:
             store[key] = value
 
 
+def _record_diagnosis_artifact(
+    ctx: ToolContext, name: str, result: Dict[str, Any]
+) -> None:
+    if name not in {"debug_by_metric", "explain_error", "run_diagnosis_checks"}:
+        return
+    report_path = str(result.get("report_path") or "")
+    if not report_path and result.get("ok") is not False:
+        path = Path(ctx.out_dir or ".") / "diagnosis" / "diagnosis_report.json"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(
+                    {"tool": name, "result": result},
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str,
+                ),
+                encoding="utf-8",
+            )
+            report_path = str(path)
+        except OSError:
+            return
+    if report_path:
+        _merge_artifacts(ctx, {"diagnosis_report": report_path})
+
+
 #: 幂等只读/纯计算工具:同一 Stage 内相同入参重复调用必然得到相同结果,
 #: 直接回放首次结果并附提示,省掉一整轮"工具执行 + 大上下文 LLM"。
 #: 实测(local/agent_sessions/gui-f8262d88)一次 BLE 部署里
@@ -126,6 +153,8 @@ def _call_registry(ctx: ToolContext, name: str, arguments: Dict[str, Any]) -> st
     result = registry.call(name, arguments, ctx)
     kind = _EVENT_KIND.get(name, name)
     record_tool_event(ctx, kind, result, arguments)
+    if name == "render_grc" and result.get("path"):
+        _merge_artifacts(ctx, {"grc_path": result["path"]})
     if result.get("grc_path"):
         _merge_artifacts(ctx, {"grc_path": result["grc_path"]})
     if result.get("out_dir"):
@@ -133,6 +162,7 @@ def _call_registry(ctx: ToolContext, name: str, arguments: Dict[str, Any]) -> st
     plot_key = _PLOT_ARTIFACTS.get(name)
     if plot_key and result.get("path"):
         _merge_artifacts(ctx, {plot_key: result["path"]})
+    _record_diagnosis_artifact(ctx, name, result)
     if name in _IDEMPOTENT_TOOLS and result.get("ok"):
         cache[cache_key] = dict(result)
     return json.dumps(result, ensure_ascii=False)
