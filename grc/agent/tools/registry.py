@@ -250,13 +250,6 @@ def _requirement_satisfied(
     state = extra.get("state")
     project = getattr(state, "project", None)
     runtime = getattr(state, "runtime", None)
-    if name == "rf_runtime":
-        try:
-            from .hardware_tools import rf_runtime_enabled
-
-            return bool(rf_runtime_enabled())
-        except Exception:  # noqa: BLE001
-            return False
     if name == "user_effect_grant":
         try:
             from .hardware_tools import _rf_approved

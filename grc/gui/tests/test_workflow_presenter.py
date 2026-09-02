@@ -469,10 +469,6 @@ class WorkflowPresenterTest(unittest.TestCase):
         class _Harness:
             _build_stage_row = ClaimsPanel._build_stage_row
             _build_stage_claim_line = ClaimsPanel._build_stage_claim_line
-            _font_desc = ClaimsPanel._font_desc
-
-            def __init__(self):
-                self._font_pt = 10
 
         row = _Harness()._build_stage_row({
             "id": "tx_build",

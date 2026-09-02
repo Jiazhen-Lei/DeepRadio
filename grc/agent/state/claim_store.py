@@ -84,6 +84,18 @@ class ClaimStore:
                 invalidated.append(claim.id)
         return invalidated
 
+    def invalidate_by_intent_revision(self, new_revision: int) -> List[str]:
+        """Mark prior conclusions stale after a user-directed Workflow revision."""
+        invalidated = []
+        for claim in self.state.claims:
+            if claim.intent_revision < new_revision and claim.status != "Stale":
+                claim.status = "Stale"
+                claim.stale_reason = (
+                    f"intent_revision {claim.intent_revision} < {new_revision}"
+                )
+                invalidated.append(claim.id)
+        return invalidated
+
     def summary(self, *, active_intent_only: bool = False) -> List[dict]:
         claims = list(self.state.claims)
         intent_id = str(self.state.intent.intent_id or "")

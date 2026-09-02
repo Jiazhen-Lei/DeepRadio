@@ -3,6 +3,7 @@
 from .dynamic import (
     DynamicIntent,
     DynamicStage,
+    DynamicTask,
     DynamicWorkflow,
     DynamicWorkflowStore,
 )
@@ -10,6 +11,7 @@ from .dynamic import (
 __all__ = [
     "DynamicIntent",
     "DynamicStage",
+    "DynamicTask",
     "DynamicWorkflow",
     "DynamicWorkflowStore",
 ]

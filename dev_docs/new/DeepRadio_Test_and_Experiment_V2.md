@@ -207,7 +207,6 @@ PYTHONPATH=$PWD python -m unittest grc.agent.tests.test_hardware -v
 在符合当地法规的屏蔽或低功率实验条件下：
 
 ```bash
-export GRC_AGENT_ENABLE_RF=1
 PYTHONPATH=$PWD python -m grc --gtk --fresh
 ```
 

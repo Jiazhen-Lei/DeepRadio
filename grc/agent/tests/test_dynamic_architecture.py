@@ -21,13 +21,26 @@ from grc.agent.tools.registry import ToolContext
 from grc.agent.workflow.dynamic import DynamicWorkflowStore
 
 
-def stage(status: str = "running") -> dict:
+def task(
+    task_id="build", status="running", target_agent="flowgraph_agent",
+    evidence=None, inputs=None,
+) -> dict:
+    return {
+        "id": task_id,
+        "objective": task_id.replace("_", " ").title(),
+        "target_agent": target_agent,
+        "inputs": inputs or {"modulation": "bpsk"},
+        "expected_evidence": evidence or ["artifact:grc_path"],
+        "status": status,
+        "result_refs": [],
+    }
+
+
+def stage(status: str = "running", *, objective="Build and verify") -> dict:
     return {
         "id": "design",
-        "objective": "Build the requested flowgraph",
-        "target_agent": "flowgraph_agent",
-        "inputs": {"modulation": "bpsk"},
-        "expected_evidence": ["artifact:grc_path"],
+        "objective": objective,
+        "tasks": [task(status=status)],
         "status": status,
         "result_refs": [],
     }
@@ -67,8 +80,10 @@ class DynamicWorkflowStoreTest(unittest.TestCase):
                 {
                     "id": "validate",
                     "objective": "Validate",
-                    "target_agent": "verification_agent",
-                    "expected_evidence": ["validate_flowgraph"],
+                    "tasks": [task(
+                        "validate", "pending", "verification_agent",
+                        ["validate_flowgraph"],
+                    )],
                     "status": "pending",
                 },
                 stage(),
@@ -99,6 +114,101 @@ class DynamicWorkflowStoreTest(unittest.TestCase):
         )
         self.assertEqual(completed.execution_status, "completed")
 
+    def test_one_user_stage_can_contain_multiple_agent_tasks(self):
+        combined = stage()
+        combined["tasks"].append(task(
+            "validate", "pending", "verification_agent",
+            ["validate_flowgraph"],
+        ))
+        result = self.update([combined])
+        self.assertEqual(len(result.stage("design").tasks), 2)
+        self.assertEqual(
+            [item.target_agent for item in result.stage("design").tasks],
+            ["flowgraph_agent", "verification_agent"],
+        )
+
+    def test_missing_input_waits_inside_the_same_stage(self):
+        self.update([stage("pending")])
+        checkpoint = self.store.request_decision(
+            stage_id="design",
+            question="What BLE local name should be used?",
+            purpose="missing_parameter",
+            permission="",
+            kind="input",
+        )
+        self.assertEqual(self.store.digest()["wait_kind"], "input")
+        self.store.begin_turn("DeepRadio", 0)
+        self.assertEqual(self.store.workflow.current_stage, "design")
+        self.assertEqual(self.store.workflow.stage().status, "pending")
+        self.assertEqual(checkpoint["id"], self.store.workflow.checkpoint["id"])
+        self.assertEqual(self.store.workflow.checkpoint["answer"], "DeepRadio")
+
+    def test_editing_a_completed_stage_reopens_it_and_later_stages(self):
+        first = stage("completed", objective="Build BLE named MyBeacon")
+        hardware = {
+            "id": "hardware",
+            "objective": "Prepare hardware",
+            "tasks": [task(
+                "probe", "pending", "hardware_agent", ["probe_device"]
+            )],
+            "status": "pending",
+            "result_refs": [],
+        }
+        running = self.update(
+            [first, hardware],
+            current_stage="hardware",
+            artifacts={"grc_path": "/session/final/ble.grc"},
+        )
+        changed = stage("completed", objective="Build BLE named DeepRadio")
+        revised = self.update(
+            [changed, hardware],
+            current_stage="design",
+            expected_revision=running.revision,
+            artifacts={"grc_path": "/session/final/ble.grc"},
+        )
+        self.assertEqual(revised.current_stage, "design")
+        self.assertEqual([item.status for item in revised.stages], ["pending", "pending"])
+        self.assertEqual(self.store.reopened_from, "design")
+
+    def test_user_can_insert_simulation_before_future_hardware_stage(self):
+        design = stage("completed")
+        hardware = {
+            "id": "hardware",
+            "objective": "Prepare hardware",
+            "tasks": [task(
+                "probe", "pending", "hardware_agent", ["probe_device"]
+            )],
+            "status": "pending",
+        }
+        current = self.update(
+            [design, hardware],
+            current_stage="hardware",
+            artifacts={"grc_path": "/session/final/ble.grc"},
+        )
+        simulation = {
+            "id": "simulation",
+            "objective": "Run and review simulation",
+            "tasks": [task(
+                "simulate", "pending", "verification_agent", ["run_simulation"]
+            )],
+            "status": "pending",
+        }
+        revised = self.update(
+            [design, simulation, hardware],
+            current_stage="simulation",
+            expected_revision=current.revision,
+            artifacts={"grc_path": "/session/final/ble.grc"},
+        )
+        self.assertEqual(revised.current_stage, "simulation")
+        self.assertEqual(revised.stage("design").status, "completed")
+        self.assertEqual([item.id for item in revised.stages], [
+            "design", "simulation", "hardware",
+        ])
+
+    def test_conversation_turn_does_not_replace_original_intent(self):
+        self.store.begin_turn("What stage are we at?", 0)
+        self.assertEqual(self.store.workflow.intent.raw_text, "Build BPSK")
+
     def test_user_decision_is_recorded_but_does_not_grant_permission(self):
         self.update([stage()])
         checkpoint = self.store.request_decision(
@@ -125,6 +235,26 @@ class DynamicWorkflowStoreTest(unittest.TestCase):
             corrupted.begin_turn("replace it", 0)
         self.assertEqual(Path(self.path).read_text(encoding="utf-8"), "{broken")
 
+    def test_schema_v2_stage_loads_as_one_task(self):
+        legacy = self.update([stage("pending")]).to_dict()
+        legacy_stage = {
+            "id": "design",
+            "objective": "Build the requested flowgraph",
+            "target_agent": "flowgraph_agent",
+            "inputs": {"modulation": "bpsk"},
+            "expected_evidence": ["artifact:grc_path"],
+            "status": "pending",
+            "result_refs": [],
+        }
+        Path(self.path).write_text(json.dumps({
+            "schema_version": 2,
+            **legacy,
+            "stages": [legacy_stage],
+        }), encoding="utf-8")
+        loaded = DynamicWorkflowStore(self.path, subagent_names())
+        self.assertFalse(loaded.load_error)
+        self.assertEqual(loaded.workflow.stage().tasks[0].target_agent, "flowgraph_agent")
+
 
 class PermissionGuardTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -149,7 +279,11 @@ class PermissionGuardTest(unittest.TestCase):
         self.assertEqual(result.get("policy"), "DENY")
         self.assertEqual(result.get("permission"), "project.write")
 
-    def test_rf_start_fails_closed_without_runtime_and_user_grant(self):
+    def test_rf_start_requires_user_grant(self):
+        self.assertNotIn(
+            "rf_runtime",
+            registry.action_metadata("start_flowgraph")["requires"],
+        )
         result = registry.call("start_flowgraph", {"grc_path": "missing.grc"}, self.ctx)
         self.assertEqual(result.get("policy"), "DENY")
         self.assertIn("Missing execution preconditions", result.get("error", ""))

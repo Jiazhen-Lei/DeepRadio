@@ -8,6 +8,7 @@ import logging
 import os
 import time
 import uuid
+from dataclasses import asdict
 from typing import Any, Dict, Optional
 
 from ..memory.profile import UserProfile
@@ -162,6 +163,10 @@ class ServiceAgent:
                     self._workflow.workflow.to_dict()
                     if self._workflow.workflow else {}
                 ),
+                "turn_stage_id": (
+                    self._workflow.workflow.current_stage
+                    if self._workflow.workflow else ""
+                ),
                 "mutation_forbidden": False,
                 "forbidden_permissions": [],
                 "profile_snapshot": self.profile.level,
@@ -169,6 +174,7 @@ class ServiceAgent:
         )
         ctx.extra.pop("pending_decision", None)
         ctx.extra.pop("_idempotent_results", None)
+        ctx.extra.pop("completed_stage_this_turn", None)
         if ctx.flow_graph is None:
             self._load_flowgraph(ctx)
         return ctx
@@ -245,6 +251,8 @@ class ServiceAgent:
                 "the production chain no longer switches to a deterministic Workflow."
             )
         current = self._workflow.digest()
+        current_stage = self._workflow.current_stage()
+        stage_payload = asdict(current_stage) if current_stage else {}
         project = {
             "grc_path": self._state.project.grc_path,
             "project_version": self._state.project.flowgraph_version,
@@ -253,20 +261,28 @@ class ServiceAgent:
         prompt = (
             f"USER_REQUEST:\n{user_text}\n\n"
             f"CURRENT_WORKFLOW:\n{json.dumps(current, ensure_ascii=False)}\n\n"
+            f"CURRENT_STAGE:\n{json.dumps(stage_payload, ensure_ascii=False)}\n\n"
             f"CURRENT_PROJECT:\n{json.dumps(project, ensure_ascii=False, default=str)}\n\n"
-            "Read grc-orchestration. Maintain the Workflow with update_workflow, "
-            "delegate domain work through task, and use only verified evidence."
+            "Read grc-orchestration. If this is a status question or the user asks "
+            "for an answer only, answer without tools or Workflow changes. Otherwise "
+            "work only on CURRENT_STAGE, using its internal Tasks. You may revise the "
+            "plan when the user changes an earlier decision or requests a new future "
+            "Stage. Complete at most one user-visible Stage, then stop. Use only "
+            "verified evidence."
         )
-        from .trace import build_trace_callback
+        try:
+            from .trace import build_trace_callback
 
-        trace = build_trace_callback(
-            session_id=self.session_id,
-            context=lambda: {
-                "workflow_id": self._workflow.workflow.workflow_id,
-                "revision": self._workflow.workflow.revision,
-                "stage_id": self._workflow.workflow.current_stage,
-            } if self._workflow.workflow else {},
-        )
+            trace = build_trace_callback(
+                session_id=self.session_id,
+                context=lambda: {
+                    "workflow_id": self._workflow.workflow.workflow_id,
+                    "revision": self._workflow.workflow.revision,
+                    "stage_id": self._workflow.workflow.current_stage,
+                } if self._workflow.workflow else {},
+            )
+        except ImportError:
+            trace = None
         if trace:
             trace.start()
         try:
@@ -307,7 +323,7 @@ class ServiceAgent:
             workflow.execution_status = "running"
             stage = workflow.stage()
             if stage:
-                stage.status = "pending"
+                stage.reset()
             self._workflow.save()
             return self._invoke_mainagent("The user requested a retry. Re-check current evidence before acting.")
         if action in {"specification_update", "interaction_response"}:
@@ -450,6 +466,9 @@ class ServiceAgent:
         waiting = bool(
             checkpoint and checkpoint.get("status") == "pending"
         )
+        approval_waiting = (
+            waiting and checkpoint.get("kind", "approval") == "approval"
+        )
         pending = (
             {
                 **checkpoint,
@@ -459,7 +478,7 @@ class ServiceAgent:
                 "can_confirm": True,
                 "approved": False,
             }
-            if waiting else {}
+            if approval_waiting else {}
         )
         status = (
             self._workflow.workflow.execution_status
@@ -471,7 +490,7 @@ class ServiceAgent:
                 if ok else "The MainAgent could not complete this turn."
             ),
             stage="WAITING" if waiting else "DELIVER" if ok else "ERROR",
-            needs_confirmation=waiting,
+            needs_confirmation=approval_waiting,
             tool_invocations=invocations,
             artifacts=artifacts,
             done=status == "completed",

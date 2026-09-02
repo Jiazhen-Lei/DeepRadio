@@ -1,6 +1,6 @@
 schema_version: 1
 
-stages:
+capabilities:
   clarify_spec:
     objective: Clarify and record the radio requirements.
     target_agent: spec_agent

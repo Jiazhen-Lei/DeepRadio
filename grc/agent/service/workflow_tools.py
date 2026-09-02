@@ -26,10 +26,33 @@ def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> li
         """Create or update the complete ordered Workflow.
 
         MainAgent must call this before delegation and after verified results.
-        Stage fields: id, objective, target_agent, inputs, expected_evidence,
-        status, result_refs. Use the revision from CURRENT_WORKFLOW.
+        Stage fields: id, objective, status, result_refs, tasks. Each Task has
+        id, objective, target_agent, inputs, expected_evidence, status and
+        result_refs. A Stage is user-visible; its Tasks are internal delegated
+        work. Use the revision from CURRENT_WORKFLOW.
         """
         state = ctx.extra.get("state")
+        previous_status = {
+            stage.id: stage.status
+            for stage in (workflow.workflow.stages if workflow.workflow else [])
+        }
+        newly_completed = [
+            str(stage.get("id") or "")
+            for stage in stages or []
+            if stage.get("status") == "completed"
+            and previous_status.get(str(stage.get("id") or "")) != "completed"
+        ]
+        if len(newly_completed) > 1:
+            return json.dumps({
+                "ok": False,
+                "error": "Only one user-visible Stage may complete in one turn",
+            }, ensure_ascii=False)
+        completed_this_turn = str(ctx.extra.get("completed_stage_this_turn") or "")
+        if newly_completed and completed_this_turn not in {"", newly_completed[0]}:
+            return json.dumps({
+                "ok": False,
+                "error": "This turn already completed its current Stage",
+            }, ensure_ascii=False)
         project_version = int(
             getattr(getattr(state, "project", None), "flowgraph_version", 0)
         )
@@ -49,8 +72,11 @@ def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> li
             )
         except (TypeError, ValueError) as exc:
             return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+        if newly_completed and result.execution_status != "completed":
+            result.execution_status = "pending"
+            workflow.save()
         if state is not None:
-            from ..state import SharedIntent
+            from ..state import ClaimStore, SharedIntent
 
             if not state.intent.intent_id:
                 state.intent = SharedIntent.new(result.intent.raw_text)
@@ -64,11 +90,28 @@ def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> li
             state.intent.goals = [result.intent.summary] if result.intent.summary else []
             state.intent.revision = result.revision
             state.intent.refresh_hash()
+            if workflow.reopened_from:
+                ClaimStore(state).invalidate_by_intent_revision(result.revision)
+                state.project.config["rf_armed"] = False
+                state.project.config.pop("rf_armed_path", None)
+                state.project.config.pop("rf_permission_grant", None)
+                state.runtime.granted_permissions = [
+                    permission
+                    for permission in state.runtime.granted_permissions
+                    if permission not in {"rf.start", "RF_RUN"}
+                ]
+                runtime = dict(state.project.config.get("runtime") or {})
+                if runtime.get("running"):
+                    from ..tools import registry
+
+                    registry.call("stop_flowgraph", {}, ctx)
             state_path = str(ctx.extra.get("state_path") or "")
             if state_path:
                 state.save(state_path)
         ctx.extra["workflow"] = result.to_dict()
         ctx.extra["stage_id"] = result.current_stage
+        if newly_completed:
+            ctx.extra["completed_stage_this_turn"] = newly_completed[0]
         store.append_session_event(
             str(ctx.extra.get("session_id") or ""),
             "workflow_updated_by_mainagent",
@@ -79,9 +122,13 @@ def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> li
                 "execution_status": result.execution_status,
             },
         )
-        return json.dumps(
-            {"ok": True, "workflow": workflow.digest()}, ensure_ascii=False
-        )
+        payload = {"ok": True, "workflow": workflow.digest()}
+        if newly_completed:
+            payload["turn_complete"] = True
+            payload["instruction"] = (
+                "Reply with this Stage result and stop. Do not execute the next Stage in this turn."
+            )
+        return json.dumps(payload, ensure_ascii=False)
 
     @tool
     def request_user_decision(
@@ -89,11 +136,13 @@ def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> li
         question: str,
         purpose: str = "user_decision",
         permission: str = "",
+        kind: str = "approval",
     ) -> str:
         """Pause the Workflow and request one structured user decision.
 
-        Use permission='rf.start' before physical RF transmission. This tool
-        records a request only; it never grants a permission.
+        Use kind='input' for missing information. Use kind='approval' and
+        permission='rf.start' before physical RF transmission. This tool records
+        a request only; it never grants a permission.
         """
         try:
             checkpoint = workflow.request_decision(
@@ -101,6 +150,7 @@ def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> li
                 question=question,
                 purpose=purpose,
                 permission=permission,
+                kind=kind,
             )
         except ValueError as exc:
             return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)

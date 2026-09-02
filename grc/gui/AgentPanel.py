@@ -3,11 +3,9 @@ Agent 右侧对话面板 (多轮协商版 GTK 界面)。
 
 在 MainWindow 右侧提供一个人机对话面板:
 
-* **多轮协商 DeepRadio**(默认): 持有 ``ServiceAgent``，按闭环模式委派六个领域
+* **多轮协商 DeepRadio**(默认): 持有 ``ServiceAgent``，按闭环模式委派多个领域
   Subagent，并通过 SharedState 展示可追溯 Spec 与 Claim/Evidence；
   交付 .grc 时 emit ``open_flow_graph`` 让 MainWindow **原地刷新**当前画布。
-* **一句话直出 (baseline)**: 勾选开关后走 ``build_flow_graph_from_text``,
-  LLM 直接产 .grc, 作为论文对照组。
 * **专业度档位**(创新 B): 下拉可选 自适应 / 小白 / 学生 / 专家; 选具体档位则
   钉档 (pin), 选"自适应"则放开 (unpin) 让画像随对话自适应。
 
@@ -27,10 +25,6 @@ import gi
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, GLib, GObject, Gdk, GdkPixbuf, Pango
 
-from grc.agent.runtime_config import (
-    rf_runtime_enabled,
-    set_rf_runtime_enabled,
-)
 from .ClaimsPanel import ClaimsPanel
 from .chat_markup import escape_pango, markdown_to_pango
 from .workflow_presenter import present
@@ -67,12 +61,6 @@ _ARTIFACT_IMAGES = [
 ]
 
 _USER_ROLES = ("You",)
-_FONT_CHOICES = (
-    ("Small", 11),
-    ("Medium", 13),
-    ("Large", 16),
-)
-_DEFAULT_FONT_PT = 13
 _BUBBLE_RADIUS = 16
 
 # Quartz 上 CSS background-color 经常不生效,气泡底色用 Cairo 画。
@@ -308,56 +296,29 @@ class AgentPanel(Gtk.VBox):
         self.platform = platform
         self._busy = False
         self._out_dir = _output_dir()
-        self._font_pt = _DEFAULT_FONT_PT
         self._runtime_poll_id = None
 
         # 多轮协商 Agent 实例 (惰性创建, 避免无 gnuradio 时导入报错)。
         self._agent = None
         self._canvas_path = ""
-        # baseline 一句话直出的历史 [(role, content), ...]。
-        self._baseline_history = []
-
-        # ---- 顶部控制条拆成两行,避免把侧栏最小宽度撑死 ----
-        ctrl = Gtk.VBox(spacing=2)
-        row1 = Gtk.HBox()
-        row1.pack_start(Gtk.Label(label="Expertise:"), False, False, 2)
+        # ---- 顶部控制条 ----
+        ctrl = Gtk.HBox()
+        ctrl.pack_start(Gtk.Label(label="Expertise:"), False, False, 2)
 
         self.level_combo = Gtk.ComboBoxText()
         for label, _ in _LEVEL_CHOICES:
             self.level_combo.append_text(label)
         self.level_combo.set_active(0)  # 默认"自适应"
         self.level_combo.connect('changed', self._on_level_changed)
-        row1.pack_start(self.level_combo, False, False, 2)
-
-        row1.pack_start(Gtk.Label(label="Text size:"), False, False, 2)
-        self.font_combo = Gtk.ComboBoxText()
-        for label, _pt in _FONT_CHOICES:
-            self.font_combo.append_text(label)
-        self.font_combo.set_active(1)
-        self.font_combo.connect('changed', self._on_font_changed)
-        row1.pack_start(self.font_combo, False, False, 2)
-        ctrl.pack_start(row1, False, False, 0)
-
-        row2 = Gtk.HBox()
-        self.baseline_check = Gtk.CheckButton(label="One-shot baseline")
-        row2.pack_start(self.baseline_check, False, False, 2)
-
-        self.rf_runtime_check = Gtk.CheckButton(label="Physical RF")
-        self.rf_runtime_check.set_tooltip_text(
-            "Persistently allow bounded physical RF operations; each run still requires confirmation."
-        )
-        self.rf_runtime_check.set_active(rf_runtime_enabled())
-        self.rf_runtime_check.connect('toggled', self._on_rf_runtime_toggled)
-        row2.pack_start(self.rf_runtime_check, False, False, 8)
+        ctrl.pack_start(self.level_combo, False, False, 2)
 
         self.reset_button = Gtk.Button(label="Reset")
         self.reset_button.connect('clicked', self._on_reset)
-        row2.pack_end(self.reset_button, False, False, 2)
+        ctrl.pack_end(self.reset_button, False, False, 2)
 
         self.undo_button = Gtk.Button(label="Undo to Previous Version")
         self.undo_button.connect('clicked', self._on_undo)
-        row2.pack_end(self.undo_button, False, False, 2)
-        ctrl.pack_start(row2, False, False, 0)
+        ctrl.pack_end(self.undo_button, False, False, 2)
 
         self.pack_start(ctrl, expand=False, fill=True, padding=2)
 
@@ -392,7 +353,6 @@ class AgentPanel(Gtk.VBox):
         self._live_cards = []
         scroll.connect("size-allocate", self._on_chat_size_allocate)
         self.claims_panel = ClaimsPanel()
-        self.claims_panel.set_font_pt(self._font_pt)
         self.claims_panel.connect("confirm-pending", self._on_confirm_pending)
         self.claims_panel.connect("cancel-pending", self._on_cancel_pending)
         self.claims_panel.connect("retry-transmit", self._on_retry_transmit)
@@ -430,8 +390,6 @@ class AgentPanel(Gtk.VBox):
         self.set_hexpand(True)
         self.set_halign(Gtk.Align.FILL)
         self.set_size_request(260, -1)
-        self._apply_chat_font()
-
         self._append("DeepRadio",
                      "Hello! I can help design and operate a radio system through iterative collaboration "
                      "(flowgraph → simulation → refinement).\nArtifacts are saved under "
@@ -465,28 +423,6 @@ class AgentPanel(Gtk.VBox):
                 except Exception as exc:  # noqa: BLE001
                     log.warning("绑定画布工程失败: %s", exc)
         return self._agent
-
-    def _on_rf_runtime_toggled(self, button):
-        enabled = bool(button.get_active())
-        try:
-            set_rf_runtime_enabled(enabled)
-            if self._agent is not None:
-                view = self._agent.refresh_runtime_capability()
-                claims = view.get("claims") or []
-                spec = view.get("spec_digest") or {}
-                workflow = view.get("workflow_digest") or {}
-                self.claims_panel.update_data(
-                    claims, spec, workflow=workflow
-                )
-                self._replace_interaction_cards(
-                    spec, workflow, claims,
-                    workflow.get("interaction_request") or {},
-                )
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Failed to persist RF runtime preference: %s", exc)
-            button.handler_block_by_func(self._on_rf_runtime_toggled)
-            button.set_active(not enabled)
-            button.handler_unblock_by_func(self._on_rf_runtime_toggled)
 
     def _on_confirm_pending(self, _panel):
         self._submit_checkpoint_decision("approved")
@@ -692,13 +628,6 @@ class AgentPanel(Gtk.VBox):
         label = _LEVEL_CHOICES[max(idx, 0)][0]
         self._set_status("Expertise: {}".format(label))
 
-    def _on_font_changed(self, combo):
-        idx = combo.get_active()
-        if idx < 0:
-            idx = 1
-        self._font_pt = _FONT_CHOICES[idx][1]
-        self._apply_chat_font()
-
     def _on_split_allocate(self, paned, allocation):
         if self._split_inited or allocation.height < 240:
             return
@@ -729,28 +658,6 @@ class AgentPanel(Gtk.VBox):
             for child in widget.get_children():
                 self._constrain_chat_bodies(child, body_w)
 
-    def _font_desc(self, delta=0):
-        desc = Pango.FontDescription()
-        desc.set_size(max(9, self._font_pt + delta) * Pango.SCALE)
-        return desc
-
-    def _apply_chat_font(self):
-        body = self._font_desc(0)
-        cap = self._font_desc(-3)
-        self.entry.override_font(body)
-        self._apply_font_walk(self._log_box, body, cap)
-        self.claims_panel.set_font_pt(self._font_pt)
-
-    def _apply_font_walk(self, widget, body, cap):
-        role = getattr(widget, "_dr_role", None)
-        if role == "body":
-            widget.override_font(body)
-        elif role == "caption":
-            widget.override_font(cap)
-        if isinstance(widget, Gtk.Container):
-            for child in widget.get_children():
-                self._apply_font_walk(child, body, cap)
-
     def _on_reset(self, _widget):
         if self._busy:
             return
@@ -763,7 +670,6 @@ class AgentPanel(Gtk.VBox):
                 log.warning("归档 Workflow 失败: %s", exc)
         self._agent = None
         self._canvas_path = ""
-        self._baseline_history = []
         for child in self._log_box.get_children():
             self._log_box.remove(child)
         self._live_cards = []
@@ -782,21 +688,14 @@ class AgentPanel(Gtk.VBox):
         self.entry.set_text('')
         self._submit_agent_text(text)
 
-    def _submit_agent_text(self, text, echo=True, force_agent=False):
+    def _submit_agent_text(self, text, echo=True):
         if self._busy or not text:
             return
         if echo:
             self._append("You", text)
         self._set_busy(True)
-        baseline = (not force_agent) and self.baseline_check.get_active()
-        if baseline:
-            self._baseline_history.append(("user", text))
-            history = list(self._baseline_history)
-            threading.Thread(target=self._handle_baseline,
-                             args=(text, history), daemon=True).start()
-        else:
-            threading.Thread(target=self._handle_agent,
-                             args=(text,), daemon=True).start()
+        threading.Thread(target=self._handle_agent,
+                         args=(text,), daemon=True).start()
 
     # -- 多轮协商 Agent 路径 --------------------------------------------- #
     def _handle_agent(self, text):
@@ -918,28 +817,6 @@ class AgentPanel(Gtk.VBox):
             return False
         return True
 
-    # -- baseline 一句话直出路径 ----------------------------------------- #
-    def _handle_baseline(self, text, history):
-        """子线程: 走 build_flow_graph_from_text 直出 .grc。"""
-        try:
-            from grc.agent import build_flow_graph_from_text
-            grc_path = build_flow_graph_from_text(
-                text, self.platform, out_dir=self._out_dir, history=history)
-            GLib.idle_add(self._on_baseline_done, grc_path)
-        except Exception as e:  # noqa: BLE001
-            log.exception("baseline 生成流图失败")
-            GLib.idle_add(self._on_error, str(e))
-
-    def _on_baseline_done(self, grc_path):
-        name = os.path.basename(grc_path)
-        self._set_status("Generated {}; the canvas has been refreshed".format(name))
-        self.claims_panel.clear()
-        self._replace_interaction_cards({}, {}, [], {})
-        self._baseline_history.append(("assistant", "Generated " + name))
-        self._set_busy(False)
-        self.emit('open_flow_graph', grc_path)
-        return False
-
     def _on_error(self, message):
         self._append("DeepRadio", "Error: {}".format(message))
         self._set_status("Error")
@@ -1014,10 +891,8 @@ class AgentPanel(Gtk.VBox):
         self.entry.set_sensitive(not busy)
         self.send_button.set_sensitive(not busy)
         self.level_combo.set_sensitive(not busy)
-        self.baseline_check.set_sensitive(not busy)
         self.reset_button.set_sensitive(not busy)
         self.undo_button.set_sensitive(not busy)
-        self.font_combo.set_sensitive(not busy)
         self.send_button.set_label("Processing…" if busy else "Send")
         if busy and self._runtime_poll_id is None:
             self._runtime_poll_id = GLib.timeout_add(1000, self._on_runtime_poll)
@@ -1035,7 +910,6 @@ class AgentPanel(Gtk.VBox):
             "<span foreground='{}'>{}</span>".format(
                 theme["caption"], escape_pango(text)))
         cap.set_halign(Gtk.Align.END if align_end else Gtk.Align.START)
-        cap.override_font(self._font_desc(-3))
         return cap
 
     def _append(self, who, text):
@@ -1072,7 +946,6 @@ class AgentPanel(Gtk.VBox):
         except Exception:  # noqa: BLE001
             label.set_use_markup(False)
             label.set_text(body)
-        label.override_font(self._font_desc(0))
         if self._chat_width >= 80:
             label.set_size_request(self._body_wrap_width(), -1)
         bubble.pack_start(label, False, False, 0)

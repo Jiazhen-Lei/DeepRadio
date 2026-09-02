@@ -1,50 +1,79 @@
 # DeepRadio
 
-From: jensenlei, cindysha, sihanwang
+DeepRadio 在 GNU Radio Companion（GRC）中加入智能体能力。用户通过自然语言描述无线通信任务，系统负责规划 Workflow、调用 SubAgent、生成并验证流图，并在需要时执行真实 RF。
 
-## 介绍
+## 核心架构
 
-DeepRadio 在 GNU Radio Companion 之上增加一层「自然语言意图 → 可运行流图」能力。
+```text
+用户请求 → MainAgent → 当前 Stage → SubAgent Tasks → Evidence → 下一 Stage
+                         ├─ 缺少参数：停留并等待用户补充
+                         └─ 需求变化：回到受影响的 Stage 重新执行
+```
 
-## 快速开始
-### 初次使用
+- **Workflow**：根据当前目标动态生成的完整执行链路。
+- **Stage**：用户可见的工作阶段，例如需求确认、离线构建与验证、真实 RF 执行。
+- **Task**：Stage 内部交给 SubAgent 完成的技术任务。一个 Stage 可以包含多个 Task。
+- **Evidence**：工具执行后产生的可验证结果，用于更新 Workflow 状态。
+
+MainAgent 每轮只推进当前 Stage。Stage 完成后，系统等待用户继续。用户可以补充参数、修改已完成阶段的需求，或要求加入新的阶段，例如先进行 simulation。系统会更新 Workflow，并从最早受影响的 Stage 继续。
+
+## 安装
+
 ```bash
-# 1. 创建并激活 gnuradio 环境
+cd deepradio_dev
 conda env create -f environment.yml
 conda activate gnuradio
-
-# 2. 配置 Agent API (从模板复制并填写你的 key)
 cp .env.example .env
-# 编辑 .env, 填入 GRC_AGENT_BASE_URL / GRC_AGENT_API_KEY / GRC_AGENT_MODEL
-# 未配置时 Agent 会降级为确定性建图
-
-# 3. 启动 DeepRadio (GTK)
-cd DeepRadio          # 确保在项目根目录
-PYTHONPATH=$PWD python -m grc.main --gtk --fresh
-# 也可用环境变量：GRC_DEEPRADIO_FRESH=1 PYTHONPATH=$PWD python -m grc --gtk
-# 不加 --fresh 时仍会按 GRC 偏好恢复上次打开的文件
-
-# Agent 状态默认实时输出到启动终端；显式开启或关闭：
-GRC_AGENT_TRACE=1 PYTHONPATH=$PWD python -m grc --gtk --fresh
-GRC_AGENT_TRACE=0 PYTHONPATH=$PWD python -m grc --gtk --fresh
 ```
-### 后续使用（内部测试，开源要删）
-即已有 `gnuradio` 环境时：
+
+在 `.env` 中配置模型：
 
 ```bash
-conda activate gnuradio
-conda env update -f environment.yml --prune
+GRC_AGENT_BASE_URL=...
+GRC_AGENT_API_KEY=...
+GRC_AGENT_MODEL=...
 ```
 
-这会按 yml **增量安装/升级**缺失依赖（本次主要是 pip 包 `markdown`），不会重装 GNU Radio。`--prune` 会卸掉 yml 里已删除的包；只想补新包、不想动现有包时可以去掉 `--prune`。
+这三项未配置时，MainAgent 无法运行。
 
-如果暂时拉不到新 yml、只缺某一个 pip 包，激活环境后直接装也可以，例如：
+## 启动
 
 ```bash
-conda activate gnuradio
-pip install markdown
+PYTHONPATH=$PWD python -m grc --gtk --fresh
 ```
----
+
+运行数据保存在：
+
+- `local/output/<session_id>/`：生成的流图及构建产物。
+- `local/agent_sessions/<session_id>/`：Workflow、事件和证据记录。
+
+## 使用
+
+在 GRC 的 DeepRadio 面板中直接描述目标，例如：
+
+```text
+创建一个 BPSK 仿真链路并验证输出。
+```
+
+```text
+使用 PlutoSDR 构建 BLE 发射流程，local name 设置为 DeepRadio，最长运行 30 秒。
+```
+
+如果参数不足，系统会停留在当前 Stage，用户补充后继续。需求发生变化时，可以直接说明：
+
+```text
+把 BLE local name 改为 DeepRadio-Demo。
+```
+
+```text
+先增加一个 simulation 验证，再执行后续流程。
+```
+
+## 真实 RF
+
+真实 RF 没有全局开关。只有 Workflow 执行到对应 Stage 时，界面才会展示设备、频率、功率和时长，并请求用户确认当前 Workflow 与流图版本。
+
+确认后系统仍会检查设备状态和离线验证结果。单次运行最长 60 秒，运行期间可以随时停止。真实 RF 应通过 DeepRadio Workflow 启动，不应绕过流程手动运行流图。
 
 ### 连接 USRP B210
 
@@ -95,50 +124,26 @@ pip install markdown
 
    没有报错则继续；有报错请阅读《DeepRadio硬件连接指南.md》。
 
-4. 启用受控 RF 并启动 DeepRadio：
+4. 启动 DeepRadio：
 
    ```bash
-   export GRC_AGENT_ENABLE_RF=1
    PYTHONPATH=$PWD python -m grc --gtk --fresh
    ```
 
-5. 点击 DeepRadio 交互栏，输入：
-
-   ```text
-   用plutosdr发射一段2.402GHz的ble信号，local name为xxx，目标实现是人工可以用手机软件接收到
-   ```
-
-   其中 `xxx` 可以替换为任意广播名称。
-
-6. 等待交互。交互过程中会提供确认或取消选项，确认实验条件无误后点击确认。最后输出的流图如果没有自动发射，请点击 GRC 中的运行箭头；看到左下方进度中出现 `UUU…` 字样后，使用手机端 LightBlue 抓取 BLE 信号，应能发现 local name 为 `xxx` 的信号。
-
-
-## 自动契约测试
+### 常用设备检查：
 
 ```bash
-conda activate gnuradio
-PYTHONPATH=$PWD python -m unittest discover -s grc/agent/tests -v
+# USRP B210
+uhd_find_devices --args "type=b200"
+
+# PlutoSDR
+iio_info -S
 ```
 
-不启动真实 RF。GUI 人机用例见下；空口 HIL 见 `dev_docs/new/DeepRadio_Test_and_Experiment_V2.md`。
+## 主要代码
 
-## GUI 任务测试
-
-启动后不要勾选「一句话直出(baseline)」。独立用例先点「重置」。`DIAGNOSE` / `MODIFY_PROJECT` / `OBSERVE` 需先打开已有工程。回退改图用「撤销到上一版本」。
-
-```bash
-conda activate gnuradio
-PYTHONPATH=$PWD python -m grc --gtk --fresh
-```
-
-| Task | 输入 | 期望 |
-| --- | --- | --- |
-| `END_TO_END_SIM` | `做一个 BPSK 过 AWGN 的基带链路，EVM 小于 10%，显示星座图和频谱。` | Task 为端到端仿真；产出 `.grc`、EVM、星座图、频谱图；EVM 达标才完成。阈值若被追问，答 `10%`。 |
-| `TX_BUILD` | `构建一个 QPSK 基带发射链路，只做仿真，不接真实硬件。` | 只建 TX `.grc` 并做结构校验；无设备发现/配置/start。出现 RF 确认即失败。 |
-| `RX_BUILD` | `构建一个自包含的 BPSK AWGN 接收机，包含定时恢复和判决，并测 BER。` | 生成接收流图；BER 同时引用发送参考和接收判决 probe。缺 Eb/N0 时答 `8 dB`，并保持同一 `workflow_id`。 |
-| `DIAGNOSE` | `诊断当前链路的 EVM，解释主要原因并给出最小修改建议，先保持工程不变。` | 有诊断与 Evidence；`.grc` 哈希、版本和画布不变。若询问修复，选择拒绝。 |
-| `MODIFY_PROJECT` | `把当前 BPSK 工程改成 QPSK，其余条件保持一致。` | 确认前工程不变；确认后 version +1，流图变为 QPSK，受影响 Claim 重验。 |
-| `OBSERVE` | `查看当前接收信号的频谱和星座图，给出主峰，只观察工程。` | 输出图和指标；工程哈希与版本不变。无需修改确认。 |
-| `HARDWARE_CONFIGURE` | `为 PlutoSDR 配置 2.402 GHz、2 Msps 的发射流图，保存配置并停在发射确认。` | 发现并 probe 设备；生成禁用发射的 `.grc`；批准配置、拒绝发射；无 `start_flowgraph` 成功事件。 |
-
-产物：`local/output/`；会话：`local/agent_sessions/gui-*/state.json`。
+- `grc/agent/service/mainagent_service.py`：MainAgent 调度。
+- `grc/agent/service/subagents.py`：SubAgent 定义。
+- `grc/agent/workflow/dynamic.py`：动态 Workflow 状态。
+- `grc/agent/tools/`：GRC、验证和 RF 工具。
+- `grc/gui/AgentPanel.py`：交互界面。

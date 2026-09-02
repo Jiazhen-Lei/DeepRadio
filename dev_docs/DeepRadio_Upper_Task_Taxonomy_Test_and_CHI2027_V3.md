@@ -1348,7 +1348,7 @@ Claim–Evidence 和 stale 状态能否降低用户对错误成功声明的过�
 
 为了识别真正贡献，建议至少比较：
 
-1. `One-shot Baseline`：一句话直接生成，没有 Workflow；
+1. `Codex + GRC Baseline`：使用 Codex 和标准 GRC，没有 DeepRadio Workflow；
 2. `Opaque Agent`：内部多步执行，但只展示聊天结果；
 3. `Inspectable Workflow`：展示 Task、Stage、Checkpoint、Claim/Evidence；
 4. `Bidirectional Workflow`：在条件 3 上增加 Canvas 逆同步和局部重规划。
@@ -1506,4 +1506,3 @@ failure_policy
 不要让 Dynamic Workflow 只是后台状态机；
 要让它成为人能够理解、干预并通过工程操作反向影响的共享协作对象。
 ```
-

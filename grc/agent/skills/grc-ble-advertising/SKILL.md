@@ -13,5 +13,5 @@ legacy advertising payload. Treat phone observation as independent evidence.
 
 Use `generate_ble_1m_waveform` and `verify_ble_packet_bits`. Building a B210
 UHD or PlutoSDR TX flowgraph does not mean it was started. RF execution requires
-the dedicated checkpoint, explicit feature flag, bounded duration, and a
-confirmed stop.
+confirmation bound to the current Workflow and flowgraph version, bounded
+duration, and a confirmed stop.

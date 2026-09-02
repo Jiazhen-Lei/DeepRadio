@@ -27,7 +27,6 @@ import time
 import uuid
 from typing import Any, Dict, List
 
-from ..runtime_config import rf_runtime_enabled
 logger = logging.getLogger(__name__)
 
 #: 会话虚拟路径前缀约定(与 backend 一致)。
@@ -131,7 +130,6 @@ def ensure_run_metadata(session_id: str) -> str:
         "gnuradio": gnuradio_version,
         "conda_environment": str(os.environ.get("CONDA_DEFAULT_ENV") or ""),
         "platform": runtime_platform.platform(),
-        "rf_enabled": rf_runtime_enabled(),
     }
     environment_hash = _stable_hash(environment)
     payload = {

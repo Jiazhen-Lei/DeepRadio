@@ -16,28 +16,28 @@ _escape = escape_pango
 
 
 #: Stage visual styles: completed stages fade to a small muted line, the
-#: current stage is emphasized with a bigger bold label on tinted background,
-#: upcoming stages stay quiet gray.  ``scale`` is a font-point delta.
+#: current stage is emphasized with a bold label on tinted background,
+#: upcoming stages stay quiet gray. Font sizing follows the GTK theme.
 _STAGE_STYLES = {
     "passed": {
         "marker": "✓", "marker_color": "#2E9E5B", "text": "#5E6C7E",
-        "background": None, "scale": -2, "bold": False,
+        "background": None, "bold": False,
     },
     "failed": {
         "marker": "✕", "marker_color": "#C43E3E", "text": "#8A2A2A",
-        "background": "#FDECEC", "scale": 0, "bold": True,
+        "background": "#FDECEC", "bold": True,
     },
     "running": {
         "marker": "▶", "marker_color": "#1B62D6", "text": "#1F2933",
-        "background": "#E8F0FE", "scale": 1, "bold": True,
+        "background": "#E8F0FE", "bold": True,
     },
     "waiting": {
         "marker": "▶", "marker_color": "#C45B08", "text": "#3D3419",
-        "background": "#FFF4E5", "scale": 1, "bold": True,
+        "background": "#FFF4E5", "bold": True,
     },
     "pending": {
         "marker": "○", "marker_color": "#98A2B3", "text": "#98A2B3",
-        "background": None, "scale": -1, "bold": False,
+        "background": None, "bold": False,
     },
 }
 _STAGE_STYLES["error"] = _STAGE_STYLES["failed"]
@@ -98,7 +98,6 @@ class ClaimsPanel(Gtk.Frame):
         self.add(panel_scroll)
 
         self._claims = []
-        self._font_pt = 13
         self._updating = False
         self.evidence_path = ""
         self._last_workflow = {}
@@ -189,7 +188,6 @@ class ClaimsPanel(Gtk.Frame):
         self._detail_scroll.set_size_request(-1, 48)
         self._detail_scroll.set_no_show_all(True)
         self._detail_scroll.add(self._details)
-        self._apply_font()
 
     def _build_activity_bar(self):
         box = Gtk.VBox(spacing=2)
@@ -260,32 +258,6 @@ class ClaimsPanel(Gtk.Frame):
         self._metrics_label.set_margin_start(4)
         self._metrics_label.set_no_show_all(True)
         return self._metrics_label
-
-    def set_font_pt(self, pt):
-        self._font_pt = max(10, int(pt))
-        self._apply_font()
-
-    def _font_desc(self, delta=0):
-        desc = Pango.FontDescription()
-        desc.set_size(max(9, self._font_pt + delta) * Pango.SCALE)
-        return desc
-
-    def _apply_font(self):
-        desc = Pango.FontDescription()
-        desc.set_size(self._font_pt * Pango.SCALE)
-        self._view.override_font(desc)
-        self._details.override_font(desc)
-        small = Pango.FontDescription()
-        small.set_size(max(10, self._font_pt - 1) * Pango.SCALE)
-        for widget in (
-            self._metrics_label,
-            self._pending_label,
-            self._hint,
-            self._runtime_label,
-            self._claim_summary,
-        ):
-            if widget is not None:
-                widget.override_font(small)
 
     def update_data(self, claims, spec_digest, pending=None,
                     metrics=None, activity=None, workflow=None):
@@ -441,7 +413,6 @@ class ClaimsPanel(Gtk.Frame):
             )
         )
         label.set_margin_start(8)
-        label.override_font(self._font_desc(0))
         self._hardware_rows.pack_start(label, False, False, 2)
         error = str((detection or {}).get("error") or "").strip()
         if error and state in {"failed", "not_found"}:
@@ -450,7 +421,6 @@ class ClaimsPanel(Gtk.Frame):
                 "<span foreground='#C43E3E'>{}</span>".format(_escape(error))
             )
             err.set_margin_start(8)
-            err.override_font(self._font_desc(-1))
             self._hardware_rows.pack_start(err, False, False, 0)
         self._hardware_rows.show_all()
 
@@ -470,7 +440,6 @@ class ClaimsPanel(Gtk.Frame):
         label.set_markup("<span foreground='#B0B7C3'>{}</span>".format(
             _escape(text)))
         label.set_margin_top(6)
-        label.override_font(self._font_desc(-2))
         return label
 
     def _build_stage_row(self, stage):
@@ -508,7 +477,6 @@ class ClaimsPanel(Gtk.Frame):
                 _escape(header_text),
             )
         )
-        header.override_font(self._font_desc(style["scale"]))
         box.pack_start(header, False, False, 0)
         for claim in stage.get("claims") or []:
             box.pack_start(
@@ -540,7 +508,6 @@ class ClaimsPanel(Gtk.Frame):
             )
         )
         label.set_margin_start(18)
-        label.override_font(self._font_desc(-2))
         return label
 
     def _set_activity(self, activity, workflow=None):

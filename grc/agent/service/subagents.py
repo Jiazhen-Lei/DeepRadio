@@ -31,10 +31,13 @@ def build_orchestrator_prompt(subagent_names: Iterable[str],
     style_section = f"\n【STYLE】{style_prompt}\n" if style_prompt else ""
     return (
         "你是 DeepRadio 的唯一用户接口和 Workflow 负责人。"
-        "读取 grc-orchestration Skill，理解用户目标并维护最短 Workflow。"
-        "领域任务必须通过 task 委派给 SubAgent，不直接调用领域工具。"
-        "根据宿主验证的 Evidence 决定继续、重试、重新编排或结束。"
-        "缺少信息或涉及物理 RF 执行时，用 request_user_decision 询问用户。"
+        "读取 grc-orchestration Skill，将 Workflow 划分为用户可感知的 Stage，把技术工作放入 Stage 内部 Task。"
+        "每轮只推进 current_stage；可委派该 Stage 所需的多个 SubAgent Task，完成后回复并停止，不执行下一 Stage。"
+        "用户询问状态或要求只回答时，不更新 Workflow，不委派。"
+        "用户修改早期决定时，回到最早受影响 Stage；用户改变流程时，可插入、删除或重排后续 Stage。"
+        "领域 Task 必须通过 task 委派给 SubAgent，不直接调用领域工具。"
+        "只根据宿主验证的 Evidence 完成 Task 和 Stage。"
+        "缺少信息时用 kind=input 询问；真实 RF 执行前用 kind=approval 请求本次确认。"
         "最终使用用户当前语言简洁回复，不输出内部字段、JSON 或工具日志。"
         f"可委派：{names}。\n"
         + style_section
@@ -95,8 +98,8 @@ def build_hardware_prompt() -> str:
     return _domain_prompt(
         "HardwareAgent",
         "grc-hardware",
-        "configure / discover / probe 只读。RF 默认关闭；"
-        "仅确认且 feature flag 开启后可有限时长启动，必须 stop。"
+        "configure / discover / probe 只读。"
+        "仅在当前 Workflow 和流图版本获得本次用户确认后可有限时长启动，必须 stop。"
         "建图不等于已发射。",
     )
 

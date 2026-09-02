@@ -9,7 +9,6 @@ import shutil
 from typing import Any, Dict, List, Optional
 
 from ..knowledge import recipes
-from ..runtime_config import rf_runtime_enabled
 from ..state import (
     ALLOW,
     CONFIRM,
@@ -405,9 +404,6 @@ def hardware_preflight(ctx: ToolContext, device_type: str = ""):
         "driver_command_available": bool(driver and shutil.which(driver)),
         "center_frequency_present": center_freq is not None,
         "sample_rate_present": sample_rate is not None,
-        "real_hardware_actions_enabled": (
-            rf_runtime_enabled()
-        ),
     }
     complete = all(
         checks[name]
@@ -425,20 +421,8 @@ def hardware_preflight(ctx: ToolContext, device_type: str = ""):
         "readiness_scope": "host_environment",
         "physical_device_checked": False,
         "checks": checks,
-        "system_capabilities": {
-            "rf_runtime": {
-                "available": checks["real_hardware_actions_enabled"],
-                "requires_restart": False,
-                "environment_key": "GRC_AGENT_ENABLE_RF",
-                "persistent_preference": "rf_runtime_enabled",
-            }
-        },
-        "missing": [name for name, value in checks.items() if not value and name != "real_hardware_actions_enabled"],
-        "note": (
-            "Host configuration and driver readiness checks passed; RF runtime is enabled."
-            if checks["real_hardware_actions_enabled"]
-            else "Host configuration and driver readiness checks passed; RF runtime is not enabled."
-        ),
+        "missing": [name for name, value in checks.items() if not value],
+        "note": "Host configuration and driver readiness checks passed.",
     }
 
 
