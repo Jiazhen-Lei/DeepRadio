@@ -142,74 +142,24 @@ def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> li
             result.execution_status = "pending"
             workflow.save()
         if state is not None:
-            from ..knowledge.spec_requirements import (
-                missing_profile_fields,
-                missing_required_fields,
-                resolve_specification,
-            )
             from ..state import ClaimStore, SharedIntent
 
             if not state.intent.intent_id:
-                state.intent = SharedIntent.new(result.intent.raw_text)
-            previous_parameters = dict(state.intent.parameters)
-            previous_sources = dict(state.intent.parameter_sources)
+                state.intent = SharedIntent.new(
+                    result.intent.raw_text, workflow_id=result.workflow_id
+                )
+            elif (
+                state.intent.workflow_id
+                and state.intent.workflow_id != result.workflow_id
+            ):
+                state.intent = SharedIntent.new(
+                    result.intent.raw_text, workflow_id=result.workflow_id
+                )
+            elif not state.intent.workflow_id:
+                state.intent.workflow_id = result.workflow_id
             state.intent.raw_text = result.intent.raw_text
             state.intent.task_type = result.task_type
             state.intent.capabilities = capabilities
-            state.intent.parameters = dict(result.intent.slots)
-            state.intent.parameter_sources = {
-                key: (
-                    previous_sources.get(key, "user_text")
-                    if previous_parameters.get(key) == value
-                    else "user_revision" if key in previous_parameters
-                    else "user_text"
-                )
-                for key, value in result.intent.slots.items()
-            }
-            state.intent.goals = [result.intent.summary] if result.intent.summary else []
-            criteria = result.intent.slots.get("success_conditions") or []
-            state.intent.success_criteria = (
-                [str(item) for item in criteria]
-                if isinstance(criteria, list)
-                else [str(criteria)]
-            )
-            missing = missing_required_fields(
-                capabilities=capabilities,
-                slots=state.intent.parameters,
-                slot_sources=state.intent.parameter_sources,
-            )
-            for field in missing_profile_fields(
-                task_type=result.task_type,
-                capabilities=capabilities,
-                slots=state.intent.parameters,
-                slot_sources=state.intent.parameter_sources,
-            ):
-                if field not in missing:
-                    missing.append(field)
-            state.intent.missing_fields = missing
-            aligned_stage = next(
-                (
-                    stage for stage in result.stages
-                    if stage.id == "radio_specification_alignment"
-                ),
-                None,
-            )
-            state.intent.status = (
-                "confirmed"
-                if aligned_stage and aligned_stage.status == "completed"
-                else "awaiting_input" if missing
-                else "draft"
-            )
-            state.intent.specification = resolve_specification(
-                task_type=result.task_type,
-                capabilities=capabilities,
-                slots=state.intent.parameters,
-                slot_sources=state.intent.parameter_sources,
-                missing_fields=missing,
-                validation_errors=state.intent.validation_errors,
-                goals=state.intent.goals,
-                raw_text=state.intent.raw_text,
-            )
             state.intent.revision = result.revision
             state.intent.refresh_hash()
             if workflow.reopened_from:

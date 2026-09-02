@@ -39,6 +39,7 @@ _SOURCE_LABELS = {
     "user_text": "User",
     "user_revision": "User",
     "llm": "Extracted",
+    "extracted": "Extracted",
     "protocol_default": "Protocol Default",
     "safety_default": "Safety Default",
     "safe_preview_default": "Safety Default",
@@ -142,8 +143,23 @@ def specification_view(
         if key == "max_duration_seconds" and "duration_seconds" in visible_keys:
             continue
         value = item.get("display_value", item.get("value"))
-        unresolved = bool(item.get("unresolved")) or value in (None, "", [])
-        needs_confirmation = bool(item.get("needs_confirmation"))
+        group = str(item.get("group") or "").lower()
+        if group not in {"required", "added"}:
+            group = (
+                "required"
+                if str(item.get("requirement") or "") == "required"
+                else "added"
+            )
+        status = str(item.get("status") or "").lower()
+        if status not in {"aligned", "needs_confirmation", "missing"}:
+            if bool(item.get("unresolved")) or value in (None, "", []):
+                status = "missing"
+            elif bool(item.get("needs_confirmation")):
+                status = "needs_confirmation"
+            else:
+                status = "aligned"
+        unresolved = status == "missing"
+        needs_confirmation = status == "needs_confirmation"
         source = str(item.get("source") or "")
         rows.append({
             "key": key,
@@ -154,18 +170,12 @@ def specification_view(
             ),
             "unresolved": unresolved,
             "needs_confirmation": needs_confirmation,
-            "editable": bool(item.get("editable")),
-            "choices": list(item.get("choices") or []),
-            "allow_custom": bool(item.get("allow_custom", True)),
-            "raw_value": item.get("value"),
-            "requirement": str(item.get("requirement") or "mentioned"),
-            "group": (
-                "Required"
-                if str(item.get("requirement") or "") == "required"
-                else "Added"
+            "status": status,
+            "status_label": (
+                "Needs confirmation" if needs_confirmation
+                else ""
             ),
-            "locked": bool(item.get("locked", True)),
-            "confirmed": bool(item.get("confirmed")),
+            "group": "Required" if group == "required" else "Added",
         })
     if not rows:
         summary = str(spec.get("summary") or "Not extracted")
@@ -181,23 +191,17 @@ def specification_view(
         (workflow.get("shared_intent") or {}).get("status")
         or spec.get("intent_status") or ""
     )
-    blocking_questions = [
-        str(item.get("prompt") or item.get("field") or "").strip()
-        for item in spec.get("blocking_questions") or []
-        if isinstance(item, dict)
-        and str(item.get("prompt") or item.get("field") or "").strip()
-    ]
     return {
         "title": "Radio Specification",
         "rows": rows,
         "aligned": not unresolved and intent_status == "confirmed",
         "unresolved": unresolved,
         "status": intent_status or "draft",
-        "revision": int(spec.get("intent_revision") or 0),
-        "profiles": list(spec.get("specification_profiles") or []),
+        "revision": int(
+            spec.get("specification_revision") or spec.get("intent_revision") or 0
+        ),
         "blocking_questions": list(spec.get("blocking_questions") or []),
         "open_question": "",
-        "optional_prompts": list(spec.get("optional_prompts") or []),
     }
 
 

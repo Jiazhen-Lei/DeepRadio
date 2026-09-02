@@ -6,16 +6,20 @@ import copy
 import os
 import re
 import shutil
+import time
+from dataclasses import asdict
 from typing import Any, Dict, List, Optional
 
 from ..knowledge import recipes
 from ..state import (
     Claim,
     ClaimStore,
-    Decision,
     Evidence,
+    SharedIntent,
+    SpecificationField,
 )
 from .registry import ToolContext, tool
+
 
 def _state(ctx: ToolContext):
     state = ctx.extra.get("state")
@@ -39,50 +43,23 @@ def resolve_confirmation_decision(
     return {"ok": True, "resolved": True, "approved": bool(approved)}
 
 
-def looks_like_task_dump(text: str) -> bool:
-    """True when *text* is a TaskCard / USER DECISIONS dump, not a user goal."""
-    stripped = (text or "").strip()
-    if not stripped:
-        return False
-    if stripped.startswith("TaskCard") or "当前 Stage TaskCard" in stripped:
-        return True
-    if "USER DECISIONS" in stripped.upper():
-        return True
-    return len(stripped) > 240
-
-
 _EVM_THRESHOLD_RE = re.compile(
     r"(?:evm)\s*(?:要|需|必须|应)?\s*(?:小于|低于|<|≤)\s*(\d+(?:\.\d+)?)\s*%?"
 )
 
 
-def ensure_success_condition_claims(
-    state, conditions: List[str], *, keep_verbatim: bool = True
-) -> List[str]:
-    """Register success conditions and derive evaluable Claims from EVM thresholds.
-
-    Shared by the legacy ``commit_intent`` tool path and the workflow
-    intent-sync path so "EVM < x%" always maps to an ``evm_lt_x`` sim-layer
-    claim regardless of which path produced the intent. Non-EVM conditions
-    are recorded verbatim when *keep_verbatim* is set.
-    """
+def ensure_success_condition_claims(state, conditions: List[str]) -> List[str]:
+    """Derive evaluable Claims from aligned success conditions."""
     claim_ids: List[str] = []
     for raw in conditions or []:
         text = str(raw or "").strip()
         if not text:
             continue
         match = _EVM_THRESHOLD_RE.search(text.lower())
-        if match:
-            threshold = float(match.group(1))
-            condition = f"EVM < {threshold:g}%"
-        else:
-            if not keep_verbatim:
-                continue
-            condition = text
-        if condition not in state.spec.success_conditions:
-            state.spec.success_conditions.append(condition)
         if not match:
             continue
+        threshold = float(match.group(1))
+        condition = f"EVM < {threshold:g}%"
         claim_id = f"evm_lt_{threshold:g}".replace(".", "_")
         ClaimStore(state).upsert(
             Claim(
@@ -94,72 +71,6 @@ def ensure_success_condition_claims(
         )
         claim_ids.append(claim_id)
     return claim_ids
-
-
-def commit_intent(ctx: ToolContext, text: str) -> Dict[str, Any]:
-    """Project the canonical LLM-owned SharedIntent into the legacy Spec view.
-
-    This tool deliberately performs no text interpretation.  Natural-language
-    understanding belongs to MainAgent; accepting raw text here would create
-    a second intent source that could disagree with the active Workflow.
-    """
-    state = _state(ctx)
-    shared = state.intent
-    if shared.status == "idle" or not shared.intent_id:
-        return {
-            "ok": False,
-            "decisions": [],
-            "rejected_locked": [],
-            "claims": [],
-            "open_questions": list(state.spec.open_questions),
-            "error": "No canonical SharedIntent is available; run LLM intent alignment first",
-        }
-    for goal in shared.goals or ([shared.raw_text] if shared.raw_text else []):
-        if goal and goal not in state.spec.goals and not looks_like_task_dump(goal):
-            state.spec.goals.append(str(goal))
-    changed = []
-    for key, value in dict(shared.parameters or {}).items():
-        if value in (None, "", []):
-            continue
-        source = str(shared.parameter_sources.get(key) or "shared_intent")
-        existing = next((item for item in state.spec.decisions if item.key == key), None)
-        if existing is None:
-            state.spec.decisions.append(Decision(key, value, source))
-        else:
-            existing.value = value
-            existing.source = source
-        changed.append(key)
-    claim_ids = ensure_success_condition_claims(
-        state, list(shared.success_criteria or []), keep_verbatim=True
-    )
-    state.spec.open_questions = list(shared.missing_fields or [])
-    return {
-        "ok": True,
-        "decisions": changed,
-        "proposed": [],
-        "rejected_locked": [],
-        "claims": claim_ids,
-        "open_questions": list(state.spec.open_questions),
-    }
-
-
-def apply_proposed_decisions(state, proposed: List[Dict[str, Any]]) -> None:
-    for item in proposed or []:
-        key = str(item.get("key") or "")
-        if not key:
-            continue
-        existing = next((d for d in state.spec.decisions if d.key == key), None)
-        if existing:
-            existing.value = item.get("value")
-            existing.source = str(item.get("source") or "user")
-        else:
-            state.spec.decisions.append(
-                Decision(
-                    key=key,
-                    value=item.get("value"),
-                    source=str(item.get("source") or "user"),
-                )
-            )
 
 
 def verify_state_claims(ctx: ToolContext, metrics: Dict[str, Any]) -> Dict[str, Any]:
@@ -211,37 +122,174 @@ def verify_state_claims(ctx: ToolContext, metrics: Dict[str, Any]) -> Dict[str, 
 
 
 @tool(
-    name="spec_clarify",
-    description="Inspect missing radio specification fields without writing them.",
-    parameters={"type": "object", "properties": {"text": {"type": "string"}}},
+    name="spec_update",
+    description=(
+        "Merge a SpecAgent-authored Radio Specification patch and return Required "
+        "fields that are not aligned. Each field needs key, label, value, group, "
+        "source and status."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "fields": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "key": {"type": "string"},
+                        "label": {"type": "string"},
+                        "value": {},
+                        "group": {"type": "string", "enum": ["required", "added"]},
+                        "source": {"type": "string"},
+                        "status": {
+                            "type": "string",
+                            "enum": ["aligned", "needs_confirmation", "missing"],
+                        },
+                    },
+                    "required": ["key"],
+                },
+            },
+            "remove_fields": {"type": "array", "items": {"type": "string"}},
+            "constraints": {"type": "object"},
+            "assumptions": {"type": "array", "items": {"type": "object"}},
+        },
+    },
     group="state",
+    permission="project.write",
 )
-def spec_clarify(ctx: ToolContext, text: str = ""):
+def spec_update(
+    ctx: ToolContext,
+    fields: Optional[List[Dict[str, Any]]] = None,
+    remove_fields: Optional[List[str]] = None,
+    constraints: Optional[Dict[str, Any]] = None,
+    assumptions: Optional[List[Dict[str, Any]]] = None,
+):
     state = _state(ctx)
     shared = state.intent
-    open_questions = list(shared.missing_fields or []) if shared.status != "idle" else [
-        "Run LLM intent alignment before inspecting missing fields."
-    ]
+    if shared.status == "idle" or not shared.intent_id:
+        workflow = dict(ctx.extra.get("workflow") or {})
+        previous_specification = shared.specification
+        shared = SharedIntent.new(
+            str(ctx.extra.get("user_text") or ""),
+            workflow_id=str(workflow.get("workflow_id") or ""),
+        )
+        shared.specification = previous_specification
+        state.intent = shared
+
+    candidate = copy.deepcopy(shared.specification)
+    by_key = {item.key: item for item in candidate.fields}
+    changed_fields: List[str] = []
+    for raw in fields or []:
+        if not isinstance(raw, dict) or not str(raw.get("key") or "").strip():
+            return {"ok": False, "error": "Every Specification field needs a key"}
+        key = str(raw["key"]).strip()
+        if key not in by_key:
+            missing_keys = [
+                name for name in ("label", "value", "group", "source", "status")
+                if name not in raw
+            ]
+            if missing_keys:
+                return {
+                    "ok": False,
+                    "error": f"New field {key} is missing: {', '.join(missing_keys)}",
+                }
+        if "group" in raw and raw.get("group") not in {"required", "added"}:
+            return {"ok": False, "error": f"Invalid group for {key}: {raw.get('group')}"}
+        if "status" in raw and raw.get("status") not in {
+            "aligned", "needs_confirmation", "missing",
+        }:
+            return {"ok": False, "error": f"Invalid status for {key}: {raw.get('status')}"}
+        base = asdict(by_key[key]) if key in by_key else {}
+        item = SpecificationField.from_dict({**base, **raw, "key": key})
+        if key not in by_key or asdict(by_key[key]) != asdict(item):
+            by_key[key] = item
+            changed_fields.append(key)
+    for key in remove_fields or []:
+        key = str(key or "").strip()
+        if key in by_key:
+            del by_key[key]
+            changed_fields.append(key)
+    candidate.fields = list(by_key.values())
+
+    metadata_changed = False
+    if constraints is not None and dict(constraints) != candidate.constraints:
+        candidate.constraints = dict(constraints)
+        metadata_changed = True
+    if assumptions is not None and list(assumptions) != candidate.assumptions:
+        candidate.assumptions = list(assumptions)
+        metadata_changed = True
+
+    errors = candidate.validate()
+    if errors:
+        return {"ok": False, "error": "Invalid Radio Specification", "errors": errors}
+    if changed_fields or metadata_changed or candidate.revision < 1:
+        candidate.revision = max(1, candidate.revision + 1)
+    candidate.validation_errors = []
+    shared.specification = candidate
+    unresolved = candidate.unresolved_fields()
+    shared.status = "awaiting_input" if unresolved else "draft"
+    shared.refresh_hash()
+    if changed_fields or metadata_changed:
+        shared.record_patch(
+            changed_fields=changed_fields,
+            scope="radio_specification",
+            source="spec_agent",
+        )
     return {
         "ok": True,
-        "open_questions": open_questions,
-        "complete": not open_questions,
+        "status": "awaiting_input" if unresolved else "ready",
+        "spec_revision": candidate.revision,
+        "changed_fields": list(dict.fromkeys(changed_fields)),
+        "unresolved_fields": unresolved,
+        "specification": candidate.to_dict(),
     }
 
 
 @tool(
     name="spec_commit",
-    description="Commit traceable user goals and radio decisions.",
-    parameters={
-        "type": "object",
-        "properties": {"text": {"type": "string"}},
-        "required": ["text"],
-    },
+    description="Commit the current Radio Specification only when all Required fields are aligned.",
+    parameters={"type": "object", "properties": {}},
     group="state",
     permission="project.write",
 )
-def spec_commit(ctx: ToolContext, text: str):
-    return commit_intent(ctx, text)
+def spec_commit(ctx: ToolContext):
+    state = _state(ctx)
+    shared = state.intent
+    if shared.status == "idle" or not shared.intent_id:
+        return {"ok": False, "error": "No Radio Specification is available"}
+    specification = shared.specification
+    errors = specification.validate()
+    unresolved = specification.unresolved_fields()
+    specification.validation_errors = list(errors)
+    if errors or unresolved:
+        shared.status = "awaiting_input"
+        shared.refresh_hash()
+        return {
+            "ok": False,
+            "status": "awaiting_input",
+            "error": "Radio Specification is not aligned",
+            "errors": errors,
+            "unresolved_fields": unresolved,
+            "spec_revision": specification.revision,
+        }
+    success = specification.field("success_conditions")
+    criteria = success.value if success is not None else []
+    if not isinstance(criteria, list):
+        criteria = [criteria] if criteria not in (None, "") else []
+    claim_ids = ensure_success_condition_claims(
+        state, [str(item) for item in criteria]
+    )
+    shared.status = "confirmed"
+    shared.confirmed_at = time.time()
+    shared.refresh_hash()
+    return {
+        "ok": True,
+        "status": "aligned",
+        "spec_revision": specification.revision,
+        "changed_fields": [],
+        "unresolved_fields": [],
+        "claims": claim_ids,
+    }
 
 
 @tool(

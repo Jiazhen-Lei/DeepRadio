@@ -1,0 +1,157 @@
+options:
+  parameters:
+    alias: ''
+    author: ''
+    catch_exceptions: 'True'
+    comment: ''
+    copyright: ''
+    description: ''
+    gen_linking: dynamic
+    generate_options: no_gui
+    generator_class_name: PythonNoGuiGenerator
+    generator_module: gnuradio.grc.workflows.python_nogui
+    hier_block_src_path: '.:'
+    id: ble_beacon_tx
+    max_nouts: '0'
+    output_language: python
+    realtime_scheduling: ''
+    run_command: '{python} -u {filename}'
+    run_options: prompt
+    thread_safe_setters: ''
+    title: ''
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    state: enabled
+
+blocks:
+- name: duration_samps
+  id: variable
+  parameters:
+    comment: ''
+    value: '40000000'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate:
+    - 810
+    - 140
+    state: enabled
+- name: samp_rate
+  id: variable
+  parameters:
+    comment: ''
+    value: '4000000'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate:
+    - 120
+    - 140
+    state: enabled
+- name: tx_freq
+  id: variable
+  parameters:
+    comment: ''
+    value: '2402000000'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate:
+    - 350
+    - 140
+    state: enabled
+- name: tx_gain
+  id: variable
+  parameters:
+    comment: ''
+    value: '40'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate:
+    - 580
+    - 140
+    state: enabled
+- name: file_source
+  id: blocks_file_source
+  parameters:
+    affinity: ''
+    alias: ''
+    begin_tag: pmt.PMT_NIL
+    comment: ''
+    file: /session/work/build/ble_beacon_waveform.complex
+    length: '0'
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    offset: '0'
+    repeat: 'True'
+    type: complex
+    vlen: '1'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate:
+    - 120
+    - 310
+    state: enabled
+- name: head
+  id: blocks_head
+  parameters:
+    affinity: ''
+    alias: ''
+    comment: ''
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    num_items: '40000000'
+    type: complex
+    vlen: '1'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate:
+    - 350
+    - 310
+    state: enabled
+- name: pluto_sink
+  id: iio_pluto_sink
+  parameters:
+    affinity: ''
+    alias: ''
+    attenuation1: 89 - tx_gain
+    bandwidth: '2000000'
+    buffer_size: '32768'
+    comment: ''
+    cyclic: 'False'
+    filter: ''
+    filter_source: '''Auto'''
+    fpass: '0'
+    frequency: tx_freq
+    fstop: '0'
+    len_tag_key: ''
+    samplerate: samp_rate
+    type: fc32
+    uri: ''
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate:
+    - 580
+    - 310
+    state: enabled
+
+connections:
+- [file_source, '0', head, '0']
+- [head, '0', pluto_sink, '0']
+
+metadata:
+  file_format: 1
+  grc_version: 3.10.12.0

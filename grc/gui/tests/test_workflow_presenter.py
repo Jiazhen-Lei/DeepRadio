@@ -390,11 +390,22 @@ class WorkflowPresenterTest(unittest.TestCase):
                 "radio_specification": [
                     {
                         "key": "goal", "label": "Goal", "value": "BLE advertising",
-                        "source": "user", "requirement": "required",
-                        "reason": "This legacy sentence must not reach the view model",
+                        "source": "user", "group": "required", "status": "aligned",
                     },
-                    {"key": "carrier_frequency", "label": "Carrier", "display_value": "2.402 GHz", "source": "protocol_default"},
-                    {"key": "success_conditions", "label": "Success condition", "unresolved": True},
+                    {
+                        "key": "carrier_frequency", "label": "Carrier",
+                        "display_value": "2.402 GHz", "source": "protocol_default",
+                        "group": "required", "status": "aligned",
+                    },
+                    {
+                        "key": "success_conditions", "label": "Success condition",
+                        "source": "unresolved", "group": "required", "status": "missing",
+                    },
+                    {
+                        "key": "local_name", "label": "Advertising name",
+                        "value": "DeepRadio", "source": "extracted",
+                        "group": "added", "status": "aligned",
+                    },
                 ],
             },
             workflow={
@@ -408,10 +419,12 @@ class WorkflowPresenterTest(unittest.TestCase):
         rows = {item["key"]: item for item in view["specification"]["rows"]}
         self.assertEqual(rows["goal"]["source"], "User")
         self.assertEqual(rows["goal"]["group"], "Required")
-        self.assertEqual(rows["carrier_frequency"]["group"], "Added")
+        self.assertEqual(rows["carrier_frequency"]["group"], "Required")
         self.assertEqual(rows["carrier_frequency"]["source"], "Protocol Default")
         self.assertEqual(rows["success_conditions"]["value"], "?")
-        self.assertNotIn("reason", rows["goal"])
+        self.assertEqual(rows["success_conditions"]["status"], "missing")
+        self.assertEqual(rows["local_name"]["group"], "Added")
+        self.assertEqual(rows["local_name"]["source"], "Extracted")
         self.assertEqual(view["specification"]["open_question"], "")
         self.assertFalse(view["specification"]["aligned"])
 

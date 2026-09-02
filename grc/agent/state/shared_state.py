@@ -15,23 +15,6 @@ from .intent_state import SharedIntent
 
 
 @dataclass
-class Decision:
-    key: str
-    value: Any
-    source: str
-    rationale: str = ""
-
-
-@dataclass
-class RadioSpec:
-    goals: List[str] = field(default_factory=list)
-    success_conditions: List[str] = field(default_factory=list)
-    constraints: Dict[str, Any] = field(default_factory=dict)
-    decisions: List[Decision] = field(default_factory=list)
-    open_questions: List[str] = field(default_factory=list)
-
-
-@dataclass
 class ProjectState:
     grc_path: str = ""
     flowgraph_version: int = 0
@@ -136,7 +119,6 @@ class Coordination:
 class SharedState:
     session_id: str = ""
     intent: SharedIntent = field(default_factory=SharedIntent)
-    spec: RadioSpec = field(default_factory=RadioSpec)
     project: ProjectState = field(default_factory=ProjectState)
     claims: List[Claim] = field(default_factory=list)
     coordination: Coordination = field(default_factory=Coordination)
@@ -162,7 +144,7 @@ class SharedState:
         if self.intent.intent_id:
             specification_path = os.path.join(parent, "radio_specification.json")
             specification_payload = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "intent_id": self.intent.intent_id,
                 "revision": self.intent.revision,
                 "status": self.intent.status,
@@ -205,38 +187,25 @@ class SharedState:
             return state
 
     def spec_digest(self) -> Dict[str, Any]:
-        decided = {item.key: item.value for item in self.spec.decisions}
-        decision_sources = {item.key: item.source for item in self.spec.decisions}
         config = self.project.config
         shared = self.intent
+        specification = shared.specification
+        fields = {item.key: item for item in specification.fields}
         active_intent = bool(
-            shared.task_type or shared.parameters or shared.status != "idle"
+            shared.task_type or specification.fields or shared.status != "idle"
         )
-        parameters = dict(shared.parameters or {}) if active_intent else {}
-        sources = dict(shared.parameter_sources or {}) if active_intent else {}
 
         def value(key: str, *fallback_keys: str) -> Any:
-            if key in parameters and parameters.get(key) not in (None, "", []):
-                return parameters.get(key)
-            for fallback in fallback_keys:
-                if fallback in parameters and parameters.get(fallback) not in (None, "", []):
-                    return parameters.get(fallback)
+            for candidate in (key,) + fallback_keys:
+                item = fields.get(candidate)
+                if item is not None and item.value not in (None, "", []):
+                    return item.value
             if active_intent:
                 return None
             for candidate in (key,) + fallback_keys:
                 if config.get(candidate) not in (None, "", []):
                     return config.get(candidate)
-                if decided.get(candidate) not in (None, "", []):
-                    return decided.get(candidate)
             return None
-
-        def source(key: str, *fallback_keys: str) -> str:
-            for candidate in (key,) + fallback_keys:
-                if sources.get(candidate):
-                    return str(sources[candidate])
-                if not active_intent and decision_sources.get(candidate):
-                    return str(decision_sources[candidate])
-            return ""
 
         protocol = str(
             value("protocol") or ""
@@ -256,18 +225,25 @@ class SharedState:
             value("max_duration_seconds", "duration_seconds")
             or ""
         )
-        goals = list(shared.goals or self.spec.goals) if active_intent else list(self.spec.goals)
-        success_conditions = list(
-            shared.success_criteria or parameters.get("success_conditions") or []
-        ) if active_intent else list(self.spec.success_conditions)
+        goal = value("goal")
+        goals = [str(goal)] if goal not in (None, "", []) else []
+        criteria = value("success_conditions") or []
+        success_conditions = (
+            [str(item) for item in criteria]
+            if isinstance(criteria, list)
+            else [str(criteria)]
+        )
+        unresolved = specification.unresolved_fields()
         digest = {
             "goals": goals,
             "success_conditions": success_conditions,
-            "constraints": dict(shared.constraints or self.spec.constraints)
-            if active_intent else dict(self.spec.constraints),
-            "decisions": [asdict(item) for item in self.spec.decisions],
-            "open_questions": list(shared.missing_fields or self.spec.open_questions)
-            if active_intent else list(self.spec.open_questions),
+            "constraints": dict(specification.constraints),
+            "assumptions": list(specification.assumptions),
+            "decisions": [
+                asdict(item) for item in specification.fields
+                if item.status == "aligned"
+            ],
+            "open_questions": [item["key"] for item in unresolved],
             "recipe": str(value("recipe") or ""),
             "modulation": str(
                 value("modulation") or ""
@@ -291,52 +267,27 @@ class SharedState:
             "intent_id": shared.intent_id if active_intent else "",
             "intent_revision": shared.revision if active_intent else 0,
             "intent_status": shared.status if active_intent else "idle",
-            "parameter_sources": sources,
+            "specification_revision": specification.revision,
+            "parameter_sources": {
+                item.key: item.source for item in specification.fields
+            },
         }
-        specification = shared.specification
-        if active_intent and not specification.fields:
-            from ..knowledge.spec_requirements import resolve_specification
-
-            specification = resolve_specification(
-                task_type=shared.task_type,
-                capabilities=shared.capabilities,
-                slots=parameters,
-                slot_sources=sources,
-                missing_fields=shared.missing_fields,
-                validation_errors=shared.validation_errors,
-                goals=shared.goals,
-                raw_text=shared.raw_text,
-            )
-            shared.specification = specification
         rows = []
         for item in specification.fields:
-            from ..knowledge.spec_requirements import question_for
-
-            unresolved = item.value in (None, "", []) or item.source == "unresolved"
-            question = question_for(item.key)
             rows.append({
                 "key": item.key,
                 "label": item.label or item.key,
                 "value": item.value,
-                "display_value": "" if unresolved else _display_spec_value(
-                    item.key, item.value
+                "display_value": (
+                    "" if item.status == "missing"
+                    else _display_spec_value(item.key, item.value)
                 ),
                 "source": item.source,
-                "unresolved": unresolved,
-                "needs_confirmation": item.requirement == "required" and not item.confirmed,
-                "editable": False,
-                "locked": True,
-                "confirmed": bool(item.confirmed),
-                "requirement": item.requirement,
-                "reason": item.reason,
-                "depends_on": list(item.depends_on),
-                "choices": list(question.get("choices") or []),
-                "allow_custom": bool(question.get("allow_custom", True)),
+                "group": item.group,
+                "status": item.status,
             })
         digest["radio_specification"] = rows
-        digest["specification_profiles"] = list(specification.profile_refs)
-        digest["blocking_questions"] = list(specification.blocking_questions)
-        digest["optional_prompts"] = list(specification.optional_prompts)
+        digest["blocking_questions"] = unresolved
         digest["summary"] = _spec_summary_line(digest)
         if protocol.lower() == "ble" and duration not in ("", None):
             digest["duration_note"] = (
@@ -460,18 +411,27 @@ def _spec_summary_line(digest: Dict[str, Any]) -> str:
 
 
 def _from_dict(data: Dict[str, Any]) -> SharedState:
-    intent_data = data.get("intent") or {}
+    intent_data = dict(data.get("intent") or {})
     spec_data = data.get("spec") or {}
+    if spec_data and not (intent_data.get("specification") or {}).get("fields"):
+        intent_data.setdefault("goals", list(spec_data.get("goals") or []))
+        intent_data.setdefault("constraints", dict(spec_data.get("constraints") or {}))
+        intent_data.setdefault(
+            "success_criteria", list(spec_data.get("success_conditions") or [])
+        )
+        intent_data.setdefault("parameters", {
+            str(item.get("key") or ""): item.get("value")
+            for item in spec_data.get("decisions") or []
+            if isinstance(item, dict) and item.get("key")
+        })
+        intent_data.setdefault("parameter_sources", {
+            str(item.get("key") or ""): str(item.get("source") or "extracted")
+            for item in spec_data.get("decisions") or []
+            if isinstance(item, dict) and item.get("key")
+        })
     project_data = data.get("project") or {}
     coord_data = data.get("coordination") or {}
     runtime_data = data.get("runtime") or {}
-    spec = RadioSpec(
-        goals=list(spec_data.get("goals") or []),
-        success_conditions=list(spec_data.get("success_conditions") or []),
-        constraints=dict(spec_data.get("constraints") or {}),
-        decisions=[Decision(**item) for item in spec_data.get("decisions") or []],
-        open_questions=list(spec_data.get("open_questions") or []),
-    )
     claims = []
     for item in data.get("claims") or []:
         evidence = [
@@ -513,7 +473,6 @@ def _from_dict(data: Dict[str, Any]) -> SharedState:
     return SharedState(
         session_id=str(data.get("session_id") or ""),
         intent=SharedIntent.from_dict(intent_data),
-        spec=spec,
         project=ProjectState(
             grc_path=str(project_data.get("grc_path") or ""),
             flowgraph_version=int(project_data.get("flowgraph_version", 0)),

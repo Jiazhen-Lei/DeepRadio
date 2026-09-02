@@ -238,6 +238,7 @@ class ServiceAgent:
 
     def _invoke_mainagent(self, user_text: str) -> AgentReply:
         ctx = self._make_ctx()
+        ctx.extra["user_text"] = user_text
         ctx.extra["workflow"] = self._workflow.workflow.to_dict()
         try:
             agent = orch.build_agent(ctx)
@@ -257,10 +258,13 @@ class ServiceAgent:
             "project_version": self._state.project.flowgraph_version,
             "config": dict(self._state.project.config),
         }
+        specification = self._state.intent.specification.to_dict()
         prompt = (
             f"USER_REQUEST:\n{user_text}\n\n"
             f"CURRENT_WORKFLOW:\n{json.dumps(current, ensure_ascii=False)}\n\n"
             f"CURRENT_STAGE:\n{json.dumps(stage_payload, ensure_ascii=False)}\n\n"
+            f"CURRENT_RADIO_SPECIFICATION:\n"
+            f"{json.dumps(specification, ensure_ascii=False, default=str)}\n\n"
             f"CURRENT_PROJECT:\n{json.dumps(project, ensure_ascii=False, default=str)}\n\n"
             "请根据以上用户请求和当前状态，读取并遵循 grc-orchestration Skill "
             "处理本轮请求。"

@@ -100,8 +100,8 @@ _ACTIVITY_BY_TOOL = {
     "apply_grc_diff": ("Update parameters", "Flowgraph"),
     "recipe_switch_propose": ("Await confirmation", "Flowgraph"),
     "select_recipe": ("Select design", "RadioDesign"),
-    "spec_commit": ("Extract specification", "Spec"),
-    "spec_clarify": ("Clarify intent", "Spec"),
+    "spec_update": ("Update specification", "Spec"),
+    "spec_commit": ("Commit specification", "Spec"),
 }
 _LOOP_BY_STAGE = {
     "CONFIRM": "Revise",
@@ -956,7 +956,7 @@ class AgentPanel(Gtk.VBox):
         rows = sorted(
             specification.get("rows") or [],
             key=lambda item: (
-                0 if item.get("requirement") == "required" else 1,
+                0 if item.get("group") == "Required" else 1,
                 str(item.get("label") or ""),
             ),
         )
@@ -979,8 +979,8 @@ class AgentPanel(Gtk.VBox):
             item = Gtk.EventBox()
             row_color = Gdk.RGBA()
             row_color.parse(
-                "#FFF4E5" if row.get("needs_confirmation")
-                else "#EDF4FF" if row.get("requirement") == "required"
+                "#FFF4E5" if row.get("needs_confirmation") or row.get("unresolved")
+                else "#EDF4FF" if row.get("group") == "Required"
                 else "#F3F0FA"
             )
             item.override_background_color(Gtk.StateFlags.NORMAL, row_color)
@@ -994,12 +994,16 @@ class AgentPanel(Gtk.VBox):
             name.set_markup("<b>{}</b>".format(escape_pango(name.get_text())))
             header.pack_start(name, True, True, 0)
             source = str(row.get("source") or "System")
+            status_label = str(row.get("status_label") or "")
+            badge_text = " · ".join(
+                part for part in (source, status_label) if part
+            )
             badge = Gtk.Label()
             badge.set_halign(Gtk.Align.END)
             badge.set_markup(
                 "<span foreground='{}'>[{}]</span>".format(
                     source_colors.get(source, "#52606D"),
-                    escape_pango(source),
+                    escape_pango(badge_text),
                 )
             )
             header.pack_end(badge, False, False, 0)

@@ -312,11 +312,6 @@ def design_link(ctx, profile=None, intent: str = "",
         state.project.config["recipe"] = rc.name
         state.project.config["modulation"] = _recipes.guess_modulation(rc.name)
         state.project.config["canvas_dirty"] = False
-        from .state_tools import apply_proposed_decisions
-
-        apply_proposed_decisions(
-            state, (approved_pending or {}).get("proposed_decisions") or []
-        )
         state.project.flowgraph_version += 1
         ClaimStore(state).invalidate_by_version(
             state.project.flowgraph_version

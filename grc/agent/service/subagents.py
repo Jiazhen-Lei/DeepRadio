@@ -55,7 +55,9 @@ def build_spec_prompt() -> str:
     return _domain_prompt(
         "SpecAgent",
         "grc-spec",
-        "只记录 TaskCard 已有事实；不足则 open_questions，不把假设写成用户决定。",
+        "你是 Radio Specification 的唯一维护者。根据 TaskCard、当前 Specification "
+        "和 Skill reference 判断 Required 与 Added，调用 spec_update 保存变更。"
+        "将未对齐字段返回 MainAgent；只有全部 Required 已对齐时才调用 spec_commit。",
     )
 
 
@@ -114,7 +116,7 @@ _SUBAGENT_DEFS = [
         "维护可追溯 RadioSpec 与成功条件。",
         build_spec_prompt,
         ["grc-spec"],
-        ["spec_clarify", "spec_commit"],
+        ["spec_update", "spec_commit"],
     ),
     (
         "radio_design_agent",

@@ -1,4 +1,4 @@
-"""Domain recipes and block knowledge used by tools and Agent references."""
+"""Legacy Flowgraph recipe helpers; SpecAgent knowledge lives in its Skill."""
 
 from __future__ import annotations
 
