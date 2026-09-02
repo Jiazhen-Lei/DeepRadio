@@ -1,8 +1,4 @@
-"""MainAgent-owned dynamic Workflow state.
-
-The store persists and validates state, but never chooses a Stage or a
-transition.  Planning authority belongs to MainAgent.
-"""
+"""Validated state transitions for a MainAgent-planned Workflow."""
 
 from __future__ import annotations
 
@@ -375,6 +371,13 @@ class DynamicWorkflowStore:
                     raise ValueError(
                         f"Stage {stage.id} lacks verified evidence: {', '.join(missing)}"
                     )
+        newly_completed = any(
+            stage.status == "completed"
+            and previous_status.get(stage.id) != "completed"
+            for stage in candidate.stages
+        )
+        if newly_completed and candidate.execution_status != "completed":
+            candidate.execution_status = "pending"
         self.workflow = candidate
         self.save()
         return candidate
@@ -430,6 +433,28 @@ class DynamicWorkflowStore:
         self.workflow.updated_at = time.time()
         self.save()
         return dict(checkpoint)
+
+    def retry_current_stage(self) -> bool:
+        if self.workflow is None:
+            return False
+        self.workflow.execution_status = "running"
+        stage = self.workflow.stage()
+        if stage:
+            stage.reset()
+        self.workflow.revision += 1
+        self.workflow.updated_at = time.time()
+        self.save()
+        return True
+
+    def bind_project_version(self, project_version: int) -> bool:
+        if self.workflow is None:
+            return False
+        version = int(project_version)
+        if self.workflow.base_project_version == version:
+            return False
+        self.workflow.base_project_version = version
+        self.save()
+        return True
 
     def invalidate(self, project_version: int) -> None:
         if self.workflow is None:

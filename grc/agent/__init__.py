@@ -16,7 +16,7 @@
 对外高层入口:
     UserProfile    三档用户画像(创新 B 数据核心, 见 grc.agent.memory)
     design_link / debug_by_metric   领域动作(见 grc.agent.tools)
-    ServiceAgent   主路径编排器(见 grc.agent.service);
+    MainAgentRuntime   MainAgent 的宿主运行环境(见 grc.agent.service);
                    step(text) 返回 AgentReply, GUI 侧渲染逻辑零改动。
 """
 
@@ -25,7 +25,7 @@ from __future__ import annotations
 __all__ = [
     "env", "llm", "UserProfile",
     "design_link", "debug_by_metric",
-    "ServiceAgent", "build_service_agent",
+    "MainAgentRuntime", "build_mainagent_runtime",
 ]
 
 #: 顶层惰性入口名 -> (子模块, 属性名)。避免无 gnuradio 时过早导入依赖链。
@@ -33,8 +33,8 @@ _LAZY = {
     "UserProfile": ("memory", "UserProfile"),
     "design_link": ("tools.design_link", "design_link"),
     "debug_by_metric": ("tools.debug_by_metric", "debug_by_metric"),
-    "ServiceAgent": ("service", "ServiceAgent"),
-    "build_service_agent": ("service", "build_service_agent"),
+    "MainAgentRuntime": ("service", "MainAgentRuntime"),
+    "build_mainagent_runtime": ("service", "build_mainagent_runtime"),
 }
 
 

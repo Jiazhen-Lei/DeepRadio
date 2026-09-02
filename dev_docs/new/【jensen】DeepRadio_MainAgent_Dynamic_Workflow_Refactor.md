@@ -2,13 +2,13 @@
 
 ## 目标
 
-将 Workflow 的创建、阶段编排、状态推进和失败恢复统一交给 MainAgent。MainAgent 是唯一用户接口，SubAgent 只执行领域任务。UI 继续使用现有 `ServiceAgent.step()`、`step_command()` 和 `AgentReply`，不改变界面契约。
+将 Workflow 的创建、阶段编排、状态推进和失败恢复统一交给 MainAgent。MainAgent 是唯一用户接口，SubAgent 只执行领域任务。UI 继续使用现有 `MainAgentRuntime.step()`、`step_command()` 和 `AgentReply`，不改变界面契约。
 
 ## 新链路
 
 ```text
 AgentPanel
-  -> ServiceAgent（UI 兼容层）
+  -> MainAgentRuntime（宿主运行环境）
   -> MainAgent（Intent、Workflow、用户交互）
   -> Domain SubAgent（执行 TaskCard）
   -> Tool Permission Guard
@@ -119,8 +119,8 @@ SubAgent 的公共约束简化为：
 以下接口保持不变：
 
 - `AgentPanel`；
-- `ServiceAgent.step()`；
-- `ServiceAgent.step_command()`；
+- `MainAgentRuntime.step()`；
+- `MainAgentRuntime.step_command()`；
 - `AgentReply`；
 - UI 所需的进度事件、artifact 和 workflow digest。
 

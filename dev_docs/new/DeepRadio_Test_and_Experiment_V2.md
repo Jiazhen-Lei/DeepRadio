@@ -66,7 +66,7 @@ python -m unittest discover -s grc/agent/tests -p 'test_*.py'
 
 ```text
 静态/单元
-→ ServiceAgent 集成
+→ MainAgentRuntime 集成
 → session replay/manifest
 → 无 RF GUI 七类回归
 → 硬件 discover/probe（含跨家族 mismatch 分支）

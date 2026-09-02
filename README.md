@@ -142,7 +142,7 @@ iio_info -S
 
 ## 主要代码
 
-- `grc/agent/service/mainagent_service.py`：MainAgent 调度。
+- `grc/agent/service/mainagent_runtime.py`：MainAgent 宿主运行环境。
 - `grc/agent/service/subagents.py`：SubAgent 定义。
 - `grc/agent/workflow/dynamic.py`：动态 Workflow 状态。
 - `grc/agent/tools/`：GRC、验证和 RF 工具。

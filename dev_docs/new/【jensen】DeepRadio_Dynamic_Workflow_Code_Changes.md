@@ -55,8 +55,8 @@
 
 ## 3. MainAgent 服务链
 
-- `grc/agent/service/mainagent_service.py`（新增）
-  - 提供新的 `ServiceAgent` 主实现，保持 GUI 接口不变。
+- `grc/agent/service/mainagent_runtime.py`（新增）
+  - 提供新的 `MainAgentRuntime` 主实现，保持 GUI 接口不变。
   - 内部只调用 MainAgent，不再运行固定 Stage 执行链。
   - 负责会话状态、Workflow 持久化、Artifact/Claim 汇总、用户确认和 UI digest 投影。
   - 管理 RF 授权绑定、画布同步、工程版本、快照恢复和异常状态。
@@ -68,7 +68,7 @@
 
 - `grc/agent/service/adapter.py`（修改）
   - 从完整混合编排器缩减为兼容导出。
-  - 转发新的 `ServiceAgent`，保持原有 import 路径。
+  - 暴露新的 `MainAgentRuntime`。
 
 - `grc/agent/service/orchestrator.py`（修改）
   - `build_agent()` 不再接收固定 Stage。
@@ -223,4 +223,3 @@
 - Python 编译检查通过。
 - `git diff --check` 通过。
 - 尚未执行真实 LLM 和 SDR 硬件联调。
-

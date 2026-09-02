@@ -1,6 +1,6 @@
 """BPSK @ 2.4GHz 手工回归:验证 grc.agent.env 支撑的完整链路。
 
-不是 live 架构层。产品路径请走 ServiceAgent + Workflow。
+不是 live 架构层。产品路径请走 MainAgentRuntime + Workflow。
 
 运行::
 

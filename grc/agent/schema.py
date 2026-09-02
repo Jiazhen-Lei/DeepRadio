@@ -1,7 +1,7 @@
 """统一数据结构:Agent 与 GUI 之间流转的类型(GUI 契约)。
 
-:class:`AgentReply` / :class:`ToolInvocation` 是 :mod:`grc.agent.service.adapter`
-返回给 GUI 的稳定契约;:class:`ExpertiseLevel` 等供画像/渲染分档使用。
+:class:`AgentReply` / :class:`ToolInvocation` 是 MainAgentRuntime 返回给 GUI
+的稳定契约;:class:`ExpertiseLevel` 等供画像/渲染分档使用。
 
 保持"贫血"——只装数据、少行为,便于序列化回喂 LLM、也便于 CHI 实验埋点。
 """

@@ -1,4 +1,4 @@
-"""UI-compatible service for the MainAgent-owned dynamic Workflow."""
+"""Host runtime for one MainAgent-driven DeepRadio session."""
 
 from __future__ import annotations
 
@@ -66,24 +66,13 @@ def _recursion_limit() -> int:
         return DEFAULT_RECURSION_LIMIT
 
 
-class _ToolCtxShim:
-    def __init__(self, out_dir: str = "") -> None:
-        self.out_dir = out_dir
+class MainAgentRuntime:
+    """Run MainAgent turns without making semantic Workflow decisions.
 
-
-class _CtxShim:
-    def __init__(self, agent: "ServiceAgent") -> None:
-        self._agent = agent
-        self.tool_ctx = _ToolCtxShim()
-        self.adaptive = True
-
-    @property
-    def profile(self) -> UserProfile:
-        return self._agent.profile
-
-
-class ServiceAgent:
-    """Stable GUI facade; MainAgent owns all planning and Stage decisions."""
+    MainAgent plans Stages and delegates SubAgents. This runtime owns the
+    deterministic host lifecycle: context assembly, persistence, explicit UI
+    commands, artifact projection and ``AgentReply`` construction.
+    """
 
     def __init__(
         self,
@@ -103,7 +92,22 @@ class ServiceAgent:
         )
         self._tool_ctx: Optional[ToolContext] = None
         self._progress_listeners: list[Any] = []
-        self.ctx = _CtxShim(self)
+        self._output_dir = ""
+        self._adaptive = True
+
+    def set_output_dir(self, path: str) -> None:
+        self._output_dir = str(path or "")
+
+    def workflow_digest(self) -> Dict[str, Any]:
+        return self._digest()
+
+    def intent_slots(self) -> Dict[str, Any]:
+        workflow = self._workflow.workflow
+        return dict(workflow.intent.slots) if workflow else {}
+
+    @property
+    def profile_level(self) -> str:
+        return self.profile.level
 
     def subscribe_progress(self, callback: Any) -> None:
         if callable(callback) and callback not in self._progress_listeners:
@@ -130,7 +134,7 @@ class ServiceAgent:
 
     def _make_ctx(self) -> ToolContext:
         export_dir = store.nested_export_dir(
-            self.session_id, (self.ctx.tool_ctx.out_dir or "").strip()
+            self.session_id, self._output_dir.strip()
         )
         out_dir = os.path.join(store.session_root(self.session_id), "final")
         os.makedirs(out_dir, exist_ok=True)
@@ -154,10 +158,10 @@ class ServiceAgent:
                 "artifacts": {},
                 "events": [],
                 "metrics": {},
-                "subagent_invocations": [],
                 "export_dir": export_dir,
                 "session_id": self.session_id,
                 "workflow_store": self._workflow,
+                "on_workflow_reopened": self._handle_workflow_reopened,
                 "workflow": (
                     self._workflow.workflow.to_dict()
                     if self._workflow.workflow else {}
@@ -177,6 +181,17 @@ class ServiceAgent:
         if ctx.flow_graph is None:
             self._load_flowgraph(ctx)
         return ctx
+
+    def _handle_workflow_reopened(self, revision: int) -> None:
+        ClaimStore(self._state).invalidate_by_intent_revision(int(revision))
+        self._state.project.config["rf_armed"] = False
+        self._state.project.config.pop("rf_armed_path", None)
+        self._clear_rf_grant()
+        runtime = dict(self._state.project.config.get("runtime") or {})
+        if runtime.get("running") and self._tool_ctx is not None:
+            from ..tools import registry
+
+            registry.call("stop_flowgraph", {}, self._tool_ctx)
 
     def _load_flowgraph(self, ctx: ToolContext) -> None:
         path = store.resolve_session_path(
@@ -205,10 +220,7 @@ class ServiceAgent:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to load the session flowgraph %s: %s", path, exc)
 
-    def step(
-        self, user_text: str, recipe: str = "", simulate: bool = True
-    ) -> AgentReply:
-        del recipe, simulate
+    def step(self, user_text: str) -> AgentReply:
         if getattr(self._state, "_load_failed", False):
             return self._error_reply("The session state is corrupted; writes were stopped.")
         if self._workflow.load_error:
@@ -241,11 +253,11 @@ class ServiceAgent:
         ctx.extra["user_text"] = user_text
         ctx.extra["workflow"] = self._workflow.workflow.to_dict()
         try:
-            agent = orch.build_agent(ctx)
+            mainagent = orch.build_agent(ctx)
         except Exception as exc:  # noqa: BLE001
             logger.exception("MainAgent assembly failed")
             return self._error_reply(f"MainAgent could not be created: {exc}")
-        if agent is None:
+        if mainagent is None:
             return self._error_reply(
                 "MainAgent is unavailable. Configure the LLM and install deepagents; "
                 "the production chain no longer switches to a deterministic Workflow."
@@ -285,7 +297,7 @@ class ServiceAgent:
         if trace:
             trace.start()
         try:
-            result = agent.invoke(
+            result = mainagent.invoke(
                 {"messages": [{"role": "user", "content": prompt}]},
                 {
                     "configurable": {"thread_id": self.session_id},
@@ -302,7 +314,7 @@ class ServiceAgent:
             trace.finish()
         narrative = self._extract_final_text(result)
         self._record_delegations(result)
-        reply = self._fold(ctx, narrative, ok=True)
+        reply = self._finalize_turn(ctx, narrative, ok=True)
         self._notify_progress("workflow_updated")
         return reply
 
@@ -316,14 +328,8 @@ class ServiceAgent:
             self._workflow.cancel()
             return self._simple_reply("The current task was cancelled.", "CANCELLED")
         if action in {"retry_stage", "retry_transmit"}:
-            workflow = self._workflow.workflow
-            if workflow is None:
+            if not self._workflow.retry_current_stage():
                 return self._error_reply("There is no active Workflow to retry.")
-            workflow.execution_status = "running"
-            stage = workflow.stage()
-            if stage:
-                stage.reset()
-            self._workflow.save()
             return self._invoke_mainagent("The user requested a retry. Re-check current evidence before acting.")
         if action in {"specification_update", "interaction_response"}:
             return self._invoke_mainagent(
@@ -387,9 +393,11 @@ class ServiceAgent:
         self._state.project.config.pop("rf_armed_path", None)
         self._clear_rf_grant()
         text = "Emergency stop completed." if emergency else "The RF runtime was stopped."
-        return self._fold(ctx, text, ok=bool(result.get("ok", True)))
+        return self._finalize_turn(ctx, text, ok=bool(result.get("ok", True)))
 
-    def _fold(self, ctx: ToolContext, narrative: str, *, ok: bool) -> AgentReply:
+    def _finalize_turn(
+        self, ctx: ToolContext, narrative: str, *, ok: bool
+    ) -> AgentReply:
         artifacts = dict(ctx.extra.get("artifacts") or {})
         grc_path = str(artifacts.get("grc_path") or "")
         if grc_path:
@@ -417,11 +425,9 @@ class ServiceAgent:
                     self._state.project.config["rf_permission_grant"] = binding
                 elif binding:
                     self._clear_rf_grant()
-                if self._workflow.workflow is not None:
-                    self._workflow.workflow.base_project_version = (
-                        self._state.project.flowgraph_version
-                    )
-                    self._workflow.save()
+                self._workflow.bind_project_version(
+                    self._state.project.flowgraph_version
+                )
         elif self._state.project.grc_path and os.path.isfile(self._state.project.grc_path):
             artifacts["grc_path"] = self._state.project.grc_path
 
@@ -626,27 +632,17 @@ class ServiceAgent:
         self._tool_ctx = None
         self._state.save(store.state_path(self.session_id))
 
-    def refresh_runtime_capability(self) -> Dict[str, Any]:
-        return {
-            "claims": ClaimStore(self._state).summary(),
-            "spec_digest": self._state.spec_digest(),
-            "workflow_digest": self._digest(),
-        }
-
     def record_profile_choice(
         self, *, adaptive: bool, pinned: Optional[str] = None
     ) -> None:
-        self.ctx.adaptive = bool(adaptive)
+        self._adaptive = bool(adaptive)
         if pinned:
             self.profile.pin(str(pinned))
         else:
             self.profile.unpin()
 
-    def peek_runtime_digest(self) -> Dict[str, Any]:
-        return self._digest()
-
     def _observe_profile(self, text: str) -> None:
-        if not self.ctx.adaptive:
+        if not self._adaptive:
             return
         try:
             self.profile.observe(text)
@@ -722,9 +718,11 @@ class ServiceAgent:
         )
 
 
-def build_service_agent(
+def build_mainagent_runtime(
     session_id: Optional[str] = None,
     profile: Any = None,
     platform: Any = None,
-) -> ServiceAgent:
-    return ServiceAgent(session_id=session_id, profile=profile, platform=platform)
+) -> MainAgentRuntime:
+    return MainAgentRuntime(
+        session_id=session_id, profile=profile, platform=platform
+    )

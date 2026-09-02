@@ -977,7 +977,7 @@ cancelled
 
 失败则停止。
 
-### Gate 2：ServiceAgent 集成测试
+### Gate 2：MainAgentRuntime 集成测试
 
 - 七类 Task 的全部 scenario；
 - 多轮补参数；

@@ -3,7 +3,7 @@ Agent 右侧对话面板 (多轮协商版 GTK 界面)。
 
 在 MainWindow 右侧提供一个人机对话面板:
 
-* **多轮协商 DeepRadio**(默认): 持有 ``ServiceAgent``，按闭环模式委派多个领域
+* **多轮协商 DeepRadio**(默认): 持有 ``MainAgentRuntime``，按闭环模式委派多个领域
   Subagent，并通过 SharedState 展示可追溯 Spec 与 Claim/Evidence；
   交付 .grc 时 emit ``open_flow_graph`` 让 MainWindow **原地刷新**当前画布。
 * **专业度档位**(创新 B): 下拉可选 自适应 / 小白 / 学生 / 专家; 选具体档位则
@@ -296,8 +296,8 @@ class AgentPanel(Gtk.VBox):
         self._out_dir = _output_dir()
         self._runtime_poll_id = None
 
-        # 多轮协商 Agent 实例 (惰性创建, 避免无 gnuradio 时导入报错)。
-        self._agent = None
+        # MainAgent Runtime 惰性创建，避免无 gnuradio 时导入报错。
+        self._runtime = None
         self._canvas_path = ""
         # ---- 顶部控制条 ----
         ctrl = Gtk.HBox()
@@ -387,32 +387,28 @@ class AgentPanel(Gtk.VBox):
                      "Describe what you want to accomplish.")
 
     # ------------------------------------------------------------------ #
-    # Agent 惰性创建
+    # MainAgent Runtime 惰性创建
     # ------------------------------------------------------------------ #
-    def _ensure_agent(self):
-        """首次交互时创建 Agent, 并把当前档位/输出目录同步进去。
+    def _ensure_runtime(self):
+        """首次交互时创建 Runtime，并同步当前档位和输出目录。"""
+        if self._runtime is None:
+            from grc.agent.service import build_mainagent_runtime
 
-        主 Agent 走 deepagents 深度代理(service.ServiceAgent);未装 deepagents
-        或未配置 LLM 时, ServiceAgent 内部自动降级到确定性 design_link 建图。
-        """
-        if self._agent is None:
-            from grc.agent.service import build_service_agent
-            self._agent = build_service_agent()
-            if hasattr(self._agent, "subscribe_progress"):
-                self._agent.subscribe_progress(self._on_agent_progress_from_worker)
+            self._runtime = build_mainagent_runtime()
+            self._runtime.subscribe_progress(self._on_agent_progress_from_worker)
             # 必须用 core Platform(env.make_platform),不能复用 GUI Platform.
             # design_link 在后台线程跑 FlowGraph.update,GUI 块带 Pango/Cairo,
             # 与主线程画布抢同一套 GTK 对象会在 macOS 上 malloc abort.
-            # 产物统一落到 local/output/ (通过 ctx 兼容层)。
-            self._agent.ctx.tool_ctx.out_dir = self._out_dir
+            # 产物统一落到 local/output/。
+            self._runtime.set_output_dir(self._out_dir)
             # 把当前下拉档位应用到画像。
-            self._apply_level_to_agent()
+            self._apply_level_to_runtime()
             if self._canvas_path:
                 try:
-                    self._agent.bind_opened_project(self._canvas_path)
+                    self._runtime.bind_opened_project(self._canvas_path)
                 except Exception as exc:  # noqa: BLE001
                     log.warning("绑定画布工程失败: %s", exc)
-        return self._agent
+        return self._runtime
 
     def _on_confirm_pending(self, _panel):
         self._submit_checkpoint_decision("approved")
@@ -426,7 +422,7 @@ class AgentPanel(Gtk.VBox):
         self._append("You", "Retry Bounded Transmission")
         self._set_busy(True)
         threading.Thread(
-            target=self._handle_agent_command,
+            target=self._handle_runtime_command,
             args=({"action": "retry_transmit"},),
             daemon=True,
         ).start()
@@ -438,12 +434,12 @@ class AgentPanel(Gtk.VBox):
         self._submit_runtime_stop(emergency=True)
 
     def _submit_runtime_stop(self, *, emergency):
-        if self._busy or self._agent is None:
+        if self._busy or self._runtime is None:
             return
         self._append("You", "Emergency Stop" if emergency else "Stop Runtime")
         self._set_busy(True)
         threading.Thread(
-            target=self._handle_agent_command,
+            target=self._handle_runtime_command,
             args=({"action": "emergency_stop" if emergency else "stop_runtime"},),
             daemon=True,
         ).start()
@@ -463,14 +459,14 @@ class AgentPanel(Gtk.VBox):
         self._append("You", label)
         self._set_busy(True)
         threading.Thread(
-            target=self._handle_agent_command, args=(command,), daemon=True
+            target=self._handle_runtime_command, args=(command,), daemon=True
         ).start()
 
     def _submit_checkpoint_decision(self, decision):
         if self._busy:
             return
-        agent = self._ensure_agent()
-        digest = agent._workflow.digest()
+        runtime = self._ensure_runtime()
+        digest = runtime.workflow_digest()
         wait_kind = str(digest.get("wait_kind") or "")
         if wait_kind == "capability":
             blocker = dict(digest.get("blocker") or {})
@@ -493,7 +489,7 @@ class AgentPanel(Gtk.VBox):
             )
             self._set_busy(True)
             threading.Thread(
-                target=self._handle_agent_command,
+                target=self._handle_runtime_command,
                 args=({"action": action},),
                 daemon=True,
             ).start()
@@ -517,7 +513,7 @@ class AgentPanel(Gtk.VBox):
             "decision": decision,
         }
         if is_ota:
-            slots = agent._workflow.workflow.intent.slots
+            slots = runtime.intent_slots()
             artifact = str(getattr(self.claims_panel, "evidence_path", "") or "")
             command["observation"] = {
                 "observed_name": str(slots.get("local_name") or ""),
@@ -526,12 +522,12 @@ class AgentPanel(Gtk.VBox):
                 "artifact": artifact,
             }
         threading.Thread(
-            target=self._handle_agent_command, args=(command,), daemon=True
+            target=self._handle_runtime_command, args=(command,), daemon=True
         ).start()
 
-    def _handle_agent_command(self, command):
+    def _handle_runtime_command(self, command):
         try:
-            reply = self._ensure_agent().step_command(command)
+            reply = self._ensure_runtime().step_command(command)
             GLib.idle_add(self._on_agent_reply, reply)
         except Exception as exc:  # noqa: BLE001
             log.exception("Agent command 失败")
@@ -539,10 +535,10 @@ class AgentPanel(Gtk.VBox):
 
     def notify_canvas_saved(self, file_path):
         """画布保存 session 工程后，把版本与 Claim 标脏。"""
-        if self._agent is None:
+        if self._runtime is None:
             return
         try:
-            result = self._agent.sync_from_canvas(file_path)
+            result = self._runtime.sync_from_canvas(file_path)
         except Exception as exc:  # noqa: BLE001
             log.warning("canvas 逆同步失败: %s", exc)
             return
@@ -575,45 +571,37 @@ class AgentPanel(Gtk.VBox):
         if not path or not os.path.isfile(path) or not path.endswith(".grc"):
             return
         self._canvas_path = path
-        if self._agent is None:
+        if self._runtime is None:
             return
         try:
-            self._agent.bind_opened_project(path)
+            self._runtime.bind_opened_project(path)
         except Exception as exc:  # noqa: BLE001
             log.warning("绑定打开的流图失败: %s", exc)
 
     def notify_canvas_cleared(self):
         self._canvas_path = ""
-        if self._agent is None:
+        if self._runtime is None:
             return
         try:
-            self._agent.clear_opened_project()
+            self._runtime.clear_opened_project()
         except Exception as exc:  # noqa: BLE001
             log.warning("清除画布工程失败: %s", exc)
 
-    def _apply_level_to_agent(self):
-        """把档位下拉的选择应用到 Agent 的 profile / adaptive 开关。"""
-        if self._agent is None:
+    def _apply_level_to_runtime(self):
+        """把档位下拉的选择应用到 MainAgent Runtime。"""
+        if self._runtime is None:
             return
         idx = self.level_combo.get_active()
         if idx < 0:
             idx = 0
         adaptive, pinned = _LEVEL_CHOICES[idx][1]
-        if hasattr(self._agent, "record_profile_choice"):
-            self._agent.record_profile_choice(adaptive=adaptive, pinned=pinned)
-            return
-        ctx = self._agent.ctx
-        ctx.adaptive = adaptive
-        if pinned is None:
-            ctx.profile.unpin()
-        else:
-            ctx.profile.pin(pinned)
+        self._runtime.record_profile_choice(adaptive=adaptive, pinned=pinned)
 
     # ------------------------------------------------------------------ #
     # 交互
     # ------------------------------------------------------------------ #
     def _on_level_changed(self, _combo):
-        self._apply_level_to_agent()
+        self._apply_level_to_runtime()
         idx = self.level_combo.get_active()
         label = _LEVEL_CHOICES[max(idx, 0)][0]
         self._set_status("Expertise: {}".format(label))
@@ -663,17 +651,17 @@ class AgentPanel(Gtk.VBox):
         if echo:
             self._append("You", text)
         self._set_busy(True)
-        threading.Thread(target=self._handle_agent,
+        threading.Thread(target=self._handle_runtime_turn,
                          args=(text,), daemon=True).start()
 
     # -- 多轮协商 Agent 路径 --------------------------------------------- #
-    def _handle_agent(self, text):
-        """子线程: 走 agent.step 多轮协商。UI 更新回主线程。"""
+    def _handle_runtime_turn(self, text):
+        """子线程：运行一次 MainAgent turn，再回到 GTK 主线程更新 UI。"""
         try:
-            agent = self._ensure_agent()
+            runtime = self._ensure_runtime()
             if self._canvas_path:
-                agent.bind_opened_project(self._canvas_path)
-            reply = agent.step(text)
+                runtime.bind_opened_project(self._canvas_path)
+            reply = runtime.step(text)
             GLib.idle_add(self._on_agent_reply, reply)
         except Exception as e:  # noqa: BLE001
             log.exception("Agent step 失败")
@@ -719,7 +707,7 @@ class AgentPanel(Gtk.VBox):
 
         tip = " (Waiting for your confirmation or response)" if getattr(reply, "needs_confirmation",
                                             False) else ""
-        level = self._agent.ctx.profile.level if self._agent else "?"
+        level = self._runtime.profile_level if self._runtime else "?"
         digest = getattr(reply, "workflow_digest", None) or {}
         workflow_note = ""
         if digest:
@@ -740,7 +728,7 @@ class AgentPanel(Gtk.VBox):
         return False
 
     def _on_agent_progress_from_worker(self, snapshot):
-        """Service callback may run on an executor thread; marshal into GTK."""
+        """Runtime callback may run on a worker thread; marshal into GTK."""
         GLib.idle_add(self._on_agent_progress, dict(snapshot or {}))
 
     def _on_agent_progress(self, snapshot):
@@ -772,10 +760,10 @@ class AgentPanel(Gtk.VBox):
             self._runtime_poll_id = None
 
     def _on_runtime_poll(self):
-        if self._agent is None:
+        if self._runtime is None:
             return True
         try:
-            digest = self._agent.peek_runtime_digest()
+            digest = self._runtime.workflow_digest()
         except Exception as exc:  # noqa: BLE001
             log.debug("runtime poll failed: %s", exc)
             return True

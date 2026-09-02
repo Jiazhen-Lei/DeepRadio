@@ -138,11 +138,8 @@ def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> li
             )
         except (TypeError, ValueError) as exc:
             return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
-        if newly_completed and result.execution_status != "completed":
-            result.execution_status = "pending"
-            workflow.save()
         if state is not None:
-            from ..state import ClaimStore, SharedIntent
+            from ..state import SharedIntent
 
             if not state.intent.intent_id:
                 state.intent = SharedIntent.new(
@@ -163,20 +160,9 @@ def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> li
             state.intent.revision = result.revision
             state.intent.refresh_hash()
             if workflow.reopened_from:
-                ClaimStore(state).invalidate_by_intent_revision(result.revision)
-                state.project.config["rf_armed"] = False
-                state.project.config.pop("rf_armed_path", None)
-                state.project.config.pop("rf_permission_grant", None)
-                state.runtime.granted_permissions = [
-                    permission
-                    for permission in state.runtime.granted_permissions
-                    if permission not in {"rf.start", "RF_RUN"}
-                ]
-                runtime = dict(state.project.config.get("runtime") or {})
-                if runtime.get("running"):
-                    from ..tools import registry
-
-                    registry.call("stop_flowgraph", {}, ctx)
+                on_reopened = ctx.extra.get("on_workflow_reopened")
+                if callable(on_reopened):
+                    on_reopened(result.revision)
             state_path = str(ctx.extra.get("state_path") or "")
             if state_path:
                 state.save(state_path)

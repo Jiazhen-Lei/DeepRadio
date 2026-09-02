@@ -24,7 +24,7 @@ V2 以最小改动、运行可控、状态可恢复和研究可复现为主要�
 ### 2.2 工程目标
 
 - 复用现有六个领域 Subagent；
-- 复用 `ServiceAgent.step(text) -> AgentReply` GUI 契约；
+- 复用 `MainAgentRuntime.step(text) -> AgentReply` GUI 契约；
 - 复用 `SharedState`、`PolicyGateway`、`ClaimStore`、snapshot 和工具注册表；
 - 由代码控制 Workflow 状态迁移，模型负责受约束的意图补全、Stage 内协作和结果叙述；
 - 所有工程变更继续经过确定性 Tool 和 PolicyGateway；
@@ -85,7 +85,7 @@ Stage 内一次实际的领域任务委派。调用内容由 TaskCard 描述，�
 └──────────────────────────────┬───────────────────────────────┘
                                │ user turn
 ┌──────────────────────────────▼───────────────────────────────┐
-│ ServiceAgent                                                 │
+│ MainAgentRuntime                                             │
 │ GUI 契约 · 会话上下文 · 结果折叠 · 主/降级执行路由             │
 └──────────────────────────────┬───────────────────────────────┘
                                │
@@ -432,7 +432,7 @@ class WorkflowEngine:
 ### 9.2 单轮执行逻辑
 
 ```text
-ServiceAgent.step(user_text)
+MainAgentRuntime.step(user_text)
   → WorkflowEngine.consume_turn
   → 创建或恢复 Workflow
   → 处理 Checkpoint / 调整 / 反馈
@@ -441,7 +441,7 @@ ServiceAgent.step(user_text)
   → 校验 ResultEnvelope
   → WorkflowEngine.accept_result
   → 保存 workflow.yaml 与 state.json
-  → ServiceAgent._fold
+  → MainAgentRuntime._finalize_turn
   → AgentReply
 ```
 
@@ -680,7 +680,7 @@ CONFIRM  等待明确批准
 DENY     终止该操作并记录原因
 ```
 
-WorkflowEngine 将 Policy 结果转换为 Stage 状态和 Checkpoint。GUI 的确认/取消按钮继续通过 `ServiceAgent.step()` 提交决定。
+WorkflowEngine 将 Policy 结果转换为 Stage 状态和 Checkpoint。GUI 的确认/取消按钮继续通过 `MainAgentRuntime.step()` 提交决定。
 
 ## 15. 失效、回退与恢复
 
@@ -709,7 +709,7 @@ build_and_verify
 
 ### 15.3 会话恢复
 
-启动或恢复 ServiceAgent 时：
+启动或恢复 MainAgentRuntime 时：
 
 1. 加载 `state.json`；
 2. 加载并校验 `workflow.yaml`；
@@ -862,7 +862,7 @@ grc/agent/workflow/
 4. 用户拒绝修改后 Workflow 进入 `cancelled` 终态；
 5. 只诊断请求完成测量和诊断，工程版本保持不变；
 6. 校验失败进入重试，达到上限后等待用户；
-7. 重启 ServiceAgent 后恢复当前 Stage 和 Checkpoint；
+7. 重启 MainAgentRuntime 后恢复当前 Stage 和 Checkpoint；
 8. 画布保存后验证 Stage 与相关 Claims 失效；
 9. 旧版本 ResultEnvelope 被识别为 stale；
 10. deepagents 与确定性路径产生一致的状态事件。
