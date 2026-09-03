@@ -233,7 +233,7 @@ def spec_update(
         shared.record_patch(
             changed_fields=changed_fields,
             scope="radio_specification",
-            source="spec_agent",
+            source="spec_update",
         )
     return {
         "ok": True,

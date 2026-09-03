@@ -10,7 +10,7 @@ import inspect
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, List, Optional
 
 from ..tools.registry import ToolContext
 
@@ -25,7 +25,7 @@ _PLOT_ARTIFACTS = {
     "plot_constellation": "constellation_png",
     "plot_eye": "eye_png",
 }
-_SKIP_AUTOWRAP = frozenset({"design_link", "read_metric"})
+_SKIP_AUTOWRAP = frozenset({"read_metric"})
 _JSON_TYPES = {
     "string": str,
     "integer": int,
@@ -235,9 +235,7 @@ def _wrap_spec(spec: Any, ctx: ToolContext) -> Any:
     )
 
 
-def build_grc_tools(
-    ctx: ToolContext, allowed: Optional[Iterable[str]] = None
-) -> List[Any]:
+def build_grc_tools(ctx: ToolContext) -> List[Any]:
     """Bind Registry tools as LangChain tools."""
     from langchain_core.tools import tool
 
@@ -279,5 +277,4 @@ def build_grc_tools(
         if spec.name in existing or spec.name in _SKIP_AUTOWRAP:
             continue
         tools.append(_wrap_spec(spec, ctx))
-    allowed_set = set(allowed or ())
-    return [item for item in tools if not allowed_set or item.name in allowed_set]
+    return tools

@@ -87,7 +87,6 @@ _THEME = {
 _CHAT_BG = "#EEF1F6"
 
 _ACTIVITY_BY_TOOL = {
-    "design_link": ("Build", "Flowgraph"),
     "simulate": ("Simulate", "Verification"),
     "run_simulation": ("Simulate", "Verification"),
     "plot_spectrum": ("Plot", "Verification"),
@@ -397,7 +396,7 @@ class AgentPanel(Gtk.VBox):
             self._runtime = build_mainagent_runtime()
             self._runtime.subscribe_progress(self._on_agent_progress_from_worker)
             # 必须用 core Platform(env.make_platform),不能复用 GUI Platform.
-            # design_link 在后台线程跑 FlowGraph.update,GUI 块带 Pango/Cairo,
+            # Agent 工具在后台线程更新 FlowGraph；GUI 块带 Pango/Cairo，
             # 与主线程画布抢同一套 GTK 对象会在 macOS 上 malloc abort.
             # 产物统一落到 local/output/。
             self._runtime.set_output_dir(self._out_dir)

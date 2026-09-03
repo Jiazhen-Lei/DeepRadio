@@ -38,15 +38,9 @@ def _materialize_stage_plan(
         definition = catalog.get(stage_id)
         if not isinstance(definition, dict):
             raise ValueError(f"Unknown Stage: {stage_id or '(empty)'}")
-        legacy_tasks = [item for item in stage.get("tasks") or [] if isinstance(item, dict)]
-        legacy_task = legacy_tasks[0] if legacy_tasks else {}
         status = str(stage.get("status") or "pending")
-        result_refs = list(
-            stage.get("result_refs") or legacy_task.get("result_refs") or []
-        )
-        inputs = stage.get("inputs")
-        if inputs is None:
-            inputs = legacy_task.get("inputs") or {}
+        result_refs = list(stage.get("result_refs") or [])
+        inputs = stage.get("inputs") or {}
         materialized.append({
             "id": stage_id,
             "objective": str(

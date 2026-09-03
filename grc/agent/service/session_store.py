@@ -6,7 +6,7 @@
   镜像到磁盘 ``local/agent_sessions/<session_id>/{work,final}/``,供回归、
   断点续跑与 GUI 读取产物。
 * **会话事件流** ``append_session_event``:把 MainAgent 和工具的关键事件
-  (委派、工具调用、产物发布)以 JSONL 追加到 ``events.jsonl``,作为 CHI 埋点
+  (Workflow 更新、工具调用、产物发布)以 JSONL 追加到 ``events.jsonl``,作为 CHI 埋点
   与可复现实验的数据源。
 
 会话根目录 ``local/agent_sessions/`` 应加入 .gitignore(运行期产物)。
@@ -465,8 +465,7 @@ def recent_events(session_id: str, limit: int = 40) -> List[Dict[str, Any]]:
 
 def _event_actor(payload: Dict[str, Any]) -> str:
     target = str(
-        payload.get("target_agent")
-        or payload.get("tool")
+        payload.get("tool")
         or payload.get("source")
         or ""
     )

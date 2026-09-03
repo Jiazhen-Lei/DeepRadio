@@ -44,7 +44,7 @@ def debug_by_metric(ctx, profile=None, metric: str = "evm",
                     sps: int = 4) -> Dict[str, Any]:
     """读指标 -> 判断 -> 给改参建议。
 
-    要求 ``ctx.last_sim`` 已有成功仿真(通常先跑 design_link 或 run_simulation)。
+    要求 ``ctx.last_sim`` 已有成功仿真(通常先跑 run_simulation)。
     """
     metric = (metric or "evm").lower().strip()
     if metric in ("spectrum", "spectrum_peak", "psd"):
@@ -152,7 +152,7 @@ def _profile_of(ctx):
     name="debug_by_metric",
     description=(
         "宏工具:以指标为线索定位问题并给改参建议(读 EVM/频谱峰→判决→分档改参)。"
-        "适合 TUNE 阶段;需先有一次成功仿真(先调 design_link 或 run_simulation)。"),
+        "适合诊断阶段;需先有一次成功仿真(先调 run_simulation)。"),
     parameters={
         "type": "object",
         "properties": {

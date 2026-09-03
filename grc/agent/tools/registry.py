@@ -1,7 +1,7 @@
 """工具注册表:统一的 ``@tool`` 装饰器 + JSON-Schema + 调度入口。
 
 工具由 :mod:`service.tools_lc` 桥接为 LangChain ``StructuredTool``,再经
-deepagents 的 function-calling 协议供主 Agent / Subagent 调度。
+deepagents 的 function-calling 协议供 MainAgent 调度。
 
 工具签名统一为 ``fn(ctx, **kwargs) -> dict``:
 
@@ -90,7 +90,6 @@ _TOOL_MODULES = (
     "state_tools",
     "ble_tools",
     "hardware_tools",
-    "design_link",
     "debug_by_metric",
     "diagnosis_experiment",
     "diagnosis_checks",

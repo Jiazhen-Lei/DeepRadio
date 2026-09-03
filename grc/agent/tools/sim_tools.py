@@ -24,7 +24,7 @@ _DTYPE_BY_SINK_TYPE = {
 #: 无样本时给模型的可执行提示,避免它去猜产物路径或反复重跑。
 _NO_SAMPLE_HINT = (
     "The probe returned 0 samples. The probe path must come from the flowgraph file sink's file parameter; "
-    "do not infer a filename from probe_id. Prefer design_flowgraph(simulate=True) for the complete path."
+    "do not infer a filename from probe_id. Inspect the flowgraph and rerun the simulation with that path."
 )
 
 

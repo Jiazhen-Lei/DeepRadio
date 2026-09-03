@@ -1,6 +1,6 @@
 # 仿真输出契约
 
-simulation_agent 完成后必须满足:
+MainAgent 完成该 Stage 后必须满足:
 
 ## 产物路径
 - 指标:`/session/work/sim/metrics.json`(如 `{"evm_pct": 3.21, "n_symbols": 2048}`)。

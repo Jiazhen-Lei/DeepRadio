@@ -83,15 +83,11 @@ class DynamicStage:
 
         stage_id = str(data.get("id") or "")
         definition = stage_contract(stage_id)
-        legacy_tasks = [
-            item for item in data.get("tasks") or [] if isinstance(item, dict)
-        ]
-        legacy_task = legacy_tasks[0] if legacy_tasks else {}
         return cls(
             id=stage_id,
             objective=str(definition.get("objective") or data.get("objective") or ""),
             skills=[str(item) for item in definition.get("skills") or [] if item],
-            inputs=dict(data.get("inputs") or legacy_task.get("inputs") or {}),
+            inputs=dict(data.get("inputs") or {}),
             expected_evidence=[
                 str(item)
                 for item in definition.get("expected_evidence") or []
@@ -100,9 +96,7 @@ class DynamicStage:
             status=str(data.get("status") or "pending"),
             result_refs=[
                 str(item)
-                for item in data.get("result_refs")
-                or legacy_task.get("result_refs")
-                or []
+                for item in data.get("result_refs") or []
                 if item
             ],
         )
@@ -168,7 +162,7 @@ class DynamicWorkflowStore:
 
     schema_version = 4
 
-    def __init__(self, path: str, _legacy_known_agents: Iterable[str] = ()) -> None:
+    def __init__(self, path: str) -> None:
         self.path = path
         self.load_error = ""
         self.reopened_from = ""
@@ -564,7 +558,6 @@ class DynamicWorkflowStore:
                     "id": item.id,
                     "label": item.objective,
                     "objective": item.objective,
-                    "target_agent": "main_agent",
                     "skills": list(item.skills),
                     "inputs": dict(item.inputs),
                     "status": item.status,
@@ -597,7 +590,7 @@ class DynamicWorkflowStore:
         try:
             with open(self.path, "r", encoding="utf-8") as handle:
                 data = json.load(handle)
-            if int(data.get("schema_version") or 0) not in {2, 3, self.schema_version}:
+            if int(data.get("schema_version") or 0) != self.schema_version:
                 self.load_error = "Unsupported Workflow state version"
                 return None
             workflow = DynamicWorkflow.from_dict(data)

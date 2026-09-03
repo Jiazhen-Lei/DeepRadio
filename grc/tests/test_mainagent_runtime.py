@@ -283,37 +283,6 @@ class MainAgentRuntimeTest(unittest.TestCase):
         self.assertEqual(result.stages[1].skills, ["grc-ble-advertising", "grc-block-rag"])
         self.assertEqual(result.stages[1].inputs, {"protocol": "BLE"})
 
-    def test_legacy_subagent_workflow_loads_as_single_agent_stage(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "workflow.json"
-            path.write_text(json.dumps({
-                "schema_version": 3,
-                "workflow_id": "wf-legacy",
-                "revision": 2,
-                "intent": {"raw_text": "Build BLE", "summary": "Build BLE"},
-                "stages": [{
-                    "id": "radio_specification_alignment",
-                    "objective": "Legacy objective",
-                    "status": "running",
-                    "tasks": [{
-                        "id": "align_radio_specification",
-                        "objective": "Legacy task",
-                        "target_agent": "spec_agent",
-                        "inputs": {"protocol": "BLE"},
-                        "expected_evidence": ["spec_commit"],
-                        "status": "running",
-                    }],
-                }],
-                "current_stage": "radio_specification_alignment",
-                "execution_status": "pending",
-            }), encoding="utf-8")
-
-            workflow = DynamicWorkflowStore(str(path))
-
-        self.assertFalse(workflow.load_error)
-        self.assertEqual(workflow.current_stage().skills, ["grc-spec"])
-        self.assertEqual(workflow.current_stage().inputs, {"protocol": "BLE"})
-
     def test_stage_gateway_rejects_cross_stage_tool(self):
         ctx = ToolContext(extra={
             "enforce_stage_tools": True,

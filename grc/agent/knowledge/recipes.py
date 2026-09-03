@@ -44,7 +44,7 @@ class Recipe:
     knobs: Dict[str, str] = field(default_factory=dict)
     metrics: List[str] = field(default_factory=list)
     keywords: List[str] = field(default_factory=list)
-    #: 仿真时的 file_sink 探针 id(design_link 会据此配 run_simulation)
+    #: 仿真时供 run_simulation 使用的 file_sink 探针 id
     probe_block_id: Optional[str] = None
     tx_probe_block_id: Optional[str] = None
     probe_dtype: str = "complex64"
