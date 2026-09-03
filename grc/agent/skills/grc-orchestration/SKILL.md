@@ -31,6 +31,10 @@ description: 根据 Stage 候选库规划、执行和调整由用户驱动的 De
 5. 将第一个 Stage 设置为 `running`，其余 Stage 设置为 `pending`。
 6. 在委派任何 Task 前调用 `update_workflow`。
 
+`update_workflow` 只接收 Stage 的 `id`、`objective`、`inputs`、`status` 和
+`result_refs`。Task、`target_agent` 和预期 Evidence 由 Stage 候选库确定，
+MainAgent 不重复生成这些固定字段。
+
 所有当前可确定的 Stage 应在 Workflow 初次创建时完成规划，不能等当前 Stage 完成后再逐个规划。
 
 如果用户只是提问、请求解释或查看状态，直接回答，不创建或推进 Workflow。
@@ -44,7 +48,7 @@ description: 根据 Stage 候选库规划、执行和调整由用户驱动的 De
 1. 根据对应的 Stage 候选定义生成一个 TaskCard。
 2. 使用 `task` 将其委派给固定的 `target_agent`。
 3. 收集 SubAgent 返回的结果、Artifact、Measurement 和 Evidence。
-4. Stage 状态或结果发生变化后，调用 `update_workflow`。
+4. Stage 状态或结果发生变化后，调用 `update_current_stage`。
 5. 只有声明的 Evidence 已经存在时，才能将 Stage 标记为 `completed`。
 
 MainAgent 不直接执行 SubAgent 负责的领域任务。
@@ -74,6 +78,8 @@ Stage 完成不代表下一 Stage 自动开始。
 
 只有当用户明确表示“继续”“下一步”“开始下一阶段”或同等意图时，才能将下一 Stage 设置为 `running` 并开始执行。
 
+推进到已规划的下一个 Stage 时调用 `update_current_stage`，不要重新提交完整 Workflow。
+
 用户提出问题、发表评论或者仅确认结果时，不推进 Workflow。
 
 普通 Stage 之间的推进不使用 `request_user_decision`。
@@ -102,6 +108,8 @@ Stage 完成不代表下一 Stage 自动开始。
 多轮参数补充始终属于同一个 Stage，不创建新的 Stage。
 
 ## Workflow 调整
+
+只有 Workflow 结构发生变化或需要回溯已完成 Stage 时，才调用 `update_workflow`。
 
 如果用户修改当前 Stage 的内容，更新并重新执行当前 Stage。
 

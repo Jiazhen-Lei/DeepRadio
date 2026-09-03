@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import time
@@ -385,6 +386,83 @@ class DynamicWorkflowStore:
             candidate.execution_status = "errored"
         elif newly_completed and candidate.execution_status != "completed":
             candidate.execution_status = "pending"
+        self.workflow = candidate
+        self.save()
+        return candidate
+
+    def update_stage(
+        self,
+        *,
+        stage_id: str,
+        status: str,
+        inputs: Optional[Dict[str, Any]],
+        result_refs: Optional[List[str]],
+        expected_revision: int,
+        events: Iterable[Dict[str, Any]],
+        artifacts: Dict[str, Any],
+        metrics: Dict[str, Any],
+        project_version: int,
+    ) -> DynamicWorkflow:
+        """Update one existing Stage without rebuilding the Workflow plan."""
+        if self.workflow is None:
+            raise ValueError("There is no active Workflow")
+        if int(expected_revision) != self.workflow.revision:
+            raise ValueError(
+                f"Stale Workflow revision: expected {expected_revision}, "
+                f"current {self.workflow.revision}"
+            )
+        candidate = copy.deepcopy(self.workflow)
+        stage = candidate.stage(stage_id)
+        if stage is None:
+            raise ValueError(f"Unknown Stage: {stage_id or '(empty)'}")
+        if status not in STAGE_STATUSES:
+            raise ValueError(f"Invalid Stage status: {status}")
+
+        current = candidate.stage()
+        if stage.id != candidate.current_stage:
+            current_index = candidate.stages.index(current) if current else -1
+            target_index = candidate.stages.index(stage)
+            if (
+                status != "running"
+                or current is None
+                or current.status != "completed"
+                or target_index != current_index + 1
+            ):
+                raise ValueError("Only the next Stage may be started")
+            candidate.current_stage = stage.id
+        elif stage.status == "completed" and status != "completed":
+            raise ValueError("Use update_workflow to reopen a completed Stage")
+
+        if inputs is not None:
+            stage.tasks[0].inputs = dict(inputs)
+        if result_refs is not None:
+            refs = [str(item) for item in result_refs if item]
+            stage.result_refs = refs
+            stage.tasks[0].result_refs = list(refs)
+
+        if status == "completed" and stage.status != "completed":
+            missing = missing_evidence(
+                stage.expected_evidence, events, artifacts, metrics
+            )
+            if missing:
+                raise ValueError(
+                    f"Stage {stage.id} lacks verified evidence: {', '.join(missing)}"
+                )
+
+        stage.status = status
+        stage.tasks[0].status = status
+        if status == "failed":
+            candidate.execution_status = "errored"
+        elif status == "completed":
+            candidate.execution_status = "pending"
+        elif status == "waiting":
+            candidate.execution_status = "waiting"
+        else:
+            candidate.execution_status = "running"
+        candidate.base_project_version = int(project_version)
+        candidate.revision += 1
+        candidate.updated_at = time.time()
+        candidate.validate(self.known_agents)
         self.workflow = candidate
         self.save()
         return candidate

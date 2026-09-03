@@ -21,8 +21,7 @@ def _normalize_intent_slots(
     raise ValueError("intent_slots must be a dictionary or an empty string")
 
 
-def _validate_stage_plan(stages: List[Dict[str, Any]]) -> List[str]:
-    """Validate fixed Stage-to-Task mappings from the maintained library."""
+def _load_stage_catalog() -> Dict[str, Dict[str, Any]]:
     try:
         from grc.core.io import yaml
 
@@ -36,9 +35,18 @@ def _validate_stage_plan(stages: List[Dict[str, Any]]) -> List[str]:
         raise ValueError(f"Stage library could not be loaded: {exc}") from exc
     if not catalog:
         raise ValueError("Stage library is empty")
+    return catalog
+
+
+def _materialize_stage_plan(
+    stages: List[Dict[str, Any]],
+) -> tuple[List[Dict[str, Any]], List[str]]:
+    """Build fixed Task fields from the Stage library."""
     if not stages:
         raise ValueError("Workflow requires at least one Stage")
 
+    catalog = _load_stage_catalog()
+    materialized: List[Dict[str, Any]] = []
     capabilities: List[str] = []
     for stage in stages or []:
         if not isinstance(stage, dict):
@@ -47,27 +55,41 @@ def _validate_stage_plan(stages: List[Dict[str, Any]]) -> List[str]:
         definition = catalog.get(stage_id)
         if not isinstance(definition, dict):
             raise ValueError(f"Unknown Stage: {stage_id or '(empty)'}")
-        tasks = [item for item in stage.get("tasks") or [] if isinstance(item, dict)]
-        if len(tasks) != 1:
-            raise ValueError(f"Stage {stage_id} requires exactly one Task")
-        task = tasks[0]
+        legacy_tasks = [
+            item for item in stage.get("tasks") or [] if isinstance(item, dict)
+        ]
+        legacy_task = legacy_tasks[0] if legacy_tasks else {}
         expected_task = dict(definition.get("task") or {})
-        if str(task.get("id") or "") != str(expected_task.get("id") or ""):
-            raise ValueError(f"Stage {stage_id} has an invalid Task id")
-        if str(task.get("target_agent") or "") != str(definition.get("target_agent") or ""):
-            raise ValueError(f"Stage {stage_id} has an invalid target_agent")
-        required_evidence = {
-            str(item) for item in expected_task.get("expected_evidence") or []
-        }
-        declared_evidence = {
-            str(item) for item in task.get("expected_evidence") or []
-        }
-        if not required_evidence.issubset(declared_evidence):
-            raise ValueError(f"Stage {stage_id} is missing required Evidence")
+        status = str(stage.get("status") or "pending")
+        result_refs = list(
+            stage.get("result_refs") or legacy_task.get("result_refs") or []
+        )
+        inputs = stage.get("inputs")
+        if inputs is None:
+            inputs = legacy_task.get("inputs") or {}
+        materialized.append({
+            "id": stage_id,
+            "objective": str(
+                stage.get("objective") or definition.get("objective") or ""
+            ),
+            "status": status,
+            "result_refs": result_refs,
+            "tasks": [{
+                "id": str(expected_task.get("id") or ""),
+                "objective": str(expected_task.get("objective") or ""),
+                "target_agent": str(definition.get("target_agent") or ""),
+                "inputs": dict(inputs or {}),
+                "expected_evidence": list(
+                    expected_task.get("expected_evidence") or []
+                ),
+                "status": status,
+                "result_refs": list(result_refs),
+            }],
+        })
         for capability in definition.get("capabilities") or []:
             if capability not in capabilities:
                 capabilities.append(str(capability))
-    return capabilities
+    return materialized, capabilities
 
 
 def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> list[Any]:
@@ -85,16 +107,15 @@ def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> li
     ) -> str:
         """Create or update the complete ordered Workflow.
 
-        MainAgent must call this before delegation and after verified results.
-        Stage fields: id, objective, status, result_refs, tasks. Each Stage has
-        exactly one Task. The Task has
-        id, objective, target_agent, inputs, expected_evidence, status and
-        result_refs. Use the revision from CURRENT_WORKFLOW.
+        Use this for initial planning or user-requested structural replanning.
+        Stage fields: id, objective, inputs, status and result_refs. Fixed Task,
+        target_agent and expected_evidence fields come from the Stage library.
+        Use the revision from CURRENT_WORKFLOW.
         intent_slots must be a JSON object; an empty string is treated as {}.
         """
         try:
             normalized_slots = _normalize_intent_slots(intent_slots)
-            capabilities = _validate_stage_plan(stages)
+            stage_plan, capabilities = _materialize_stage_plan(stages)
         except (TypeError, ValueError) as exc:
             return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
         state = ctx.extra.get("state")
@@ -104,13 +125,13 @@ def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> li
         }
         newly_completed = [
             str(stage.get("id") or "")
-            for stage in stages or []
+            for stage in stage_plan
             if stage.get("status") == "completed"
             and previous_status.get(str(stage.get("id") or "")) != "completed"
         ]
         newly_failed = [
             str(stage.get("id") or "")
-            for stage in stages or []
+            for stage in stage_plan
             if stage.get("status") == "failed"
             and previous_status.get(str(stage.get("id") or "")) != "failed"
         ]
@@ -126,7 +147,7 @@ def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> li
                 "error": "Keep current_stage on the Stage finished this turn",
             }, ensure_ascii=False)
         if newly_finished and any(
-            str(stage.get("status") or "") == "running" for stage in stages
+            str(stage.get("status") or "") == "running" for stage in stage_plan
         ):
             return json.dumps({
                 "ok": False,
@@ -145,7 +166,7 @@ def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> li
             result = workflow.update(
                 intent_summary=intent_summary,
                 intent_slots=normalized_slots,
-                stages=list(stages or []),
+                stages=stage_plan,
                 current_stage=current_stage,
                 execution_status=execution_status,
                 task_type=task_type,
@@ -211,6 +232,77 @@ def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> li
         return json.dumps(payload, ensure_ascii=False)
 
     @tool
+    def update_current_stage(
+        stage_id: str,
+        status: str,
+        expected_revision: int,
+        inputs: Dict[str, Any] | None = None,
+        result_refs: List[str] | None = None,
+    ) -> str:
+        """Update one Stage or start the immediate next Stage.
+
+        Use this for routine execution updates. It preserves the Workflow plan
+        and all unrelated Stages. Use update_workflow for structural replanning
+        or reopening a completed Stage.
+        """
+        finished = status in {"completed", "failed"}
+        finished_this_turn = str(ctx.extra.get("finished_stage_this_turn") or "")
+        if finished and finished_this_turn not in {"", stage_id}:
+            return json.dumps({
+                "ok": False,
+                "error": "This turn already finished its current Stage",
+            }, ensure_ascii=False)
+        state = ctx.extra.get("state")
+        project_version = int(
+            getattr(getattr(state, "project", None), "flowgraph_version", 0)
+        )
+        try:
+            result = workflow.update_stage(
+                stage_id=stage_id,
+                status=status,
+                inputs=inputs,
+                result_refs=result_refs,
+                expected_revision=expected_revision,
+                events=list(ctx.extra.get("events") or []),
+                artifacts=dict(ctx.extra.get("artifacts") or {}),
+                metrics=dict(ctx.extra.get("metrics") or {}),
+                project_version=project_version,
+            )
+        except (TypeError, ValueError) as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+        if state is not None:
+            state.intent.revision = result.revision
+            state.intent.refresh_hash()
+            state_path = str(ctx.extra.get("state_path") or "")
+            if state_path:
+                state.save(state_path)
+        ctx.extra["workflow"] = result.to_dict()
+        ctx.extra["stage_id"] = result.current_stage
+        if finished:
+            ctx.extra["finished_stage_this_turn"] = stage_id
+        store.append_session_event(
+            str(ctx.extra.get("session_id") or ""),
+            "workflow_updated_by_mainagent",
+            {
+                "workflow_id": result.workflow_id,
+                "revision": result.revision,
+                "current_stage": result.current_stage,
+                "execution_status": result.execution_status,
+            },
+        )
+        on_updated = ctx.extra.get("on_workflow_updated")
+        if callable(on_updated):
+            on_updated("workflow_updated")
+        payload = {"ok": True, "workflow": workflow.digest()}
+        if finished:
+            payload["turn_complete"] = True
+            payload["instruction"] = (
+                "Reply with this Stage result and stop. Do not execute the next Stage in this turn."
+            )
+        return json.dumps(payload, ensure_ascii=False)
+
+    @tool
     def request_user_decision(
         stage_id: str,
         question: str,
@@ -245,4 +337,4 @@ def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> li
             on_updated("workflow_waiting")
         return json.dumps({"ok": True, "checkpoint": checkpoint}, ensure_ascii=False)
 
-    return [update_workflow, request_user_decision]
+    return [update_workflow, update_current_stage, request_user_decision]

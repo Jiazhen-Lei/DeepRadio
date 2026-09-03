@@ -10,6 +10,7 @@ from grc.agent.service import MainAgentRuntime, build_mainagent_runtime
 from grc.agent.service import session_store
 from grc.agent.service.tools_lc import _call_registry
 from grc.agent.service.workflow_tools import (
+    _materialize_stage_plan,
     _normalize_intent_slots,
     build_workflow_tools,
 )
@@ -35,6 +36,25 @@ def _spec_stage(status="running"):
     }
 
 
+def _radio_design_stage(status="pending"):
+    return {
+        "id": "radio_design",
+        "objective": "Build the transmit waveform",
+        "status": status,
+        "tasks": [{
+            "id": "build_transmit_waveform",
+            "objective": "Build the transmit waveform",
+            "target_agent": "radio_design_agent",
+            "expected_evidence": [
+                "artifact:tx_data",
+                "artifact:waveform_path",
+                "artifact:waveform_manifest",
+            ],
+            "status": status,
+        }],
+    }
+
+
 class MainAgentRuntimeTest(unittest.TestCase):
     def test_empty_intent_slots_are_normalized(self):
         self.assertEqual(_normalize_intent_slots(""), {})
@@ -44,6 +64,34 @@ class MainAgentRuntimeTest(unittest.TestCase):
         })
         with self.assertRaises(ValueError):
             _normalize_intent_slots("BLE")
+
+    def test_stage_plan_uses_fixed_library_task(self):
+        catalog = {
+            "flowgraph_verification": {
+                "objective": "Verify the flowgraph",
+                "target_agent": "verification_agent",
+                "task": {
+                    "id": "verify_flowgraph",
+                    "objective": "Validate the current flowgraph",
+                    "expected_evidence": ["validate_flowgraph"],
+                },
+            },
+        }
+        with patch(
+            "grc.agent.service.workflow_tools._load_stage_catalog",
+            return_value=catalog,
+        ):
+            stages, _ = _materialize_stage_plan([{
+                "id": "flowgraph_verification",
+                "objective": "Verify the generated flowgraph",
+                "status": "pending",
+                "tasks": [{"target_agent": "wrong_agent"}],
+            }])
+
+        task = stages[0]["tasks"][0]
+        self.assertEqual(task["id"], "verify_flowgraph")
+        self.assertEqual(task["target_agent"], "verification_agent")
+        self.assertEqual(task["expected_evidence"], ["validate_flowgraph"])
 
     def test_turn_keeps_the_agent_reply_contract(self):
         captured = {}
@@ -172,6 +220,54 @@ class MainAgentRuntimeTest(unittest.TestCase):
             )
 
         self.assertEqual(result.execution_status, "pending")
+
+    def test_stage_update_preserves_the_workflow_plan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workflow = DynamicWorkflowStore(
+                str(Path(directory) / "workflow.json"),
+                ["spec_agent", "radio_design_agent"],
+            )
+            workflow.begin_turn("Build a radio", 0)
+            workflow.update(
+                intent_summary="Build a radio",
+                intent_slots={},
+                stages=[_spec_stage(), _radio_design_stage()],
+                current_stage="radio_specification_alignment",
+                execution_status="running",
+                task_type="DYNAMIC",
+                expected_revision=1,
+                events=[],
+                artifacts={},
+                metrics={},
+                project_version=0,
+            )
+            workflow.update_stage(
+                stage_id="radio_specification_alignment",
+                status="completed",
+                inputs=None,
+                result_refs=["spec_commit"],
+                expected_revision=2,
+                events=[{"kind": "spec_commit", "payload": {"ok": True}}],
+                artifacts={},
+                metrics={},
+                project_version=0,
+            )
+            result = workflow.update_stage(
+                stage_id="radio_design",
+                status="running",
+                inputs={"protocol": "BLE"},
+                result_refs=None,
+                expected_revision=3,
+                events=[],
+                artifacts={},
+                metrics={},
+                project_version=0,
+            )
+
+        self.assertEqual(result.current_stage, "radio_design")
+        self.assertEqual(result.stages[0].status, "completed")
+        self.assertEqual(result.stages[1].tasks[0].target_agent, "radio_design_agent")
+        self.assertEqual(result.stages[1].tasks[0].inputs, {"protocol": "BLE"})
 
     def test_registry_tool_persists_shared_state_immediately(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -46,7 +46,7 @@ def build_agent(ctx: ToolContext, *, temperature: float = 0.2) -> Optional[Any]:
     from .workflow_tools import build_workflow_tools
 
     # MainAgent never receives domain tools. DeepAgents adds ``task`` for
-    # delegation; these two tools are its only host-side mutation authority.
+    # delegation; these tools are its only host-side mutation authority.
     tools = build_workflow_tools(ctx, workflow_store)
     be = build_backend()
     style_prompt = _resolve_style_prompt(ctx)
