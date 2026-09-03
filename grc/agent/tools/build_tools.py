@@ -2,11 +2,24 @@
 
 from __future__ import annotations
 
+import ast
 import os
 from typing import Optional
 
 from .. import env
 from .registry import ToolContext, tool
+
+
+def _missing_literal_file_source(key: str, params: dict) -> str:
+    if key != "blocks_file_source" or "file" not in params:
+        return ""
+    raw = str(params.get("file") or "").strip()
+    try:
+        value = ast.literal_eval(raw)
+    except (SyntaxError, ValueError):
+        value = raw if os.path.isabs(raw) else ""
+    path = str(value) if isinstance(value, str) else ""
+    return path if path and os.path.isabs(path) and not os.path.isfile(path) else ""
 
 
 @tool(
@@ -63,6 +76,9 @@ def init_flow_graph(
 def add_block(
     ctx: ToolContext, key: str, id: str, params: Optional[dict] = None
 ):
+    missing = _missing_literal_file_source(key, params or {})
+    if missing:
+        return {"ok": False, "error": f"File Source input does not exist: {missing}"}
     if id in ctx.blocks:
         return {"ok": False, "error": f"Block ID already exists: {id}"}
     flow_graph = ctx.ensure_flow_graph()
@@ -119,6 +135,11 @@ def set_param(ctx: ToolContext, id: str, name: str, value):
             "error": f"Block {id} has no parameter named {name}",
             "available": list(block.params),
         }
+    missing = _missing_literal_file_source(
+        str(getattr(block, "key", "") or ""), {name: value}
+    )
+    if missing:
+        return {"ok": False, "error": f"File Source input does not exist: {missing}"}
     block.params[name].set_value(str(value))
     return {"ok": True, "id": id, "name": name, "value": value}
 

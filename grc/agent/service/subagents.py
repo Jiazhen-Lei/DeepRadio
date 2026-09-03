@@ -76,6 +76,7 @@ def build_flowgraph_prompt() -> str:
         "FlowgraphAgent",
         "grc-build",
         "根据 TaskCard 创建或修改 Flowgraph，并返回 .grc 产物。"
+        "File Source 必须使用 TaskCard 中已存在的宿主机文件路径，不得猜测或改写路径。"
         "只负责 Build，不执行 Verification 或 Simulation。",
     )
 
@@ -86,6 +87,7 @@ def build_verification_prompt() -> str:
         "grc-critic, grc-sim",
         "根据 stage_id 执行对应任务：flowgraph_verification 只校验，"
         "simulation_and_measurement 只仿真并读取所需指标。"
+        "每次委派只执行一次对应任务并立即返回；失败或缺少输入时不得自行重试或提问。"
         "不修改 Flowgraph，结论必须绑定 Evidence。",
     )
 

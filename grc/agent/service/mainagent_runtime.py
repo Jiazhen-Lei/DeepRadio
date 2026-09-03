@@ -156,12 +156,14 @@ class MainAgentRuntime:
                 "state": self._state,
                 "state_path": store.state_path(self.session_id),
                 "artifacts": {},
+                "available_artifacts": store.read_named_artifacts(self.session_id),
                 "events": [],
                 "metrics": {},
                 "export_dir": export_dir,
                 "session_id": self.session_id,
                 "workflow_store": self._workflow,
                 "on_workflow_reopened": self._handle_workflow_reopened,
+                "on_workflow_updated": self._notify_progress,
                 "workflow": (
                     self._workflow.workflow.to_dict()
                     if self._workflow.workflow else {}
@@ -177,7 +179,7 @@ class MainAgentRuntime:
         )
         ctx.extra.pop("pending_decision", None)
         ctx.extra.pop("_idempotent_results", None)
-        ctx.extra.pop("completed_stage_this_turn", None)
+        ctx.extra.pop("finished_stage_this_turn", None)
         if ctx.flow_graph is None:
             self._load_flowgraph(ctx)
         return ctx
@@ -271,6 +273,7 @@ class MainAgentRuntime:
             "config": dict(self._state.project.config),
         }
         specification = self._state.intent.specification.to_dict()
+        available_artifacts = dict(ctx.extra.get("available_artifacts") or {})
         prompt = (
             f"USER_REQUEST:\n{user_text}\n\n"
             f"CURRENT_WORKFLOW:\n{json.dumps(current, ensure_ascii=False)}\n\n"
@@ -278,6 +281,8 @@ class MainAgentRuntime:
             f"CURRENT_RADIO_SPECIFICATION:\n"
             f"{json.dumps(specification, ensure_ascii=False, default=str)}\n\n"
             f"CURRENT_PROJECT:\n{json.dumps(project, ensure_ascii=False, default=str)}\n\n"
+            f"CURRENT_ARTIFACTS:\n"
+            f"{json.dumps(available_artifacts, ensure_ascii=False, default=str)}\n\n"
             "请根据以上用户请求和当前状态，读取并遵循 grc-orchestration Skill "
             "处理本轮请求。"
         )
@@ -314,9 +319,7 @@ class MainAgentRuntime:
             trace.finish()
         narrative = self._extract_final_text(result)
         self._record_delegations(result)
-        reply = self._finalize_turn(ctx, narrative, ok=True)
-        self._notify_progress("workflow_updated")
-        return reply
+        return self._finalize_turn(ctx, narrative, ok=True)
 
     def step_command(self, command: Dict[str, Any]) -> AgentReply:
         action = str((command or {}).get("action") or "")

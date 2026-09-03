@@ -11,6 +11,16 @@ from ..workflow.dynamic import DynamicWorkflowStore
 from . import session_store as store
 
 
+def _normalize_intent_slots(
+    value: Dict[str, Any] | str | None,
+) -> Dict[str, Any]:
+    if value is None or value == "":
+        return {}
+    if isinstance(value, dict):
+        return dict(value)
+    raise ValueError("intent_slots must be a dictionary or an empty string")
+
+
 def _validate_stage_plan(stages: List[Dict[str, Any]]) -> List[str]:
     """Validate fixed Stage-to-Task mappings from the maintained library."""
     try:
@@ -70,7 +80,7 @@ def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> li
         current_stage: str = "",
         execution_status: str = "running",
         task_type: str = "DYNAMIC",
-        intent_slots: Dict[str, Any] | None = None,
+        intent_slots: Dict[str, Any] | str | None = None,
         expected_revision: int = 1,
     ) -> str:
         """Create or update the complete ordered Workflow.
@@ -80,8 +90,10 @@ def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> li
         exactly one Task. The Task has
         id, objective, target_agent, inputs, expected_evidence, status and
         result_refs. Use the revision from CURRENT_WORKFLOW.
+        intent_slots must be a JSON object; an empty string is treated as {}.
         """
         try:
+            normalized_slots = _normalize_intent_slots(intent_slots)
             capabilities = _validate_stage_plan(stages)
         except (TypeError, ValueError) as exc:
             return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
@@ -96,28 +108,35 @@ def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> li
             if stage.get("status") == "completed"
             and previous_status.get(str(stage.get("id") or "")) != "completed"
         ]
-        if len(newly_completed) > 1:
+        newly_failed = [
+            str(stage.get("id") or "")
+            for stage in stages or []
+            if stage.get("status") == "failed"
+            and previous_status.get(str(stage.get("id") or "")) != "failed"
+        ]
+        newly_finished = newly_completed + newly_failed
+        if len(newly_finished) > 1:
             return json.dumps({
                 "ok": False,
-                "error": "Only one user-visible Stage may complete in one turn",
+                "error": "Only one user-visible Stage may finish in one turn",
             }, ensure_ascii=False)
-        if newly_completed and str(current_stage or "") != newly_completed[0]:
+        if newly_finished and str(current_stage or "") != newly_finished[0]:
             return json.dumps({
                 "ok": False,
-                "error": "Keep current_stage on the Stage completed this turn",
+                "error": "Keep current_stage on the Stage finished this turn",
             }, ensure_ascii=False)
-        if newly_completed and any(
+        if newly_finished and any(
             str(stage.get("status") or "") == "running" for stage in stages
         ):
             return json.dumps({
                 "ok": False,
-                "error": "Do not start another Stage in the completion update",
+                "error": "Do not start another Stage in the current Stage result update",
             }, ensure_ascii=False)
-        completed_this_turn = str(ctx.extra.get("completed_stage_this_turn") or "")
-        if newly_completed and completed_this_turn not in {"", newly_completed[0]}:
+        finished_this_turn = str(ctx.extra.get("finished_stage_this_turn") or "")
+        if newly_finished and finished_this_turn not in {"", newly_finished[0]}:
             return json.dumps({
                 "ok": False,
-                "error": "This turn already completed its current Stage",
+                "error": "This turn already finished its current Stage",
             }, ensure_ascii=False)
         project_version = int(
             getattr(getattr(state, "project", None), "flowgraph_version", 0)
@@ -125,7 +144,7 @@ def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> li
         try:
             result = workflow.update(
                 intent_summary=intent_summary,
-                intent_slots=dict(intent_slots or {}),
+                intent_slots=normalized_slots,
                 stages=list(stages or []),
                 current_stage=current_stage,
                 execution_status=execution_status,
@@ -168,8 +187,8 @@ def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> li
                 state.save(state_path)
         ctx.extra["workflow"] = result.to_dict()
         ctx.extra["stage_id"] = result.current_stage
-        if newly_completed:
-            ctx.extra["completed_stage_this_turn"] = newly_completed[0]
+        if newly_finished:
+            ctx.extra["finished_stage_this_turn"] = newly_finished[0]
         store.append_session_event(
             str(ctx.extra.get("session_id") or ""),
             "workflow_updated_by_mainagent",
@@ -181,7 +200,10 @@ def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> li
             },
         )
         payload = {"ok": True, "workflow": workflow.digest()}
-        if newly_completed:
+        on_updated = ctx.extra.get("on_workflow_updated")
+        if callable(on_updated):
+            on_updated("workflow_updated")
+        if newly_finished:
             payload["turn_complete"] = True
             payload["instruction"] = (
                 "Reply with this Stage result and stop. Do not execute the next Stage in this turn."
@@ -218,6 +240,9 @@ def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> li
             "checkpoint_opened",
             dict(checkpoint),
         )
+        on_updated = ctx.extra.get("on_workflow_updated")
+        if callable(on_updated):
+            on_updated("workflow_waiting")
         return json.dumps({"ok": True, "checkpoint": checkpoint}, ensure_ascii=False)
 
     return [update_workflow, request_user_decision]

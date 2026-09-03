@@ -260,7 +260,9 @@ def workflow_view(
         outcome = {"pass": "passed", "complete": "completed"}.get(
             outcome, outcome
         )
-        execution = {"pass": "passed", "complete": "completed"}.get(
+        execution = {
+            "pass": "passed", "complete": "passed", "completed": "passed"
+        }.get(
             execution, execution
         )
         status = outcome or execution
@@ -329,12 +331,15 @@ def workflow_view(
     completed = [
         item for item in stages
         if str(item.get("status") or "") in {"passed", "completed"}
-        and not item.get("current")
     ]
     current_rows = [
         item for item in stages
-        if item.get("current")
-        or str(item.get("status") or "") in {"running", "waiting", "failed", "errored"}
+        if item not in completed and (
+            item.get("current")
+            or str(item.get("status") or "") in {
+                "running", "waiting", "failed", "errored"
+            }
+        )
     ]
     pending = [
         item for item in stages

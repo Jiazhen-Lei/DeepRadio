@@ -151,6 +151,11 @@ def _call_registry(ctx: ToolContext, name: str, arguments: Dict[str, Any]) -> st
         return json.dumps(cached, ensure_ascii=False)
 
     result = registry.call(name, arguments, ctx)
+    if name == "validate_flowgraph":
+        result = dict(result)
+        result["instruction"] = (
+            "Return the validation outcome now. Do not validate again or ask a question."
+        )
     state = ctx.extra.get("state")
     state_path = str(ctx.extra.get("state_path") or "")
     if state is not None and state_path:

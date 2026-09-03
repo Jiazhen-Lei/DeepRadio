@@ -7,6 +7,9 @@ fg.get_error_messages()。explain_error 把原始报错整理成可读要点,
 
 from __future__ import annotations
 
+import ast
+import os
+
 from .registry import ToolContext, tool
 
 # Disabled RF sinks look unconnected to GNU Radio. Topology checks may
@@ -50,6 +53,32 @@ def _enable_disabled_rf(ctx: ToolContext):
     return restored
 
 
+def _missing_file_sources(ctx: ToolContext):
+    errors = []
+    blocks = list((ctx.blocks or {}).values())
+    if not blocks and ctx.flow_graph is not None:
+        blocks = list(getattr(ctx.flow_graph, "blocks", []) or [])
+    for block in blocks:
+        if str(getattr(block, "key", "") or "") != "blocks_file_source":
+            continue
+        params = getattr(block, "params", None) or {}
+        if "file" not in params:
+            continue
+        raw = str(params["file"].get_value()).strip()
+        try:
+            value = ast.literal_eval(raw)
+        except (SyntaxError, ValueError):
+            value = raw if os.path.isabs(raw) else ""
+        if not isinstance(value, str) or not value:
+            continue
+        path = value if os.path.isabs(value) else os.path.join(
+            ctx.out_dir or os.getcwd(), value
+        )
+        if not os.path.isfile(path):
+            errors.append(f"File Source input does not exist: {path}")
+    return errors
+
+
 @tool(
     name="validate_flowgraph",
     description="Validate the current flowgraph (type consistency, port connectivity, and related checks) and return errors.",
@@ -71,6 +100,10 @@ def validate_flowgraph(ctx: ToolContext, arm_disabled_rf: bool = False):
     restored = _enable_disabled_rf(ctx) if arm_disabled_rf else []
     try:
         valid, msgs = _collect_errors(fg)
+        missing_files = _missing_file_sources(ctx)
+        if missing_files:
+            valid = False
+            msgs.extend(missing_files)
     finally:
         for block in restored:
             block.state = "disabled"

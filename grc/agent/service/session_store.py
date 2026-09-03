@@ -560,11 +560,29 @@ def write_artifact_manifest(
     root = session_root(session_id)
     final_dir = os.path.join(root, "final")
     os.makedirs(final_dir, exist_ok=True)
+    manifest_path = os.path.join(final_dir, "manifest.json")
+    named_artifacts: Dict[str, str] = {}
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            previous = json.load(handle)
+        for key, relative in dict(previous.get("named_artifacts") or {}).items():
+            resolved = resolve_session_path(session_id, str(relative or ""))
+            if resolved and os.path.isfile(resolved):
+                named_artifacts[str(key)] = _posix_relpath(resolved, root)
+    except (OSError, TypeError, ValueError):
+        pass
     roles = {
         os.path.abspath(value): _artifact_role_from_key(key, value)
         for key, value in (artifacts or {}).items()
         if isinstance(value, str) and os.path.isfile(value)
     }
+    root_prefix = os.path.abspath(root) + os.sep
+    for key, value in (artifacts or {}).items():
+        if not isinstance(value, str) or not os.path.isfile(value):
+            continue
+        absolute = os.path.abspath(value)
+        if absolute.startswith(root_prefix):
+            named_artifacts[str(key)] = _posix_relpath(absolute, root)
     listed = []
     for current_root, dirnames, names in os.walk(final_dir):
         dirnames[:] = [
@@ -578,18 +596,18 @@ def write_artifact_manifest(
     if os.path.isfile(metadata):
         listed.append(metadata)
     entries = []
-    for path in listed:
+    for artifact_path in listed:
         try:
-            with open(path, "rb") as handle:
+            with open(artifact_path, "rb") as handle:
                 digest = hashlib.sha256(handle.read()).hexdigest()
-            size = os.path.getsize(path)
+            size = os.path.getsize(artifact_path)
         except OSError:
             continue
         try:
-            rel = _posix_relpath(path, root)
+            rel = _posix_relpath(artifact_path, root)
         except ValueError:
-            rel = os.path.basename(path)
-        role = roles.get(os.path.abspath(path)) or _infer_artifact_role(rel)
+            rel = os.path.basename(artifact_path)
+        role = roles.get(os.path.abspath(artifact_path)) or _infer_artifact_role(rel)
         artifact_id = "art-" + hashlib.sha256(
             f"{rel}\0{digest}".encode("utf-8")
         ).hexdigest()[:16]
@@ -600,18 +618,37 @@ def write_artifact_manifest(
             "size": size,
             "sha256": digest,
         })
-    path = os.path.join(final_dir, "manifest.json")
     payload = {
         "schema_version": 1,
         "session_id": session_id,
         "path_base": "session_root",
+        "named_artifacts": named_artifacts,
         "artifacts": entries,
     }
-    tmp = f"{path}.tmp"
+    tmp = f"{manifest_path}.tmp"
     with open(tmp, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
-    return path
+    os.replace(tmp, manifest_path)
+    return manifest_path
+
+
+def read_named_artifacts(session_id: str) -> Dict[str, str]:
+    """Return existing host paths keyed by their stable artifact names."""
+    root = os.path.abspath(session_root(session_id))
+    path = os.path.join(root, "final", "manifest.json")
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, TypeError, ValueError):
+        return {}
+    result: Dict[str, str] = {}
+    prefix = root + os.sep
+    for key, relative in dict(payload.get("named_artifacts") or {}).items():
+        resolved = resolve_session_path(session_id, str(relative or ""))
+        absolute = os.path.abspath(resolved) if resolved else ""
+        if absolute.startswith(prefix) and os.path.isfile(absolute):
+            result[str(key)] = absolute
+    return result
 
 
 def rewrite_exported_grc_paths(session_id: str, destination_dir: str) -> None:
@@ -802,7 +839,7 @@ def _infer_artifact_role(relative_path: str) -> str:
         return "armed_flowgraph" if "armed" in name else "safe_preview"
     if name.endswith((".png", ".jpg", ".jpeg", ".svg")):
         return "visualization"
-    if name.endswith((".bin", ".c64", ".dat", ".npy")):
+    if name.endswith((".bin", ".c64", ".cfile", ".dat", ".npy")):
         return "signal_data"
     if name.endswith(".py"):
         return "generated_program"

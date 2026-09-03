@@ -22,6 +22,7 @@ stages:
     task:
       id: build_transmit_waveform
       objective: Build protocol-independent transmit data, baseband samples, and waveform metadata.
+      output_contract: Publish named artifacts tx_data, waveform_path, and waveform_manifest.
       expected_evidence:
         - artifact:tx_data
         - artifact:waveform_path
@@ -36,6 +37,7 @@ stages:
     task:
       id: build_flowgraph
       objective: Create or modify the flowgraph without claiming that it has been verified.
+      input_contract: Use the exact waveform_path from Radio Design when that Stage is present. Host file paths must not be invented.
       expected_evidence:
         - artifact:grc_path
 
@@ -48,6 +50,7 @@ stages:
     task:
       id: verify_flowgraph
       objective: Validate the current flowgraph without modifying it.
+      input_contract: Use the current project grc_path and return after one validation attempt.
       expected_evidence:
         - validate_flowgraph
 

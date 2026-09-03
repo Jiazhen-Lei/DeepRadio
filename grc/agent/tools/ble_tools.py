@@ -583,18 +583,17 @@ def build_ble_uhd_tx_flowgraph(
     invoke("connect", {"src_id": "ble_waveform", "dst_id": "bounded_tx"})
     # UHD Sink exposes the message command port before stream channel 0.
     invoke("connect", {"src_id": "bounded_tx", "dst_id": "b210_sink", "dst_port": 1})
-    validation = invoke("validate_flowgraph", {})
-    if validation.get("valid"):
-        _leave_hardware_sink_unarmed(ctx, "b210_sink")
-    rendered = invoke("render_grc", {}) if validation.get("valid") else {"ok": False}
+    _leave_hardware_sink_unarmed(ctx, "b210_sink")
+    rendered = invoke("render_grc", {}) if all(
+        step["ok"] for step in steps
+    ) else {"ok": False}
     if rendered.get("path"):
         ctx.extra.setdefault("artifacts", {})["grc_path"] = rendered["path"]
     return {
-        "ok": bool(validation.get("valid") and rendered.get("ok")),
-        "valid": bool(validation.get("valid")),
+        "ok": bool(rendered.get("ok")),
+        "built": bool(rendered.get("ok")),
         "grc_path": rendered.get("path"),
         "steps": steps,
-        "errors": validation.get("errors", []),
         "center_freq": ADV_FREQUENCIES[int(channel)],
         "gain": float(gain),
         "hardware": "b210",
@@ -701,18 +700,17 @@ def build_ble_pluto_tx_flowgraph(
         }
     invoke("connect", {"src_id": "ble_waveform", "dst_id": "bounded_tx"})
     invoke("connect", {"src_id": "bounded_tx", "dst_id": "pluto_sink"})
-    validation = invoke("validate_flowgraph", {})
-    if validation.get("valid"):
-        _leave_hardware_sink_unarmed(ctx, "pluto_sink")
-    rendered = invoke("render_grc", {}) if validation.get("valid") else {"ok": False}
+    _leave_hardware_sink_unarmed(ctx, "pluto_sink")
+    rendered = invoke("render_grc", {}) if all(
+        step["ok"] for step in steps
+    ) else {"ok": False}
     if rendered.get("path"):
         ctx.extra.setdefault("artifacts", {})["grc_path"] = rendered["path"]
     return {
-        "ok": bool(validation.get("valid") and rendered.get("ok")),
-        "valid": bool(validation.get("valid")),
+        "ok": bool(rendered.get("ok")),
+        "built": bool(rendered.get("ok")),
         "grc_path": rendered.get("path"),
         "steps": steps,
-        "errors": validation.get("errors", []),
         "center_freq": ADV_FREQUENCIES[int(channel)],
         "attenuation": float(attenuation),
         "hardware": "pluto",

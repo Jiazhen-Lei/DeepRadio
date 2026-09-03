@@ -59,6 +59,8 @@ TaskCard 必须包含：
 - 任务输入
 - 预期 Evidence
 
+如果当前 Stage 依赖已有 Artifact，Task 输入必须使用 `CURRENT_ARTIFACTS` 中对应的真实路径。不得猜测路径或把 `/session/work/...` 写入需要由宿主机读取的 Flowgraph 参数。
+
 ## Stage 推进
 
 Stage 完成不代表下一 Stage 自动开始。
@@ -118,8 +120,9 @@ Stage 完成不代表下一 Stage 自动开始。
 如果当前 Stage 执行失败：
 
 - 保存已有的失败 Evidence。
-- 不得将该 Stage 标记为 `completed`。
+- 将该 Stage 标记为 `failed`，不得标记为 `completed`。
 - 向用户说明失败结果。
+- 当前轮立即结束，不得再次委派同一个 Stage。
 - 不得自动进入 Diagnosis，也不得自动修改 Flowgraph。
 
 Diagnosis、Flowgraph Build 和 Flowgraph Verification 是相互独立的 Stage，必须遵守 Stage 候选库中的职责边界。

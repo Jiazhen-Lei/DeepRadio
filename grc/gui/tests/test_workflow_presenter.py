@@ -620,6 +620,23 @@ class WorkflowPresenterTest(unittest.TestCase):
         self.assertEqual([item["id"] for item in monitor["current"]], ["validate"])
         self.assertEqual([item["id"] for item in monitor["pending"]], ["deliver"])
 
+    def test_completed_current_stage_is_not_shown_as_running(self):
+        monitor = present(
+            spec={},
+            claims=[],
+            workflow={
+                "current_stage": "design",
+                "execution_status": "pending",
+                "stages": [
+                    {"id": "design", "status": "completed"},
+                    {"id": "build", "status": "pending"},
+                ],
+            },
+        )["workflow"]
+        self.assertEqual([item["id"] for item in monitor["completed"]], ["design"])
+        self.assertEqual(monitor["current"], [])
+        self.assertEqual([item["id"] for item in monitor["pending"]], ["build"])
+
     def test_dynamic_rf_permission_keeps_existing_confirmation_ui(self):
         view = interaction_view(
             {

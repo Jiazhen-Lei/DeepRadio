@@ -376,7 +376,14 @@ class DynamicWorkflowStore:
             and previous_status.get(stage.id) != "completed"
             for stage in candidate.stages
         )
-        if newly_completed and candidate.execution_status != "completed":
+        newly_failed = any(
+            stage.status == "failed"
+            and previous_status.get(stage.id) != "failed"
+            for stage in candidate.stages
+        )
+        if newly_failed:
+            candidate.execution_status = "errored"
+        elif newly_completed and candidate.execution_status != "completed":
             candidate.execution_status = "pending"
         self.workflow = candidate
         self.save()
@@ -602,6 +609,10 @@ def missing_evidence(
         if payload.get("ok") is False or str(payload.get("policy") or "") == "DENY":
             continue
         kind = str(event.get("kind") or "")
+        if kind in {"validate", "validate_flowgraph"} and not bool(
+            payload.get("valid")
+        ):
+            continue
         if kind:
             successful.add(kind)
     aliases = {
