@@ -239,8 +239,9 @@ def _execution_denial(
             allowed = allowed_tools_for_stage(stage_id)
         except ValueError as exc:
             return str(exc)
-        if spec.name not in allowed:
-            return f"Tool {spec.name} is not allowed in Stage {stage_id}"
+        requested_tool = str(extra.get("_gateway_parent_tool") or spec.name)
+        if requested_tool not in allowed:
+            return f"Tool {requested_tool} is not allowed in Stage {stage_id}"
     forbidden = set(extra.get("forbidden_permissions") or [])
     if spec.permission in forbidden and spec.permission != "rf.stop":
         return f"Permission {spec.permission} is forbidden for this user request"

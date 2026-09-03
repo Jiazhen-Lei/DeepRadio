@@ -193,6 +193,51 @@ class MainAgentRuntimeTest(unittest.TestCase):
 
         self.assertEqual(result.execution_status, "pending")
 
+    @unittest.skipUnless(
+        importlib.util.find_spec("langchain_core"), "langchain_core is not installed"
+    )
+    def test_next_stage_cannot_start_in_the_same_turn(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workflow = DynamicWorkflowStore(str(Path(directory) / "workflow.json"))
+            workflow.begin_turn("Build a radio", 0)
+            workflow.update(
+                intent_summary="Build a radio",
+                intent_slots={},
+                stages=[_spec_stage(), _radio_design_stage()],
+                current_stage="radio_specification_alignment",
+                execution_status="running",
+                task_type="DYNAMIC",
+                expected_revision=1,
+                events=[],
+                artifacts={},
+                metrics={},
+                project_version=0,
+            )
+            ctx = ToolContext(extra={
+                "workflow_store": workflow,
+                "session_id": "runtime-test",
+                "events": [{"kind": "spec_commit", "payload": {"ok": True}}],
+                "artifacts": {},
+                "metrics": {},
+            })
+            tools = {tool.name: tool for tool in build_workflow_tools(ctx, workflow)}
+            with patch.object(session_store, "append_session_event"):
+                completed = json.loads(tools["update_current_stage"].invoke({
+                    "stage_id": "radio_specification_alignment",
+                    "status": "completed",
+                    "expected_revision": 2,
+                    "result_refs": ["spec_commit"],
+                }))
+                blocked = json.loads(tools["update_current_stage"].invoke({
+                    "stage_id": "radio_design",
+                    "status": "running",
+                    "expected_revision": 3,
+                }))
+
+        self.assertTrue(completed["ok"])
+        self.assertFalse(blocked["ok"])
+        self.assertEqual(workflow.workflow.current_stage, "radio_specification_alignment")
+
     def test_stage_update_preserves_the_workflow_plan(self):
         with tempfile.TemporaryDirectory() as directory:
             workflow = DynamicWorkflowStore(str(Path(directory) / "workflow.json"))
@@ -281,6 +326,18 @@ class MainAgentRuntimeTest(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["policy"], "DENY")
         self.assertIn("not allowed", result["error"])
+
+    def test_stage_gateway_allows_internal_calls_from_allowed_tool(self):
+        ctx = ToolContext(extra={
+            "enforce_stage_tools": True,
+            "stage_id": "diagnosis",
+            "workflow": {"current_stage": "diagnosis"},
+        })
+
+        result = registry.call("debug_by_metric", {"metric": "evm"}, ctx)
+
+        self.assertFalse(result["ok"])
+        self.assertNotIn("not allowed", result["error"])
 
     def test_registry_tool_persists_shared_state_immediately(self):
         with tempfile.TemporaryDirectory() as directory:

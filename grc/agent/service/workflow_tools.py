@@ -219,10 +219,10 @@ def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> li
         """
         finished = status in {"completed", "failed"}
         finished_this_turn = str(ctx.extra.get("finished_stage_this_turn") or "")
-        if finished and finished_this_turn not in {"", stage_id}:
+        if finished_this_turn and stage_id != finished_this_turn:
             return json.dumps({
                 "ok": False,
-                "error": "This turn already finished its current Stage",
+                "error": "The current turn already finished a Stage; wait for the next user turn",
             }, ensure_ascii=False)
         state = ctx.extra.get("state")
         project_version = int(

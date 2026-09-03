@@ -47,16 +47,39 @@ def build_agent(ctx: ToolContext, *, temperature: float = 0.2) -> Optional[Any]:
     be = build_backend()
     style_prompt = _resolve_style_prompt(ctx)
     orch_prompt = build_mainagent_prompt(style_prompt)
+    _disable_default_subagent(str(llm.get_config()["model"]))
 
     agent: Any = create_deep_agent(
         model=chat,
         tools=tools,
         system_prompt=orch_prompt,
+        subagents=[],
         skills=[SKILLS_MOUNT],
         backend=be,
     )
     logger.info("deepagents 单 MainAgent 组装完成: %d tools", len(tools))
     return agent
+
+
+def _disable_default_subagent(model_name: str) -> None:
+    """Disable DeepAgents' auto-added general-purpose subagent when supported."""
+    try:
+        from deepagents import (
+            GeneralPurposeSubagentProfile,
+            HarnessProfile,
+            register_harness_profile,
+        )
+    except ImportError:
+        # Older DeepAgents releases did not auto-add this subagent.
+        return
+
+    profile_key = model_name if model_name.count(":") == 1 else f"openai:{model_name}"
+    register_harness_profile(
+        profile_key,
+        HarnessProfile(
+            general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False)
+        ),
+    )
 
 
 def build_mainagent_prompt(style_prompt: str = "") -> str:
