@@ -209,6 +209,7 @@ class _FlowLabel(Gtk.Label):
         self.set_xalign(0.0)
         self.set_hexpand(True)
         self.set_halign(Gtk.Align.FILL)
+        self.set_selectable(True)
         self.set_max_width_chars(1)
         self.set_width_chars(1)
         self._dr_role = "body"
@@ -365,7 +366,7 @@ class AgentPanel(Gtk.VBox):
         if hasattr(split, "set_wide_handle"):
             split.set_wide_handle(True)
         split.pack1(scroll, True, False)
-        split.pack2(self.claims_panel, False, False)
+        split.pack2(self.claims_panel, True, True)
         split.connect("size-allocate", self._on_split_allocate)
         self._split = split
         self._split_inited = False

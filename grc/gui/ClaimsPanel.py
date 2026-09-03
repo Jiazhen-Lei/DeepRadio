@@ -89,8 +89,9 @@ class ClaimsPanel(Gtk.Frame):
 
     def __init__(self):
         Gtk.Frame.__init__(self, label="Workflow Monitor")
-        self.set_size_request(-1, 280)
+        self.set_size_request(-1, 120)
         root = Gtk.VBox(spacing=4)
+        root.set_vexpand(True)
         panel_scroll = Gtk.ScrolledWindow()
         panel_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         panel_scroll.add(root)
@@ -134,6 +135,7 @@ class ClaimsPanel(Gtk.Frame):
         scroll = Gtk.ScrolledWindow()
         scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scroll.set_min_content_height(48)
+        scroll.set_vexpand(True)
         scroll.add(self._view)
 
         self._workflow_steps = Gtk.VBox(spacing=3)
@@ -147,19 +149,15 @@ class ClaimsPanel(Gtk.Frame):
         self._claim_summary.set_halign(Gtk.Align.START)
         self._claim_summary.set_xalign(0.0)
         self._claim_summary.set_margin_start(6)
-        claims_expander = Gtk.Expander(label="Claim details")
-        claims_body = Gtk.VBox(spacing=2)
-        claims_body.pack_start(self._claim_summary, False, False, 0)
-        claims_body.pack_start(scroll, False, False, 0)
-        claims_expander.add(claims_body)
-        self._claims_expander = claims_expander
         self._claims_frame = Gtk.Frame(label="Claims")
+        self._claims_frame.set_vexpand(True)
         claims_box = Gtk.VBox(spacing=2)
-        claims_box.pack_start(claims_expander, False, False, 0)
+        claims_box.pack_start(self._claim_summary, False, False, 0)
+        claims_box.pack_start(scroll, True, True, 0)
         self._claims_frame.add(claims_box)
         self._claims_frame.set_margin_start(2)
         self._claims_frame.set_margin_end(2)
-        root.pack_start(self._claims_frame, False, False, 0)
+        root.pack_start(self._claims_frame, True, True, 0)
 
         self._hardware_rows = Gtk.VBox(spacing=2)
         self._hardware_frame = Gtk.Frame(label="Hardware Detection")
@@ -291,7 +289,6 @@ class ClaimsPanel(Gtk.Frame):
         self._set_activity(activity or {}, self._last_workflow)
         self._set_metrics(metrics, self._claims)
         self._set_pending(dict(view_model.get("interaction") or {}))
-        self._sync_expanders(workflow_view, self._claims)
         empty = (
             not self._claims
             and not spec.get("recipe")
@@ -317,8 +314,6 @@ class ClaimsPanel(Gtk.Frame):
         self._set_workflow_monitor({})
         self._set_hardware_detection({})
         self._hint.set_visible(True)
-        if hasattr(self, "_claims_expander"):
-            self._claims_expander.set_expanded(False)
         self._updating = False
 
     def _set_paper_view(self, view_model):
@@ -354,9 +349,11 @@ class ClaimsPanel(Gtk.Frame):
             return
         stages = list(workflow.get("stages") or [])
         status = str(workflow.get("state_label") or "Planned")
+        title = str(workflow.get("title") or "")
+        prefix = "Workflow" if title in {"", "Workflow"} else "Workflow · " + title
         self._workflow_monitor.set_label(
-            "Workflow · {} · Step {}/{} · {}".format(
-                workflow.get("title") or "Workflow",
+            "{} · Step {}/{} · {}".format(
+                prefix,
                 workflow.get("stage_index") or 0,
                 workflow.get("stage_total") or len(stages),
                 status,
@@ -878,11 +875,6 @@ class ClaimsPanel(Gtk.Frame):
         if hasattr(self, "_detail_scroll"):
             self._detail_scroll.set_visible(visible)
 
-    def _sync_expanders(self, workflow, claims):
-        # Expanding evidence is always a deliberate user action.
-        del workflow, claims
-
-
 def _fmt_metric(value):
     try:
         number = float(value)
@@ -904,6 +896,7 @@ def _stage_label(wrap=False):
     label = Gtk.Label()
     label.set_halign(Gtk.Align.START)
     label.set_xalign(0.0)
+    label.set_selectable(True)
     if wrap:
         label.set_line_wrap(True)
         label.set_line_wrap_mode(Pango.WrapMode.WORD)

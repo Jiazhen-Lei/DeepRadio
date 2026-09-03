@@ -553,6 +553,62 @@ class WorkflowPresenterTest(unittest.TestCase):
             "stage row natural width collapsed; text would wrap per character",
         )
 
+    def test_chat_selection_and_resizable_claim_panel(self):
+        try:
+            import gi
+
+            gi.require_version("Gtk", "3.0")
+            from gi.repository import Gtk
+        except Exception:  # noqa: BLE001
+            self.skipTest("GTK unavailable")
+        if not Gtk.init_check()[0]:
+            self.skipTest("no display available")
+
+        from grc.gui.AgentPanel import _FlowLabel
+        from grc.gui.ClaimsPanel import _stage_label
+
+        self.assertTrue(_FlowLabel().get_selectable())
+        self.assertTrue(_stage_label().get_selectable())
+        panel = AgentPanel(None)
+        self.assertTrue(
+            panel._split.child_get_property(panel.claims_panel, "resize")
+        )
+        self.assertTrue(
+            panel._split.child_get_property(panel.claims_panel, "shrink")
+        )
+        self.assertTrue(panel.claims_panel._claims_frame.get_vexpand())
+        claims_children = (
+            panel.claims_panel._claims_frame.get_child().get_children()
+        )
+        self.assertIs(claims_children[0], panel.claims_panel._claim_summary)
+        self.assertIsInstance(claims_children[1], Gtk.ScrolledWindow)
+
+    def test_workflow_header_does_not_repeat_default_title(self):
+        try:
+            import gi
+
+            gi.require_version("Gtk", "3.0")
+            from gi.repository import Gtk
+        except Exception:  # noqa: BLE001
+            self.skipTest("GTK unavailable")
+        if not Gtk.init_check()[0]:
+            self.skipTest("no display available")
+
+        panel = ClaimsPanel()
+        panel._set_workflow_monitor({
+            "visible": True,
+            "title": "Workflow",
+            "stage_index": 1,
+            "stage_total": 7,
+            "state_label": "In progress",
+            "stages": [],
+        })
+
+        self.assertEqual(
+            panel._workflow_monitor.get_label(),
+            "Workflow · Step 1/7 · In progress",
+        )
+
     def test_diagnosis_card_only_uses_scoped_findings(self):
         view = present(
             spec={}, claims=[{
