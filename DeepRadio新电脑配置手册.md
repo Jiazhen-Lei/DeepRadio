@@ -133,7 +133,7 @@ macOS 不需要额外 USB 驱动。打开 PlutoSDR 虚拟磁盘中的 `config.tx
 usb_ethernet_mode = ncm
 ```
 
-保存后安全弹出 PlutoSDR，等待设备重启。随后检查：
+保存后安全弹出 PlutoSDR，等待设备重启。随后在Miniforge Prompt中检查：
 
 ```bash
 iio_info -S
