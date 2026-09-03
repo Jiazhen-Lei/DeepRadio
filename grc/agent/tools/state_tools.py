@@ -60,13 +60,14 @@ def ensure_success_condition_claims(state, conditions: List[str]) -> List[str]:
             continue
         threshold = float(match.group(1))
         condition = f"EVM < {threshold:g}%"
-        claim_id = f"evm_lt_{threshold:g}".replace(".", "_")
+        claim_id = "evm_threshold"
         ClaimStore(state).upsert(
             Claim(
                 id=claim_id,
                 statement=condition,
                 layer="sim",
                 project_version=state.project.flowgraph_version,
+                producer="simulation_and_measurement",
             )
         )
         claim_ids.append(claim_id)
@@ -226,6 +227,8 @@ def spec_update(
         candidate.revision = max(1, candidate.revision + 1)
     candidate.validation_errors = []
     shared.specification = candidate
+    if changed_fields or metadata_changed:
+        shared.revision = max(1, shared.revision + 1)
     unresolved = candidate.unresolved_fields()
     shared.status = "awaiting_input" if unresolved else "draft"
     shared.refresh_hash()

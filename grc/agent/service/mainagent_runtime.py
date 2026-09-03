@@ -182,8 +182,19 @@ class MainAgentRuntime:
             self._load_flowgraph(ctx)
         return ctx
 
-    def _handle_workflow_reopened(self, revision: int) -> None:
-        ClaimStore(self._state).invalidate_by_intent_revision(int(revision))
+    def _handle_workflow_reopened(self, stage_id: str) -> None:
+        stages = (
+            list(self._workflow.workflow.stages)
+            if self._workflow.workflow else []
+        )
+        reopened_index = next(
+            (index for index, stage in enumerate(stages) if stage.id == stage_id),
+            0,
+        )
+        ClaimStore(self._state).invalidate_by_producers(
+            [stage.id for stage in stages[reopened_index:]],
+            f"Workflow reopened from {stage_id}",
+        )
         self._state.project.config["rf_armed"] = False
         self._state.project.config.pop("rf_armed_path", None)
         self._clear_rf_grant()
@@ -537,7 +548,10 @@ class MainAgentRuntime:
                 statement=statement,
                 layer=layer,
                 project_version=version,
-                producer=producer,
+                producer=producer or (
+                    self._workflow.workflow.current_stage
+                    if self._workflow.workflow else ""
+                ),
                 measurement_id=measurement_id,
             )
         )
@@ -559,6 +573,10 @@ class MainAgentRuntime:
         config = self._state.project.config
         digest["project_version"] = self._state.project.flowgraph_version
         digest["capabilities"] = list(self._state.intent.capabilities)
+        digest["shared_intent"] = {
+            "intent_id": self._state.intent.intent_id,
+            "revision": self._state.intent.revision,
+        }
         digest["timeline"] = store.recent_events(self.session_id, limit=40)
         digest["control_state"] = {
             "current_node": digest.get("current_stage") or "",

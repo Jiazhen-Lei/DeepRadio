@@ -62,6 +62,12 @@ _ARTIFACT_IMAGES = [
 
 _USER_ROLES = ("You",)
 _BUBBLE_RADIUS = 16
+_WELCOME_TEXT = (
+    "Hello! I can help design and operate a radio system through iterative "
+    "collaboration (flowgraph → simulation → refinement).\nArtifacts are saved under "
+    "local/output/<session_id>/ and session records under local/agent_sessions/. "
+    "Describe what you want to accomplish."
+)
 
 # Quartz 上 CSS background-color 经常不生效,气泡底色用 Cairo 画。
 _THEME = {
@@ -283,6 +289,7 @@ class AgentPanel(Gtk.VBox):
 
     __gsignals__ = {
         'open_flow_graph': (GObject.SignalFlags.RUN_FIRST, None, (str,)),
+        'new_session': (GObject.SignalFlags.RUN_FIRST, None, ()),
     }
 
     def __init__(self, platform):
@@ -308,6 +315,10 @@ class AgentPanel(Gtk.VBox):
         self.level_combo.set_active(0)  # 默认"自适应"
         self.level_combo.connect('changed', self._on_level_changed)
         ctrl.pack_start(self.level_combo, False, False, 2)
+
+        self.new_session_button = Gtk.Button(label="New Session")
+        self.new_session_button.connect('clicked', self._on_new_session)
+        ctrl.pack_end(self.new_session_button, False, False, 2)
 
         self.pack_start(ctrl, expand=False, fill=True, padding=2)
 
@@ -379,11 +390,7 @@ class AgentPanel(Gtk.VBox):
         self.set_hexpand(True)
         self.set_halign(Gtk.Align.FILL)
         self.set_size_request(260, -1)
-        self._append("DeepRadio",
-                     "Hello! I can help design and operate a radio system through iterative collaboration "
-                     "(flowgraph → simulation → refinement).\nArtifacts are saved under "
-                     "local/output/<session_id>/ and session records under local/agent_sessions/. "
-                     "Describe what you want to accomplish.")
+        self._append("DeepRadio", _WELCOME_TEXT)
 
     # ------------------------------------------------------------------ #
     # MainAgent Runtime 惰性创建
@@ -605,6 +612,46 @@ class AgentPanel(Gtk.VBox):
         label = _LEVEL_CHOICES[max(idx, 0)][0]
         self._set_status("Expertise: {}".format(label))
 
+    def _on_new_session(self, _button):
+        if self._busy:
+            return
+        self._set_busy(True)
+        threading.Thread(target=self._prepare_new_session, daemon=True).start()
+
+    def _prepare_new_session(self):
+        runtime = self._runtime
+        try:
+            if runtime and bool(
+                (runtime.workflow_digest().get("runtime") or {}).get("running")
+            ):
+                runtime.step_command({"action": "emergency_stop"})
+                if bool(
+                    (runtime.workflow_digest().get("runtime") or {}).get("running")
+                ):
+                    raise RuntimeError("The RF runtime could not be stopped.")
+        except Exception as exc:  # noqa: BLE001
+            log.exception("New Session failed while stopping the runtime")
+            GLib.idle_add(self._on_error, str(exc))
+            return
+        GLib.idle_add(self._finish_new_session, runtime)
+
+    def _finish_new_session(self, old_runtime):
+        if old_runtime is not None:
+            old_runtime.unsubscribe_progress(self._on_agent_progress_from_worker)
+        self._stop_runtime_poll()
+        self._runtime = None
+        self._canvas_path = ""
+        self.entry.set_text("")
+        for child in list(self._log_box.get_children()):
+            self._log_box.remove(child)
+        self._live_cards = []
+        self.claims_panel.clear()
+        self.emit('new_session')
+        self._ensure_runtime()
+        self._append("DeepRadio", _WELCOME_TEXT)
+        self._set_busy(False)
+        return False
+
     def _on_split_allocate(self, paned, allocation):
         if self._split_inited or allocation.height < 240:
             return
@@ -795,6 +842,7 @@ class AgentPanel(Gtk.VBox):
         self.entry.set_sensitive(not busy)
         self.send_button.set_sensitive(not busy)
         self.level_combo.set_sensitive(not busy)
+        self.new_session_button.set_sensitive(not busy)
         self.send_button.set_label("Processing…" if busy else "Send")
         if busy and self._runtime_poll_id is None:
             self._runtime_poll_id = GLib.timeout_add(1000, self._on_runtime_poll)

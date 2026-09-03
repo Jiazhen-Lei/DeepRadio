@@ -163,12 +163,11 @@ def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> li
             state.intent.raw_text = result.intent.raw_text
             state.intent.task_type = result.task_type
             state.intent.capabilities = capabilities
-            state.intent.revision = result.revision
             state.intent.refresh_hash()
             if workflow.reopened_from:
                 on_reopened = ctx.extra.get("on_workflow_reopened")
                 if callable(on_reopened):
-                    on_reopened(result.revision)
+                    on_reopened(workflow.reopened_from)
             state_path = str(ctx.extra.get("state_path") or "")
             if state_path:
                 state.save(state_path)
@@ -238,8 +237,6 @@ def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> li
             return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
 
         if state is not None:
-            state.intent.revision = result.revision
-            state.intent.refresh_hash()
             state_path = str(ctx.extra.get("state_path") or "")
             if state_path:
                 state.save(state_path)

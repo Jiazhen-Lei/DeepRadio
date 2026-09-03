@@ -115,6 +115,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.agent_panel = AgentPanel(platform)
         self.agent_panel.connect(
             'open_flow_graph', self._on_agent_open_flow_graph)
+        self.agent_panel.connect('new_session', self._on_agent_new_session)
 
         # Figure out which place to put the variable editor
         self.left = Gtk.VPaned()  # orientation=Gtk.Orientation.VERTICAL)
@@ -192,6 +193,10 @@ class MainWindow(Gtk.ApplicationWindow):
     def _on_agent_open_flow_graph(self, _widget, file_path):
         """Refresh the current notebook page with a DeepRadio .grc (in place)."""
         self.load_flow_graph_in_place(file_path)
+
+    def _on_agent_new_session(self, _widget):
+        """Open a fresh canvas while preserving existing tabs and files."""
+        Actions.FLOW_GRAPH_NEW()
 
     def _remove_block_from_current_flow_graph(self, widget, key):
         block = self.current_flow_graph.get_block(key)

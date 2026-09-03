@@ -96,6 +96,46 @@ class RadioSpecificationTest(unittest.TestCase):
         self.assertEqual(field.status, "aligned")
         self.assertEqual(loaded.intent.specification.revision, 1)
 
+    def test_intent_revision_changes_only_with_the_specification(self):
+        initial = self.state.intent.revision
+        fields = [{
+            "key": "goal", "label": "Goal", "value": "BLE advertising",
+            "group": "required", "source": "user", "status": "aligned",
+        }]
+
+        spec_update(self.ctx, fields=fields)
+        first_revision = self.state.intent.revision
+        spec_update(self.ctx, fields=fields)
+
+        self.assertEqual(first_revision, initial + 1)
+        self.assertEqual(self.state.intent.revision, first_revision)
+        spec_update(self.ctx, fields=[{"key": "goal", "value": "QPSK link"}])
+        self.assertEqual(self.state.intent.revision, first_revision + 1)
+
+    def test_changed_success_condition_replaces_the_current_claim(self):
+        spec_update(self.ctx, fields=[
+            {
+                "key": "goal", "label": "Goal", "value": "Measure EVM",
+                "group": "required", "source": "user", "status": "aligned",
+            },
+            {
+                "key": "success_conditions", "label": "Success condition",
+                "value": ["EVM < 10%"], "group": "required",
+                "source": "extracted", "status": "aligned",
+            },
+        ])
+        self.assertTrue(spec_commit(self.ctx)["ok"])
+        self.state.claims[0].status = "Passed"
+
+        spec_update(self.ctx, fields=[{
+            "key": "success_conditions", "value": ["EVM < 5%"],
+        }])
+        self.assertTrue(spec_commit(self.ctx)["ok"])
+
+        self.assertEqual(len(self.state.claims), 1)
+        self.assertEqual(self.state.claims[0].statement, "EVM < 5%")
+        self.assertEqual(self.state.claims[0].status, "NotTested")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -183,19 +183,6 @@ def project_tool_results(
             True,
             artifact=report,
         )
-        record_claim(
-            "rf_not_started",
-            "Flowgraph artifact is in RF-safe preview mode and has not started RF",
-            "hardware",
-            "build_sdr_tx_flowgraph",
-            {
-                "armed": bool(built_tx.get("armed")),
-                "not_started": bool(built_tx.get("not_started")),
-                "preview_mode": built_tx.get("preview_mode"),
-            },
-            bool(built_tx.get("not_started") and not built_tx.get("armed")),
-            artifact=report,
-        )
     verified = latest("verify_ble_packet_bits", lambda item: item.get("valid"))
     if verified:
         record_claim(
@@ -227,14 +214,6 @@ def project_tool_results(
         state.project.config["rf_started"] = True  # compatibility key
         state.project.config["rf_ever_started"] = True
         state.project.config["rf_active"] = True
-        record_claim(
-            "rf_not_started",
-            "Flowgraph artifact is in RF-safe preview mode and has not started RF",
-            "hardware",
-            "start_flowgraph",
-            {"run_id": started.get("run_id"), "running": True},
-            False,
-        )
         record_claim(
             "rf_runtime_started",
             "Bounded RF runtime was started by the controlled service",
@@ -284,19 +263,6 @@ def project_tool_results(
         )
         if not clean and ClaimStore(state).get("rf_runtime_started"):
             state.runtime.quality = "failed"
-            record_claim(
-                "rf_runtime_started",
-                "Bounded RF runtime was started by the controlled service",
-                "hardware",
-                "runtime_failure",
-                {
-                    "run_id": terminal.get("run_id"),
-                    "return_code": terminal.get("return_code"),
-                    "reason": terminal.get("reason"),
-                },
-                False,
-                artifact=str(terminal.get("log_path") or ""),
-            )
     quality_samples = [
         item
         for name in (
@@ -324,7 +290,7 @@ def project_tool_results(
         ] + [warning]
         record_claim(
             "rf_runtime_underflow",
-            "Hardware runtime reported scheduler underflow or overrun markers",
+            "Hardware runtime completed without scheduler underflow or overrun markers",
             "hardware",
             "runtime_stream_quality",
             warning,

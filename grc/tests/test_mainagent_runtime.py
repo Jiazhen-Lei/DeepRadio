@@ -14,7 +14,7 @@ from grc.agent.service.workflow_tools import (
     _normalize_intent_slots,
     build_workflow_tools,
 )
-from grc.agent.state import SharedIntent, SharedState
+from grc.agent.state import ClaimStore, SharedIntent, SharedState
 from grc.agent.schema import AgentReply, ToolInvocation
 from grc.agent.tools import registry
 from grc.agent.tools.build_tools import _missing_literal_file_source
@@ -173,8 +173,69 @@ class MainAgentRuntimeTest(unittest.TestCase):
                 digest = runtime.workflow_digest()
 
         self.assertEqual(digest["capabilities"], ["hardware_configure"])
+        self.assertEqual(
+            digest["shared_intent"]["intent_id"], runtime._state.intent.intent_id
+        )
         self.assertEqual(digest["hardware_detection"]["state"], "detected")
         self.assertEqual(digest["observed_device"]["identity"], "usb:1.2.3")
+
+    def test_claims_bind_to_the_current_stage_and_invalidate_by_dependency(self):
+        runtime = MainAgentRuntime.__new__(MainAgentRuntime)
+        runtime._state = SharedState(session_id="runtime-test")
+        runtime._state.intent = SharedIntent.new("Build a radio", "wf-test")
+        runtime._workflow = SimpleNamespace(
+            workflow=SimpleNamespace(current_stage="flowgraph_verification")
+        )
+        runtime._record_claim(
+            "flowgraph_valid", "Flowgraph is valid", "structure",
+            "validate_flowgraph", {"valid": True}, True,
+        )
+        runtime._workflow.workflow.current_stage = "hardware_preparation"
+        runtime._record_claim(
+            "device_probed", "Device was probed", "hardware",
+            "probe_device", {"identity": "usb:test"}, True,
+        )
+
+        invalidated = ClaimStore(runtime._state).invalidate_by_producers(
+            ["flowgraph_verification"], "workflow reopened"
+        )
+
+        self.assertEqual(invalidated, ["flowgraph_valid"])
+        self.assertEqual(runtime._state.claims[0].status, "Stale")
+        self.assertEqual(runtime._state.claims[1].status, "Passed")
+        self.assertEqual(runtime._state.claims[1].producer, "hardware_preparation")
+
+    def test_rf_lifecycle_does_not_create_or_flip_safety_claims(self):
+        runtime = MainAgentRuntime.__new__(MainAgentRuntime)
+        runtime._state = SharedState(session_id="runtime-test")
+        runtime._state.intent = SharedIntent.new("Run RF", "wf-test")
+        runtime._workflow = SimpleNamespace(
+            workflow=SimpleNamespace(current_stage="physical_rf_execution")
+        )
+        reply = AgentReply(tool_invocations=[
+            ToolInvocation(name="start_flowgraph", result={
+                "ok": True, "running": True, "ready": True,
+                "startup_health_passed": True, "run_id": "run-test",
+            }),
+            ToolInvocation(name="query_runtime_status", result={
+                "ok": False, "running": False, "run_id": "run-test",
+                "reason": "crashed", "return_code": 1, "crashed": True,
+            }),
+        ])
+
+        result_projector.project_tool_results(
+            runtime._state,
+            reply,
+            record_claim=runtime._record_claim,
+            semantic_hash=lambda _path: "hash",
+        )
+
+        claims = {claim.id: claim for claim in runtime._state.claims}
+        self.assertNotIn("rf_not_started", claims)
+        self.assertEqual(claims["rf_runtime_started"].status, "Passed")
+        self.assertEqual(
+            claims["rf_runtime_reached_terminal_state"].status, "Failed"
+        )
 
     def test_hardware_tool_results_are_projected(self):
         state = SharedState(session_id="runtime-test")
@@ -293,6 +354,43 @@ class MainAgentRuntimeTest(unittest.TestCase):
     @unittest.skipUnless(
         importlib.util.find_spec("langchain_core"), "langchain_core is not installed"
     )
+    def test_workflow_revision_does_not_change_intent_revision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workflow = DynamicWorkflowStore(str(Path(directory) / "workflow.json"))
+            workflow.begin_turn("Build a radio", 0)
+            state = SharedState(session_id="runtime-test")
+            state.intent = SharedIntent.new(
+                "Build a radio", workflow.workflow.workflow_id
+            )
+            ctx = ToolContext(extra={
+                "workflow_store": workflow,
+                "session_id": "runtime-test",
+                "state": state,
+                "events": [],
+                "artifacts": {},
+                "metrics": {},
+            })
+            tools = {tool.name: tool for tool in build_workflow_tools(ctx, workflow)}
+            with patch.object(session_store, "append_session_event"):
+                created = json.loads(tools["update_workflow"].invoke({
+                    "intent_summary": "Build a radio",
+                    "stages": [_spec_stage()],
+                    "current_stage": "radio_specification_alignment",
+                    "expected_revision": 1,
+                }))
+                updated = json.loads(tools["update_current_stage"].invoke({
+                    "stage_id": "radio_specification_alignment",
+                    "status": "running",
+                    "expected_revision": 2,
+                }))
+
+        self.assertTrue(created["ok"])
+        self.assertTrue(updated["ok"])
+        self.assertEqual(state.intent.revision, 1)
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("langchain_core"), "langchain_core is not installed"
+    )
     def test_next_stage_cannot_start_in_the_same_turn(self):
         with tempfile.TemporaryDirectory() as directory:
             workflow = DynamicWorkflowStore(str(Path(directory) / "workflow.json"))
@@ -405,12 +503,11 @@ class MainAgentRuntimeTest(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertNotIn("not allowed", result["error"])
 
-    def test_registry_tool_persists_shared_state_immediately(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = str(Path(directory) / "state.json")
-            state = SharedState(session_id="runtime-test")
-            state.intent = SharedIntent.new("Build a BLE transmitter", "wf-test")
-            ctx = ToolContext(extra={"state": state, "state_path": path})
+    def test_registry_tool_leaves_persistence_to_the_runtime(self):
+        state = SharedState(session_id="runtime-test")
+        state.intent = SharedIntent.new("Build a BLE transmitter", "wf-test")
+        ctx = ToolContext(extra={"state": state, "state_path": "/unused/state.json"})
+        with patch.object(state, "save") as save:
             result = json.loads(_call_registry(ctx, "spec_update", {
                 "fields": [{
                     "key": "goal",
@@ -421,10 +518,10 @@ class MainAgentRuntimeTest(unittest.TestCase):
                     "status": "aligned",
                 }],
             }))
-            loaded = SharedState.load(path)
 
         self.assertTrue(result["ok"])
-        self.assertEqual(loaded.intent.specification.field("goal").status, "aligned")
+        save.assert_not_called()
+        self.assertEqual(state.intent.specification.field("goal").status, "aligned")
 
     def test_named_artifacts_survive_later_manifest_updates(self):
         with tempfile.TemporaryDirectory() as directory:

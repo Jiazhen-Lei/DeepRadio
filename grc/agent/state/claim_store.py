@@ -84,15 +84,16 @@ class ClaimStore:
                 invalidated.append(claim.id)
         return invalidated
 
-    def invalidate_by_intent_revision(self, new_revision: int) -> List[str]:
-        """Mark prior conclusions stale after a user-directed Workflow revision."""
+    def invalidate_by_producers(
+        self, producers: List[str], reason: str
+    ) -> List[str]:
+        """Mark only conclusions produced by affected Workflow stages stale."""
+        affected = {str(item) for item in producers if item}
         invalidated = []
         for claim in self.state.claims:
-            if claim.intent_revision < new_revision and claim.status != "Stale":
+            if claim.producer in affected and claim.status != "Stale":
                 claim.status = "Stale"
-                claim.stale_reason = (
-                    f"intent_revision {claim.intent_revision} < {new_revision}"
-                )
+                claim.stale_reason = str(reason or "Workflow dependency changed")
                 invalidated.append(claim.id)
         return invalidated
 

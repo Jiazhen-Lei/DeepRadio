@@ -5,7 +5,9 @@ without constructing a real GTK window.  Visual layout remains a manual check.
 """
 
 import unittest
+from unittest.mock import Mock, patch
 
+from grc.gui.AgentPanel import AgentPanel
 from grc.gui.ClaimsPanel import ClaimsPanel
 from grc.gui.workflow_presenter import interaction_view, present
 
@@ -56,6 +58,50 @@ class _PresenterHarness:
 class WorkflowPresenterTest(unittest.TestCase):
     def setUp(self):
         self.panel = _PresenterHarness()
+
+    def test_new_session_stops_running_rf_before_reset(self):
+        class _Runtime:
+            def __init__(self):
+                self.running = True
+                self.commands = []
+
+            def workflow_digest(self):
+                return {"runtime": {"running": self.running}}
+
+            def step_command(self, command):
+                self.commands.append(command)
+                self.running = False
+
+        runtime = _Runtime()
+        panel = type("Panel", (), {
+            "_runtime": runtime,
+            "_finish_new_session": lambda *_args: False,
+            "_on_error": lambda *_args: False,
+        })()
+
+        with patch("grc.gui.AgentPanel.GLib.idle_add") as idle_add:
+            AgentPanel._prepare_new_session(panel)
+
+        self.assertEqual(runtime.commands, [{"action": "emergency_stop"}])
+        idle_add.assert_called_once_with(panel._finish_new_session, runtime)
+
+    def test_new_session_replaces_runtime_and_clears_the_panel(self):
+        panel = Mock()
+        old_runtime = Mock()
+        child = Mock()
+        panel._log_box.get_children.return_value = [child]
+        panel._ensure_runtime.side_effect = lambda: setattr(
+            panel, "_runtime", "new-runtime"
+        )
+
+        result = AgentPanel._finish_new_session(panel, old_runtime)
+
+        self.assertFalse(result)
+        self.assertEqual(panel._runtime, "new-runtime")
+        self.assertEqual(panel._canvas_path, "")
+        panel._log_box.remove.assert_called_once_with(child)
+        panel.claims_panel.clear.assert_called_once_with()
+        panel.emit.assert_called_once_with("new_session")
 
     def test_activity_and_runtime_show_current_control_state(self):
         workflow = {

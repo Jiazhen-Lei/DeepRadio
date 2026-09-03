@@ -141,17 +141,6 @@ def _call_registry(ctx: ToolContext, name: str, arguments: Dict[str, Any]) -> st
         result["instruction"] = (
             "Return the validation outcome now. Do not validate again or ask a question."
         )
-    state = ctx.extra.get("state")
-    state_path = str(ctx.extra.get("state_path") or "")
-    if state is not None and state_path:
-        try:
-            state.save(state_path)
-        except (OSError, TypeError, ValueError) as exc:
-            result = {
-                "ok": False,
-                "error": f"SharedState could not be saved: {exc}",
-                "tool_result": result,
-            }
     kind = _EVENT_KIND.get(name, name)
     record_tool_event(ctx, kind, result, arguments)
     if name == "render_grc" and result.get("path"):
