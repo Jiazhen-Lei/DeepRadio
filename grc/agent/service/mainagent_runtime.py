@@ -19,7 +19,6 @@ from ..workflow.dynamic import DynamicWorkflowStore
 from . import orchestrator as orch
 from . import result_projector as projector
 from . import session_store as store
-from . import subagents
 
 logger = logging.getLogger(__name__)
 DEFAULT_RECURSION_LIMIT = 150
@@ -69,7 +68,7 @@ def _recursion_limit() -> int:
 class MainAgentRuntime:
     """Run MainAgent turns without making semantic Workflow decisions.
 
-    MainAgent plans Stages and delegates SubAgents. This runtime owns the
+    MainAgent plans and executes Stages. This runtime owns the
     deterministic host lifecycle: context assembly, persistence, explicit UI
     commands, artifact projection and ``AgentReply`` construction.
     """
@@ -87,9 +86,7 @@ class MainAgentRuntime:
         self._state = SharedState.load(
             store.state_path(self.session_id), session_id=self.session_id
         )
-        self._workflow = DynamicWorkflowStore(
-            store.workflow_path(self.session_id), subagents.subagent_names()
-        )
+        self._workflow = DynamicWorkflowStore(store.workflow_path(self.session_id))
         self._tool_ctx: Optional[ToolContext] = None
         self._progress_listeners: list[Any] = []
         self._output_dir = ""
@@ -172,6 +169,7 @@ class MainAgentRuntime:
                     self._workflow.workflow.current_stage
                     if self._workflow.workflow else ""
                 ),
+                "enforce_stage_tools": True,
                 "mutation_forbidden": False,
                 "forbidden_permissions": [],
                 "profile_snapshot": self.profile.level,
@@ -318,7 +316,6 @@ class MainAgentRuntime:
         if trace:
             trace.finish()
         narrative = self._extract_final_text(result)
-        self._record_delegations(result)
         return self._finalize_turn(ctx, narrative, ok=True)
 
     def step_command(self, command: Dict[str, Any]) -> AgentReply:
@@ -678,27 +675,6 @@ class MainAgentRuntime:
                 if text:
                     return text
         return ""
-
-    def _record_delegations(self, result: Any) -> None:
-        if not isinstance(result, dict):
-            return
-        for message in result.get("messages") or []:
-            calls = getattr(message, "tool_calls", None)
-            if calls is None and isinstance(message, dict):
-                calls = message.get("tool_calls")
-            for call in calls or []:
-                if not isinstance(call, dict) or call.get("name") != "task":
-                    continue
-                args = dict(call.get("args") or {})
-                store.append_session_event(
-                    self.session_id,
-                    "llm_subagent_invoked",
-                    {
-                        "target_agent": args.get("subagent_type") or "",
-                        "description": args.get("description") or "",
-                        "call_id": call.get("id") or "",
-                    },
-                )
 
     def _simple_reply(self, text: str, stage: str) -> AgentReply:
         return AgentReply(

@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Any, Dict, List
 
 from ..tools.registry import ToolContext
+from ..workflow.catalog import load_stage_catalog
 from ..workflow.dynamic import DynamicWorkflowStore
 from . import session_store as store
 
@@ -21,31 +21,14 @@ def _normalize_intent_slots(
     raise ValueError("intent_slots must be a dictionary or an empty string")
 
 
-def _load_stage_catalog() -> Dict[str, Dict[str, Any]]:
-    try:
-        from grc.core.io import yaml
-
-        path = (
-            Path(__file__).resolve().parents[1]
-            / "skills/grc-orchestration/references/stage_library.yaml"
-        )
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        catalog = dict(data.get("stages") or {})
-    except Exception as exc:  # noqa: BLE001 - surface a controlled tool error
-        raise ValueError(f"Stage library could not be loaded: {exc}") from exc
-    if not catalog:
-        raise ValueError("Stage library is empty")
-    return catalog
-
-
 def _materialize_stage_plan(
     stages: List[Dict[str, Any]],
 ) -> tuple[List[Dict[str, Any]], List[str]]:
-    """Build fixed Task fields from the Stage library."""
+    """Build fixed Stage fields from the canonical library."""
     if not stages:
         raise ValueError("Workflow requires at least one Stage")
 
-    catalog = _load_stage_catalog()
+    catalog = load_stage_catalog()
     materialized: List[Dict[str, Any]] = []
     capabilities: List[str] = []
     for stage in stages or []:
@@ -55,11 +38,8 @@ def _materialize_stage_plan(
         definition = catalog.get(stage_id)
         if not isinstance(definition, dict):
             raise ValueError(f"Unknown Stage: {stage_id or '(empty)'}")
-        legacy_tasks = [
-            item for item in stage.get("tasks") or [] if isinstance(item, dict)
-        ]
+        legacy_tasks = [item for item in stage.get("tasks") or [] if isinstance(item, dict)]
         legacy_task = legacy_tasks[0] if legacy_tasks else {}
-        expected_task = dict(definition.get("task") or {})
         status = str(stage.get("status") or "pending")
         result_refs = list(
             stage.get("result_refs") or legacy_task.get("result_refs") or []
@@ -70,21 +50,13 @@ def _materialize_stage_plan(
         materialized.append({
             "id": stage_id,
             "objective": str(
-                stage.get("objective") or definition.get("objective") or ""
+                definition.get("objective") or stage.get("objective") or ""
             ),
+            "skills": list(definition.get("skills") or []),
+            "inputs": dict(inputs or {}),
+            "expected_evidence": list(definition.get("expected_evidence") or []),
             "status": status,
             "result_refs": result_refs,
-            "tasks": [{
-                "id": str(expected_task.get("id") or ""),
-                "objective": str(expected_task.get("objective") or ""),
-                "target_agent": str(definition.get("target_agent") or ""),
-                "inputs": dict(inputs or {}),
-                "expected_evidence": list(
-                    expected_task.get("expected_evidence") or []
-                ),
-                "status": status,
-                "result_refs": list(result_refs),
-            }],
         })
         for capability in definition.get("capabilities") or []:
             if capability not in capabilities:
@@ -108,8 +80,8 @@ def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> li
         """Create or update the complete ordered Workflow.
 
         Use this for initial planning or user-requested structural replanning.
-        Stage fields: id, objective, inputs, status and result_refs. Fixed Task,
-        target_agent and expected_evidence fields come from the Stage library.
+        Stage fields: id, inputs, status and result_refs. Objective, skills and
+        expected_evidence come from the Stage library.
         Use the revision from CURRENT_WORKFLOW.
         intent_slots must be a JSON object; an empty string is treated as {}.
         """

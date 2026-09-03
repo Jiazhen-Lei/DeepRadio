@@ -3,8 +3,8 @@ Agent 右侧对话面板 (多轮协商版 GTK 界面)。
 
 在 MainWindow 右侧提供一个人机对话面板:
 
-* **多轮协商 DeepRadio**(默认): 持有 ``MainAgentRuntime``，按闭环模式委派多个领域
-  Subagent，并通过 SharedState 展示可追溯 Spec 与 Claim/Evidence；
+* **多轮协商 DeepRadio**(默认): 持有 ``MainAgentRuntime``，由单 MainAgent 按动态
+  Workflow 加载领域 Skill，并通过 SharedState 展示可追溯 Spec 与 Claim/Evidence；
   交付 .grc 时 emit ``open_flow_graph`` 让 MainWindow **原地刷新**当前画布。
 * **专业度档位**(创新 B): 下拉可选 自适应 / 小白 / 学生 / 专家; 选具体档位则
   钉档 (pin), 选"自适应"则放开 (unpin) 让画像随对话自适应。

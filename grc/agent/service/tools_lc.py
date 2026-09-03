@@ -16,10 +16,6 @@ from ..tools.registry import ToolContext
 
 logger = logging.getLogger(__name__)
 
-_ARTIFACTS_NOTE = (
-    "artifacts 里的路径位于宿主机磁盘,不在你的虚拟文件系统里。"
-    "GUI 会自动展示这些产物,禁止用 read_file / ls / glob 去确认它们是否存在。"
-)
 _EVENT_KIND = {
     "validate_flowgraph": "validate",
     "run_simulation": "simulate",
@@ -242,49 +238,10 @@ def _wrap_spec(spec: Any, ctx: ToolContext) -> Any:
 def build_grc_tools(
     ctx: ToolContext, allowed: Optional[Iterable[str]] = None
 ) -> List[Any]:
-    """Bind Registry tools (plus design_flowgraph) as LangChain tools."""
+    """Bind Registry tools as LangChain tools."""
     from langchain_core.tools import tool
 
     from ..tools import registry
-    from ..tools.design_link import design_link as _design_link
-
-    profile = ctx.extra.get("profile")
-
-    @tool
-    def design_flowgraph(intent: str = "", recipe: str = "",
-                         simulate: bool = True) -> str:
-        """按一句通信意图端到端搭出一张可跑流图并自检。
-
-        选配方 -> 逐块建图 -> critic 校验 -> 可选仿真取指标 -> 存 .grc。
-        参数: intent(自然语言意图) 或 recipe(配方名)择一;simulate 是否顺带仿真。
-        """
-        result = _design_link(ctx, profile=profile, intent=intent,
-                              recipe=recipe, simulate=simulate, render=True)
-        record_tool_event(ctx, "design_link", {
-            "ok": result.get("ok"),
-            "recipe": result.get("recipe"),
-            "valid": result.get("valid"),
-            "steps": result.get("steps", []),
-            "policy": result.get("policy"),
-            "requires_confirmation": result.get("requires_confirmation"),
-            "error": result.get("error"),
-        })
-        _merge_artifacts(ctx, result.get("artifacts", {}))
-        if result.get("metrics"):
-            ctx.extra.setdefault("metrics", {}).update(result["metrics"])
-        if result.get("narrative"):
-            ctx.extra["narrative"] = result["narrative"]
-        return json.dumps({
-            "ok": result.get("ok"),
-            "recipe": result.get("recipe"),
-            "valid": result.get("valid"),
-            "num_blocks": result.get("num_blocks"),
-            "errors": result.get("errors"),
-            "metrics": result.get("metrics"),
-            "artifacts": list((result.get("artifacts") or {}).keys()),
-            "error": result.get("error"),
-            "artifacts_note": _ARTIFACTS_NOTE,
-        }, ensure_ascii=False)
 
     @tool
     def read_metric(kind: str = "evm", probe_id: str = "sink",
@@ -315,7 +272,7 @@ def build_grc_tools(
         })
         return json.dumps(result, ensure_ascii=False)
 
-    tools = [design_flowgraph, read_metric]
+    tools = [read_metric]
     existing = {item.name for item in tools}
     registry.load_all()
     for spec in registry.all_specs():

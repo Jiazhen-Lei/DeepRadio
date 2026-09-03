@@ -129,10 +129,7 @@ class AgentTraceCallback(BaseCallbackHandler):
     ) -> None:
         del input_str, parent_run_id, tags, kwargs
         name = str(serialized.get("name") or "tool")
-        if name == "task":
-            target = str((inputs or {}).get("subagent_type") or "subagent")
-            self._begin(run_id, "MainAgent", "TASK", target)
-            return
+        del inputs
         self._begin(run_id, self._component(metadata), "TOOL", name)
 
     def on_tool_end(self, output: Any, *, run_id: Any, **kwargs: Any) -> None:

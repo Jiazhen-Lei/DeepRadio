@@ -11,7 +11,7 @@
     knowledge  名词料: 领域知识层(通信任务配方库 recipes)
     runtime    名词料: 无头仿真执行体(simulate)
     memory     名词料: 用户画像(创新 B, profile)
-    service    ★ deepagents 装配层(create_deep_agent: 主 Agent + subagents + SKILL)
+    service    ★ deepagents 装配层(create_deep_agent: 单 MainAgent + SKILL)
 
 对外高层入口:
     UserProfile    三档用户画像(创新 B 数据核心, 见 grc.agent.memory)

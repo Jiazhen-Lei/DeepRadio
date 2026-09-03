@@ -5,7 +5,7 @@
 * **落盘镜像** ``mirror_session_files``:把虚拟文件系统里的 ``path -> content``
   镜像到磁盘 ``local/agent_sessions/<session_id>/{work,final}/``,供回归、
   断点续跑与 GUI 读取产物。
-* **会话事件流** ``append_session_event``:把主 Agent / subagent 的关键事件
+* **会话事件流** ``append_session_event``:把 MainAgent 和工具的关键事件
   (委派、工具调用、产物发布)以 JSONL 追加到 ``events.jsonl``,作为 CHI 埋点
   与可复现实验的数据源。
 

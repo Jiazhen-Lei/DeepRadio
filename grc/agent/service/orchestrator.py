@@ -6,7 +6,7 @@ from typing import Any, Optional
 
 from .. import llm
 from ..tools.registry import ToolContext
-from . import subagents as _subagents
+from . import tools_lc
 
 logger = logging.getLogger(__name__)
 def deepagents_available() -> bool:
@@ -38,32 +38,38 @@ def build_agent(ctx: ToolContext, *, temperature: float = 0.2) -> Optional[Any]:
     from deepagents import create_deep_agent
 
     chat = build_chat_model(temperature=temperature)
-    agent_names = _subagents.subagent_names()
-    subs = _subagents.build_grc_subagents(ctx)
     workflow_store = ctx.extra.get("workflow_store")
     if workflow_store is None:
         raise ValueError("ToolContext is missing the dynamic Workflow store")
     from .workflow_tools import build_workflow_tools
 
-    # MainAgent never receives domain tools. DeepAgents adds ``task`` for
-    # delegation; these tools are its only host-side mutation authority.
-    tools = build_workflow_tools(ctx, workflow_store)
+    tools = build_workflow_tools(ctx, workflow_store) + tools_lc.build_grc_tools(ctx)
     be = build_backend()
     style_prompt = _resolve_style_prompt(ctx)
-    orch_prompt = _subagents.build_orchestrator_prompt(
-        agent_names or _subagents.subagent_names(), style_prompt=style_prompt)
+    orch_prompt = build_mainagent_prompt(style_prompt)
 
     agent: Any = create_deep_agent(
         model=chat,
         tools=tools,
         system_prompt=orch_prompt,
-        subagents=subs,
         skills=[SKILLS_MOUNT],
         backend=be,
     )
-    logger.info("deepagents 主 Agent 组装完成: %d tools, %d subagents",
-        len(tools), len(subs))
+    logger.info("deepagents 单 MainAgent 组装完成: %d tools", len(tools))
     return agent
+
+
+def build_mainagent_prompt(style_prompt: str = "") -> str:
+    style_section = f"\n【STYLE】{style_prompt}\n" if style_prompt else ""
+    return """你是 DeepRadio 唯一的 MainAgent，也是唯一与用户交互的 Agent。
+
+你负责理解用户意图、维护动态 Workflow，并亲自执行当前 Stage。处理涉及 Workflow 的请求时，必须先读取并遵循 grc-orchestration Skill 及 Stage 候选库，再读取当前 Stage 声明的领域 Skill。
+
+每次只处理 current_stage。领域工具虽然可见，但只能调用当前 Stage 的 allowed_tools；宿主机会拒绝跨 Stage 调用。Stage 完成或失败后立即向用户报告并结束本轮，不自动开始下一 Stage。
+
+工具结果、Artifact、Measurement 和 Evidence 必须绑定当前 Workflow、Stage 和工程版本。不能用叙述代替 Evidence，也不能绕过用户确认、工程写入或 RF 安全检查。
+
+使用用户当前使用的语言回复。保持简洁明确，不展示内部 JSON、Stage Context、工具日志或状态字段。""".strip() + style_section
 
 
 def _resolve_style_prompt(ctx: ToolContext) -> str:

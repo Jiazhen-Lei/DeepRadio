@@ -1,4 +1,4 @@
-schema_version: 2
+schema_version: 3
 
 stages:
   radio_specification_alignment:
@@ -6,102 +6,121 @@ stages:
     objective: Align the goal, Required parameters, Added parameters, and success conditions with the user.
     select_when: Use as the default first stage for a new executable radio task.
     capabilities: []
-    target_agent: spec_agent
-    task:
-      id: align_radio_specification
-      objective: Build and record the Radio Specification without treating assumptions as user decisions.
-      expected_evidence:
-        - spec_commit
+    skills: [grc-spec]
+    allowed_tools: [spec_update, spec_commit]
+    expected_evidence: [spec_commit]
 
   radio_design:
     label: Radio Design
     objective: Convert the aligned Radio Specification into the data and baseband waveform to be transmitted.
     select_when: Use when the task requires new or revised transmit data or waveform generation.
     capabilities: [build_signal]
-    target_agent: radio_design_agent
-    task:
-      id: build_transmit_waveform
-      objective: Build protocol-independent transmit data, baseband samples, and waveform metadata.
-      output_contract: Publish named artifacts tx_data, waveform_path, and waveform_manifest.
-      expected_evidence:
-        - artifact:tx_data
-        - artifact:waveform_path
-        - artifact:waveform_manifest
+    skills: [grc-ble-advertising, grc-block-rag]
+    allowed_tools:
+      - select_recipe
+      - search_blocks
+      - describe_block
+      - list_examples
+      - build_ble_advertising_pdu
+      - generate_ble_1m_waveform
+      - verify_ble_packet_bits
+    output_contract: Publish named artifacts tx_data, waveform_path, and waveform_manifest.
+    expected_evidence:
+      - artifact:tx_data
+      - artifact:waveform_path
+      - artifact:waveform_manifest
 
   flowgraph_build:
     label: Flowgraph Build
     objective: Create or modify the GNU Radio flowgraph from the aligned specification and radio design outputs.
     select_when: Use when the task needs a new or modified GRC project.
     capabilities: [build_signal]
-    target_agent: flowgraph_agent
-    task:
-      id: build_flowgraph
-      objective: Create or modify the flowgraph without claiming that it has been verified.
-      input_contract: Use the exact waveform_path from Radio Design when that Stage is present. Host file paths must not be invented.
-      expected_evidence:
-        - artifact:grc_path
+    skills: [grc-build, grc-block-rag]
+    allowed_tools:
+      - select_recipe
+      - search_blocks
+      - describe_block
+      - list_examples
+      - init_flow_graph
+      - add_block
+      - set_param
+      - connect
+      - render_grc
+      - inspect_flowgraph
+      - apply_grc_diff
+      - apply_flowgraph_patch
+      - build_sdr_tx_flowgraph
+      - build_ble_uhd_tx_flowgraph
+      - build_ble_pluto_tx_flowgraph
+    input_contract: Use the exact waveform_path from Radio Design when that Stage is present. Host file paths must not be invented.
+    expected_evidence: [artifact:grc_path]
 
   flowgraph_verification:
     label: Flowgraph Verification
     objective: Check the current flowgraph structure, connections, and parameters.
     select_when: Use when the current GRC project must be verified before simulation or hardware use.
     capabilities: []
-    target_agent: verification_agent
-    task:
-      id: verify_flowgraph
-      objective: Validate the current flowgraph without modifying it.
-      input_contract: Use the current project grc_path and return after one validation attempt.
-      expected_evidence:
-        - validate_flowgraph
+    skills: [grc-critic]
+    allowed_tools: [validate_flowgraph, explain_error, verify_claims]
+    input_contract: Use the current project grc_path and return after one validation attempt.
+    expected_evidence: [validate_flowgraph]
 
   simulation_and_measurement:
     label: Simulation and Measurement
     objective: Run the current flowgraph offline and collect the metrics requested by the Radio Specification.
     select_when: Use when the user requests simulation or when success conditions require offline measurements.
     capabilities: [simulate]
-    target_agent: verification_agent
-    task:
-      id: simulate_and_measure
-      objective: Run offline simulation and report the requested measurements without changing the flowgraph.
-      expected_evidence:
-        - run_simulation
-      evidence_note: Add the metrics named by the Radio Specification to this task's expected evidence.
+    skills: [grc-sim]
+    allowed_tools:
+      - run_simulation
+      - read_metric
+      - plot_spectrum
+      - plot_constellation
+      - plot_eye
+      - verify_claims
+    expected_evidence: [run_simulation]
+    evidence_note: Add the metrics named by the Radio Specification to this Stage's expected evidence.
 
   diagnosis:
     label: Diagnosis
     objective: Determine the cause of a reported problem from reproducible evidence.
     select_when: Use when the user requests diagnosis or an earlier stage returns a failure that needs explanation.
     capabilities: [diagnose]
-    target_agent: diagnosis_agent
-    task:
-      id: diagnose_problem
-      objective: Report the cause and recommended change without modifying or revalidating the flowgraph.
-      expected_evidence:
-        - artifact:diagnosis_report
+    skills: [grc-diagnosis]
+    allowed_tools: [debug_by_metric, explain_error, run_diagnosis_checks]
+    expected_evidence: [artifact:diagnosis_report]
 
   hardware_preparation:
     label: Hardware Preparation
     objective: Discover and probe the selected SDR, then prepare the session flowgraph without starting RF.
     select_when: Use before physical RF execution when the task involves supported SDR hardware.
     capabilities: [hardware_configure]
-    target_agent: hardware_agent
-    task:
-      id: prepare_hardware
-      objective: Discover, probe, and arm the selected device without transmitting.
-      expected_evidence:
-        - discover_devices
-        - probe_device
-        - arm_hardware_flowgraph
+    skills: [grc-hardware]
+    allowed_tools:
+      - hardware_preflight
+      - configure_sdr
+      - discover_devices
+      - probe_device
+      - arm_hardware_flowgraph
+      - query_runtime_status
+      - stop_flowgraph
+      - emergency_stop
+    expected_evidence:
+      - discover_devices
+      - probe_device
+      - arm_hardware_flowgraph
 
   physical_rf_execution:
     label: Physical RF Execution
     objective: Run the prepared hardware flowgraph for a bounded duration after the user confirms this execution.
     select_when: Use only when the user requests physical RF operation.
     capabilities: [hardware_runtime, deploy]
-    target_agent: hardware_agent
-    task:
-      id: execute_physical_rf
-      objective: Request execution confirmation, start the bounded RF run, and record its stopped state.
-      expected_evidence:
-        - start_flowgraph
-        - stop_flowgraph
+    skills: [grc-hardware]
+    allowed_tools:
+      - start_flowgraph
+      - query_runtime_status
+      - stop_flowgraph
+      - emergency_stop
+    expected_evidence:
+      - start_flowgraph
+      - stop_flowgraph

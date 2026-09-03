@@ -1,11 +1,10 @@
-"""DeepAgents runtime: MainAgent plans, SubAgents execute, host persists."""
+"""DeepAgents runtime: one MainAgent plans and executes, host persists."""
 
 from __future__ import annotations
 
 __all__ = [
     "MainAgentRuntime",
     "build_mainagent_runtime",
-    "build_grc_subagents",
 ]
 
 
@@ -17,7 +16,4 @@ def __getattr__(name):
             "MainAgentRuntime": MainAgentRuntime,
             "build_mainagent_runtime": build_mainagent_runtime,
         }[name]
-    if name == "build_grc_subagents":
-        from .subagents import build_grc_subagents
-        return build_grc_subagents
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

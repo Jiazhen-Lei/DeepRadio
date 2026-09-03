@@ -6,7 +6,7 @@ description: 对已校验通过的 GRC 流图执行无头仿真,读回 EVM/BER �
 # grc-sim:无头仿真与指标
 
 ## 何时使用
-- 主 Agent 在 SIMULATE 阶段委派:对**已校验通过**的流图跑无头仿真并出指标/图。
+- 当前 Stage 为 `simulation_and_measurement` 时，对**已校验通过**的流图跑无头仿真并出指标或图。
 
 ## 使用协议
 1. 用 `run_simulation(probes=...)` 执行无头仿真(本地 GNU Radio,安全)。

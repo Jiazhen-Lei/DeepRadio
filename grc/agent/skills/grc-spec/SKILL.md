@@ -5,7 +5,7 @@ description: 根据用户意图和当前 Workflow 对齐并维护唯一的 Radio
 
 # Radio Specification Alignment
 
-你只维护 Radio Specification，不与用户交互，也不修改 Workflow。
+执行 `radio_specification_alignment` 时，只维护 Radio Specification，不执行其他领域工作。
 
 执行前读取 `references/radio-specification.yaml`。它提供字段和无线电领域参考，
 最终字段由你根据用户意图、完整 Workflow 和当前 Specification 判断。
@@ -16,7 +16,7 @@ description: 根据用户意图和当前 Workflow 对齐并维护唯一的 Radio
 4. 用户主动增加的非必需字段归入 `added`。默认值、派生值和假设不能归入 Added。
 5. 字段状态只能是 `aligned`、`needs_confirmation` 或 `missing`。
 6. 使用 `spec_update` 保存字段、约束和假设。
-7. 将 `unresolved_fields` 返回 MainAgent，由 MainAgent 向用户提问。
+7. 存在 `unresolved_fields` 时，通过 Workflow 的输入检查点向用户提问。
 8. 只有所有 Required 字段均为 `aligned` 时才调用 `spec_commit`。
 
 协议唯一确定的标准值和由已对齐字段直接计算的值可以标记为 `aligned`。
@@ -28,5 +28,4 @@ description: 根据用户意图和当前 Workflow 对齐并维护唯一的 Radio
 推断写入 assumptions，不能作为用户决定。新的协议或参数可以直接加入 Specification，
 不受 reference 中示例范围限制。
 
-多轮补充始终属于同一个 Radio Specification Alignment Stage。返回固定字段：
-`status`、`spec_revision`、`changed_fields`、`unresolved_fields`、`outcome` 和 `evidence`。
+多轮补充始终属于同一个 Radio Specification Alignment Stage。完成后更新当前 Stage，并向用户说明对齐结果。

@@ -45,121 +45,66 @@ class DynamicIntent:
 
 
 @dataclass
-class DynamicTask:
+class DynamicStage:
+    """A user-visible phase executed by the single MainAgent."""
+
     id: str
     objective: str
-    target_agent: str
+    skills: List[str] = field(default_factory=list)
     inputs: Dict[str, Any] = field(default_factory=dict)
     expected_evidence: List[str] = field(default_factory=list)
     status: str = "pending"
     result_refs: List[str] = field(default_factory=list)
 
-    def validate(self, known_agents: Iterable[str]) -> None:
-        if not self.id or not self.objective or not self.target_agent:
-            raise ValueError("Task requires id, objective and target_agent")
-        if self.status not in STAGE_STATUSES:
-            raise ValueError(f"Invalid Task status: {self.status}")
-        if self.target_agent not in set(known_agents):
-            raise ValueError(f"Unknown SubAgent: {self.target_agent}")
-        if self.status == "completed" and not self.expected_evidence:
-            raise ValueError("A completed Task must declare expected_evidence")
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "DynamicTask":
-        return cls(
-            id=str(data.get("id") or ""),
-            objective=str(data.get("objective") or ""),
-            target_agent=str(data.get("target_agent") or ""),
-            inputs=dict(data.get("inputs") or {}),
-            expected_evidence=[
-                str(item) for item in data.get("expected_evidence") or [] if item
-            ],
-            status=str(data.get("status") or "pending"),
-            result_refs=[str(item) for item in data.get("result_refs") or [] if item],
-        )
-
-
-@dataclass
-class DynamicStage:
-    """A user-visible phase delegated through exactly one Task."""
-
-    id: str
-    objective: str
-    tasks: List[DynamicTask] = field(default_factory=list)
-    status: str = "pending"
-    result_refs: List[str] = field(default_factory=list)
-
-    @property
-    def expected_evidence(self) -> List[str]:
-        return list(dict.fromkeys(
-            evidence
-            for task in self.tasks
-            for evidence in task.expected_evidence
-        ))
-
-    def validate(self, known_agents: Iterable[str]) -> None:
-        if not self.id or not self.objective or not self.tasks:
-            raise ValueError("Stage requires id, objective and tasks")
-        if len(self.tasks) != 1:
-            raise ValueError("Stage requires exactly one Task")
+    def validate(self) -> None:
+        if not self.id or not self.objective or not self.skills:
+            raise ValueError("Stage requires id, objective and skills")
         if self.status not in STAGE_STATUSES:
             raise ValueError(f"Invalid Stage status: {self.status}")
-        for task in self.tasks:
-            task.validate(known_agents)
         if self.status == "completed" and not self.expected_evidence:
             raise ValueError("A completed Stage must declare expected evidence")
-        if self.status == "completed" and any(
-            task.status != "completed" for task in self.tasks
-        ):
-            raise ValueError("A completed Stage requires completed Tasks")
 
     def signature(self) -> tuple:
         """Fields whose change makes this Stage and later results outdated."""
         return (
             self.objective,
-            tuple(
-                (
-                    task.id,
-                    task.objective,
-                    task.target_agent,
-                    json.dumps(task.inputs, ensure_ascii=False, sort_keys=True),
-                    tuple(task.expected_evidence),
-                )
-                for task in self.tasks
-            ),
+            tuple(self.skills),
+            json.dumps(self.inputs, ensure_ascii=False, sort_keys=True),
+            tuple(self.expected_evidence),
         )
 
     def reset(self) -> None:
         self.status = "pending"
         self.result_refs = []
-        for task in self.tasks:
-            task.status = "pending"
-            task.result_refs = []
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "DynamicStage":
-        tasks = [
-            DynamicTask.from_dict(item)
-            for item in data.get("tasks") or []
-            if isinstance(item, dict)
+        from .catalog import stage_contract
+
+        stage_id = str(data.get("id") or "")
+        definition = stage_contract(stage_id)
+        legacy_tasks = [
+            item for item in data.get("tasks") or [] if isinstance(item, dict)
         ]
-        # Load schema-v2 workflows as a one-task user Stage.
-        if not tasks and data.get("target_agent"):
-            tasks = [DynamicTask.from_dict({
-                "id": f"{data.get('id') or 'stage'}_task",
-                "objective": data.get("objective"),
-                "target_agent": data.get("target_agent"),
-                "inputs": data.get("inputs") or {},
-                "expected_evidence": data.get("expected_evidence") or [],
-                "status": data.get("status") or "pending",
-                "result_refs": data.get("result_refs") or [],
-            })]
+        legacy_task = legacy_tasks[0] if legacy_tasks else {}
         return cls(
-            id=str(data.get("id") or ""),
-            objective=str(data.get("objective") or ""),
-            tasks=tasks,
+            id=stage_id,
+            objective=str(definition.get("objective") or data.get("objective") or ""),
+            skills=[str(item) for item in definition.get("skills") or [] if item],
+            inputs=dict(data.get("inputs") or legacy_task.get("inputs") or {}),
+            expected_evidence=[
+                str(item)
+                for item in definition.get("expected_evidence") or []
+                if item
+            ],
             status=str(data.get("status") or "pending"),
-            result_refs=[str(item) for item in data.get("result_refs") or [] if item],
+            result_refs=[
+                str(item)
+                for item in data.get("result_refs")
+                or legacy_task.get("result_refs")
+                or []
+                if item
+            ],
         )
 
 
@@ -177,7 +122,7 @@ class DynamicWorkflow:
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
-    def validate(self, known_agents: Iterable[str]) -> None:
+    def validate(self) -> None:
         if not self.workflow_id or self.revision < 1:
             raise ValueError("Workflow requires a valid id and revision")
         if self.execution_status not in WORKFLOW_STATUSES:
@@ -188,7 +133,7 @@ class DynamicWorkflow:
         if self.current_stage and self.current_stage not in ids:
             raise ValueError("current_stage is not present in stages")
         for stage in self.stages:
-            stage.validate(known_agents)
+            stage.validate()
 
     def stage(self, stage_id: str = "") -> Optional[DynamicStage]:
         wanted = stage_id or self.current_stage
@@ -221,11 +166,10 @@ class DynamicWorkflow:
 class DynamicWorkflowStore:
     """Persist MainAgent decisions and expose the legacy GUI digest shape."""
 
-    schema_version = 3
+    schema_version = 4
 
-    def __init__(self, path: str, known_agents: Iterable[str]) -> None:
+    def __init__(self, path: str, _legacy_known_agents: Iterable[str] = ()) -> None:
         self.path = path
-        self.known_agents = tuple(known_agents)
         self.load_error = ""
         self.reopened_from = ""
         self.workflow = self._load()
@@ -305,7 +249,7 @@ class DynamicWorkflowStore:
             created_at=self.workflow.created_at,
             updated_at=time.time(),
         )
-        candidate.validate(self.known_agents)
+        candidate.validate()
         previous = {stage.id: stage for stage in self.workflow.stages}
         previous_status = {stage.id: stage.status for stage in self.workflow.stages}
         previous_index = {
@@ -434,11 +378,10 @@ class DynamicWorkflowStore:
             raise ValueError("Use update_workflow to reopen a completed Stage")
 
         if inputs is not None:
-            stage.tasks[0].inputs = dict(inputs)
+            stage.inputs = dict(inputs)
         if result_refs is not None:
             refs = [str(item) for item in result_refs if item]
             stage.result_refs = refs
-            stage.tasks[0].result_refs = list(refs)
 
         if status == "completed" and stage.status != "completed":
             missing = missing_evidence(
@@ -450,7 +393,6 @@ class DynamicWorkflowStore:
                 )
 
         stage.status = status
-        stage.tasks[0].status = status
         if status == "failed":
             candidate.execution_status = "errored"
         elif status == "completed":
@@ -462,7 +404,7 @@ class DynamicWorkflowStore:
         candidate.base_project_version = int(project_version)
         candidate.revision += 1
         candidate.updated_at = time.time()
-        candidate.validate(self.known_agents)
+        candidate.validate()
         self.workflow = candidate
         self.save()
         return candidate
@@ -622,10 +564,9 @@ class DynamicWorkflowStore:
                     "id": item.id,
                     "label": item.objective,
                     "objective": item.objective,
-                    "target_agent": (
-                        item.tasks[0].target_agent if len(item.tasks) == 1 else ""
-                    ),
-                    "tasks": [asdict(task) for task in item.tasks],
+                    "target_agent": "main_agent",
+                    "skills": list(item.skills),
+                    "inputs": dict(item.inputs),
                     "status": item.status,
                     "execution_status": item.status,
                     "completion": list(item.expected_evidence),
@@ -656,11 +597,11 @@ class DynamicWorkflowStore:
         try:
             with open(self.path, "r", encoding="utf-8") as handle:
                 data = json.load(handle)
-            if int(data.get("schema_version") or 0) not in {2, self.schema_version}:
+            if int(data.get("schema_version") or 0) not in {2, 3, self.schema_version}:
                 self.load_error = "Unsupported Workflow state version"
                 return None
             workflow = DynamicWorkflow.from_dict(data)
-            workflow.validate(self.known_agents)
+            workflow.validate()
             if workflow.execution_status == "running":
                 workflow.execution_status = "pending"
                 for stage in workflow.stages:

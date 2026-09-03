@@ -228,6 +228,19 @@ def _execution_denial(
 ) -> str:
     """Central execution gateway shared by all tool callers."""
     extra = getattr(ctx, "extra", {}) or {}
+    if extra.get("enforce_stage_tools") and spec.permission != "rf.stop":
+        workflow = dict(extra.get("workflow") or {})
+        stage_id = str(extra.get("stage_id") or workflow.get("current_stage") or "")
+        if not stage_id:
+            return "A current Workflow Stage is required before using domain tools"
+        try:
+            from ..workflow.catalog import allowed_tools_for_stage
+
+            allowed = allowed_tools_for_stage(stage_id)
+        except ValueError as exc:
+            return str(exc)
+        if spec.name not in allowed:
+            return f"Tool {spec.name} is not allowed in Stage {stage_id}"
     forbidden = set(extra.get("forbidden_permissions") or [])
     if spec.permission in forbidden and spec.permission != "rf.stop":
         return f"Permission {spec.permission} is forbidden for this user request"

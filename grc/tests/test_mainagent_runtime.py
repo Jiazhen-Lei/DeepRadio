@@ -15,6 +15,7 @@ from grc.agent.service.workflow_tools import (
     build_workflow_tools,
 )
 from grc.agent.state import SharedIntent, SharedState
+from grc.agent.tools import registry
 from grc.agent.tools.build_tools import _missing_literal_file_source
 from grc.agent.tools.critic_tools import _missing_file_sources
 from grc.agent.tools.registry import ToolContext
@@ -24,34 +25,14 @@ from grc.agent.workflow.dynamic import DynamicWorkflowStore, missing_evidence
 def _spec_stage(status="running"):
     return {
         "id": "radio_specification_alignment",
-        "objective": "Align the Radio Specification",
         "status": status,
-        "tasks": [{
-            "id": "align_radio_specification",
-            "objective": "Align the Radio Specification",
-            "target_agent": "spec_agent",
-            "expected_evidence": ["spec_commit"],
-            "status": status,
-        }],
     }
 
 
 def _radio_design_stage(status="pending"):
     return {
         "id": "radio_design",
-        "objective": "Build the transmit waveform",
         "status": status,
-        "tasks": [{
-            "id": "build_transmit_waveform",
-            "objective": "Build the transmit waveform",
-            "target_agent": "radio_design_agent",
-            "expected_evidence": [
-                "artifact:tx_data",
-                "artifact:waveform_path",
-                "artifact:waveform_manifest",
-            ],
-            "status": status,
-        }],
     }
 
 
@@ -65,33 +46,28 @@ class MainAgentRuntimeTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             _normalize_intent_slots("BLE")
 
-    def test_stage_plan_uses_fixed_library_task(self):
+    def test_stage_plan_uses_fixed_library_contract(self):
         catalog = {
             "flowgraph_verification": {
                 "objective": "Verify the flowgraph",
-                "target_agent": "verification_agent",
-                "task": {
-                    "id": "verify_flowgraph",
-                    "objective": "Validate the current flowgraph",
-                    "expected_evidence": ["validate_flowgraph"],
-                },
+                "skills": ["grc-critic"],
+                "allowed_tools": ["validate_flowgraph"],
+                "expected_evidence": ["validate_flowgraph"],
             },
         }
         with patch(
-            "grc.agent.service.workflow_tools._load_stage_catalog",
+            "grc.agent.service.workflow_tools.load_stage_catalog",
             return_value=catalog,
         ):
             stages, _ = _materialize_stage_plan([{
                 "id": "flowgraph_verification",
                 "objective": "Verify the generated flowgraph",
                 "status": "pending",
-                "tasks": [{"target_agent": "wrong_agent"}],
             }])
 
-        task = stages[0]["tasks"][0]
-        self.assertEqual(task["id"], "verify_flowgraph")
-        self.assertEqual(task["target_agent"], "verification_agent")
-        self.assertEqual(task["expected_evidence"], ["validate_flowgraph"])
+        self.assertEqual(stages[0]["objective"], "Verify the flowgraph")
+        self.assertEqual(stages[0]["skills"], ["grc-critic"])
+        self.assertEqual(stages[0]["expected_evidence"], ["validate_flowgraph"])
 
     def test_turn_keeps_the_agent_reply_contract(self):
         captured = {}
@@ -160,9 +136,7 @@ class MainAgentRuntimeTest(unittest.TestCase):
 
     def test_workflow_store_owns_retry_and_project_version(self):
         with tempfile.TemporaryDirectory() as directory:
-            workflow = DynamicWorkflowStore(
-                str(Path(directory) / "workflow.json"), ["spec_agent"]
-            )
+            workflow = DynamicWorkflowStore(str(Path(directory) / "workflow.json"))
             workflow.begin_turn("Build a radio", 0)
             workflow.update(
                 intent_summary="Build a radio",
@@ -188,9 +162,7 @@ class MainAgentRuntimeTest(unittest.TestCase):
 
     def test_completed_stage_waits_for_the_next_user_turn(self):
         with tempfile.TemporaryDirectory() as directory:
-            workflow = DynamicWorkflowStore(
-                str(Path(directory) / "workflow.json"), ["spec_agent"]
-            )
+            workflow = DynamicWorkflowStore(str(Path(directory) / "workflow.json"))
             workflow.begin_turn("Build a radio", 0)
             workflow.update(
                 intent_summary="Build a radio",
@@ -223,10 +195,7 @@ class MainAgentRuntimeTest(unittest.TestCase):
 
     def test_stage_update_preserves_the_workflow_plan(self):
         with tempfile.TemporaryDirectory() as directory:
-            workflow = DynamicWorkflowStore(
-                str(Path(directory) / "workflow.json"),
-                ["spec_agent", "radio_design_agent"],
-            )
+            workflow = DynamicWorkflowStore(str(Path(directory) / "workflow.json"))
             workflow.begin_turn("Build a radio", 0)
             workflow.update(
                 intent_summary="Build a radio",
@@ -266,8 +235,52 @@ class MainAgentRuntimeTest(unittest.TestCase):
 
         self.assertEqual(result.current_stage, "radio_design")
         self.assertEqual(result.stages[0].status, "completed")
-        self.assertEqual(result.stages[1].tasks[0].target_agent, "radio_design_agent")
-        self.assertEqual(result.stages[1].tasks[0].inputs, {"protocol": "BLE"})
+        self.assertEqual(result.stages[1].skills, ["grc-ble-advertising", "grc-block-rag"])
+        self.assertEqual(result.stages[1].inputs, {"protocol": "BLE"})
+
+    def test_legacy_subagent_workflow_loads_as_single_agent_stage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "workflow.json"
+            path.write_text(json.dumps({
+                "schema_version": 3,
+                "workflow_id": "wf-legacy",
+                "revision": 2,
+                "intent": {"raw_text": "Build BLE", "summary": "Build BLE"},
+                "stages": [{
+                    "id": "radio_specification_alignment",
+                    "objective": "Legacy objective",
+                    "status": "running",
+                    "tasks": [{
+                        "id": "align_radio_specification",
+                        "objective": "Legacy task",
+                        "target_agent": "spec_agent",
+                        "inputs": {"protocol": "BLE"},
+                        "expected_evidence": ["spec_commit"],
+                        "status": "running",
+                    }],
+                }],
+                "current_stage": "radio_specification_alignment",
+                "execution_status": "pending",
+            }), encoding="utf-8")
+
+            workflow = DynamicWorkflowStore(str(path))
+
+        self.assertFalse(workflow.load_error)
+        self.assertEqual(workflow.current_stage().skills, ["grc-spec"])
+        self.assertEqual(workflow.current_stage().inputs, {"protocol": "BLE"})
+
+    def test_stage_gateway_rejects_cross_stage_tool(self):
+        ctx = ToolContext(extra={
+            "enforce_stage_tools": True,
+            "stage_id": "flowgraph_verification",
+            "workflow": {"current_stage": "flowgraph_verification"},
+        })
+
+        result = registry.call("spec_commit", {}, ctx)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["policy"], "DENY")
+        self.assertIn("not allowed", result["error"])
 
     def test_registry_tool_persists_shared_state_immediately(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -337,9 +350,7 @@ class MainAgentRuntimeTest(unittest.TestCase):
     )
     def test_failed_stage_notifies_progress_and_finishes_turn(self):
         with tempfile.TemporaryDirectory() as directory:
-            workflow = DynamicWorkflowStore(
-                str(Path(directory) / "workflow.json"), ["spec_agent"]
-            )
+            workflow = DynamicWorkflowStore(str(Path(directory) / "workflow.json"))
             workflow.begin_turn("Build a radio", 0)
             updates = []
             ctx = ToolContext(extra={
