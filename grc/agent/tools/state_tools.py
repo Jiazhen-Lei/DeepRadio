@@ -49,28 +49,37 @@ _EVM_THRESHOLD_RE = re.compile(
 
 
 def ensure_success_condition_claims(state, conditions: List[str]) -> List[str]:
-    """Derive evaluable Claims from aligned success conditions."""
+    """Expose every aligned success condition as an evaluable Claim."""
     claim_ids: List[str] = []
-    for raw in conditions or []:
+    for index, raw in enumerate(conditions or [], 1):
         text = str(raw or "").strip()
         if not text:
             continue
         match = _EVM_THRESHOLD_RE.search(text.lower())
-        if not match:
-            continue
-        threshold = float(match.group(1))
-        condition = f"EVM < {threshold:g}%"
-        claim_id = "evm_threshold"
+        if match:
+            threshold = float(match.group(1))
+            statement = f"EVM < {threshold:g}%"
+            layer = "signal"
+            producer = "simulation_and_measurement"
+        else:
+            statement = text
+            layer = "task"
+            producer = "over_air_verification"
+        claim_id = f"success_condition_{index}"
         ClaimStore(state).upsert(
             Claim(
                 id=claim_id,
-                statement=condition,
-                layer="sim",
+                statement=statement,
+                layer=layer,
                 project_version=state.project.flowgraph_version,
-                producer="simulation_and_measurement",
+                producer=producer,
             )
         )
         claim_ids.append(claim_id)
+    state.claims[:] = [
+        claim for claim in state.claims
+        if not claim.id.startswith("success_condition_") or claim.id in claim_ids
+    ]
     return claim_ids
 
 
@@ -79,7 +88,7 @@ def verify_state_claims(ctx: ToolContext, metrics: Dict[str, Any]) -> Dict[str, 
     store = ClaimStore(state)
     updated = []
     for claim in state.claims:
-        if claim.layer != "sim":
+        if claim.layer != "signal":
             continue
         statement = claim.statement.upper()
         match = re.search(r"<\s*(\d+(?:\.\d+)?)", claim.statement)
@@ -237,6 +246,10 @@ def spec_update(
             changed_fields=changed_fields,
             scope="radio_specification",
             source="spec_update",
+        )
+        ClaimStore(state).invalidate_scopes(
+            ("protocol", "flowgraph", "signal", "hardware", "runtime", "rf", "task"),
+            "Radio Specification changed",
         )
     return {
         "ok": True,
@@ -492,7 +505,10 @@ def apply_grc_diff(
         if not rendered.get("ok"):
             return rendered
         state.project.flowgraph_version += 1
-        ClaimStore(state).invalidate_by_version(state.project.flowgraph_version)
+        ClaimStore(state).invalidate_scopes(
+            ("flowgraph", "signal", "runtime", "rf", "task"),
+            "Flowgraph parameters changed",
+        )
         result["path"] = rendered.get("path")
         result["grc_path"] = rendered.get("path")
         result["flowgraph_version"] = state.project.flowgraph_version
@@ -629,7 +645,10 @@ def apply_flowgraph_patch(
     state.project.grc_path = target
     state.project.flowgraph_version += 1
     state.project.config["canvas_dirty"] = False
-    ClaimStore(state).invalidate_by_version(state.project.flowgraph_version)
+    ClaimStore(state).invalidate_scopes(
+        ("flowgraph", "signal", "runtime", "rf", "task"),
+        "Flowgraph structure changed",
+    )
     ctx.extra.setdefault("artifacts", {})["grc_path"] = target
     return {
         "ok": True,

@@ -67,11 +67,10 @@ _STAGE_STATUS_WORDS = {
 
 #: Claim status colors for the compact evidence lines under a stage.
 _CLAIM_STATUS_STYLES = {
-    "Passed": ("✓", "#2E9E5B"),
-    "Failed": ("✕", "#C43E3E"),
-    "Inconclusive": ("?", "#C45B08"),
-    "Stale": ("○", "#98A2B3"),
-    "Not tested": ("○", "#98A2B3"),
+    "Supported": ("✓", "#2E9E5B"),
+    "Contradicted": ("✕", "#C43E3E"),
+    "Unresolved": ("?", "#C45B08"),
+    "Untested": ("○", "#98A2B3"),
     "Unknown": ("?", "#98A2B3"),
     "Running": ("▶", "#1B62D6"),
     "Pending": ("○", "#98A2B3"),
@@ -278,8 +277,13 @@ class ClaimsPanel(Gtk.Frame):
                 [
                     str(claim.get("statement", "")),
                     layer_label(claim.get("layer", "")),
-                    str(claim.get("status", "NotTested")),
-                    int(claim.get("project_version", 0)),
+                    "{}{}".format(
+                        str(claim.get("status", "Untested")),
+                        " · stale"
+                        if str(claim.get("freshness") or "").lower() == "stale"
+                        else "",
+                    ),
+                    int(claim.get("version", 0)),
                 ]
             )
         self._set_paper_view(view_model)
@@ -321,11 +325,14 @@ class ClaimsPanel(Gtk.Frame):
         claim_view = dict(view_model.get("claims") or {})
         counts = dict(claim_view.get("counts") or {})
         if counts:
-            ordered = ("Failed", "Inconclusive", "Stale", "Not tested", "Passed")
-            summary = " · ".join(
+            ordered = ("Contradicted", "Unresolved", "Untested", "Supported")
+            parts = [
                 "{} {}".format(name, counts[name])
                 for name in ordered if counts.get(name)
-            )
+            ]
+            if claim_view.get("stale_count"):
+                parts.append("Stale {}".format(claim_view["stale_count"]))
+            summary = " · ".join(parts)
             self._claim_summary.set_text("Claims: " + summary)
         else:
             self._claim_summary.set_text("No verifiable claims yet")
@@ -492,8 +499,11 @@ class ClaimsPanel(Gtk.Frame):
         return box
 
     def _build_stage_claim_line(self, claim):
-        status = str(claim.get("status") or "Not tested")
+        status = str(claim.get("status") or "Untested")
         marker, color = _CLAIM_STATUS_STYLES.get(status, ("○", "#98A2B3"))
+        if str(claim.get("freshness") or "").lower() == "stale":
+            marker, color = "○", "#98A2B3"
+            status += " · stale"
         layer = str(claim.get("layer_label") or layer_label(claim.get("layer")))
         label = _stage_label(wrap=True)
         label.set_markup(
@@ -788,10 +798,19 @@ class ClaimsPanel(Gtk.Frame):
         if index >= len(self._claims):
             return
         claim = self._claims[index]
-        text = "{}\nCategory: {}\nStatus: {}\nEvidence source: {}".format(
+        status = str(claim.get("status") or "")
+        if str(claim.get("freshness") or "").lower() == "stale":
+            status += " · stale"
+        text = (
+            "{}\nCategory: {}\nStatus: {}\nProject version: {}"
+            "\nEvidence check: {}\nEvidence: {}\nEvidence source: {}"
+        ).format(
             claim.get("statement", ""),
             layer_label(claim.get("layer", "")),
-            claim.get("status", ""),
+            status,
+            claim.get("version", 0),
+            claim.get("evidence_test") or "Not tested",
+            claim.get("evidence_summary") or "No current evidence",
             claim.get("producer") or "Not available",
         )
         self._set_details(text)

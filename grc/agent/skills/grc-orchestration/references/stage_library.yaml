@@ -26,9 +26,13 @@ stages:
       - verify_ble_packet_bits
     output_contract: Publish named artifacts tx_data, waveform_path, and waveform_manifest.
     expected_evidence:
-      - artifact:tx_data
-      - artifact:waveform_path
-      - artifact:waveform_manifest
+      - "artifact:tx_data"
+      - "artifact:waveform_path"
+      - "artifact:waveform_manifest"
+    claims:
+      - id: ble_offline_protocol_valid
+        scope: protocol
+        statement: Generated BLE advertising data conforms to the requested packet fields and checksum.
 
   flowgraph_build:
     label: Flowgraph Build
@@ -53,7 +57,7 @@ stages:
       - build_ble_uhd_tx_flowgraph
       - build_ble_pluto_tx_flowgraph
     input_contract: Use the exact waveform_path from Radio Design when that Stage is present. Host file paths must not be invented.
-    expected_evidence: [artifact:grc_path]
+    expected_evidence: ["artifact:grc_path"]
 
   flowgraph_verification:
     label: Flowgraph Verification
@@ -64,6 +68,10 @@ stages:
     allowed_tools: [validate_flowgraph, explain_error, verify_claims]
     input_contract: Use the current project grc_path and return after one validation attempt.
     expected_evidence: [validate_flowgraph]
+    claims:
+      - id: final_flowgraph_valid
+        scope: flowgraph
+        statement: Current flowgraph has valid blocks, ports, parameters, and connections.
 
   simulation_and_measurement:
     label: Simulation and Measurement
@@ -88,7 +96,7 @@ stages:
     capabilities: [diagnose]
     skills: [grc-diagnosis]
     allowed_tools: [debug_by_metric, explain_error, run_diagnosis_checks]
-    expected_evidence: [artifact:diagnosis_report]
+    expected_evidence: ["artifact:diagnosis_report"]
 
   hardware_preparation:
     label: Hardware Preparation
@@ -109,6 +117,10 @@ stages:
       - discover_devices
       - probe_device
       - arm_hardware_flowgraph
+    claims:
+      - id: hardware_device_probed
+        scope: hardware
+        statement: Selected SDR is available and satisfies the required device capabilities.
 
   physical_rf_execution:
     label: Physical RF Execution
@@ -124,3 +136,16 @@ stages:
     expected_evidence:
       - start_flowgraph
       - stop_flowgraph
+    claims:
+      - id: bounded_runtime_healthy
+        scope: runtime
+        statement: Bounded radio execution completes without a runtime error.
+
+  over_air_verification:
+    label: Over-the-Air Verification
+    objective: Assess the task success condition from an observation made during the active radio run.
+    select_when: Use when task success requires an observation from the user or an external receiver.
+    capabilities: []
+    skills: [grc-hardware]
+    allowed_tools: [query_runtime_status, stop_flowgraph, emergency_stop]
+    expected_evidence: [task_observation]

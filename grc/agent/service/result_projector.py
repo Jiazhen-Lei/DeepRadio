@@ -57,8 +57,6 @@ def project_tool_results(
     """Project host-observed tool facts identically for every executor."""
     import time
 
-    from ..state import ClaimStore
-
     results: dict[str, list[dict]] = {}
     for invocation in reply.tool_invocations or []:
         if isinstance(invocation.result, dict):
@@ -116,20 +114,24 @@ def project_tool_results(
             state.project.config.pop("observed_device", None)
     if detection is not None:
         state.project.config["hardware_detection"] = detection
-    if probe is not None and probe.get("device_probed"):
-        state.project.config["observed_device"] = {
+    if probe is not None:
+        observed_device = {
             "type": probe.get("device_type"),
             "identity": probe.get("device_identity"),
             "driver_family": probe.get("driver_family"),
             "observed_at": probe.get("observed_at") or time.time(),
         }
+        if probe.get("device_probed"):
+            state.project.config["observed_device"] = observed_device
         record_claim(
             "hardware_device_probed",
-            "Selected SDR was discovered and probed by its explicit identity",
+            "Selected SDR is available and satisfies the required device capabilities.",
             "hardware",
             "discover_and_probe",
-            state.project.config["observed_device"],
-            True,
+            observed_device if probe.get("device_probed") else detection,
+            True if probe.get("device_probed") else (
+                False if probe.get("ok") else None
+            ),
             artifact=str(probe.get("report_path") or ""),
         )
         probe_warnings = list(
@@ -150,48 +152,33 @@ def project_tool_results(
                 ),
                 "details": probe_warnings,
             })
-    built_tx = latest(
-        "build_sdr_tx_flowgraph",
-        lambda item: item.get("ok") and item.get("valid") and item.get("compiled"),
+    validation_results = (
+        results.get("validate_flowgraph") or results.get("validate") or []
     )
-    if built_tx:
-        report = str(built_tx.get("report_path") or "")
+    validation = validation_results[-1] if validation_results else None
+    if validation is not None:
         record_claim(
             "final_flowgraph_valid",
-            "Saved flowgraph passed structural validation and grcc compilation",
-            "structure",
-            "build_sdr_tx_flowgraph",
+            "Current flowgraph has valid blocks, ports, parameters, and connections.",
+            "flowgraph",
+            "validate_flowgraph",
             {
-                "grc_path": built_tx.get("grc_path"),
-                "preview_topology_valid": built_tx.get("preview_topology_valid"),
-                "compiled": built_tx.get("compiled"),
+                "valid": validation.get("valid"),
+                "errors": list(validation.get("errors") or []),
             },
-            True,
-            artifact=report,
+            bool(validation.get("valid")) if "valid" in validation else None,
+            artifact=str(validation.get("report_path") or ""),
         )
-        record_claim(
-            "hardware_endpoint_configured",
-            "Requested SDR TX endpoint is present with the requested radio parameters",
-            "structure",
-            "build_sdr_tx_flowgraph",
-            {
-                "hardware": built_tx.get("hardware"),
-                "sink_key": built_tx.get("sink_key"),
-                "center_freq": built_tx.get("center_freq"),
-                "sample_rate": built_tx.get("sample_rate"),
-            },
-            True,
-            artifact=report,
-        )
-    verified = latest("verify_ble_packet_bits", lambda item: item.get("valid"))
-    if verified:
+    verified_results = results.get("verify_ble_packet_bits") or []
+    verified = verified_results[-1] if verified_results else None
+    if verified is not None:
         record_claim(
             "ble_offline_protocol_valid",
-            "BLE packet and IQ waveform passed independent offline validation",
-            "structure",
+            "Generated BLE advertising data conforms to the requested packet fields and checksum.",
+            "protocol",
             "verify_ble_packet_bits",
             {"checks": dict(verified.get("checks") or {})},
-            True,
+            bool(verified.get("valid")) if "valid" in verified else None,
         )
     armed = latest(
         "arm_hardware_flowgraph",
@@ -203,6 +190,18 @@ def project_tool_results(
         hashed = semantic_hash(str(armed.get("grc_path") or ""))
         if hashed:
             state.project.config["flowgraph_semantic_hash"] = hashed
+        record_claim(
+            "final_flowgraph_valid",
+            "Current flowgraph has valid blocks, ports, parameters, and connections.",
+            "flowgraph",
+            "arm_hardware_flowgraph",
+            {
+                "grc_path": armed.get("grc_path"),
+                "compiled": bool(dict(armed.get("compile") or {}).get("compiled")),
+            },
+            True,
+            artifact=str(armed.get("report_path") or ""),
+        )
     started = latest(
         "start_flowgraph",
         lambda item: (
@@ -215,9 +214,9 @@ def project_tool_results(
         state.project.config["rf_ever_started"] = True
         state.project.config["rf_active"] = True
         record_claim(
-            "rf_runtime_started",
-            "Bounded RF runtime was started by the controlled service",
-            "hardware",
+            "bounded_runtime_healthy",
+            "Bounded radio execution completes without a runtime error.",
+            "runtime",
             "start_flowgraph",
             {
                 "pid": started.get("pid"),
@@ -225,7 +224,21 @@ def project_tool_results(
                 "duration_seconds": started.get("duration_seconds"),
                 "program": started.get("program"),
             },
-            True,
+            None,
+        )
+    elif results.get("start_flowgraph"):
+        attempt = results["start_flowgraph"][-1]
+        record_claim(
+            "bounded_runtime_healthy",
+            "Bounded radio execution completes without a runtime error.",
+            "runtime",
+            "start_flowgraph",
+            {
+                "error": attempt.get("error"),
+                "policy": attempt.get("policy"),
+                "run_id": attempt.get("run_id"),
+            },
+            None,
         )
     terminal = next(
         (
@@ -248,9 +261,9 @@ def project_tool_results(
             and terminal.get("return_code") in (0, -15, -9)
         )
         record_claim(
-            "rf_runtime_reached_terminal_state",
-            "Controlled RF process reached a verified terminal state",
-            "hardware",
+            "bounded_runtime_healthy",
+            "Bounded radio execution completes without a runtime error.",
+            "runtime",
             "runtime_terminal_status",
             {
                 "run_id": terminal.get("run_id"),
@@ -261,7 +274,7 @@ def project_tool_results(
             clean,
             artifact=str(terminal.get("log_path") or ""),
         )
-        if not clean and ClaimStore(state).get("rf_runtime_started"):
+        if not clean:
             state.runtime.quality = "failed"
     quality_samples = [
         item
@@ -288,12 +301,3 @@ def project_tool_results(
             item for item in state.runtime.warnings
             if item.get("code") != "rf_stream_quality"
         ] + [warning]
-        record_claim(
-            "rf_runtime_underflow",
-            "Hardware runtime completed without scheduler underflow or overrun markers",
-            "hardware",
-            "runtime_stream_quality",
-            warning,
-            False,
-            artifact=str((terminal or quality).get("log_path") or ""),
-        )

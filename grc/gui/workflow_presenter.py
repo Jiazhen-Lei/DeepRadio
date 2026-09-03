@@ -14,7 +14,12 @@ from typing import Any, Dict, Iterable, List
 _LAYER_LABELS = {
     "sim": "Simulation",
     "structure": "Flowgraph check",
+    "flowgraph": "Flowgraph",
+    "signal": "Signal",
     "hardware": "Hardware",
+    "runtime": "Runtime",
+    "rf": "RF",
+    "task": "Task",
     "protocol": "Protocol",
     "waveform": "Waveform",
     "radio": "Radio design",
@@ -22,6 +27,18 @@ _LAYER_LABELS = {
     "measurement": "Measurement",
     "ota": "Over-the-air",
     "": "General",
+}
+
+_CLAIM_ASSESSMENTS = {
+    "passed": "Supported",
+    "supported": "Supported",
+    "failed": "Contradicted",
+    "contradicted": "Contradicted",
+    "inconclusive": "Unresolved",
+    "unresolved": "Unresolved",
+    "nottested": "Untested",
+    "not_tested": "Untested",
+    "untested": "Untested",
 }
 
 
@@ -438,24 +455,52 @@ def claims_view(
         ):
             continue
         details.append(dict(claim))
-        status = str(claim.get("status") or "NotTested")
+        status = _CLAIM_ASSESSMENTS.get(
+            str(claim.get("status") or "Untested").lower(),
+            str(claim.get("status") or "Untested"),
+        )
+        freshness = str(claim.get("freshness") or "Current")
         evidence = list(claim.get("evidence") or [])
         latest = evidence[-1] if evidence else {}
+        observation = latest.get("observation") or {}
+        if isinstance(observation, dict):
+            evidence_summary = ", ".join(
+                "{}={}".format(key, value)
+                for key, value in list(observation.items())[:4]
+                if value not in (None, "", [], {})
+            )
+        else:
+            evidence_summary = str(observation or "")
         rows.append({
             "statement": str(claim.get("statement") or ""),
             "layer": str(claim.get("layer") or ""),
             "layer_label": layer_label(claim.get("layer")),
             "status": _STATUS_LABELS.get(status.lower(), status),
+            "freshness": freshness,
             "version": int(claim.get("project_version") or project_version),
             "evidence_grade": str(latest.get("evidence_grade") or ""),
+            "evidence_test": str(latest.get("test") or ""),
+            "evidence_summary": evidence_summary,
+            "artifact": str(latest.get("artifact") or ""),
+            "stale_reason": str(claim.get("stale_reason") or ""),
             "producer": str(claim.get("producer") or ""),
         })
-    priority = {"Failed": 0, "Inconclusive": 1, "Stale": 2, "Not tested": 3, "Passed": 4}
-    rows.sort(key=lambda item: priority.get(item["status"], 5))
+    priority = {"Contradicted": 0, "Unresolved": 1, "Untested": 2, "Supported": 3}
+    rows.sort(key=lambda item: (
+        str(item.get("freshness") or "").lower() != "stale",
+        priority.get(item["status"], 4),
+    ))
     counts: Dict[str, int] = {}
     for row in rows:
         counts[row["status"]] = counts.get(row["status"], 0) + 1
-    return {"rows": rows, "counts": counts, "details": details}
+    return {
+        "rows": rows,
+        "counts": counts,
+        "stale_count": sum(
+            str(item.get("freshness") or "").lower() == "stale" for item in rows
+        ),
+        "details": details,
+    }
 
 
 def runtime_view(workflow: Dict[str, Any]) -> Dict[str, Any]:

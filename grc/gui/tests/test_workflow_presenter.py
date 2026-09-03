@@ -498,7 +498,7 @@ class WorkflowPresenterTest(unittest.TestCase):
                 ],
             },
             claims=[{
-                "statement": "PHY valid", "status": "Passed",
+                "statement": "PHY valid", "status": "Supported",
                 "producer": "verify", "layer": "protocol",
             }],
         )
@@ -538,7 +538,7 @@ class WorkflowPresenterTest(unittest.TestCase):
                 "statement": "Saved flowgraph passed structural validation",
                 "layer": "structure",
                 "layer_label": "Flowgraph check",
-                "status": "Passed",
+                "status": "Supported",
             }],
         })
         window = Gtk.OffscreenWindow()
@@ -557,7 +557,7 @@ class WorkflowPresenterTest(unittest.TestCase):
         view = present(
             spec={}, claims=[{
                 "id": "old-ble", "statement": "old BLE packet passed",
-                "layer": "protocol", "status": "Passed",
+                "layer": "protocol", "status": "Supported",
                 "intent_id": "intent-old",
             }],
             workflow={

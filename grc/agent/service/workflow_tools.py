@@ -145,7 +145,7 @@ def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> li
         except (TypeError, ValueError) as exc:
             return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
         if state is not None:
-            from ..state import SharedIntent
+            from ..state import ClaimStore, SharedIntent
 
             if not state.intent.intent_id:
                 state.intent = SharedIntent.new(
@@ -164,6 +164,7 @@ def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> li
             state.intent.task_type = result.task_type
             state.intent.capabilities = capabilities
             state.intent.refresh_hash()
+            ClaimStore(state).ensure_for_workflow(result)
             if workflow.reopened_from:
                 on_reopened = ctx.extra.get("on_workflow_reopened")
                 if callable(on_reopened):

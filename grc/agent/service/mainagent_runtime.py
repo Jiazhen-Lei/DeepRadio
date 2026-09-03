@@ -178,22 +178,33 @@ class MainAgentRuntime:
         ctx.extra.pop("pending_decision", None)
         ctx.extra.pop("_idempotent_results", None)
         ctx.extra.pop("finished_stage_this_turn", None)
+        task_observation = dict(
+            self._state.project.config.get("task_observation") or {}
+        )
+        if task_observation:
+            ctx.extra["events"].append({
+                "kind": "task_observation",
+                "payload": task_observation,
+            })
         if ctx.flow_graph is None:
             self._load_flowgraph(ctx)
         return ctx
 
     def _handle_workflow_reopened(self, stage_id: str) -> None:
-        stages = (
-            list(self._workflow.workflow.stages)
-            if self._workflow.workflow else []
-        )
-        reopened_index = next(
-            (index for index, stage in enumerate(stages) if stage.id == stage_id),
-            0,
-        )
-        ClaimStore(self._state).invalidate_by_producers(
-            [stage.id for stage in stages[reopened_index:]],
-            f"Workflow reopened from {stage_id}",
+        scopes = {
+            "radio_specification_alignment": (
+                "protocol", "flowgraph", "signal", "hardware", "runtime", "rf", "task"
+            ),
+            "radio_design": ("protocol", "flowgraph", "signal", "runtime", "rf", "task"),
+            "flowgraph_build": ("flowgraph", "signal", "runtime", "rf", "task"),
+            "flowgraph_verification": ("flowgraph", "signal", "runtime", "rf", "task"),
+            "simulation_and_measurement": ("signal", "task"),
+            "hardware_preparation": ("hardware", "runtime", "rf", "task"),
+            "physical_rf_execution": ("runtime", "rf", "task"),
+            "over_air_verification": ("rf", "task"),
+        }.get(stage_id, ("protocol", "flowgraph", "signal", "hardware", "runtime", "rf", "task"))
+        ClaimStore(self._state).invalidate_scopes(
+            scopes, f"Workflow reopened from {stage_id}"
         )
         self._state.project.config["rf_armed"] = False
         self._state.project.config.pop("rf_armed_path", None)
@@ -357,6 +368,7 @@ class MainAgentRuntime:
         except ValueError as exc:
             return self._error_reply(str(exc))
         permission = str(checkpoint.get("permission") or "")
+        ota_observation = str(checkpoint.get("purpose") or "") == "ota_observation"
         if decision == "approved" and permission:
             grants = self._state.runtime.granted_permissions
             if permission not in grants:
@@ -378,14 +390,53 @@ class MainAgentRuntime:
                 stage_id=str(checkpoint.get("stage_id") or ""),
             )
         )
+        if ota_observation:
+            observation = dict(command.get("observation") or {})
+            runtime = dict(self._state.project.config.get("runtime") or {})
+            run_id = str(runtime.get("run_id") or "")
+            observation.update({
+                "observed": decision == "approved",
+                "run_id": run_id,
+                "runtime_status": str(runtime.get("status") or ""),
+            })
+            evidence_payload = {
+                **observation,
+                "ok": bool(run_id) and decision == "approved",
+            }
+            self._state.project.config["task_observation"] = evidence_payload
+            claim_store = ClaimStore(self._state)
+            for claim in self._state.claims:
+                if (
+                    claim.layer == "task"
+                    and claim.intent_id == self._state.intent.intent_id
+                ):
+                    claim_store.add_evidence(
+                        claim.id,
+                        Evidence(
+                            test="task_observation",
+                            observation=observation,
+                            project_version=self._state.project.flowgraph_version,
+                            artifact=str(observation.get("artifact") or ""),
+                            evidence_grade="user_observation",
+                        ),
+                        passed=(decision == "approved") if run_id else None,
+                    )
+            store.append_session_event(
+                self.session_id, "task_observation", evidence_payload
+            )
         self._state.save(store.state_path(self.session_id))
         store.append_session_event(
             self.session_id,
             "checkpoint_resolved",
             {**checkpoint, "decision": decision},
         )
-        if decision == "rejected":
+        if decision == "rejected" and not ota_observation:
             return self._simple_reply("The requested action was cancelled.", "CANCELLED")
+        if decision == "rejected":
+            return self._invoke_mainagent(
+                "The user did not observe the expected task result. Treat this as "
+                "task evidence and continue the current Workflow without claiming success."
+            )
         return self._invoke_mainagent(
             "The user approved the pending decision. Continue the current Workflow "
             "without asking for the same permission again."
@@ -420,8 +471,9 @@ class MainAgentRuntime:
             if new_hash and new_hash != old_hash:
                 self._state.project.flowgraph_version += 1
                 self._state.project.config["flowgraph_semantic_hash"] = new_hash
-                ClaimStore(self._state).invalidate_by_version(
-                    self._state.project.flowgraph_version
+                ClaimStore(self._state).invalidate_scopes(
+                    ("flowgraph", "signal", "runtime", "rf", "task"),
+                    "Flowgraph artifact changed",
                 )
                 armed_under_grant = any(
                     event.get("kind") == "arm_hardware_flowgraph"
@@ -533,7 +585,7 @@ class MainAgentRuntime:
         layer: str,
         test: str,
         observation: Dict[str, Any],
-        passed: bool,
+        passed: Optional[bool],
         artifact: str = "",
         *,
         producer: str = "",
@@ -616,10 +668,14 @@ class MainAgentRuntime:
         )
         self._state.project.config.pop("rf_armed_path", None)
         self._clear_rf_grant()
-        ClaimStore(self._state).invalidate_by_version(
-            self._state.project.flowgraph_version
+        ClaimStore(self._state).invalidate_scopes(
+            ("flowgraph", "signal", "runtime", "rf", "task"),
+            "Canvas flowgraph changed",
         )
-        self._workflow.invalidate(self._state.project.flowgraph_version)
+        self._workflow.invalidate(
+            self._state.project.flowgraph_version,
+            stage_id="flowgraph_verification",
+        )
         self._tool_ctx = None
         self._state.save(store.state_path(self.session_id))
         return {

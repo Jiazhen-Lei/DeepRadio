@@ -73,7 +73,8 @@ class Claim:
     id: str
     statement: str
     layer: str
-    status: str = "NotTested"
+    status: str = "Untested"
+    freshness: str = "Current"
     evidence: List[Evidence] = field(default_factory=list)
     project_version: int = 0
     producer: str = ""
@@ -454,7 +455,8 @@ def _from_dict(data: Dict[str, Any]) -> SharedState:
                 id=item["id"],
                 statement=item["statement"],
                 layer=item["layer"],
-                status=item.get("status", "NotTested"),
+                status=item.get("status", "Untested"),
+                freshness=str(item.get("freshness") or "Current"),
                 evidence=evidence,
                 project_version=int(item.get("project_version", 0)),
                 producer=str(item.get("producer") or ""),

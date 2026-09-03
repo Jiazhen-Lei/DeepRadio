@@ -477,13 +477,22 @@ class DynamicWorkflowStore:
         self.save()
         return True
 
-    def invalidate(self, project_version: int) -> None:
+    def invalidate(self, project_version: int, stage_id: str = "") -> None:
         if self.workflow is None:
             return
         self.workflow.base_project_version = int(project_version)
-        for stage in self.workflow.stages:
+        start = next(
+            (
+                index for index, stage in enumerate(self.workflow.stages)
+                if stage.id == stage_id
+            ),
+            0,
+        )
+        for stage in self.workflow.stages[start:]:
             if stage.status == "completed":
                 stage.reset()
+        if self.workflow.stages:
+            self.workflow.current_stage = self.workflow.stages[start].id
         self.workflow.execution_status = "pending"
         self.workflow.revision += 1
         self.workflow.updated_at = time.time()

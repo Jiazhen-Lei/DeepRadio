@@ -125,7 +125,7 @@ class RadioSpecificationTest(unittest.TestCase):
             },
         ])
         self.assertTrue(spec_commit(self.ctx)["ok"])
-        self.state.claims[0].status = "Passed"
+        self.state.claims[0].status = "Supported"
 
         spec_update(self.ctx, fields=[{
             "key": "success_conditions", "value": ["EVM < 5%"],
@@ -134,7 +134,26 @@ class RadioSpecificationTest(unittest.TestCase):
 
         self.assertEqual(len(self.state.claims), 1)
         self.assertEqual(self.state.claims[0].statement, "EVM < 5%")
-        self.assertEqual(self.state.claims[0].status, "NotTested")
+        self.assertEqual(self.state.claims[0].status, "Untested")
+
+    def test_human_success_condition_creates_a_task_claim(self):
+        spec_update(self.ctx, fields=[
+            {
+                "key": "goal", "label": "Goal", "value": "Send a BLE beacon",
+                "group": "required", "source": "user", "status": "aligned",
+            },
+            {
+                "key": "success_conditions", "label": "Success condition",
+                "value": ["Phone observes Local Name syx"], "group": "required",
+                "source": "user", "status": "aligned",
+            },
+        ])
+
+        self.assertTrue(spec_commit(self.ctx)["ok"])
+        claim = self.state.claims[0]
+        self.assertEqual(claim.layer, "task")
+        self.assertEqual(claim.status, "Untested")
+        self.assertEqual(claim.producer, "over_air_verification")
 
 
 if __name__ == "__main__":

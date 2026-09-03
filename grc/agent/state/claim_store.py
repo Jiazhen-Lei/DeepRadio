@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-from typing import List, Optional
+from typing import Any, Iterable, List, Optional
 
 from .shared_state import Claim, Evidence, SharedState
 
@@ -24,27 +24,46 @@ class ClaimStore:
         if current is None:
             self.state.claims.append(claim)
             return claim
-        unchanged = (
+        same_claim = (
             current.statement == claim.statement
             and current.layer == claim.layer
-            and current.project_version == claim.project_version
         )
         current.statement = claim.statement
         current.layer = claim.layer
-        current.project_version = claim.project_version
         if claim.producer:
             current.producer = claim.producer
         if claim.measurement_id:
             current.measurement_id = claim.measurement_id
-        current.stale_reason = claim.stale_reason
         current.intent_id = claim.intent_id
         current.intent_revision = claim.intent_revision
         if claim.evidence:
             current.evidence = claim.evidence
-        elif not unchanged:
-            current.status = claim.status
+        elif not same_claim:
+            current.project_version = claim.project_version
+            current.status = "Untested"
+            current.freshness = "Current"
+            current.stale_reason = ""
             current.evidence = []
         return current
+
+    def ensure_for_workflow(self, workflow: Any) -> List[str]:
+        """Create the small Claim roster declared by the selected Stages."""
+        from ..workflow.catalog import load_stage_catalog
+
+        catalog = load_stage_catalog()
+        created = []
+        for stage in getattr(workflow, "stages", None) or []:
+            for definition in catalog.get(stage.id, {}).get("claims") or []:
+                claim = self.upsert(Claim(
+                    id=str(definition.get("id") or ""),
+                    statement=str(definition.get("statement") or ""),
+                    layer=str(definition.get("scope") or ""),
+                    project_version=self.state.project.flowgraph_version,
+                    producer=stage.id,
+                ))
+                if claim.id:
+                    created.append(claim.id)
+        return created
 
     def add_evidence(
         self, claim_id: str, evidence: Evidence, passed: Optional[bool] = None
@@ -66,34 +85,29 @@ class ClaimStore:
         claim.project_version = evidence.project_version
         claim.stale_reason = ""
         if passed is True:
-            claim.status = "Passed"
+            claim.status = "Supported"
         elif passed is False:
-            claim.status = "Failed"
+            claim.status = "Contradicted"
         else:
-            claim.status = "Inconclusive"
+            claim.status = "Unresolved"
+        claim.freshness = "Current"
         return claim
 
-    def invalidate_by_version(self, new_version: int) -> List[str]:
-        invalidated = []
-        for claim in self.state.claims:
-            if claim.project_version < new_version:
-                claim.status = "Stale"
-                claim.stale_reason = (
-                    f"project_version {claim.project_version} < {new_version}"
-                )
-                invalidated.append(claim.id)
-        return invalidated
-
-    def invalidate_by_producers(
-        self, producers: List[str], reason: str
+    def invalidate_scopes(
+        self, scopes: Iterable[str], reason: str
     ) -> List[str]:
-        """Mark only conclusions produced by affected Workflow stages stale."""
-        affected = {str(item) for item in producers if item}
+        """Invalidate only conclusions that depend on the changed scope."""
+        affected = {str(item) for item in scopes if item}
+        if "task" in affected:
+            self.state.project.config.pop("task_observation", None)
         invalidated = []
         for claim in self.state.claims:
-            if claim.producer in affected and claim.status != "Stale":
-                claim.status = "Stale"
-                claim.stale_reason = str(reason or "Workflow dependency changed")
+            if claim.layer in affected and claim.freshness != "Stale":
+                if claim.status == "Untested" and not claim.evidence:
+                    claim.project_version = self.state.project.flowgraph_version
+                    continue
+                claim.freshness = "Stale"
+                claim.stale_reason = str(reason or "Relevant project state changed")
                 invalidated.append(claim.id)
         return invalidated
 

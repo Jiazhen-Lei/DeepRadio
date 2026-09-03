@@ -14,7 +14,7 @@ from grc.agent.service.workflow_tools import (
     _normalize_intent_slots,
     build_workflow_tools,
 )
-from grc.agent.state import ClaimStore, SharedIntent, SharedState
+from grc.agent.state import Claim, ClaimStore, SharedIntent, SharedState
 from grc.agent.schema import AgentReply, ToolInvocation
 from grc.agent.tools import registry
 from grc.agent.tools.build_tools import _missing_literal_file_source
@@ -187,7 +187,7 @@ class MainAgentRuntimeTest(unittest.TestCase):
             workflow=SimpleNamespace(current_stage="flowgraph_verification")
         )
         runtime._record_claim(
-            "flowgraph_valid", "Flowgraph is valid", "structure",
+            "flowgraph_valid", "Flowgraph is valid", "flowgraph",
             "validate_flowgraph", {"valid": True}, True,
         )
         runtime._workflow.workflow.current_stage = "hardware_preparation"
@@ -196,14 +196,38 @@ class MainAgentRuntimeTest(unittest.TestCase):
             "probe_device", {"identity": "usb:test"}, True,
         )
 
-        invalidated = ClaimStore(runtime._state).invalidate_by_producers(
-            ["flowgraph_verification"], "workflow reopened"
+        invalidated = ClaimStore(runtime._state).invalidate_scopes(
+            ["flowgraph"], "workflow reopened"
         )
 
         self.assertEqual(invalidated, ["flowgraph_valid"])
-        self.assertEqual(runtime._state.claims[0].status, "Stale")
-        self.assertEqual(runtime._state.claims[1].status, "Passed")
+        self.assertEqual(runtime._state.claims[0].status, "Supported")
+        self.assertEqual(runtime._state.claims[0].freshness, "Stale")
+        self.assertEqual(runtime._state.claims[1].status, "Supported")
+        self.assertEqual(runtime._state.claims[1].freshness, "Current")
         self.assertEqual(runtime._state.claims[1].producer, "hardware_preparation")
+
+    def test_workflow_declares_claims_before_tools_run(self):
+        state = SharedState(session_id="runtime-test")
+        state.intent = SharedIntent.new("Build a radio", "wf-test")
+        workflow = SimpleNamespace(stages=[
+            SimpleNamespace(id="flowgraph_verification")
+        ])
+        definition = {"claims": [{
+            "id": "final_flowgraph_valid",
+            "scope": "flowgraph",
+            "statement": "Current flowgraph is structurally valid.",
+        }]}
+
+        with patch(
+            "grc.agent.workflow.catalog.load_stage_catalog",
+            return_value={"flowgraph_verification": definition},
+        ):
+            created = ClaimStore(state).ensure_for_workflow(workflow)
+
+        self.assertEqual(created, ["final_flowgraph_valid"])
+        self.assertEqual(state.claims[0].status, "Untested")
+        self.assertEqual(state.claims[0].producer, "flowgraph_verification")
 
     def test_rf_lifecycle_does_not_create_or_flip_safety_claims(self):
         runtime = MainAgentRuntime.__new__(MainAgentRuntime)
@@ -231,11 +255,72 @@ class MainAgentRuntimeTest(unittest.TestCase):
         )
 
         claims = {claim.id: claim for claim in runtime._state.claims}
-        self.assertNotIn("rf_not_started", claims)
-        self.assertEqual(claims["rf_runtime_started"].status, "Passed")
-        self.assertEqual(
-            claims["rf_runtime_reached_terminal_state"].status, "Failed"
+        self.assertEqual(set(claims), {"bounded_runtime_healthy"})
+        self.assertEqual(claims["bounded_runtime_healthy"].status, "Contradicted")
+        self.assertEqual(len(claims["bounded_runtime_healthy"].evidence), 2)
+
+    def test_flowgraph_validation_projects_scoped_claim(self):
+        runtime = MainAgentRuntime.__new__(MainAgentRuntime)
+        runtime._state = SharedState(session_id="runtime-test")
+        runtime._state.intent = SharedIntent.new("Validate radio", "wf-test")
+        runtime._workflow = SimpleNamespace(
+            workflow=SimpleNamespace(current_stage="flowgraph_verification")
         )
+        reply = AgentReply(tool_invocations=[ToolInvocation(
+            name="validate_flowgraph",
+            result={"ok": True, "valid": True, "errors": []},
+        )])
+
+        result_projector.project_tool_results(
+            runtime._state, reply,
+            record_claim=runtime._record_claim,
+            semantic_hash=lambda _path: "hash",
+        )
+
+        claim = ClaimStore(runtime._state).get("final_flowgraph_valid")
+        self.assertIsNotNone(claim)
+        self.assertEqual(claim.layer, "flowgraph")
+        self.assertEqual(claim.status, "Supported")
+
+    def test_ota_checkpoint_records_task_evidence_bound_to_run(self):
+        runtime = MainAgentRuntime.__new__(MainAgentRuntime)
+        runtime.session_id = "runtime-test"
+        runtime._state = SharedState(session_id="runtime-test")
+        runtime._state.intent = SharedIntent.new("Send BLE", "wf-test")
+        runtime._state.project.config["runtime"] = {
+            "run_id": "run-test", "status": "running", "running": True,
+        }
+        ClaimStore(runtime._state).upsert(Claim(
+            id="success_condition_1",
+            statement="Phone observes Local Name syx",
+            layer="task",
+            producer="over_air_verification",
+        ))
+        runtime._workflow = SimpleNamespace(
+            workflow=SimpleNamespace(workflow_id="wf-test"),
+            resolve_decision=lambda _checkpoint_id, _decision: {
+                "id": "checkpoint-test",
+                "purpose": "ota_observation",
+                "permission": "",
+                "stage_id": "over_air_verification",
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            session_store, "state_path", return_value=str(Path(directory) / "state.json")
+        ), patch.object(session_store, "append_session_event"), patch.object(
+            runtime, "_invoke_mainagent", return_value="continued"
+        ):
+            reply = runtime._resolve_checkpoint({
+                "checkpoint_id": "checkpoint-test",
+                "decision": "approved",
+                "observation": {"observed_name": "syx"},
+            })
+
+        claim = ClaimStore(runtime._state).get("success_condition_1")
+        self.assertEqual(reply, "continued")
+        self.assertEqual(claim.status, "Supported")
+        self.assertEqual(claim.evidence[-1].observation["run_id"], "run-test")
 
     def test_hardware_tool_results_are_projected(self):
         state = SharedState(session_id="runtime-test")
