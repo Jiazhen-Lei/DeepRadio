@@ -6,11 +6,10 @@ differs from ``registry.call``.  Everything else is generated from ToolSpec.
 
 from __future__ import annotations
 
-import inspect
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from ..tools.registry import ToolContext
 
@@ -26,16 +25,6 @@ _PLOT_ARTIFACTS = {
     "plot_eye": "eye_png",
 }
 _SKIP_AUTOWRAP = frozenset({"read_metric"})
-_JSON_TYPES = {
-    "string": str,
-    "integer": int,
-    "number": float,
-    "boolean": bool,
-    "array": list,
-    "object": dict,
-}
-
-
 def record_tool_event(
     ctx: ToolContext,
     kind: str,
@@ -180,58 +169,19 @@ def _call_registry(ctx: ToolContext, name: str, arguments: Dict[str, Any]) -> st
     return json.dumps(result, ensure_ascii=False)
 
 
-def _py_type(schema: Dict[str, Any]) -> Any:
-    if not isinstance(schema, dict):
-        return Any
-    json_type = schema.get("type")
-    if isinstance(json_type, list):
-        json_type = next((item for item in json_type if item != "null"), "string")
-    return _JSON_TYPES.get(str(json_type or ""), Any)
-
-
 def _wrap_spec(spec: Any, ctx: ToolContext) -> Any:
     from langchain_core.tools import StructuredTool
-
-    props = dict((spec.parameters or {}).get("properties") or {})
-    required = set((spec.parameters or {}).get("required") or [])
-    parameters = []
-    annotations: Dict[str, Any] = {}
-    # Parameters without a default must precede defaulted ones, otherwise
-    # inspect.Signature raises "non-default argument follows default
-    # argument" whenever a tool spec lists an optional property first.
-    ordered_props = sorted(
-        props.items(), key=lambda kv: 0 if kv[0] in required else 1
-    )
-    for name, schema in ordered_props:
-        schema = schema if isinstance(schema, dict) else {}
-        annotation = _py_type(schema)
-        if name not in required:
-            annotation = Optional[annotation]
-        annotations[name] = annotation
-        default = (
-            inspect.Parameter.empty
-            if name in required
-            else schema.get("default", None)
-        )
-        parameters.append(inspect.Parameter(
-            name,
-            inspect.Parameter.POSITIONAL_OR_KEYWORD,
-            default=default,
-            annotation=annotation,
-        ))
 
     def _run(**kwargs: Any) -> str:
         payload = {key: value for key, value in kwargs.items() if value is not None}
         return _call_registry(ctx, spec.name, payload)
 
-    _run.__name__ = str(spec.name).replace("-", "_")
-    _run.__doc__ = spec.description
-    _run.__signature__ = inspect.Signature(parameters, return_annotation=str)
-    _run.__annotations__ = {**annotations, "return": str}
     return StructuredTool.from_function(
         func=_run,
         name=spec.name,
         description=spec.description or spec.name,
+        args_schema=spec.parameters,
+        infer_schema=False,
     )
 
 

@@ -7,14 +7,15 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from grc.agent.service import MainAgentRuntime, build_mainagent_runtime
-from grc.agent.service import session_store
-from grc.agent.service.tools_lc import _call_registry
+from grc.agent.service import result_projector, session_store
+from grc.agent.service.tools_lc import _call_registry, _wrap_spec
 from grc.agent.service.workflow_tools import (
     _materialize_stage_plan,
     _normalize_intent_slots,
     build_workflow_tools,
 )
 from grc.agent.state import SharedIntent, SharedState
+from grc.agent.schema import AgentReply, ToolInvocation
 from grc.agent.tools import registry
 from grc.agent.tools.build_tools import _missing_literal_file_source
 from grc.agent.tools.critic_tools import _missing_file_sources
@@ -38,13 +39,28 @@ def _radio_design_stage(status="pending"):
 
 class MainAgentRuntimeTest(unittest.TestCase):
     def test_empty_intent_slots_are_normalized(self):
-        self.assertEqual(_normalize_intent_slots(""), {})
         self.assertEqual(_normalize_intent_slots(None), {})
         self.assertEqual(_normalize_intent_slots({"protocol": "BLE"}), {
             "protocol": "BLE"
         })
-        with self.assertRaises(ValueError):
-            _normalize_intent_slots("BLE")
+        for invalid in ("", "BLE", []):
+            with self.assertRaises(ValueError):
+                _normalize_intent_slots(invalid)
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("langchain_core"), "langchain_core is not installed"
+    )
+    def test_registry_tool_schema_preserves_nested_enums(self):
+        registry.load_all()
+        spec = next(item for item in registry.all_specs() if item.name == "spec_update")
+        tool = _wrap_spec(spec, ToolContext())
+        fields = tool.tool_call_schema["properties"]["fields"]["items"]["properties"]
+
+        self.assertEqual(fields["group"]["enum"], ["required", "added"])
+        self.assertEqual(
+            fields["status"]["enum"],
+            ["aligned", "needs_confirmation", "missing"],
+        )
 
     def test_stage_plan_uses_fixed_library_contract(self):
         catalog = {
@@ -133,6 +149,87 @@ class MainAgentRuntimeTest(unittest.TestCase):
         self.assertFalse(hasattr(runtime, "ctx"))
         self.assertNotIn("workflow_id", runtime.workflow_digest())
         self.assertEqual(runtime.intent_slots(), {})
+
+    def test_runtime_digest_exposes_current_hardware_detection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(session_store, "ensure_run_metadata"), patch.object(
+                session_store, "state_path", return_value=str(root / "state.json")
+            ), patch.object(
+                session_store, "workflow_path", return_value=str(root / "workflow.json")
+            ), patch.object(session_store, "recent_events", return_value=[]):
+                runtime = build_mainagent_runtime(
+                    session_id="runtime-test", platform=object()
+                )
+                workflow = runtime._workflow.begin_turn("Use a PlutoSDR", 0)
+                runtime._state.intent.capabilities = ["hardware_configure"]
+                runtime._state.project.config["hardware_detection"] = {
+                    "state": "detected",
+                    "workflow_id": workflow.workflow_id,
+                }
+                runtime._state.project.config["observed_device"] = {
+                    "type": "pluto", "identity": "usb:1.2.3"
+                }
+                digest = runtime.workflow_digest()
+
+        self.assertEqual(digest["capabilities"], ["hardware_configure"])
+        self.assertEqual(digest["hardware_detection"]["state"], "detected")
+        self.assertEqual(digest["observed_device"]["identity"], "usb:1.2.3")
+
+    def test_hardware_tool_results_are_projected(self):
+        state = SharedState(session_id="runtime-test")
+        state.intent = SharedIntent.new("Use a PlutoSDR", "wf-test")
+        reply = AgentReply(tool_invocations=[
+            ToolInvocation(name="discover_devices", result={
+                "ok": True,
+                "device_found": True,
+                "device_type": "pluto",
+                "device_identity": "usb:1.2.3",
+            }),
+            ToolInvocation(name="probe_device", result={
+                "ok": True,
+                "device_probed": True,
+                "device_type": "pluto",
+                "device_identity": "usb:1.2.3",
+            }),
+        ])
+
+        result_projector.project_tool_results(
+            state,
+            reply,
+            record_claim=lambda *args, **kwargs: None,
+            semantic_hash=lambda _path: "hash",
+        )
+
+        self.assertEqual(state.project.config["hardware_detection"]["state"], "detected")
+        self.assertEqual(state.project.config["observed_device"]["identity"], "usb:1.2.3")
+
+        reply.tool_invocations = [ToolInvocation(name="discover_devices", result={
+            "ok": True,
+            "device_found": False,
+            "device_type": "pluto",
+        })]
+        result_projector.project_tool_results(
+            state,
+            reply,
+            record_claim=lambda *args, **kwargs: None,
+            semantic_hash=lambda _path: "hash",
+        )
+        self.assertEqual(state.project.config["hardware_detection"]["state"], "not_found")
+        self.assertNotIn("observed_device", state.project.config)
+
+        reply.tool_invocations = [ToolInvocation(name="probe_device", result={
+            "ok": False,
+            "device_probed": False,
+            "error": "probe failed",
+        })]
+        result_projector.project_tool_results(
+            state,
+            reply,
+            record_claim=lambda *args, **kwargs: None,
+            semantic_hash=lambda _path: "hash",
+        )
+        self.assertEqual(state.project.config["hardware_detection"]["state"], "failed")
 
     def test_workflow_store_owns_retry_and_project_version(self):
         with tempfile.TemporaryDirectory() as directory:

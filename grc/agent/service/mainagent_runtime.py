@@ -556,7 +556,9 @@ class MainAgentRuntime:
 
     def _digest(self) -> Dict[str, Any]:
         digest = self._workflow.digest()
+        config = self._state.project.config
         digest["project_version"] = self._state.project.flowgraph_version
+        digest["capabilities"] = list(self._state.intent.capabilities)
         digest["timeline"] = store.recent_events(self.session_id, limit=40)
         digest["control_state"] = {
             "current_node": digest.get("current_stage") or "",
@@ -566,7 +568,11 @@ class MainAgentRuntime:
             "quality": self._state.runtime.quality,
             "warnings": list(self._state.runtime.warnings),
         }
-        runtime = dict(self._state.project.config.get("runtime") or {})
+        detection = dict(config.get("hardware_detection") or {})
+        if detection.get("workflow_id") == digest.get("workflow_id"):
+            digest["hardware_detection"] = detection
+            digest["observed_device"] = dict(config.get("observed_device") or {})
+        runtime = dict(config.get("runtime") or {})
         if runtime:
             deadline = float(runtime.get("deadline") or 0)
             runtime["remaining_seconds"] = (

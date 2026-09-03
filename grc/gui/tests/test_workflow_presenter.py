@@ -533,53 +533,36 @@ class WorkflowPresenterTest(unittest.TestCase):
         self.assertEqual(view["claims"]["rows"], [])
 
     def test_hardware_detection_exposes_five_states(self):
-        view = present(
-            spec={},
-            claims=[],
-            workflow={
-                "task_type": "HARDWARE_CONFIGURE",
-                "capabilities": ["hardware_configure", "deploy"],
-                "current_stage": "discover_and_probe_hardware",
-                "stages": [
-                    {
-                        "id": "hardware_precheck",
-                        "execution_status": "completed",
-                        "outcome": "passed",
+        workflow = {
+            "capabilities": ["hardware_configure"],
+            "stages": [{"id": "hardware_preparation", "status": "running"}],
+        }
+        for state in ("detected", "not_found", "failed"):
+            view = present(
+                spec={},
+                claims=[],
+                workflow={
+                    **workflow,
+                    "hardware_detection": {
+                        "state": state,
+                        "error": "probe failed" if state == "failed" else "",
                     },
-                    {
-                        "id": "discover_and_probe_hardware",
-                        "execution_status": "waiting",
-                        "outcome": "failed",
-                        "result": {"note": "no SDR was found"},
-                    },
-                    {"id": "configure_device", "execution_status": "pending"},
-                ],
-                "observed_device": {},
-            },
-        )
+                },
+            )
+            self.assertEqual(view["hardware_detection"]["state"], state)
         hw = view["hardware_detection"]
-        self.assertEqual(hw["state"], "not_found")
         self.assertEqual(hw["label"], "Hardware")
         self.assertEqual(len(hw["rows"]), 1)
-        self.assertEqual(hw["rows"][0]["state"], "not_found")
+
+        idle = present(spec={}, claims=[], workflow=workflow)
+        self.assertEqual(idle["hardware_detection"]["state"], "not_started")
+
         sim = present(
             spec={},
             claims=[],
             workflow={"task_type": "TX_BUILD", "capabilities": ["build_tx"]},
         )
         self.assertEqual(sim["hardware_detection"]["state"], "not_applicable")
-        idle = present(
-            spec={},
-            claims=[],
-            workflow={
-                "task_type": "HARDWARE_CONFIGURE",
-                "capabilities": ["hardware_configure"],
-                "stages": [
-                    {"id": "hardware_precheck", "execution_status": "pending"},
-                ],
-            },
-        )
-        self.assertEqual(idle["hardware_detection"]["state"], "not_started")
 
     def test_workflow_keeps_completed_and_pending_groups(self):
         view = present(

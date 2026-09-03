@@ -124,9 +124,9 @@ def verify_state_claims(ctx: ToolContext, metrics: Dict[str, Any]) -> Dict[str, 
 @tool(
     name="spec_update",
     description=(
-        "Merge a SpecAgent-authored Radio Specification patch and return Required "
-        "fields that are not aligned. Each field needs key, label, value, group, "
-        "source and status."
+        "Merge a MainAgent-authored Radio Specification patch and return Required "
+        "fields that are not aligned. Field group must be required or added; "
+        "status must be aligned, needs_confirmation, or missing."
     ),
     parameters={
         "type": "object",

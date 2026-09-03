@@ -12,13 +12,13 @@ from . import session_store as store
 
 
 def _normalize_intent_slots(
-    value: Dict[str, Any] | str | None,
+    value: Dict[str, Any] | None,
 ) -> Dict[str, Any]:
-    if value is None or value == "":
+    if value is None:
         return {}
     if isinstance(value, dict):
         return dict(value)
-    raise ValueError("intent_slots must be a dictionary or an empty string")
+    raise ValueError("intent_slots must be a dictionary or null")
 
 
 def _materialize_stage_plan(
@@ -68,7 +68,7 @@ def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> li
         current_stage: str = "",
         execution_status: str = "running",
         task_type: str = "DYNAMIC",
-        intent_slots: Dict[str, Any] | str | None = None,
+        intent_slots: Dict[str, Any] | None = None,
         expected_revision: int = 1,
     ) -> str:
         """Create or update the complete ordered Workflow.
@@ -77,7 +77,7 @@ def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> li
         Stage fields: id, inputs, status and result_refs. Objective, skills and
         expected_evidence come from the Stage library.
         Use the revision from CURRENT_WORKFLOW.
-        intent_slots must be a JSON object; an empty string is treated as {}.
+        intent_slots must be a JSON object; omit it when there are no slots.
         """
         try:
             normalized_slots = _normalize_intent_slots(intent_slots)

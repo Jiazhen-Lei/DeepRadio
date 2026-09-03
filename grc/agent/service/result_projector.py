@@ -70,24 +70,58 @@ def project_tool_results(
             None,
         )
 
-    discovery_attempted = bool(results.get("discover_devices"))
-    probe_attempted = bool(results.get("probe_device"))
-    discovered = latest("discover_devices", lambda item: item.get("device_found"))
-    probed = latest("probe_device", lambda item: item.get("device_probed"))
-    if (discovery_attempted or probe_attempted) and not (discovered and probed):
-        # Never carry a physical-device success fact across a failed fresh
-        # observation. Structural endpoints remain separate structure claims.
+    discovery = (
+        results.get("discover_devices", [])[-1]
+        if results.get("discover_devices") else None
+    )
+    probe = (
+        results.get("probe_device", [])[-1]
+        if results.get("probe_device") else None
+    )
+    detection = None
+    if discovery is not None:
         state.project.config.pop("observed_device", None)
-    if discovered and probed:
+        found = bool(discovery.get("device_found"))
+        detection = {
+            "state": "detected" if found else (
+                "not_found" if discovery.get("ok") else "failed"
+            ),
+            "device_type": discovery.get("device_type"),
+            "device_label": discovery.get("device_label"),
+            "identity": discovery.get("device_identity"),
+            "driver_family": discovery.get("driver_family"),
+            "observed_at": discovery.get("observed_at") or time.time(),
+            "error": "" if found else str(
+                discovery.get("error")
+                or discovery.get("mismatch_hint")
+                or "No matching SDR was found."
+            ),
+            "workflow_id": state.intent.workflow_id,
+        }
+    if probe is not None:
+        probed = bool(probe.get("device_probed"))
+        detection = {
+            "state": "detected" if probed else "failed",
+            "device_type": probe.get("device_type"),
+            "device_label": probe.get("device_label"),
+            "identity": probe.get("device_identity"),
+            "driver_family": probe.get("driver_family"),
+            "observed_at": probe.get("observed_at") or time.time(),
+            "error": "" if probed else str(
+                probe.get("error") or "Hardware probe failed."
+            ),
+            "workflow_id": state.intent.workflow_id,
+        }
+        if not probed:
+            state.project.config.pop("observed_device", None)
+    if detection is not None:
+        state.project.config["hardware_detection"] = detection
+    if probe is not None and probe.get("device_probed"):
         state.project.config["observed_device"] = {
-            "type": probed.get("device_type") or discovered.get("device_type"),
-            "identity": probed.get("device_identity")
-            or discovered.get("device_identity"),
-            "driver_family": probed.get("driver_family")
-            or discovered.get("driver_family"),
-            "observed_at": probed.get("observed_at")
-            or discovered.get("observed_at")
-            or time.time(),
+            "type": probe.get("device_type"),
+            "identity": probe.get("device_identity"),
+            "driver_family": probe.get("driver_family"),
+            "observed_at": probe.get("observed_at") or time.time(),
         }
         record_claim(
             "hardware_device_probed",
@@ -96,12 +130,10 @@ def project_tool_results(
             "discover_and_probe",
             state.project.config["observed_device"],
             True,
-            artifact=str(
-                probed.get("report_path") or discovered.get("report_path") or ""
-            ),
+            artifact=str(probe.get("report_path") or ""),
         )
         probe_warnings = list(
-            dict(probed.get("health") or {}).get("warnings") or []
+            dict(probe.get("health") or {}).get("warnings") or []
         )
         state.runtime.warnings = [
             item for item in state.runtime.warnings

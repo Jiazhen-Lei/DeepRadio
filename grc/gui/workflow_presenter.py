@@ -615,14 +615,6 @@ def interaction_view(
     }
 
 
-_HARDWARE_CHECK_DEFS = (
-    ("host_readiness", "Host readiness", "hardware_precheck"),
-    ("vendor_cli", "Driver / vendor CLI", "hardware_precheck"),
-    ("device_discovery", "Device discovery", "discover_and_probe_hardware"),
-    ("device_identity", "Device identity", "discover_and_probe_hardware"),
-    ("exact_probe", "Exact probe", "discover_and_probe_hardware"),
-)
-
 _HARDWARE_STATE_LABELS = {
     "not_started": "not_started",
     "detected": "detected",
@@ -639,34 +631,26 @@ def hardware_detection_view(
     capabilities = {
         str(item) for item in (workflow.get("capabilities") or []) if item
     }
-    hardware_needed = bool(
-        capabilities.intersection({"hardware_configure", "deploy", "hardware_runtime"})
-        or str(workflow.get("task_type") or "") == "HARDWARE_CONFIGURE"
-    )
-    stages = {
-        str(item.get("id") or ""): item
+    stage_ids = {
+        str(item.get("id") or "")
         for item in (workflow.get("stages") or [])
         if isinstance(item, dict)
     }
-    findings = {
-        str(item.get("check_id") or ""): item
-        for item in ((workflow.get("diagnosis") or {}).get("findings") or [])
-        if isinstance(item, dict)
-    }
+    hardware_needed = bool(
+        capabilities.intersection({"hardware_configure", "deploy", "hardware_runtime"})
+        or str(workflow.get("task_type") or "") == "HARDWARE_CONFIGURE"
+        or stage_ids.intersection({"hardware_preparation", "physical_rf_execution"})
+        or spec.get("hardware")
+    )
+    detection = dict(workflow.get("hardware_detection") or {})
     observed = dict(workflow.get("observed_device") or {})
-    checks = []
-    for check_id, _label, producer in _HARDWARE_CHECK_DEFS:
-        if not hardware_needed:
-            state = "not_applicable"
-        else:
-            state = _hardware_check_state(
-                check_id, producer, stages, findings, observed
-            )
-        checks.append((check_id, state))
-    state = _aggregate_hardware_state(hardware_needed, checks, observed)
-    error = ""
-    if state in {"failed", "not_found"}:
-        error = _hardware_error_message(state, stages, findings)
+    state = str(detection.get("state") or "")
+    if not hardware_needed:
+        state = "not_applicable"
+    elif state not in _HARDWARE_STATE_LABELS:
+        state = "detected" if observed else "not_started"
+    error = str(detection.get("error") or "") \
+        if state in {"failed", "not_found"} else ""
     return {
         "visible": True,
         "title": "Hardware Detection",
@@ -683,100 +667,6 @@ def hardware_detection_view(
             "detail": error,
         }],
     }
-
-
-def _aggregate_hardware_state(
-    hardware_needed: bool,
-    checks: list[tuple[str, str]],
-    observed: Dict[str, Any],
-) -> str:
-    if not hardware_needed:
-        return "not_applicable"
-    states = [state for _check_id, state in checks]
-    if any(state == "failed" for state in states):
-        return "failed"
-    if any(state == "not_found" for state in states):
-        return "not_found"
-    if observed.get("identity") or observed.get("type"):
-        return "detected"
-    if any(state == "detected" for state in states):
-        return "detected"
-    return "not_started"
-
-
-def _hardware_error_message(
-    state: str,
-    stages: Dict[str, Any],
-    findings: Dict[str, Any],
-) -> str:
-    for finding in findings.values():
-        if not isinstance(finding, dict):
-            continue
-        status = str(finding.get("status") or "").lower()
-        if status in {"fail", "failed"}:
-            note = str(
-                finding.get("message")
-                or finding.get("remediation")
-                or ""
-            ).strip()
-            if note:
-                return note
-    for stage_id in ("discover_and_probe_hardware", "hardware_precheck"):
-        note = str((stages.get(stage_id) or {}).get("result", {}).get("note") or "").strip()
-        if note:
-            return note
-    if state == "not_found":
-        return "No matching SDR was found."
-    return "Hardware detection failed."
-
-
-def _hardware_check_state(
-    check_id: str,
-    producer: str,
-    stages: Dict[str, Any],
-    findings: Dict[str, Any],
-    observed: Dict[str, Any],
-) -> str:
-    finding = findings.get({
-        "device_discovery": "device.discovery",
-        "device_identity": "device.requested_observed_identity_match",
-        "exact_probe": "device.exact_probe",
-        "vendor_cli": "environment.vendor_cli_available",
-        "host_readiness": "intent.requested_device_supported",
-    }.get(check_id, ""))
-    if isinstance(finding, dict) and finding:
-        status = str(finding.get("status") or "").lower()
-        observation = finding.get("observation")
-        if status == "pass":
-            return "detected"
-        if status in {"fail", "failed"}:
-            detail = observation if isinstance(observation, dict) else {}
-            if check_id == "device_discovery" and not detail.get("identity"):
-                return "not_found"
-            return "failed"
-        if status in {"unknown", "not_observed"}:
-            return "not_started"
-    stage = stages.get(producer) or {}
-    execution = str(stage.get("execution_status") or stage.get("status") or "")
-    outcome = str(stage.get("outcome") or "")
-    if execution in {"", "pending", "deferred"} and outcome in {"", "pending"}:
-        return "not_started"
-    if outcome == "passed" or execution in {"passed", "completed"}:
-        if check_id == "device_discovery" and not (
-            observed.get("identity") or observed.get("type")
-        ):
-            return "not_found"
-        return "detected"
-    if outcome in {"failed", "error", "errored"} or execution in {
-        "failed", "error", "errored",
-    }:
-        note = str((stage.get("result") or {}).get("note") or "").lower()
-        if "not found" in note or "no sdr" in note or "not_found" in note:
-            return "not_found"
-        return "failed"
-    if execution in {"running", "waiting"}:
-        return "not_started"
-    return "not_started"
 
 
 def present(
