@@ -16,6 +16,7 @@ from __future__ import annotations
 import importlib
 import json
 import logging
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -80,6 +81,11 @@ _REGISTRY: Dict[str, ToolSpec] = {}
 
 #: 已加载过工具模块的标记,避免重复 import
 _LOADED = False
+
+#: 当前工具调用链的顶层工具；ContextVar 避免并行调用共享 ToolContext 时互相污染。
+_GATEWAY_PARENT_TOOL: ContextVar[Optional[str]] = ContextVar(
+    "gateway_parent_tool", default=None
+)
 
 #: 各工具模块(相对本包),load_all 时依次 import 触发 @tool 注册
 _TOOL_MODULES = (
@@ -200,9 +206,7 @@ def call(name: str, arguments: Dict[str, Any],
         if name == "arm_hardware_flowgraph":
             result["armed"] = False
         return result
-    marker = object()
-    previous_parent = ctx.extra.get("_gateway_parent_tool", marker)
-    ctx.extra["_gateway_parent_tool"] = spec.name
+    parent_token = _GATEWAY_PARENT_TOOL.set(spec.name)
     try:
         result = spec.fn(ctx, **(arguments or {}))
         if not isinstance(result, dict):
@@ -216,10 +220,7 @@ def call(name: str, arguments: Dict[str, Any],
         logger.exception("工具 %s 执行异常", name)
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     finally:
-        if previous_parent is marker:
-            ctx.extra.pop("_gateway_parent_tool", None)
-        else:
-            ctx.extra["_gateway_parent_tool"] = previous_parent
+        _GATEWAY_PARENT_TOOL.reset(parent_token)
 
 
 def _execution_denial(
@@ -238,7 +239,7 @@ def _execution_denial(
             allowed = allowed_tools_for_stage(stage_id)
         except ValueError as exc:
             return str(exc)
-        requested_tool = str(extra.get("_gateway_parent_tool") or spec.name)
+        requested_tool = str(_GATEWAY_PARENT_TOOL.get() or spec.name)
         if requested_tool not in allowed:
             return f"Tool {requested_tool} is not allowed in Stage {stage_id}"
     forbidden = set(extra.get("forbidden_permissions") or [])
