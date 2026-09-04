@@ -95,7 +95,7 @@ def _diagnose_evm(
     """按 EVM 值给判断 + 分档改参建议。
 
     建议项结构统一,便于 narrate 分档渲染:
-        {knob, dir, say_novice, say_student}
+        {knob, dir, say_beginner, say_practitioner}
     """
     meets_claim = (
         claim_threshold is not None and evm < float(claim_threshold)
@@ -107,16 +107,16 @@ def _diagnose_evm(
         )
         sugg: List[dict] = [{
             "knob": "chan.noise_voltage", "dir": "↑ (optional stress test)",
-            "say_novice": "The target is already met. No change is needed; increase the noise only if you want to observe degradation.",
-            "say_student": "Optional: increase chan.noise_voltage for a robustness stress test.",
+            "say_beginner": "The target is already met. No change is needed; increase the noise only if you want to observe degradation.",
+            "say_practitioner": "Optional: increase chan.noise_voltage for a robustness stress test.",
         }]
         return verdict, sugg, True
     if evm < _EVM_GOOD:
         verdict = "EVM is normal and link quality is excellent."
         sugg = [{
             "knob": "chan.noise_voltage", "dir": "↑ (stress test)",
-            "say_novice": "The signal is clean; increase the noise only if you want to observe degradation.",
-            "say_student": "Increase chan.noise_voltage for a robustness stress test.",
+            "say_beginner": "The signal is clean; increase the noise only if you want to observe degradation.",
+            "say_practitioner": "Increase chan.noise_voltage for a robustness stress test.",
         }]
     elif evm < _EVM_USABLE:
         verdict = (
@@ -124,19 +124,19 @@ def _diagnose_evm(
         )
         sugg = [{
             "knob": "chan.noise_voltage", "dir": "↓ (optional)",
-            "say_novice": "This is not a fault. Reduce the noise if you want an even cleaner signal.",
-            "say_student": "Optional: reduce chan.noise_voltage to lower EVM further.",
+            "say_beginner": "This is not a fault. Reduce the noise if you want an even cleaner signal.",
+            "say_practitioner": "Optional: reduce chan.noise_voltage to lower EVM further.",
         }]
     else:
         verdict = "EVM is high; symbol decisions may fail. Inspect noise, frequency offset, and synchronization."
         sugg = [{
             "knob": "chan.noise_voltage", "dir": "↓",
-            "say_novice": "The signal is distorted. Reduce the noise substantially and check again.",
-            "say_student": "Reduce chan.noise_voltage substantially to determine whether noise is dominant.",
+            "say_beginner": "The signal is distorted. Reduce the noise substantially and check again.",
+            "say_practitioner": "Reduce chan.noise_voltage substantially to determine whether noise is dominant.",
         }, {
             "knob": "chan.freq_offset", "dir": "→0",
-            "say_novice": "If the signal points rotate, set the frequency offset back to 0.",
-            "say_student": "A rotating constellation indicates frequency offset; set freq_offset=0 or add carrier recovery.",
+            "say_beginner": "If the signal points rotate, set the frequency offset back to 0.",
+            "say_practitioner": "A rotating constellation indicates frequency offset; set freq_offset=0 or add carrier recovery.",
         }]
     return verdict, sugg, False
 

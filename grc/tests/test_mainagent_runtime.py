@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from grc.agent.memory.profile import UserProfile
 from grc.agent.service import MainAgentRuntime, build_mainagent_runtime
 from grc.agent.service import result_projector, session_store
 from grc.agent.service.tools_lc import _call_registry, _wrap_spec
@@ -38,6 +39,22 @@ def _radio_design_stage(status="pending"):
 
 
 class MainAgentRuntimeTest(unittest.TestCase):
+    def test_presentation_settings_are_fixed_and_language_is_explicit(self):
+        profile = UserProfile()
+        self.assertEqual((profile.level, profile.language), ("practitioner", "en"))
+
+        profile.configure("beginner", "cn")
+
+        self.assertEqual((profile.level, profile.language), ("beginner", "cn"))
+        self.assertIn("简体中文", profile.style_prompt())
+        self.assertIn("wording only", profile.style_prompt())
+        self.assertEqual(profile.text("English", "中文"), "中文")
+
+    def test_unknown_presentation_values_do_not_change_selection(self):
+        profile = UserProfile(level="expert", language="cn")
+        profile.configure("automatic", "fr")
+        self.assertEqual((profile.level, profile.language), ("expert", "cn"))
+
     def test_empty_intent_slots_are_normalized(self):
         self.assertEqual(_normalize_intent_slots(None), {})
         self.assertEqual(_normalize_intent_slots({"protocol": "BLE"}), {

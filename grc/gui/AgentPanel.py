@@ -6,8 +6,7 @@ Agent 右侧对话面板 (多轮协商版 GTK 界面)。
 * **多轮协商 DeepRadio**(默认): 持有 ``MainAgentRuntime``，由单 MainAgent 按动态
   Workflow 加载领域 Skill，并通过 SharedState 展示可追溯 Spec 与 Claim/Evidence；
   交付 .grc 时 emit ``open_flow_graph`` 让 MainWindow **原地刷新**当前画布。
-* **专业度档位**(创新 B): 下拉可选 自适应 / 小白 / 学生 / 专家; 选具体档位则
-  钉档 (pin), 选"自适应"则放开 (unpin) 让画像随对话自适应。
+* **显示偏好**: 专业度控制 MainAgent 的表达方式，语言控制 DeepRadio 界面和回复语言。
 
 所有产物统一输出到工程根目录下的 ``local/output/``, 便于查找与管理。
 
@@ -27,6 +26,7 @@ from gi.repository import Gtk, GLib, GObject, Gdk, GdkPixbuf, Pango
 
 from .ClaimsPanel import ClaimsPanel
 from .chat_markup import escape_pango, markdown_to_pango
+from .deepradio_i18n import normalize_language, tr
 from .workflow_presenter import present
 
 log = logging.getLogger(__name__)
@@ -45,13 +45,13 @@ def _output_dir():
     return out
 
 
-#: 档位下拉项 -> (是否自适应, 钉档档位值)。档位值对应 ExpertiseLevel。
 _LEVEL_CHOICES = [
-    ("Adaptive", (True, None)),
-    ("Novice", (False, "novice")),
-    ("Student", (False, "student")),
-    ("Expert", (False, "expert")),
+    ("Beginner", "beginner"),
+    ("Practitioner", "practitioner"),
+    ("Expert", "expert"),
 ]
+
+_LANGUAGE_CHOICES = [("EN", "en"), ("CN", "cn")]
 
 #: 产物图字段 -> 中文标题, 按此顺序内联展示。
 _ARTIFACT_IMAGES = [
@@ -63,10 +63,8 @@ _ARTIFACT_IMAGES = [
 _USER_ROLES = ("You",)
 _BUBBLE_RADIUS = 16
 _WELCOME_TEXT = (
-    "Hello! I can help design and operate a radio system through iterative "
-    "collaboration (flowgraph → simulation → refinement).\nArtifacts are saved under "
-    "local/output/<session_id>/ and session records under local/agent_sessions/. "
-    "Describe what you want to accomplish."
+    "Hello, I’m DeepRadio. I can help turn your radio ideas into a working "
+    "system. Tell me what you have in mind, and we can get started."
 )
 
 # Quartz 上 CSS background-color 经常不生效,气泡底色用 Cairo 画。
@@ -306,16 +304,27 @@ class AgentPanel(Gtk.VBox):
         # MainAgent Runtime 惰性创建，避免无 gnuradio 时导入报错。
         self._runtime = None
         self._canvas_path = ""
+        self._language = "en"
         # ---- 顶部控制条 ----
         ctrl = Gtk.HBox()
-        ctrl.pack_start(Gtk.Label(label="Expertise:"), False, False, 2)
+        self.expertise_label = Gtk.Label(label="Expertise:")
+        ctrl.pack_start(self.expertise_label, False, False, 2)
 
         self.level_combo = Gtk.ComboBoxText()
         for label, _ in _LEVEL_CHOICES:
             self.level_combo.append_text(label)
-        self.level_combo.set_active(0)  # 默认"自适应"
+        self.level_combo.set_active(1)
         self.level_combo.connect('changed', self._on_level_changed)
         ctrl.pack_start(self.level_combo, False, False, 2)
+
+        self.language_label = Gtk.Label(label="Language:")
+        ctrl.pack_start(self.language_label, False, False, 8)
+        self.language_combo = Gtk.ComboBoxText()
+        for label, _ in _LANGUAGE_CHOICES:
+            self.language_combo.append_text(label)
+        self.language_combo.set_active(0)
+        self.language_combo.connect('changed', self._on_language_changed)
+        ctrl.pack_start(self.language_combo, False, False, 2)
 
         self.new_session_button = Gtk.Button(label="New Session")
         self.new_session_button.connect('clicked', self._on_new_session)
@@ -352,8 +361,9 @@ class AgentPanel(Gtk.VBox):
         self._scroll = scroll
         self._chat_width = 0
         self._live_cards = []
+        self._last_interaction_data = None
         scroll.connect("size-allocate", self._on_chat_size_allocate)
-        self.claims_panel = ClaimsPanel()
+        self.claims_panel = ClaimsPanel(language=self._language)
         self.claims_panel.connect("confirm-pending", self._on_confirm_pending)
         self.claims_panel.connect("cancel-pending", self._on_cancel_pending)
         self.claims_panel.connect("retry-transmit", self._on_retry_transmit)
@@ -391,7 +401,10 @@ class AgentPanel(Gtk.VBox):
         self.set_hexpand(True)
         self.set_halign(Gtk.Align.FILL)
         self.set_size_request(260, -1)
-        self._append("DeepRadio", _WELCOME_TEXT)
+        self._apply_language()
+        self._welcome_label = self._append(
+            "DeepRadio", self._t(_WELCOME_TEXT)
+        )
 
     # ------------------------------------------------------------------ #
     # MainAgent Runtime 惰性创建
@@ -408,8 +421,7 @@ class AgentPanel(Gtk.VBox):
             # 与主线程画布抢同一套 GTK 对象会在 macOS 上 malloc abort.
             # 产物统一落到 local/output/。
             self._runtime.set_output_dir(self._out_dir)
-            # 把当前下拉档位应用到画像。
-            self._apply_level_to_runtime()
+            self._apply_presentation_to_runtime()
             if self._canvas_path:
                 try:
                     self._runtime.bind_opened_project(self._canvas_path)
@@ -426,7 +438,7 @@ class AgentPanel(Gtk.VBox):
     def _on_retry_transmit(self, _panel):
         if self._busy:
             return
-        self._append("You", "Retry Bounded Transmission")
+        self._append("You", self._t("Retry Bounded Transmission"))
         self._set_busy(True)
         threading.Thread(
             target=self._handle_runtime_command,
@@ -443,7 +455,9 @@ class AgentPanel(Gtk.VBox):
     def _submit_runtime_stop(self, *, emergency):
         if self._busy or self._runtime is None:
             return
-        self._append("You", "Emergency Stop" if emergency else "Stop Runtime")
+        self._append(
+            "You", self._t("Emergency Stop" if emergency else "Stop Runtime")
+        )
         self._set_busy(True)
         threading.Thread(
             target=self._handle_runtime_command,
@@ -457,13 +471,15 @@ class AgentPanel(Gtk.VBox):
         try:
             command = json.loads(payload or "{}")
         except (TypeError, ValueError):
-            self._append("DeepRadio", "Invalid intent response. Please try again.")
+            self._append(
+                "DeepRadio", self._t("Invalid intent response. Please try again.")
+            )
             return
         label = "Confirm Intent" if command.get("decision") == "approved" else (
             "Continue Revising Intent" if command.get("decision") == "revise" else
             str(command.get("custom_value") or command.get("value") or "Submit Answer")
         )
-        self._append("You", label)
+        self._append("You", self._t(label))
         self._set_busy(True)
         threading.Thread(
             target=self._handle_runtime_command, args=(command,), daemon=True
@@ -480,7 +496,9 @@ class AgentPanel(Gtk.VBox):
             self._append(
                 "DeepRadio",
                 "{}{}".format(
-                    blocker.get("message") or "The required system capability is not ready.",
+                    blocker.get("message") or self._t(
+                        "The required system capability is not ready."
+                    ),
                     "\n" + str(blocker.get("remediation") or "")
                     if blocker.get("remediation") else "",
                 ),
@@ -492,7 +510,9 @@ class AgentPanel(Gtk.VBox):
             )
             self._append(
                 "You",
-                "Retry This Stage" if action == "retry_stage" else "Cancel Task",
+                self._t(
+                    "Retry This Stage" if action == "retry_stage" else "Cancel Task"
+                ),
             )
             self._set_busy(True)
             threading.Thread(
@@ -503,15 +523,19 @@ class AgentPanel(Gtk.VBox):
             return
         checkpoint_id = str(digest.get("checkpoint_id") or "")
         if not checkpoint_id:
-            self._append("DeepRadio", "There is no pending checkpoint.")
+            self._append(
+                "DeepRadio", self._t("There is no pending checkpoint.")
+            )
             return
         current_stage = str(digest.get("current_stage") or "")
         purpose = str(digest.get("checkpoint_purpose") or "")
         is_ota = purpose == "ota_observation" or current_stage == "over_air_verification"
         self._append(
             "You",
-            ("Target Signal Observed" if is_ota else "Confirm")
-            if decision == "approved" else "Not Observed / Cancel",
+            self._t(
+                ("Target Signal Observed" if is_ota else "Confirm")
+                if decision == "approved" else "Not Observed / Cancel"
+            ),
         )
         self._set_busy(True)
         command = {
@@ -594,24 +618,55 @@ class AgentPanel(Gtk.VBox):
         except Exception as exc:  # noqa: BLE001
             log.warning("清除画布工程失败: %s", exc)
 
-    def _apply_level_to_runtime(self):
-        """把档位下拉的选择应用到 MainAgent Runtime。"""
+    def _t(self, text):
+        return tr(self._language, text)
+
+    def _apply_language(self):
+        self.expertise_label.set_text(self._t("Expertise:"))
+        self.language_label.set_text(self._t("Language:"))
+        active = self.level_combo.get_active()
+        self.level_combo.remove_all()
+        for label, _level in _LEVEL_CHOICES:
+            self.level_combo.append_text(self._t(label))
+        self.level_combo.set_active(active if active >= 0 else 1)
+        self.new_session_button.set_label(self._t("New Session"))
+        self.entry.set_placeholder_text(self._t(
+            "Describe the radio system you want, e.g. build a BPSK link over AWGN and show the constellation"
+        ))
+        self.send_button.set_label(self._t("Send"))
+        self.claims_panel.set_language(self._language)
+
+    def _apply_presentation_to_runtime(self):
+        """Apply the two user-selected presentation settings."""
         if self._runtime is None:
             return
         idx = self.level_combo.get_active()
         if idx < 0:
-            idx = 0
-        adaptive, pinned = _LEVEL_CHOICES[idx][1]
-        self._runtime.record_profile_choice(adaptive=adaptive, pinned=pinned)
+            idx = 1
+        self._runtime.set_presentation(
+            _LEVEL_CHOICES[idx][1], self._language
+        )
 
     # ------------------------------------------------------------------ #
     # 交互
     # ------------------------------------------------------------------ #
     def _on_level_changed(self, _combo):
-        self._apply_level_to_runtime()
-        idx = self.level_combo.get_active()
-        label = _LEVEL_CHOICES[max(idx, 0)][0]
-        self._set_status("Expertise: {}".format(label))
+        self._apply_presentation_to_runtime()
+
+    def _on_language_changed(self, _combo):
+        index = self.language_combo.get_active()
+        if index < 0:
+            index = 0
+        self._language = normalize_language(_LANGUAGE_CHOICES[index][1])
+        self._apply_language()
+        self._welcome_label.set_markup(
+            "<span foreground='{}'>{}</span>".format(
+                _THEME["agent"]["text"], escape_pango(self._t(_WELCOME_TEXT))
+            )
+        )
+        self._apply_presentation_to_runtime()
+        if self._last_interaction_data is not None:
+            self._replace_interaction_cards(*self._last_interaction_data)
 
     def _on_new_session(self, _button):
         if self._busy:
@@ -646,10 +701,13 @@ class AgentPanel(Gtk.VBox):
         for child in list(self._log_box.get_children()):
             self._log_box.remove(child)
         self._live_cards = []
+        self._last_interaction_data = None
         self.claims_panel.clear()
         self.emit('new_session')
         self._ensure_runtime()
-        self._append("DeepRadio", _WELCOME_TEXT)
+        self._welcome_label = self._append(
+            "DeepRadio", self._t(_WELCOME_TEXT)
+        )
         self._set_busy(False)
         return False
 
@@ -716,14 +774,14 @@ class AgentPanel(Gtk.VBox):
 
     def _on_agent_reply(self, reply):
         """主线程: 回显叙述 + 内联产物图；仅交付阶段刷新画布。"""
-        self._append("DeepRadio", reply.text or "(No output)")
+        self._append("DeepRadio", reply.text or self._t("(No output)"))
 
         artifacts = reply.artifacts or {}
         # 内联展示产物图。
         for key, title in _ARTIFACT_IMAGES:
             path = artifacts.get(key)
             if path and os.path.exists(path):
-                self._append_image(title, path)
+                self._append_image(self._t(title), path)
         metrics = artifacts.get("metrics") if isinstance(
             artifacts.get("metrics"), dict) else {}
         self.claims_panel.update_data(
@@ -822,8 +880,8 @@ class AgentPanel(Gtk.VBox):
         return True
 
     def _on_error(self, message):
-        self._append("DeepRadio", "Error: {}".format(message))
-        self._set_status("Error")
+        self._append("DeepRadio", "{}: {}".format(self._t("Error"), message))
+        self._set_status(self._t("Error"))
         self._set_busy(False)
         self._stop_runtime_poll()
         return False
@@ -843,8 +901,11 @@ class AgentPanel(Gtk.VBox):
         self.entry.set_sensitive(not busy)
         self.send_button.set_sensitive(not busy)
         self.level_combo.set_sensitive(not busy)
+        self.language_combo.set_sensitive(not busy)
         self.new_session_button.set_sensitive(not busy)
-        self.send_button.set_label("Processing…" if busy else "Send")
+        self.send_button.set_label(
+            self._t("Processing…" if busy else "Send")
+        )
         if busy and self._runtime_poll_id is None:
             self._runtime_poll_id = GLib.timeout_add(1000, self._on_runtime_poll)
 
@@ -874,7 +935,9 @@ class AgentPanel(Gtk.VBox):
         wrap.set_halign(Gtk.Align.FILL)
         wrap.set_margin_start(6)
         wrap.set_margin_end(6)
-        wrap.pack_start(self._make_caption(who, theme, is_user), False, False, 0)
+        wrap.pack_start(
+            self._make_caption(self._t(who), theme, is_user), False, False, 0
+        )
 
         bubble = _ChatBubble(theme["fill"], theme["border"])
 
@@ -903,6 +966,7 @@ class AgentPanel(Gtk.VBox):
         wrap.show_all()
         self._log_box.pack_start(wrap, False, False, 0)
         self._scroll_to_bottom()
+        return label
 
     def _append_image(self, title, path):
         """把一张产物图缩放后内联展示(靠左,与 DeepRadio 气泡对齐)。"""
@@ -921,7 +985,7 @@ class AgentPanel(Gtk.VBox):
                 path, img_w, 210, True)
         except Exception as e:  # noqa: BLE001
             log.warning("加载产物图失败 %s: %s", path, e)
-            self._append(title, "(Failed to load image: {})".format(path))
+            self._append(title, self._t("(Failed to load image: {})").format(path))
             return
         bubble = _ChatBubble(_THEME["agent"]["fill"], _THEME["agent"]["border"])
         img = Gtk.Image.new_from_pixbuf(pixbuf)
@@ -956,6 +1020,7 @@ class AgentPanel(Gtk.VBox):
         return wrap, body
 
     def _replace_interaction_cards(self, spec, workflow, claims, pending):
+        self._last_interaction_data = (spec, workflow, claims, pending)
         for widget in list(self._live_cards):
             parent = widget.get_parent()
             if parent is not None:
@@ -985,9 +1050,9 @@ class AgentPanel(Gtk.VBox):
 
     def _append_specification_card(self, specification, spec, workflow, pending):
         status = str(specification.get("status") or "draft")
-        title = "Radio Specification"
+        title = self._t("Radio Specification")
         wrap, body = self._new_conversation_card(title, "#F5F2FF", "#8A6FD1")
-        expander = Gtk.Expander(label="View Current Specification")
+        expander = Gtk.Expander(label=self._t("View Current Specification"))
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=7)
         rows = sorted(
             specification.get("rows") or [],
@@ -1006,7 +1071,8 @@ class AgentPanel(Gtk.VBox):
         }
         current_group = ""
         for row in rows:
-            group = str(row.get("group") or "Added") + ":"
+            group_id = str(row.get("group") or "Added")
+            group = self._t(group_id) + ":"
             if group != current_group:
                 group_label = _FlowLabel(label=group)
                 group_label.set_markup("<b>{}</b>".format(escape_pango(group)))
@@ -1032,7 +1098,7 @@ class AgentPanel(Gtk.VBox):
             source = str(row.get("source") or "System")
             status_label = str(row.get("status_label") or "")
             badge_text = " · ".join(
-                part for part in (source, status_label) if part
+                self._t(part) for part in (source, status_label) if part
             )
             badge = Gtk.Label()
             badge.set_halign(Gtk.Align.END)
@@ -1056,16 +1122,20 @@ class AgentPanel(Gtk.VBox):
 
     def _append_diagnosis_card(self, diagnosis):
         wrap, body = self._new_conversation_card(
-            "Diagnosis", "#F3F8FF", "#4C78C2"
+            self._t("Diagnosis"), "#F3F8FF", "#4C78C2"
         )
         for item in diagnosis.get("findings") or []:
             status = str(item.get("status_id") or "unknown")
             marker = "✓" if status == "pass" else "✕" if status == "fail" else "?"
             text = "{} {} — {}".format(
-                marker, item.get("label") or "Check", item.get("status") or "Unknown"
+                marker,
+                self._t(item.get("label") or "Check"),
+                self._t(item.get("status") or "Unknown"),
             )
             if item.get("remediation") and status != "pass":
-                text += "\nRecommendation: " + str(item.get("remediation"))
+                text += "\n" + self._t("Recommendation: ") + str(
+                    item.get("remediation")
+                )
             label = _FlowLabel(label=text)
             body.pack_start(label, False, False, 0)
         self._log_box.pack_start(wrap, False, False, 0)

@@ -10,6 +10,7 @@ gi.require_version("Gdk", "3.0")
 from gi.repository import Gdk, GObject, Gtk, Pango
 
 from .chat_markup import escape_pango
+from .deepradio_i18n import normalize_language, tr
 from .workflow_presenter import layer_label, present
 
 _escape = escape_pango
@@ -87,8 +88,9 @@ class ClaimsPanel(Gtk.Frame):
         "emergency-stop": (GObject.SignalFlags.RUN_FIRST, None, ()),
     }
 
-    def __init__(self):
-        Gtk.Frame.__init__(self, label="Workflow Monitor")
+    def __init__(self, language="en"):
+        self._language = normalize_language(language)
+        Gtk.Frame.__init__(self, label=self._t("Workflow Monitor"))
         self.set_size_request(-1, 120)
         root = Gtk.VBox(spacing=4)
         root.set_vexpand(True)
@@ -103,6 +105,8 @@ class ClaimsPanel(Gtk.Frame):
         self._last_workflow = {}
         self._last_pending = {}
         self._last_spec = {}
+        self._last_view_model = {}
+        self._last_metrics = {}
 
         root.pack_start(self._build_activity_bar(), False, False, 2)
         root.pack_start(self._build_metrics_row(), False, False, 0)
@@ -114,11 +118,12 @@ class ClaimsPanel(Gtk.Frame):
         self._view.set_search_column(0)
         self._view.set_grid_lines(Gtk.TreeViewGridLines.BOTH)
         self._view.set_tooltip_column(0)
-        for index, title in enumerate(("Claim", "Category", "Status", "Version")):
+        self._column_titles = ("Claim", "Category", "Status", "Version")
+        for index, title in enumerate(self._column_titles):
             renderer = Gtk.CellRendererText()
             renderer.set_property("editable", False)
             renderer.set_property("ellipsize", Pango.EllipsizeMode.END)
-            column = Gtk.TreeViewColumn(title, renderer, text=index)
+            column = Gtk.TreeViewColumn(self._t(title), renderer, text=index)
             column.set_resizable(True)
             column.set_sort_column_id(index)
             column.set_reorderable(True)
@@ -139,17 +144,17 @@ class ClaimsPanel(Gtk.Frame):
         scroll.add(self._view)
 
         self._workflow_steps = Gtk.VBox(spacing=3)
-        self._workflow_monitor = Gtk.Frame(label="Workflow")
+        self._workflow_monitor = Gtk.Frame(label=self._t("Workflow"))
         self._workflow_monitor.set_margin_start(2)
         self._workflow_monitor.set_margin_end(2)
         self._workflow_monitor.add(self._workflow_steps)
         root.pack_start(self._workflow_monitor, False, False, 0)
 
-        self._claim_summary = Gtk.Label(label="No verifiable claims yet")
+        self._claim_summary = Gtk.Label(label=self._t("No verifiable claims yet"))
         self._claim_summary.set_halign(Gtk.Align.START)
         self._claim_summary.set_xalign(0.0)
         self._claim_summary.set_margin_start(6)
-        self._claims_frame = Gtk.Frame(label="Claims")
+        self._claims_frame = Gtk.Frame(label=self._t("Claims"))
         self._claims_frame.set_vexpand(True)
         claims_box = Gtk.VBox(spacing=2)
         claims_box.pack_start(self._claim_summary, False, False, 0)
@@ -160,14 +165,16 @@ class ClaimsPanel(Gtk.Frame):
         root.pack_start(self._claims_frame, True, True, 0)
 
         self._hardware_rows = Gtk.VBox(spacing=2)
-        self._hardware_frame = Gtk.Frame(label="Hardware Detection")
+        self._hardware_frame = Gtk.Frame(label=self._t("Hardware Detection"))
         self._hardware_frame.set_margin_start(2)
         self._hardware_frame.set_margin_end(2)
         self._hardware_frame.add(self._hardware_rows)
         root.pack_start(self._hardware_frame, False, False, 0)
 
         self._hint = Gtk.Label(
-            label="After you describe a request, the current design, simulation, or diagnosis stage will appear here."
+            label=self._t(
+                "After you describe a request, the current design, simulation, or diagnosis stage will appear here."
+            )
         )
         self._hint.set_line_wrap(True)
         self._hint.set_halign(Gtk.Align.START)
@@ -186,6 +193,37 @@ class ClaimsPanel(Gtk.Frame):
         self._detail_scroll.set_no_show_all(True)
         self._detail_scroll.add(self._details)
 
+    def _t(self, text):
+        return tr(self._language, text)
+
+    def set_language(self, language):
+        self._language = normalize_language(language)
+        self.set_label(self._t("Workflow Monitor"))
+        self._claims_frame.set_label(self._t("Claims"))
+        self._hardware_frame.set_label(self._t("Hardware Detection"))
+        for column, title in zip(self._view.get_columns(), self._column_titles):
+            column.set_title(self._t(title))
+        self._stop_btn.set_label(self._t("Stop"))
+        self._emergency_btn.set_label(self._t("Emergency Stop"))
+        self._interaction_entry.set_placeholder_text(
+            self._t("Enter a custom answer")
+        )
+        self._evidence_btn.set_label(self._t("Attach Screenshot"))
+        self._retry_btn.set_label(self._t("Retry Bounded Transmission"))
+        self._hint.set_text(self._t(
+            "After you describe a request, the current design, simulation, or diagnosis stage will appear here."
+        ))
+        self._refresh_claim_store()
+        if self._last_view_model:
+            self._set_paper_view(self._last_view_model)
+        else:
+            self._claim_summary.set_text(self._t("No verifiable claims yet"))
+            self._set_workflow_monitor({})
+            self._set_hardware_detection({})
+        self._set_runtime_line(self._last_workflow)
+        self._set_metrics(self._last_metrics, self._claims)
+        self._set_pending(self._last_pending)
+
     def _build_activity_bar(self):
         box = Gtk.VBox(spacing=2)
         self._runtime_label = Gtk.Label(label="")
@@ -197,9 +235,9 @@ class ClaimsPanel(Gtk.Frame):
         box.pack_start(self._runtime_label, False, False, 0)
 
         runtime_controls = Gtk.HBox(spacing=4)
-        stop_btn = Gtk.Button(label="Stop")
+        stop_btn = Gtk.Button(label=self._t("Stop"))
         stop_btn.connect("clicked", lambda _button: self.emit("stop-runtime"))
-        emergency_btn = Gtk.Button(label="Emergency Stop")
+        emergency_btn = Gtk.Button(label=self._t("Emergency Stop"))
         emergency_btn.connect(
             "clicked", lambda _button: self.emit("emergency-stop")
         )
@@ -208,6 +246,8 @@ class ClaimsPanel(Gtk.Frame):
         runtime_controls.set_no_show_all(True)
         runtime_controls.set_visible(False)
         self._runtime_controls = runtime_controls
+        self._stop_btn = stop_btn
+        self._emergency_btn = emergency_btn
         box.pack_start(runtime_controls, False, False, 0)
 
         pending_row = Gtk.HBox(spacing=4)
@@ -220,22 +260,24 @@ class ClaimsPanel(Gtk.Frame):
         self._interaction_combo.set_no_show_all(True)
         pending_row.pack_start(self._interaction_combo, False, False, 0)
         self._interaction_entry = Gtk.Entry()
-        self._interaction_entry.set_placeholder_text("Enter a custom answer")
+        self._interaction_entry.set_placeholder_text(
+            self._t("Enter a custom answer")
+        )
         self._interaction_entry.set_no_show_all(True)
         self._interaction_entry.set_width_chars(16)
         pending_row.pack_start(self._interaction_entry, False, False, 0)
         self._interaction_choices = []
-        self._confirm_btn = Gtk.Button(label="Confirm")
+        self._confirm_btn = Gtk.Button(label=self._t("Confirm"))
         self._confirm_btn.connect("clicked", self._on_confirm_pending)
-        self._cancel_btn = Gtk.Button(label="Cancel")
+        self._cancel_btn = Gtk.Button(label=self._t("Cancel"))
         self._cancel_btn.connect("clicked", self._on_cancel_pending)
         pending_row.pack_start(self._confirm_btn, False, False, 0)
         pending_row.pack_start(self._cancel_btn, False, False, 2)
-        self._evidence_btn = Gtk.Button(label="Attach Screenshot")
+        self._evidence_btn = Gtk.Button(label=self._t("Attach Screenshot"))
         self._evidence_btn.connect("clicked", self._on_attach_evidence)
         self._evidence_btn.set_no_show_all(True)
         pending_row.pack_start(self._evidence_btn, False, False, 0)
-        self._retry_btn = Gtk.Button(label="Retry Bounded Transmission")
+        self._retry_btn = Gtk.Button(label=self._t("Retry Bounded Transmission"))
         self._retry_btn.connect("clicked", self._on_retry_transmit)
         self._retry_btn.set_no_show_all(True)
         pending_row.pack_start(self._retry_btn, False, False, 2)
@@ -269,24 +311,12 @@ class ClaimsPanel(Gtk.Frame):
         self._claims = list(
             (view_model.get("claims") or {}).get("rows") or []
         )
-        self._store.clear()
-        for claim in self._claims:
-            self._store.append(
-                [
-                    str(claim.get("statement", "")),
-                    layer_label(claim.get("layer", "")),
-                    "{}{}".format(
-                        str(claim.get("status", "Untested")),
-                        " · stale"
-                        if str(claim.get("freshness") or "").lower() == "stale"
-                        else "",
-                    ),
-                    int(claim.get("version", 0)),
-                ]
-            )
+        self._last_view_model = view_model
+        self._refresh_claim_store()
         self._set_paper_view(view_model)
         self._last_workflow = workflow_view
         self._set_activity(activity or {}, self._last_workflow)
+        self._last_metrics = dict(metrics or {})
         self._set_metrics(metrics, self._claims)
         self._set_pending(dict(view_model.get("interaction") or {}))
         empty = (
@@ -300,17 +330,35 @@ class ClaimsPanel(Gtk.Frame):
             self._set_details("")
         self._updating = False
 
+    def _refresh_claim_store(self):
+        self._store.clear()
+        for claim in self._claims:
+            status = self._t(str(claim.get("status", "Untested")))
+            if str(claim.get("freshness") or "").lower() == "stale":
+                status += " · " + self._t("stale")
+            self._store.append(
+                [
+                    str(claim.get("statement", "")),
+                    self._t(layer_label(claim.get("layer", ""))),
+                    status,
+                    int(claim.get("version", 0)),
+                ]
+            )
+
     def clear(self):
         self._updating = True
         self._claims = []
         self._store.clear()
-        self._claim_summary.set_text("No verifiable claims yet")
+        self._claim_summary.set_text(self._t("No verifiable claims yet"))
         self._set_runtime_line({})
         self.evidence_path = ""
         self._set_metrics({}, [])
         self._set_details("")
         self._set_pending({})
         self._last_spec = {}
+        self._last_view_model = {}
+        self._last_workflow = {}
+        self._last_metrics = {}
         self._set_workflow_monitor({})
         self._set_hardware_detection({})
         self._hint.set_visible(True)
@@ -322,15 +370,17 @@ class ClaimsPanel(Gtk.Frame):
         if counts:
             ordered = ("Contradicted", "Unresolved", "Untested", "Supported")
             parts = [
-                "{} {}".format(name, counts[name])
+                "{} {}".format(self._t(name), counts[name])
                 for name in ordered if counts.get(name)
             ]
             if claim_view.get("stale_count"):
-                parts.append("Stale {}".format(claim_view["stale_count"]))
+                parts.append("{} {}".format(
+                    self._t("Stale"), claim_view["stale_count"]
+                ))
             summary = " · ".join(parts)
-            self._claim_summary.set_text("Claims: " + summary)
+            self._claim_summary.set_text(self._t("Claims:") + " " + summary)
         else:
-            self._claim_summary.set_text("No verifiable claims yet")
+            self._claim_summary.set_text(self._t("No verifiable claims yet"))
         self._set_workflow_monitor(dict(view_model.get("workflow") or {}))
         self._set_hardware_detection(dict(view_model.get("hardware_detection") or {}))
 
@@ -338,10 +388,12 @@ class ClaimsPanel(Gtk.Frame):
         for child in self._workflow_steps.get_children():
             self._workflow_steps.remove(child)
         if not workflow.get("visible"):
-            self._workflow_monitor.set_label("Workflow")
+            self._workflow_monitor.set_label(self._t("Workflow"))
             empty = _stage_label()
             empty.set_markup(
-                "<span foreground='#98A2B3'>No active workflow yet</span>"
+                "<span foreground='#98A2B3'>{}</span>".format(
+                    _escape(self._t("No active workflow yet"))
+                )
             )
             empty.set_margin_start(8)
             self._workflow_steps.pack_start(empty, False, False, 4)
@@ -350,13 +402,17 @@ class ClaimsPanel(Gtk.Frame):
         stages = list(workflow.get("stages") or [])
         status = str(workflow.get("state_label") or "Planned")
         title = str(workflow.get("title") or "")
-        prefix = "Workflow" if title in {"", "Workflow"} else "Workflow · " + title
+        prefix = self._t("Workflow")
+        if title not in {"", "Workflow"}:
+            prefix += " · " + self._t(title)
         self._workflow_monitor.set_label(
-            "{} · Step {}/{} · {}".format(
+            "{} · {} · {}".format(
                 prefix,
-                workflow.get("stage_index") or 0,
-                workflow.get("stage_total") or len(stages),
-                status,
+                self._t("Step {}/{}").format(
+                    workflow.get("stage_index") or 0,
+                    workflow.get("stage_total") or len(stages),
+                ),
+                self._t(status),
             )
         )
         completed = list(workflow.get("completed") or [])
@@ -375,7 +431,7 @@ class ClaimsPanel(Gtk.Frame):
             ]
         if completed:
             expander = Gtk.Expander(
-                label="Completed ({})".format(len(completed))
+                label=self._t("Completed ({})").format(len(completed))
             )
             expander.set_expanded(False)
             box = Gtk.VBox(spacing=2)
@@ -389,7 +445,7 @@ class ClaimsPanel(Gtk.Frame):
             )
         if pending:
             expander = Gtk.Expander(
-                label="Upcoming ({})".format(len(pending))
+                label=self._t("Upcoming ({})").format(len(pending))
             )
             expander.set_expanded(False)
             box = Gtk.VBox(spacing=2)
@@ -412,7 +468,7 @@ class ClaimsPanel(Gtk.Frame):
         label.set_markup(
             "<span foreground='{color}'>{state}</span>".format(
                 color=style["text"],
-                state=_escape(state),
+                state=_escape(self._t(state)),
             )
         )
         label.set_margin_start(8)
@@ -430,14 +486,16 @@ class ClaimsPanel(Gtk.Frame):
     def _build_previous_attempt_line(self, attempt):
         """Dim summary of a superseded workflow (Previous Attempt)."""
         status = str(attempt.get("outcome") or attempt.get("status") or "")
-        text = "↩ Previous attempt: {}{} · {} stages{}".format(
-            attempt.get("task_label") or "Workflow",
+        text = "↩ {}：{}{} · {} {}{}".format(
+            self._t("Previous attempt"),
+            self._t(attempt.get("task_label") or "Workflow"),
             (
-                " (stopped at {})".format(attempt.get("stage_label"))
+                " ({})".format(self._t(attempt.get("stage_label")))
                 if attempt.get("stage_label") else ""
             ),
             attempt.get("stage_count") or 0,
-            " · {}".format(status) if status else "",
+            self._t("stages"),
+            " · {}".format(self._t(status)) if status else "",
         )
         label = _stage_label()
         label.set_markup("<span foreground='#B0B7C3'>{}</span>".format(
@@ -469,10 +527,12 @@ class ClaimsPanel(Gtk.Frame):
             else ""
         )
         header_text = "{} {}".format(
-            style["marker"], stage.get("label") or stage.get("id") or "Stage"
+            style["marker"], self._t(
+                stage.get("label") or stage.get("id") or "Stage"
+            )
         )
         if status_word:
-            header_text += "  ·  {}".format(status_word)
+            header_text += "  ·  {}".format(self._t(status_word))
         header.set_markup(
             "<span foreground='{}'{}>{}</span>".format(
                 style["text"],
@@ -498,9 +558,10 @@ class ClaimsPanel(Gtk.Frame):
     def _build_stage_claim_line(self, claim):
         status = str(claim.get("status") or "Untested")
         marker, color = _CLAIM_STATUS_STYLES.get(status, ("○", "#98A2B3"))
+        display_status = self._t(status)
         if str(claim.get("freshness") or "").lower() == "stale":
             marker, color = "○", "#98A2B3"
-            status += " · stale"
+            display_status += " · " + self._t("stale")
         layer = str(claim.get("layer_label") or layer_label(claim.get("layer")))
         label = _stage_label(wrap=True)
         label.set_markup(
@@ -508,9 +569,9 @@ class ClaimsPanel(Gtk.Frame):
             "<span foreground='#6B7A8C'> {layer} · {statement} · {status}</span>".format(
                 color=color,
                 marker=_escape(marker),
-                layer=_escape(layer),
-                statement=_escape(str(claim.get("statement") or "Evidence")),
-                status=_escape(status),
+                layer=_escape(self._t(layer)),
+                statement=_escape(str(claim.get("statement") or self._t("Evidence"))),
+                status=_escape(display_status),
             )
         )
         label.set_margin_start(18)
@@ -575,13 +636,13 @@ class ClaimsPanel(Gtk.Frame):
         status = str(runtime.get("status") or ("running" if runtime.get("running") else "—"))
         remaining = float(runtime.get("remaining_seconds") or 0.0)
         max_duration = runtime.get("max_duration_seconds") or runtime.get("duration_seconds")
-        parts = [
-            "Runtime: {}".format(status),
-        ]
+        parts = [self._t("Runtime:") + " " + self._t(status)]
         if runtime.get("running"):
-            parts.append("Remaining {:.1f}s".format(remaining))
+            parts.append("{} {:.1f}s".format(self._t("Remaining"), remaining))
         if max_duration not in (None, ""):
-            parts.append("Maximum duration {}s".format(max_duration))
+            parts.append("{} {}s".format(
+                self._t("Maximum duration"), max_duration
+            ))
         text = "  |  ".join(parts)
         self._runtime_label.set_text(text)
         self._runtime_label.set_visible(True)
@@ -601,10 +662,12 @@ class ClaimsPanel(Gtk.Frame):
         peak_bin = metrics.get("spectrum_peak_bin")
         if peak is not None:
             if peak_bin is not None:
-                parts.append("Peak {} @ bin {}".format(
-                    _fmt_metric(peak), _fmt_metric(peak_bin)))
+                parts.append("{} {} @ {} {}".format(
+                    self._t("Peak"), _fmt_metric(peak),
+                    self._t("bin"), _fmt_metric(peak_bin)))
             else:
-                parts.append("Peak {}".format(_fmt_metric(peak)))
+                parts.append("{} {}".format(
+                    self._t("Peak"), _fmt_metric(peak)))
         leftover = []
         for key, value in metrics.items():
             if key in (
@@ -617,7 +680,7 @@ class ClaimsPanel(Gtk.Frame):
         visible = bool(parts)
         self._metrics_label.set_visible(visible)
         self._metrics_label.set_text(
-            "Measurements: " + (" · ".join(parts) if parts else "")
+            self._t("Measurements: ") + (" · ".join(parts) if parts else "")
         )
 
     def _on_confirm_pending(self, _button):
@@ -664,14 +727,14 @@ class ClaimsPanel(Gtk.Frame):
     def _on_attach_evidence(self, _button):
         toplevel = self.get_toplevel()
         dialog = Gtk.FileChooserDialog(
-            title="Select a LightBlue Screenshot or Capture File",
+            title=self._t("Select a LightBlue Screenshot or Capture File"),
             parent=toplevel if isinstance(toplevel, Gtk.Window) else None,
             action=Gtk.FileChooserAction.OPEN,
         )
-        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
-        dialog.add_button("Select", Gtk.ResponseType.OK)
+        dialog.add_button(self._t("Cancel"), Gtk.ResponseType.CANCEL)
+        dialog.add_button(self._t("Select"), Gtk.ResponseType.OK)
         image_filter = Gtk.FileFilter()
-        image_filter.set_name("Images")
+        image_filter.set_name(self._t("Images"))
         image_filter.add_mime_type("image/png")
         image_filter.add_mime_type("image/jpeg")
         image_filter.add_pattern("*.png")
@@ -679,7 +742,7 @@ class ClaimsPanel(Gtk.Frame):
         image_filter.add_pattern("*.jpeg")
         dialog.add_filter(image_filter)
         any_filter = Gtk.FileFilter()
-        any_filter.set_name("All Files")
+        any_filter.set_name(self._t("All Files"))
         any_filter.add_pattern("*")
         dialog.add_filter(any_filter)
         try:
@@ -736,9 +799,18 @@ class ClaimsPanel(Gtk.Frame):
         if interaction_entry is not None:
             interaction_entry.set_visible(False)
         if visible:
-            self._pending_label.set_text(str(pending.get("message") or ""))
-            self._confirm_btn.set_label(str(pending.get("confirm_label") or "Confirm"))
-            self._cancel_btn.set_label(str(pending.get("cancel_label") or "Cancel"))
+            message = str(pending.get("message") or "")
+            if self._language == "cn":
+                message = str(pending.get("message_cn") or self._t(message))
+            self._pending_label.set_text(
+                message
+            )
+            self._confirm_btn.set_label(
+                self._t(str(pending.get("confirm_label") or "Confirm"))
+            )
+            self._cancel_btn.set_label(
+                self._t(str(pending.get("cancel_label") or "Cancel"))
+            )
         else:
             self._pending_label.set_text("")
             self._confirm_btn.set_label("")
@@ -835,8 +907,8 @@ class ClaimsPanel(Gtk.Frame):
         view.grab_focus()
         view.set_cursor(path, column, False)
         menu = Gtk.Menu()
-        copy_cell = Gtk.MenuItem(label="Copy Cell")
-        copy_row = Gtk.MenuItem(label="Copy Row")
+        copy_cell = Gtk.MenuItem(label=self._t("Copy Cell"))
+        copy_row = Gtk.MenuItem(label=self._t("Copy Row"))
         copy_cell.connect(
             "activate", lambda *_: self._copy_cell(path, column))
         copy_row.connect("activate", lambda *_: self._copy_selected_row())

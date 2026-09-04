@@ -90,7 +90,6 @@ class MainAgentRuntime:
         self._tool_ctx: Optional[ToolContext] = None
         self._progress_listeners: list[Any] = []
         self._output_dir = ""
-        self._adaptive = True
 
     def set_output_dir(self, path: str) -> None:
         self._output_dir = str(path or "")
@@ -105,6 +104,13 @@ class MainAgentRuntime:
     @property
     def profile_level(self) -> str:
         return self.profile.level
+
+    @property
+    def response_language(self) -> str:
+        return self.profile.language
+
+    def _text(self, english: str, chinese: str) -> str:
+        return self.profile.text(english, chinese)
 
     def subscribe_progress(self, callback: Any) -> None:
         if callable(callback) and callback not in self._progress_listeners:
@@ -173,6 +179,7 @@ class MainAgentRuntime:
                 "mutation_forbidden": False,
                 "forbidden_permissions": [],
                 "profile_snapshot": self.profile.level,
+                "language_snapshot": self.profile.language,
             }
         )
         ctx.extra.pop("pending_decision", None)
@@ -244,15 +251,22 @@ class MainAgentRuntime:
 
     def step(self, user_text: str) -> AgentReply:
         if getattr(self._state, "_load_failed", False):
-            return self._error_reply("The session state is corrupted; writes were stopped.")
+            return self._error_reply(self._text(
+                "The session state is corrupted; writes were stopped.",
+                "会话状态已损坏，已停止写入。",
+            ))
         if self._workflow.load_error:
             return self._error_reply(
-                f"The Workflow state is corrupted; writes were stopped. "
-                f"{self._workflow.load_error}"
+                self._text(
+                    "The Workflow state is corrupted; writes were stopped. ",
+                    "工作流状态已损坏，已停止写入。",
+                ) + str(self._workflow.load_error)
             )
         text = str(user_text or "").strip()
         if not text:
-            return self._error_reply("Please describe the radio task.")
+            return self._error_reply(self._text(
+                "Please describe the radio task.", "请描述无线电任务。"
+            ))
         prior_workflow_id = (
             self._workflow.workflow.workflow_id
             if self._workflow.workflow else ""
@@ -267,7 +281,6 @@ class MainAgentRuntime:
         store.append_session_event(
             self.session_id, "user_turn_received", {"text": text}
         )
-        self._observe_profile(text)
         return self._invoke_mainagent(text)
 
     def _invoke_mainagent(self, user_text: str) -> AgentReply:
@@ -278,12 +291,17 @@ class MainAgentRuntime:
             mainagent = orch.build_agent(ctx)
         except Exception as exc:  # noqa: BLE001
             logger.exception("MainAgent assembly failed")
-            return self._error_reply(f"MainAgent could not be created: {exc}")
+            return self._error_reply(self._text(
+                f"MainAgent could not be created: {exc}",
+                f"无法创建 MainAgent：{exc}",
+            ))
         if mainagent is None:
-            return self._error_reply(
+            return self._error_reply(self._text(
                 "MainAgent is unavailable. Configure the LLM and install deepagents; "
-                "the production chain no longer switches to a deterministic Workflow."
-            )
+                "the production chain no longer switches to a deterministic Workflow.",
+                "MainAgent 不可用。请配置大模型并安装 deepagents；"
+                "当前生产链路不会切换到确定性工作流。",
+            ))
         current = self._workflow.digest()
         current_stage = self._workflow.current_stage()
         stage_payload = asdict(current_stage) if current_stage else {}
@@ -334,7 +352,10 @@ class MainAgentRuntime:
             if trace:
                 trace.finish(exc)
             logger.exception("MainAgent execution failed")
-            return self._error_reply(f"MainAgent execution failed: {type(exc).__name__}: {exc}")
+            return self._error_reply(self._text(
+                f"MainAgent execution failed: {type(exc).__name__}: {exc}",
+                f"MainAgent 执行失败：{type(exc).__name__}：{exc}",
+            ))
         if trace:
             trace.finish()
         narrative = self._extract_final_text(result)
@@ -348,17 +369,25 @@ class MainAgentRuntime:
             return self._resolve_checkpoint(command)
         if action == "cancel_workflow":
             self._workflow.cancel()
-            return self._simple_reply("The current task was cancelled.", "CANCELLED")
+            return self._simple_reply(self._text(
+                "The current task was cancelled.", "当前任务已取消。"
+            ), "CANCELLED")
         if action in {"retry_stage", "retry_transmit"}:
             if not self._workflow.retry_current_stage():
-                return self._error_reply("There is no active Workflow to retry.")
+                return self._error_reply(self._text(
+                    "There is no active Workflow to retry.",
+                    "当前没有可重试的工作流。",
+                ))
             return self._invoke_mainagent("The user requested a retry. Re-check current evidence before acting.")
         if action in {"specification_update", "interaction_response"}:
             return self._invoke_mainagent(
                 "The user submitted this structured response: "
                 + json.dumps(command, ensure_ascii=False, default=str)
             )
-        return self._error_reply(f"Unknown GUI command: {action or '(empty)'}")
+        return self._error_reply(self._text(
+            f"Unknown GUI command: {action or '(empty)'}",
+            f"未知的界面命令：{action or '（空）'}",
+        ))
 
     def _resolve_checkpoint(self, command: Dict[str, Any]) -> AgentReply:
         checkpoint_id = str(command.get("checkpoint_id") or "")
@@ -431,7 +460,9 @@ class MainAgentRuntime:
             {**checkpoint, "decision": decision},
         )
         if decision == "rejected" and not ota_observation:
-            return self._simple_reply("The requested action was cancelled.", "CANCELLED")
+            return self._simple_reply(self._text(
+                "The requested action was cancelled.", "请求的操作已取消。"
+            ), "CANCELLED")
         if decision == "rejected":
             return self._invoke_mainagent(
                 "The user did not observe the expected task result. Treat this as "
@@ -454,7 +485,10 @@ class MainAgentRuntime:
         self._state.project.config["rf_armed"] = False
         self._state.project.config.pop("rf_armed_path", None)
         self._clear_rf_grant()
-        text = "Emergency stop completed." if emergency else "The RF runtime was stopped."
+        text = self._text(
+            "Emergency stop completed." if emergency else "The RF runtime was stopped.",
+            "紧急停止已完成。" if emergency else "射频运行已停止。",
+        )
         return self._finalize_turn(ctx, text, ok=bool(result.get("ok", True)))
 
     def _finalize_turn(
@@ -554,8 +588,13 @@ class MainAgentRuntime:
         )
         reply = AgentReply(
             text=narrative.strip() or (
-                "The MainAgent completed this turn."
-                if ok else "The MainAgent could not complete this turn."
+                self._text(
+                    "The MainAgent completed this turn.",
+                    "MainAgent 已完成本轮任务。",
+                ) if ok else self._text(
+                    "The MainAgent could not complete this turn.",
+                    "MainAgent 未能完成本轮任务。",
+                )
             ),
             stage="WAITING" if waiting else "DELIVER" if ok else "ERROR",
             needs_confirmation=approval_waiting,
@@ -712,22 +751,8 @@ class MainAgentRuntime:
         self._tool_ctx = None
         self._state.save(store.state_path(self.session_id))
 
-    def record_profile_choice(
-        self, *, adaptive: bool, pinned: Optional[str] = None
-    ) -> None:
-        self._adaptive = bool(adaptive)
-        if pinned:
-            self.profile.pin(str(pinned))
-        else:
-            self.profile.unpin()
-
-    def _observe_profile(self, text: str) -> None:
-        if not self._adaptive:
-            return
-        try:
-            self.profile.observe(text)
-        except Exception:  # noqa: BLE001
-            logger.debug("Profile observation failed", exc_info=True)
+    def set_presentation(self, expertise: str, language: str) -> None:
+        self.profile.configure(str(expertise), str(language))
 
     def _clear_rf_grant(self) -> None:
         self._state.project.config.pop("rf_permission_grant", None)

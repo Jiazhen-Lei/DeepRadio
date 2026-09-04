@@ -1,8 +1,7 @@
-"""narrate.py:按用户画像档位渲染自然语言解说(创新 B 的表达执行体)。
+"""Render metric diagnoses using the selected reply style.
 
-同一份结构化诊断结果,对 novice/student/expert 渲染出
-繁简、术语密度、是否给公式都不同的文本。这是"同一后端、分档表达"
-的落地点,被 debug_by_metric 使用。
+The same structured result is phrased for beginner, practitioner, or expert
+users.  This module is an internal dependency of ``debug_by_metric``.
 
 纯模板 + 规则,零依赖,离线可复现。有 LLM 时 agent 可在此基础上润色;
 无 LLM 时这就是最终输出。
@@ -17,11 +16,11 @@ from typing import Any, Dict
 
 def _level(profile) -> str:
     if profile is None:
-        return "student"
+        return "practitioner"
     try:
         return profile.level
     except AttributeError:
-        return "student"
+        return "practitioner"
 
 
 # ---------------------------------------------------------------------------
@@ -36,10 +35,10 @@ def narrate_debug(diagnosis: Dict[str, Any], profile) -> str:
 
     val_str = f"{value:.2f}" if isinstance(value, (int, float)) else str(value)
 
-    if lvl == "novice":
+    if lvl == "beginner":
         s = f"I checked the signal quality ({metric}={val_str}). {_plain(verdict)} "
         if suggestions:
-            s += "My suggestion: " + suggestions[0]["say_novice"]
+            s += "My suggestion: " + suggestions[0]["say_beginner"]
         return s
 
     if lvl == "expert":
@@ -49,11 +48,11 @@ def narrate_debug(diagnosis: Dict[str, Any], profile) -> str:
             s += f" Suggestions: {tips}."
         return s
 
-    # student
+    # practitioner
     s = f"Current {metric}={val_str}; assessment: {verdict}."
     if suggestions:
         s += " Try: "
-        s += "; ".join(f"{x['say_student']}" for x in suggestions[:2])
+        s += "; ".join(f"{x['say_practitioner']}" for x in suggestions[:2])
     return s
 
 

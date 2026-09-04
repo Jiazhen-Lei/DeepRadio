@@ -92,14 +92,13 @@ def build_mainagent_prompt(style_prompt: str = "") -> str:
 
 工具结果、Artifact、Measurement 和 Evidence 必须绑定当前 Workflow、Stage 和工程版本。不能用叙述代替 Evidence，也不能绕过用户确认、工程写入或 RF 安全检查。
 
-使用用户当前使用的语言回复。保持简洁明确，不展示内部 JSON、Stage Context、工具日志或状态字段。""".strip() + style_section
+严格遵循 STYLE 中指定的回复语言和表达风格。保持简洁明确，不展示内部 JSON、Stage Context、工具日志或状态字段。""".strip() + style_section
 
 
 def _resolve_style_prompt(ctx: ToolContext) -> str:
-    """从 ctx.extra['profile'] 取当前档位的表达风格串(创新 B 注入点)。
+    """Read the UI-selected reply style and language from the tool context.
 
-    兼容 profile 为 None / 非 UserProfile / 缺 style_prompt 的情况,任何异常
-    都返回空串(不注入 STYLE 段),绝不影响主流程。
+    Missing or invalid presentation settings never affect the control flow.
     """
     profile = ctx.extra.get("profile") if hasattr(ctx, "extra") else None
     if profile is None:

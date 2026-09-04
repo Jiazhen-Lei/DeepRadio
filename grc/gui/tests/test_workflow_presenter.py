@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 
 from grc.gui.AgentPanel import AgentPanel
 from grc.gui.ClaimsPanel import ClaimsPanel
+from grc.gui.deepradio_i18n import tr
 from grc.gui.workflow_presenter import interaction_view, present
 
 
@@ -33,6 +34,7 @@ class _Widget:
 
 
 class _PresenterHarness:
+    _t = ClaimsPanel._t
     _set_runtime_line = ClaimsPanel._set_runtime_line
     _set_activity = ClaimsPanel._set_activity
     _set_pending = ClaimsPanel._set_pending
@@ -41,6 +43,7 @@ class _PresenterHarness:
     _default_details = staticmethod(ClaimsPanel._default_details)
 
     def __init__(self):
+        self._language = "en"
         self._activity_label = _Widget()
         self._runtime_label = _Widget()
         self._runtime_controls = _Widget()
@@ -58,6 +61,21 @@ class _PresenterHarness:
 class WorkflowPresenterTest(unittest.TestCase):
     def setUp(self):
         self.panel = _PresenterHarness()
+
+    def test_cn_translates_panel_text_without_changing_control_ids(self):
+        pending = interaction_view({}, {
+            "action": "stage_recovery",
+            "approved": False,
+        })
+        self.panel._language = "cn"
+        self.panel._set_pending(pending)
+
+        self.assertEqual(self.panel._confirm_btn.label, "重试此步骤")
+        self.assertEqual(self.panel._cancel_btn.label, "取消工作流")
+        self.assertIn("当前步骤未通过", self.panel._pending_label.text)
+        self.assertEqual(pending["action"], "stage_recovery")
+        self.assertEqual(tr("en", "Workflow"), "Workflow")
+        self.assertEqual(tr("cn", "Workflow"), "工作流")
 
     def test_new_session_stops_running_rf_before_reset(self):
         class _Runtime:
@@ -526,6 +544,8 @@ class WorkflowPresenterTest(unittest.TestCase):
         from grc.gui.ClaimsPanel import ClaimsPanel
 
         class _Harness:
+            _language = "en"
+            _t = ClaimsPanel._t
             _build_stage_row = ClaimsPanel._build_stage_row
             _build_stage_claim_line = ClaimsPanel._build_stage_claim_line
 
@@ -570,6 +590,12 @@ class WorkflowPresenterTest(unittest.TestCase):
         self.assertTrue(_FlowLabel().get_selectable())
         self.assertTrue(_stage_label().get_selectable())
         panel = AgentPanel(None)
+        self.assertEqual(panel.level_combo.get_active(), 1)
+        self.assertEqual(panel.level_combo.get_model().iter_n_children(None), 3)
+        self.assertEqual(panel.language_combo.get_active_text(), "EN")
+        self.assertEqual(
+            panel.language_combo.get_model().iter_n_children(None), 2
+        )
         self.assertTrue(
             panel._split.child_get_property(panel.claims_panel, "resize")
         )

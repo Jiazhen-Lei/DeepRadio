@@ -14,11 +14,11 @@ from typing import Any, Dict, List
 
 
 class ExpertiseLevel(str, Enum):
-    """用户专业度档位(创新 B)。"""
+    """User-selected reply style."""
 
-    NOVICE = "novice"     # 小白:重比喻/少术语/多确认
-    STUDENT = "student"   # 学生:标准 DSP 术语 + 适度解释
-    EXPERT = "expert"     # 专家:精炼、参数直给、少寒暄
+    BEGINNER = "beginner"
+    PRACTITIONER = "practitioner"
+    EXPERT = "expert"
 
 
 @dataclass

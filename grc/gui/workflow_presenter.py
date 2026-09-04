@@ -568,10 +568,15 @@ def interaction_view(
     confirm_label = "Confirm"
     cancel_label = "Cancel"
     message = "Confirm the next workflow step."
+    message_cn = "确认后继续下一工作流步骤。"
     if action == "flowgraph_confirmation" or purpose == "flowgraph_review":
         message = (
             "Review the current flowgraph. Confirm it to continue, ask a "
             "question, or describe a change. Confirmation does not start RF."
+        )
+        message_cn = (
+            "请检查当前流图。确认后继续，也可以提问或说明需要修改的内容。"
+            "确认不会启动射频。"
         )
         confirm_label = "Confirm Flowgraph"
     elif action == "over_air_verification":
@@ -579,6 +584,10 @@ def interaction_view(
             "Confirm whether an independent receiver observed the target "
             "signal over the air. Human confirmation is required; you may "
             "attach a screenshot."
+        )
+        message_cn = (
+            "请确认独立接收设备是否通过空口观测到目标信号。"
+            "此处需要人工确认，也可以添加截图。"
         )
         confirm_label, cancel_label = "Target Signal Observed", "Not Observed"
     elif (
@@ -606,12 +615,21 @@ def interaction_view(
                 f"{frequency}, {sample_rate}, bandwidth {bandwidth}, {level}, "
                 f"for up to {duration} seconds. The controlled stop remains active."
             )
+            message_cn = (
+                f"批准在 {name} [{identity}] 上执行限时射频运行：频率 {frequency}，"
+                f"采样率 {sample_rate}，带宽 {bandwidth}，{level}，最长 {duration} 秒。"
+                "受控停止保持有效。"
+            )
             confirm_label = "Approve Bounded Transmission"
         else:
             message = (
                 f"Confirm saved configuration for {name} [{identity}] at "
                 f"{frequency}, {sample_rate}, bandwidth {bandwidth}, {level}, "
                 "without starting RF."
+            )
+            message_cn = (
+                f"确认已保存的 {name} [{identity}] 配置：频率 {frequency}，"
+                f"采样率 {sample_rate}，带宽 {bandwidth}，{level}。不会启动射频。"
             )
             confirm_label = (
                 "Confirm Saved Configuration"
@@ -623,6 +641,7 @@ def interaction_view(
             "The current step did not pass. Retry after correcting the "
             "reported condition, or cancel the workflow."
         )
+        message_cn = "当前步骤未通过。修正所报告的问题后重试，或取消工作流。"
         confirm_label, cancel_label = "Retry This Step", "Cancel Workflow"
         can_retry = True
     elif action == "capability_blocker" or wait == "capability":
@@ -631,15 +650,24 @@ def interaction_view(
             blocker.get("message")
             or "A required system capability is not available."
         )
+        message_cn = str(
+            blocker.get("message_cn")
+            or blocker.get("message")
+            or "所需的系统能力不可用。"
+        )
         remediation = str(blocker.get("remediation") or "")
         if remediation:
             message += " " + remediation
+            message_cn += " " + str(
+                blocker.get("remediation_cn") or remediation
+            )
         can_confirm = False
         can_retry = bool(blocker.get("retryable", can_retry))
         cancel_label = "Cancel Workflow"
     return {
         "visible": True,
         "message": message,
+        "message_cn": message_cn,
         "confirm_label": confirm_label,
         "cancel_label": cancel_label,
         "can_confirm": can_confirm,
