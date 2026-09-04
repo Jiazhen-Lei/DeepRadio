@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from grc.agent.memory.profile import UserProfile
 from grc.agent.service import MainAgentRuntime, build_mainagent_runtime
@@ -388,6 +388,7 @@ class MainAgentRuntimeTest(unittest.TestCase):
     def test_ota_checkpoint_records_task_evidence_bound_to_run(self):
         runtime = MainAgentRuntime.__new__(MainAgentRuntime)
         runtime.session_id = "runtime-test"
+        runtime.profile = UserProfile()
         runtime._state = SharedState(session_id="runtime-test")
         runtime._state.intent = SharedIntent.new("Send BLE", "wf-test")
         runtime._state.project.config["runtime"] = {
@@ -399,21 +400,23 @@ class MainAgentRuntimeTest(unittest.TestCase):
             layer="task",
             producer="over_air_verification",
         ))
+        update_stage = Mock()
         runtime._workflow = SimpleNamespace(
-            workflow=SimpleNamespace(workflow_id="wf-test"),
+            workflow=SimpleNamespace(workflow_id="wf-test", revision=2),
             resolve_decision=lambda _checkpoint_id, _decision: {
                 "id": "checkpoint-test",
                 "purpose": "ota_observation",
                 "permission": "",
                 "stage_id": "over_air_verification",
             },
+            update_stage=update_stage,
         )
 
         with tempfile.TemporaryDirectory() as directory, patch.object(
             session_store, "state_path", return_value=str(Path(directory) / "state.json")
         ), patch.object(session_store, "append_session_event"), patch.object(
-            runtime, "_invoke_mainagent", return_value="continued"
-        ):
+            runtime, "_make_ctx", return_value=ToolContext()
+        ), patch.object(runtime, "_finalize_turn", return_value="completed"):
             reply = runtime._resolve_checkpoint({
                 "checkpoint_id": "checkpoint-test",
                 "decision": "approved",
@@ -421,9 +424,42 @@ class MainAgentRuntimeTest(unittest.TestCase):
             })
 
         claim = ClaimStore(runtime._state).get("success_condition_1")
-        self.assertEqual(reply, "continued")
+        self.assertEqual(reply, "completed")
         self.assertEqual(claim.status, "Supported")
         self.assertEqual(claim.evidence[-1].observation["run_id"], "run-test")
+        update_stage.assert_called_once()
+        self.assertEqual(update_stage.call_args.kwargs["status"], "completed")
+        self.assertEqual(
+            update_stage.call_args.kwargs["result_refs"],
+            ["task_observation:user_confirmed"],
+        )
+
+    def test_typed_confirmation_resolves_pending_ota_checkpoint(self):
+        runtime = MainAgentRuntime.__new__(MainAgentRuntime)
+        runtime.session_id = "runtime-test"
+        runtime._state = SharedState(session_id="runtime-test")
+        runtime._workflow = SimpleNamespace(
+            load_error="",
+            workflow=SimpleNamespace(checkpoint={
+                "id": "checkpoint-test",
+                "purpose": "record_task_observation",
+                "stage_id": "over_air_verification",
+                "status": "pending",
+            }),
+        )
+
+        with patch.object(session_store, "append_session_event"), patch.object(
+            runtime, "_resolve_checkpoint", return_value="resolved"
+        ) as resolve:
+            reply = runtime.step("是的")
+
+        self.assertEqual(reply, "resolved")
+        command = resolve.call_args.args[0]
+        self.assertEqual(command["checkpoint_id"], "checkpoint-test")
+        self.assertEqual(command["decision"], "approved")
+        self.assertEqual(
+            command["observation"]["evidence_kind"], "human_confirmation"
+        )
 
     def test_hardware_tool_results_are_projected(self):
         state = SharedState(session_id="runtime-test")
@@ -622,7 +658,7 @@ class MainAgentRuntimeTest(unittest.TestCase):
         self.assertEqual(result.stage("radio_specification_alignment").status, "pending")
         self.assertEqual(workflow.reopened_from, "radio_specification_alignment")
 
-    def test_completed_stage_waits_for_the_next_user_turn(self):
+    def test_final_completed_stage_completes_workflow(self):
         with tempfile.TemporaryDirectory() as directory:
             workflow = DynamicWorkflowStore(str(Path(directory) / "workflow.json"))
             workflow.begin_turn("Build a radio", 0)
@@ -653,7 +689,7 @@ class MainAgentRuntimeTest(unittest.TestCase):
                 project_version=0,
             )
 
-        self.assertEqual(result.execution_status, "pending")
+        self.assertEqual(result.execution_status, "completed")
 
     @unittest.skipUnless(
         importlib.util.find_spec("langchain_core"), "langchain_core is not installed"
@@ -736,6 +772,46 @@ class MainAgentRuntimeTest(unittest.TestCase):
         self.assertTrue(completed["ok"])
         self.assertFalse(blocked["ok"])
         self.assertEqual(workflow.workflow.current_stage, "radio_specification_alignment")
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("langchain_core"), "langchain_core is not installed"
+    )
+    def test_over_air_checkpoint_uses_canonical_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workflow = DynamicWorkflowStore(str(Path(directory) / "workflow.json"))
+            workflow.begin_turn("Observe RX spectrum", 0)
+            workflow.update(
+                intent_summary="Observe RX spectrum",
+                intent_slots={},
+                stages=[{"id": "over_air_verification", "status": "running"}],
+                current_stage="over_air_verification",
+                execution_status="running",
+                task_type="DYNAMIC",
+                expected_revision=1,
+                events=[],
+                artifacts={},
+                metrics={},
+                project_version=0,
+            )
+            ctx = ToolContext(extra={
+                "session_id": "runtime-test",
+                "events": [],
+                "artifacts": {},
+                "metrics": {},
+            })
+            tools = {tool.name: tool for tool in build_workflow_tools(ctx, workflow)}
+            with patch.object(session_store, "append_session_event"):
+                result = json.loads(tools["request_user_decision"].invoke({
+                    "stage_id": "over_air_verification",
+                    "question": "Did you observe the target spectrum?",
+                    "purpose": "record_task_observation",
+                    "kind": "input",
+                }))
+
+        checkpoint = result["checkpoint"]
+        self.assertEqual(checkpoint["purpose"], "ota_observation")
+        self.assertEqual(checkpoint["kind"], "approval")
+        self.assertEqual(checkpoint["permission"], "")
 
     def test_stage_update_preserves_the_workflow_plan(self):
         with tempfile.TemporaryDirectory() as directory:

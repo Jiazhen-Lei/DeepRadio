@@ -281,9 +281,29 @@ def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> li
         """Pause the Workflow and request one structured user decision.
 
         Use kind='input' for missing information. Use kind='approval' and
-        permission='rf.start' before physical TX or RX execution. This tool records
-        a request only; it never grants a permission.
+        permission='rf.start' before physical TX or RX execution. Over-air task
+        observations always use the canonical ota_observation approval contract.
+        This tool records a request only; it never grants a permission.
         """
+        if stage_id == "over_air_verification":
+            purpose = "ota_observation"
+            permission = ""
+            kind = "approval"
+            existing = dict(
+                workflow.workflow.checkpoint
+                if workflow.workflow is not None else {}
+            )
+            if (
+                existing.get("status") == "pending"
+                and existing.get("stage_id") == stage_id
+                and existing.get("purpose") == purpose
+            ):
+                ctx.extra["pending_decision"] = existing
+                return json.dumps({
+                    "ok": True,
+                    "checkpoint": existing,
+                    "repeated_request": True,
+                }, ensure_ascii=False)
         try:
             checkpoint = workflow.request_decision(
                 stage_id=stage_id,
