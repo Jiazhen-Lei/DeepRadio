@@ -214,6 +214,7 @@ class DynamicWorkflowStore:
         artifacts: Dict[str, Any],
         metrics: Dict[str, Any],
         project_version: int,
+        allow_reopen: bool = False,
     ) -> DynamicWorkflow:
         if self.workflow is None:
             self.begin_turn(intent_summary, project_version)
@@ -271,6 +272,12 @@ class DynamicWorkflowStore:
         ):
             changed_indexes.append(candidate_current_index)
         self.reopened_from = ""
+        if changed_indexes and not allow_reopen:
+            reopened_index = min(changed_indexes)
+            reopen_stage = candidate.stages[reopened_index].id
+            raise ValueError(
+                f"Workflow reopening from {reopen_stage} requires allow_reopen=true"
+            )
         if changed_indexes:
             reopened_index = min(changed_indexes)
             self.reopened_from = candidate.stages[reopened_index].id

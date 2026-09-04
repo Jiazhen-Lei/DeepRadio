@@ -70,10 +70,13 @@ def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> li
         task_type: str = "DYNAMIC",
         intent_slots: Dict[str, Any] | None = None,
         expected_revision: int = 1,
+        allow_reopen: bool = False,
     ) -> str:
         """Create or update the complete ordered Workflow.
 
         Use this for initial planning or user-requested structural replanning.
+        Routine Stage progress must use update_current_stage. Set allow_reopen
+        only when the user explicitly asks to revise earlier completed work.
         Stage fields: id, inputs, status and result_refs. Objective, skills and
         expected_evidence come from the Stage library.
         Use the revision from CURRENT_WORKFLOW.
@@ -141,6 +144,7 @@ def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> li
                 artifacts=dict(ctx.extra.get("artifacts") or {}),
                 metrics=dict(ctx.extra.get("metrics") or {}),
                 project_version=project_version,
+                allow_reopen=bool(allow_reopen),
             )
         except (TypeError, ValueError) as exc:
             return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)

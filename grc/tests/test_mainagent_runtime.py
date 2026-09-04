@@ -506,6 +506,122 @@ class MainAgentRuntimeTest(unittest.TestCase):
             self.assertEqual(workflow.workflow.base_project_version, 3)
             self.assertEqual(workflow.workflow.revision, revision + 1)
 
+    def test_workflow_cannot_reopen_completed_stage_implicitly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workflow = DynamicWorkflowStore(str(Path(directory) / "workflow.json"))
+            workflow.begin_turn("Build a radio", 0)
+            workflow.update(
+                intent_summary="Build a radio",
+                intent_slots={},
+                stages=[_spec_stage(), _radio_design_stage()],
+                current_stage="radio_specification_alignment",
+                execution_status="running",
+                task_type="DYNAMIC",
+                expected_revision=1,
+                events=[],
+                artifacts={},
+                metrics={},
+                project_version=0,
+            )
+            workflow.update_stage(
+                stage_id="radio_specification_alignment",
+                status="completed",
+                inputs=None,
+                result_refs=["spec_commit"],
+                expected_revision=2,
+                events=[{"kind": "spec_commit", "payload": {"ok": True}}],
+                artifacts={},
+                metrics={},
+                project_version=0,
+            )
+            workflow.update_stage(
+                stage_id="radio_design",
+                status="running",
+                inputs=None,
+                result_refs=None,
+                expected_revision=3,
+                events=[],
+                artifacts={},
+                metrics={},
+                project_version=0,
+            )
+
+            with self.assertRaisesRegex(ValueError, "requires allow_reopen=true"):
+                workflow.update(
+                    intent_summary="Build a radio",
+                    intent_slots={},
+                    stages=[_spec_stage("completed"), _radio_design_stage("running")],
+                    current_stage="radio_specification_alignment",
+                    execution_status="running",
+                    task_type="DYNAMIC",
+                    expected_revision=4,
+                    events=[],
+                    artifacts={},
+                    metrics={},
+                    project_version=0,
+                )
+
+        self.assertEqual(workflow.workflow.current_stage, "radio_design")
+        self.assertEqual(workflow.workflow.revision, 4)
+
+    def test_workflow_can_reopen_completed_stage_explicitly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workflow = DynamicWorkflowStore(str(Path(directory) / "workflow.json"))
+            workflow.begin_turn("Build a radio", 0)
+            workflow.update(
+                intent_summary="Build a radio",
+                intent_slots={},
+                stages=[_spec_stage(), _radio_design_stage()],
+                current_stage="radio_specification_alignment",
+                execution_status="running",
+                task_type="DYNAMIC",
+                expected_revision=1,
+                events=[],
+                artifacts={},
+                metrics={},
+                project_version=0,
+            )
+            workflow.update_stage(
+                stage_id="radio_specification_alignment",
+                status="completed",
+                inputs=None,
+                result_refs=["spec_commit"],
+                expected_revision=2,
+                events=[{"kind": "spec_commit", "payload": {"ok": True}}],
+                artifacts={},
+                metrics={},
+                project_version=0,
+            )
+            workflow.update_stage(
+                stage_id="radio_design",
+                status="running",
+                inputs=None,
+                result_refs=None,
+                expected_revision=3,
+                events=[],
+                artifacts={},
+                metrics={},
+                project_version=0,
+            )
+            result = workflow.update(
+                intent_summary="Build a radio",
+                intent_slots={},
+                stages=[_spec_stage("completed"), _radio_design_stage("running")],
+                current_stage="radio_specification_alignment",
+                execution_status="running",
+                task_type="DYNAMIC",
+                expected_revision=4,
+                events=[],
+                artifacts={},
+                metrics={},
+                project_version=0,
+                allow_reopen=True,
+            )
+
+        self.assertEqual(result.current_stage, "radio_specification_alignment")
+        self.assertEqual(result.stage("radio_specification_alignment").status, "pending")
+        self.assertEqual(workflow.reopened_from, "radio_specification_alignment")
+
     def test_completed_stage_waits_for_the_next_user_turn(self):
         with tempfile.TemporaryDirectory() as directory:
             workflow = DynamicWorkflowStore(str(Path(directory) / "workflow.json"))
