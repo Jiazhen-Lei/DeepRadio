@@ -1,12 +1,7 @@
 """工具注册表:统一的 ``@tool`` 装饰器 + JSON-Schema + 调度入口。
 
-设计目标(对应架构文档第 6 节的调度决策):
-
-* **function-calling 为主**: :func:`openai_schemas` 导出 OpenAI ``tools`` 数组,
-  每个工具带 JSON-Schema 参数描述,供模型可靠地选工具、填参数。
-* **ReAct 文本协议兜底**: :func:`react_tool_descriptions` 导出人类可读的
-  ``名称(参数): 说明`` 清单,用于不支持 function-calling 的接口/离线场景,
-  由 Agent 主循环解析 ``Action/Action Input``。
+工具由 :mod:`service.tools_lc` 桥接为 LangChain ``StructuredTool``,再经
+deepagents 的 function-calling 协议供 MainAgent 调度。
 
 工具签名统一为 ``fn(ctx, **kwargs) -> dict``:
 
@@ -73,6 +68,11 @@ class ToolSpec:
     description: str
     parameters: Dict[str, Any]          # JSON-Schema (type=object)
     group: str = "misc"
+    origin: str = ""
+    runtime: str = ""
+    permission: str = "project.read"
+    idempotent: bool = True
+    requires: List[str] = field(default_factory=list)
 
 
 #: 全局注册表: name -> ToolSpec
@@ -87,13 +87,23 @@ _TOOL_MODULES = (
     "build_tools",
     "critic_tools",
     "sim_tools",
-    "skill_tools",     # 宏工具:把 skills 编排能力暴露给 function-calling
+    "state_tools",
+    "ble_tools",
+    "hardware_tools",
+    "debug_by_metric",
+    "diagnosis_experiment",
+    "diagnosis_checks",
 )
 
 
 def tool(name: str, description: str,
          parameters: Optional[Dict[str, Any]] = None,
-         group: str = "misc"):
+         group: str = "misc",
+         origin: str = "",
+         runtime: str = "",
+         permission: str = "project.read",
+         idempotent: bool = True,
+         requires: Optional[List[str]] = None):
     """把一个函数注册为工具。
 
     Args:
@@ -101,6 +111,10 @@ def tool(name: str, description: str,
         description: 给 LLM 看的一句话说明(何时该用)。
         parameters: JSON-Schema(type=object)。None 表示无参数。
         group: 分组标签(knowledge/build/critic/sim)。
+        origin: 实现归属。``deepradio_protocol`` 是 DeepRadio 协议算法；
+            ``deepradio_compose`` 用 GNU Radio 块组拓扑；``vendor_cli``
+            调用 uhd/iio 等主机命令；``deepradio_runtime`` 是受控子进程。
+        runtime: 实际执行面，如 ``gnuradio_blocks`` / ``grcc`` / ``iio_info``。
 
     被装饰函数签名应为 ``fn(ctx: ToolContext, **kwargs) -> dict``。
     """
@@ -111,7 +125,10 @@ def tool(name: str, description: str,
             logger.warning("工具 %s 已注册,后者覆盖前者", name)
         _REGISTRY[name] = ToolSpec(
             name=name, fn=fn, description=description,
-            parameters=schema, group=group)
+            parameters=schema, group=group, origin=origin, runtime=runtime,
+            permission=str(permission or "project.read"),
+            idempotent=bool(idempotent),
+            requires=list(requires or []))
         return fn
 
     return _decorator
@@ -142,52 +159,14 @@ def names() -> List[str]:
     return list(_REGISTRY.keys())
 
 
-# ---------------------------------------------------------------------------
-# 导出: OpenAI function-calling schema(主)
-# ---------------------------------------------------------------------------
-def openai_schemas(groups: Optional[List[str]] = None) -> List[Dict[str, Any]]:
-    """导出 OpenAI ``tools`` 数组,直接放进 chat/completions 请求的 ``tools`` 字段。
-
-    Args:
-        groups: 只导出指定分组的工具(如 ["knowledge","build"]);None 导全部。
-    """
-    load_all()
-    out = []
-    for spec in _REGISTRY.values():
-        if groups and spec.group not in groups:
-            continue
-        out.append({
-            "type": "function",
-            "function": {
-                "name": spec.name,
-                "description": spec.description,
-                "parameters": spec.parameters,
-            },
-        })
-    return out
+def origin_of(name: str) -> str:
+    spec = _REGISTRY.get(name)
+    return spec.origin if spec else ""
 
 
-# ---------------------------------------------------------------------------
-# 导出: ReAct 文本协议(兜底)
-# ---------------------------------------------------------------------------
-def react_tool_descriptions(groups: Optional[List[str]] = None) -> str:
-    """导出人类/模型可读的工具清单,用于 ReAct 文本协议提示词。
-
-    形如::
-
-        - search_blocks(query: string) : 语义检索可用块
-        - add_block(key: string, id: string) : 往流图添加一个块
-    """
-    load_all()
-    lines = []
-    for spec in _REGISTRY.values():
-        if groups and spec.group not in groups:
-            continue
-        props = spec.parameters.get("properties", {})
-        arg_str = ", ".join(
-            f"{k}: {v.get('type', 'any')}" for k, v in props.items())
-        lines.append(f"- {spec.name}({arg_str}) : {spec.description}")
-    return "\n".join(lines)
+def runtime_of(name: str) -> str:
+    spec = _REGISTRY.get(name)
+    return spec.runtime if spec else ""
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +186,23 @@ def call(name: str, arguments: Dict[str, Any],
     if spec is None:
         return {"ok": False, "error": f"未知工具: {name}",
                 "available": names()}
+    denial = _execution_denial(spec, ctx, arguments or {})
+    if denial:
+        result = {
+            "ok": False,
+            "policy": "DENY",
+            "error": denial,
+            "tool": name,
+            "permission": spec.permission,
+        }
+        if name == "start_flowgraph":
+            result.update({"enabled": False, "running": False})
+        if name == "arm_hardware_flowgraph":
+            result["armed"] = False
+        return result
+    marker = object()
+    previous_parent = ctx.extra.get("_gateway_parent_tool", marker)
+    ctx.extra["_gateway_parent_tool"] = spec.name
     try:
         result = spec.fn(ctx, **(arguments or {}))
         if not isinstance(result, dict):
@@ -219,19 +215,114 @@ def call(name: str, arguments: Dict[str, Any],
     except Exception as exc:  # noqa: BLE001
         logger.exception("工具 %s 执行异常", name)
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        if previous_parent is marker:
+            ctx.extra.pop("_gateway_parent_tool", None)
+        else:
+            ctx.extra["_gateway_parent_tool"] = previous_parent
 
 
-def call_from_llm_toolcall(tool_call: Dict[str, Any],
-                           ctx: ToolContext) -> Dict[str, Any]:
-    """从 OpenAI 风格的 tool_call 对象直接调用(参数是 JSON 字符串)。
+def _execution_denial(
+    spec: ToolSpec, ctx: ToolContext, arguments: Dict[str, Any]
+) -> str:
+    """Central execution gateway shared by all tool callers."""
+    extra = getattr(ctx, "extra", {}) or {}
+    if extra.get("enforce_stage_tools") and spec.permission != "rf.stop":
+        workflow = dict(extra.get("workflow") or {})
+        stage_id = str(extra.get("stage_id") or workflow.get("current_stage") or "")
+        if not stage_id:
+            return "A current Workflow Stage is required before using domain tools"
+        try:
+            from ..workflow.catalog import allowed_tools_for_stage
 
-    ``tool_call`` 形如 ``{"function": {"name": ..., "arguments": "{...}"}}``。
-    """
-    fn = (tool_call or {}).get("function", {})
-    name = fn.get("name", "")
-    raw = fn.get("arguments", "{}")
-    try:
-        args = json.loads(raw) if isinstance(raw, str) else (raw or {})
-    except json.JSONDecodeError as exc:
-        return {"ok": False, "error": f"arguments 不是合法 JSON: {exc}"}
-    return call(name, args, ctx)
+            allowed = allowed_tools_for_stage(stage_id)
+        except ValueError as exc:
+            return str(exc)
+        requested_tool = str(extra.get("_gateway_parent_tool") or spec.name)
+        if requested_tool not in allowed:
+            return f"Tool {requested_tool} is not allowed in Stage {stage_id}"
+    forbidden = set(extra.get("forbidden_permissions") or [])
+    if spec.permission in forbidden and spec.permission != "rf.stop":
+        return f"Permission {spec.permission} is forbidden for this user request"
+    if spec.permission == "project.write" and extra.get("mutation_forbidden"):
+        return "The current user request is read-only"
+    missing = [
+        name
+        for name in spec.requires
+        if not _requirement_satisfied(name, ctx, arguments)
+    ]
+    if missing:
+        return "Missing execution preconditions: {}".format(", ".join(missing))
+    return ""
+
+
+def _requirement_satisfied(
+    name: str, ctx: ToolContext, arguments: Dict[str, Any]
+) -> bool:
+    extra = getattr(ctx, "extra", {}) or {}
+    state = extra.get("state")
+    project = getattr(state, "project", None)
+    runtime = getattr(state, "runtime", None)
+    if name == "user_effect_grant":
+        try:
+            from .hardware_tools import _rf_approved
+
+            return bool(_rf_approved(ctx))
+        except Exception:  # noqa: BLE001
+            return bool({"rf.start", "RF_RUN"} & set(
+                getattr(runtime, "granted_permissions", None) or []
+            ))
+    if name == "flowgraph_armed":
+        try:
+            from .hardware_tools import _rf_armed
+
+            return bool(_rf_armed(ctx, str(arguments.get("grc_path") or "")))
+        except Exception:  # noqa: BLE001
+            return bool((getattr(project, "config", None) or {}).get("rf_armed"))
+    if name == "device_probed":
+        observed = dict(
+            getattr(getattr(state, "project", None), "config", {}).get(
+                "observed_device"
+            ) or {}
+        )
+        if observed.get("identity"):
+            return True
+        try:
+            from .hardware_tools import _completion_satisfied
+
+            return bool(_completion_satisfied(ctx, "device_probed"))
+        except Exception:  # noqa: BLE001
+            pass
+        workflow = dict(extra.get("workflow") or {})
+        for stage in workflow.get("stages") or []:
+            completion = dict((stage.get("result") or {}).get("completion") or {})
+            if completion.get("device_probed") is True:
+                return True
+        return any(
+            event.get("kind") == "probe_device"
+            and bool((event.get("payload") or {}).get("device_probed"))
+            for event in (extra.get("events") or [])
+        )
+    # Unknown requirements fail closed instead of silently becoming advisory.
+    return False
+
+
+def action_metadata(name: str) -> Dict[str, Any]:
+    """Return planner-facing metadata without exposing the callable."""
+    spec = _REGISTRY.get(name)
+    if spec is None:
+        return {}
+    return {
+        "name": spec.name,
+        "description": spec.description,
+        "group": spec.group,
+        "permission": spec.permission,
+        "idempotent": spec.idempotent,
+        "requires": list(spec.requires),
+        "parameters": dict(spec.parameters),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 导出: OpenAI function-calling schema(主)
+# ---------------------------------------------------------------------------

@@ -21,4 +21,4 @@
 
 ## 5. 仿真友好
 - 需要离线读指标时,链路末端接 `blocks_head`(截断样本数)+ `blocks_file_sink`(落盘)。
-- file_sink 的 `file` 参数由运行时填真实路径(配方里用占位符 `__PROBE__`)。
+- file_sink 的 `file` 参数由运行时填真实路径(配方里用占位符 `__PROBE__`)。发射链用 `*_tx.bin`，判决比特用 `*_bits.bin`，其余 IQ 用 `*_iq.bin`。

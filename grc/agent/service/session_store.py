@@ -5,8 +5,8 @@
 * **落盘镜像** ``mirror_session_files``:把虚拟文件系统里的 ``path -> content``
   镜像到磁盘 ``local/agent_sessions/<session_id>/{work,final}/``,供回归、
   断点续跑与 GUI 读取产物。
-* **会话事件流** ``append_session_event``:把主 Agent / subagent 的关键事件
-  (委派、工具调用、产物发布)以 JSONL 追加到 ``events.jsonl``,作为 CHI 埋点
+* **会话事件流** ``append_session_event``:把 MainAgent 和工具的关键事件
+  (Workflow 更新、工具调用、产物发布)以 JSONL 追加到 ``events.jsonl``,作为 CHI 埋点
   与可复现实验的数据源。
 
 会话根目录 ``local/agent_sessions/`` 应加入 .gitignore(运行期产物)。
@@ -15,9 +15,16 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
+import platform as runtime_platform
+import shutil
+import subprocess
+import sys
+import threading
 import time
+import uuid
 from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
@@ -26,17 +33,40 @@ logger = logging.getLogger(__name__)
 WORK_PREFIX = "/session/work/"
 FINAL_PREFIX = "/session/final/"
 
+_EVENT_LOCKS: Dict[str, threading.Lock] = {}
+_EVENT_LOCKS_GUARD = threading.Lock()
+
+
+def _posix_relpath(target: str, start: str) -> str:
+    """Return a relocatable relative path with stable POSIX separators."""
+    return os.path.relpath(target, start).replace(os.sep, "/")
+
+
+def _event_lock(path: str) -> threading.Lock:
+    with _EVENT_LOCKS_GUARD:
+        return _EVENT_LOCKS.setdefault(path, threading.Lock())
+
 
 def sessions_root() -> str:
     """返回会话根目录 ``<project_root>/local/agent_sessions``(自动创建)。
 
     project_root 由本文件位置推算:grc/agent/service/session_store.py -> 上四级。
+    ``GRC_AGENT_SESSIONS_ROOT`` 环境变量可覆盖,用于测试隔离与部署重定向,
+    防止跨运行的会话残留(例如 hw_retry_failures 计数)污染新会话。
     """
-    root = os.path.dirname(os.path.dirname(os.path.dirname(
-        os.path.dirname(os.path.abspath(__file__)))))
-    path = os.path.join(root, "local", "agent_sessions")
+    override = os.environ.get("GRC_AGENT_SESSIONS_ROOT", "").strip()
+    if override:
+        os.makedirs(override, exist_ok=True)
+        return override
+    path = os.path.join(project_root(), "local", "agent_sessions")
     os.makedirs(path, exist_ok=True)
     return path
+
+
+def project_root() -> str:
+    """Return the repository root without depending on the current cwd."""
+    return os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__)))))
 
 
 def session_root(session_id: str) -> str:
@@ -45,6 +75,202 @@ def session_root(session_id: str) -> str:
     path = os.path.join(sessions_root(), safe)
     os.makedirs(path, exist_ok=True)
     return path
+
+
+def state_path(session_id: str) -> str:
+    return os.path.join(session_root(session_id), "state.json")
+
+
+def workflow_path(session_id: str) -> str:
+    return os.path.join(session_root(session_id), "workflow.yaml")
+
+
+def run_metadata_path(session_id: str) -> str:
+    return os.path.join(session_root(session_id), "run_metadata.json")
+
+
+def ensure_run_metadata(session_id: str) -> str:
+    """Freeze non-secret code, environment and model provenance once per session."""
+    path = run_metadata_path(session_id)
+    if os.path.isfile(path):
+        return path
+    root = project_root()
+    git_commit = _command_text(["git", "rev-parse", "HEAD"], root)
+    git_status = _command_text(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"], root
+    )
+    diff = _command_bytes(
+        ["git", "diff", "--no-ext-diff", "--binary", "HEAD", "--", "grc/agent", "grc/gui"],
+        root,
+    )
+    source_tree_hash = _source_tree_hash(root)
+    dirty_material = git_status.encode("utf-8", errors="replace") + diff
+    model = {"configured": False, "name": ""}
+    try:
+        from ..llm import get_config, is_configured
+
+        if is_configured():
+            config = get_config()
+            model = {
+                "configured": True,
+                "name": str(config.get("model") or ""),
+            }
+    except Exception:  # noqa: BLE001
+        pass
+    gnuradio_version = ""
+    try:
+        from gnuradio import gr
+
+        gnuradio_version = str(gr.version())
+    except Exception:  # noqa: BLE001
+        pass
+    environment = {
+        "python": runtime_platform.python_version(),
+        "python_executable": sys.executable,
+        "gnuradio": gnuradio_version,
+        "conda_environment": str(os.environ.get("CONDA_DEFAULT_ENV") or ""),
+        "platform": runtime_platform.platform(),
+    }
+    environment_hash = _stable_hash(environment)
+    payload = {
+        "schema_version": 1,
+        "session_id": session_id,
+        "created_at": time.time(),
+        "source": {
+            "git_commit": git_commit,
+            "git_dirty": bool(git_status),
+            "dirty_diff_hash": hashlib.sha256(dirty_material).hexdigest(),
+            "source_tree_hash": source_tree_hash,
+        },
+        "environment": environment,
+        "environment_hash": environment_hash,
+        "model": model,
+        "configuration": {
+            "export_mode": _export_mode(),
+        },
+    }
+    tmp = f"{path}.tmp"
+    try:
+        with _event_lock(path):
+            if os.path.isfile(path):
+                return path
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+    except OSError as exc:
+        logger.warning("写 run metadata 失败: %s", exc)
+    return path
+
+
+def _command_text(command: List[str], cwd: str) -> str:
+    return _command_bytes(command, cwd).decode("utf-8", errors="replace").strip()
+
+
+def _command_bytes(command: List[str], cwd: str) -> bytes:
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=3.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return b""
+    return completed.stdout if completed.returncode == 0 else b""
+
+
+def _source_tree_hash(root: str) -> str:
+    digest = hashlib.sha256()
+    for relative_root in ("grc/agent", "grc/gui"):
+        start = os.path.join(root, relative_root)
+        if not os.path.isdir(start):
+            continue
+        for current_root, dirnames, names in os.walk(start):
+            dirnames[:] = sorted(
+                name for name in dirnames if name != "__pycache__"
+            )
+            for name in sorted(names):
+                if not name.endswith((".py", ".yaml", ".yml", ".json")):
+                    continue
+                path = os.path.join(current_root, name)
+                relative = _posix_relpath(path, root)
+                digest.update(relative.encode("utf-8"))
+                try:
+                    with open(path, "rb") as handle:
+                        digest.update(handle.read())
+                except OSError:
+                    continue
+    return digest.hexdigest()
+
+
+def _stable_hash(value: Any) -> str:
+    encoded = json.dumps(
+        _jsonable(value), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _export_mode() -> str:
+    value = str(os.environ.get("GRC_AGENT_EXPORT_MODE") or "display").strip().lower()
+    return value if value in {"display", "reproducible"} else "display"
+
+
+def _rewrite_jsonl_session_paths(path: str, old_root: str, new_root: str) -> None:
+    from ..state.shared_state import relativize_tree_paths, rewrite_root_prefix
+
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            lines = handle.readlines()
+    except OSError:
+        return
+    rewritten_lines = []
+    changed = False
+    for line in lines:
+        raw = line.strip()
+        if not raw:
+            rewritten_lines.append(line)
+            continue
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            rewritten_lines.append(line)
+            continue
+        updated = relativize_tree_paths(
+            new_root, rewrite_root_prefix(payload, old_root, new_root)
+        )
+        encoded = json.dumps(updated, ensure_ascii=False)
+        rewritten_lines.append(encoded + "\n")
+        changed = changed or encoded != raw
+    if not changed:
+        return
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.writelines(rewritten_lines)
+    os.replace(tmp, path)
+
+
+def nested_export_dir(session_id: str, base: str) -> str:
+    """Put each session's export under ``<base>/<session_id>/``."""
+    if not base:
+        return ""
+    safe = _safe_component(session_id)
+    abs_base = os.path.abspath(base)
+    if os.path.basename(abs_base) == safe:
+        path = abs_base
+    else:
+        path = os.path.join(abs_base, safe)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def resolve_session_path(session_id: str, path: str) -> str:
+    if not path:
+        return ""
+    from ..state.shared_state import to_abspath
+
+    return to_abspath(session_root(session_id), path)
 
 
 def _safe_component(name: str) -> str:
@@ -111,20 +337,59 @@ def _extract_content(value: Any):
     return value
 
 
+_EVENT_CONTROL_KEYS = (
+    "workflow_id",
+    "workflow_revision",
+    "task_type",
+    "stage_id",
+    "attempt",
+    "profile_level",
+)
+
+
 def append_session_event(session_id: str, event: str,
                          payload: Dict[str, Any] | None = None) -> None:
     """向会话事件流 ``events.jsonl`` 追加一条事件(JSONL)。"""
-    record = {
-        "ts": time.time(),
-        "event": event,
-        "payload": _jsonable(payload or {}),
-    }
+    payload_data = _jsonable(payload or {})
     path = os.path.join(session_root(session_id), "events.jsonl")
+    with _event_lock(path):
+        record = {
+            "event_id": f"evt-{uuid.uuid4().hex}",
+            "session_id": session_id,
+            "ts": time.time(),
+            "seq": _next_event_seq(path),
+            "event": event,
+            "payload": payload_data,
+        }
+        for key in _EVENT_CONTROL_KEYS:
+            value = payload_data.get(key)
+            if value is not None:
+                record[key] = value
+        try:
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            logger.warning("写会话事件失败: %s", exc)
+
+
+def _next_event_seq(path: str) -> int:
+    if not os.path.isfile(path):
+        return 1
+    last = ""
     try:
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-    except OSError as exc:
-        logger.warning("写会话事件失败: %s", exc)
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip():
+                    last = line
+    except OSError:
+        return 1
+    if not last:
+        return 1
+    try:
+        data = json.loads(last)
+        return int(data.get("seq") or 0) + 1
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return 1
 
 
 def scan_final_artifacts(session_id: str,
@@ -152,6 +417,449 @@ def scan_final_artifacts(session_id: str,
     return out
 
 
+def recent_events(session_id: str, limit: int = 40) -> List[Dict[str, Any]]:
+    """Return the newest session events for GUI timeline rendering."""
+    path = os.path.join(session_root(session_id), "events.jsonl")
+    if not os.path.isfile(path) or limit <= 0:
+        return []
+    lines: List[str] = []
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip():
+                    lines.append(line)
+    except OSError:
+        return []
+    items: List[Dict[str, Any]] = []
+    for line in lines[-int(limit):]:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+        items.append(
+            {
+                "seq": record.get("seq"),
+                "event": record.get("event"),
+                "ts": record.get("ts"),
+                "workflow_id": record.get("workflow_id") or payload.get("workflow_id"),
+                "stage_id": record.get("stage_id") or payload.get("stage_id"),
+                "attempt": record.get("attempt") if record.get("attempt") is not None else payload.get("attempt"),
+                "actor": _event_actor(payload),
+                "mode": payload.get("mode") or payload.get("executor") or "",
+                "outcome": payload.get("outcome") or "",
+                "cause": payload.get("cause") or payload.get("reason") or "",
+                "affected_stages": list(
+                    payload.get("affected_stages") or payload.get("stages") or []
+                ),
+                "decision": payload.get("decision") or "",
+                "ok": (
+                    (payload.get("result") or {}).get("ok")
+                    if isinstance(payload.get("result"), dict)
+                    else payload.get("ok")
+                ),
+            }
+        )
+    return items
+
+
+def _event_actor(payload: Dict[str, Any]) -> str:
+    target = str(
+        payload.get("tool")
+        or payload.get("source")
+        or ""
+    )
+    origin = str(payload.get("origin") or "")
+    mode = str(payload.get("mode") or payload.get("executor") or "")
+    return " · ".join(part for part in (target, origin, mode) if part)
+
+
+def publish_artifact(session_id: str, source: str) -> str:
+    """Mirror a user-visible artifact into the session final directory."""
+    if not source or not os.path.isfile(source):
+        return source
+    final_dir = os.path.join(session_root(session_id), "final")
+    os.makedirs(final_dir, exist_ok=True)
+    destination = os.path.join(final_dir, os.path.basename(source))
+    if os.path.abspath(source) != os.path.abspath(destination):
+        shutil.copy2(source, destination)
+    return destination
+
+
+def export_artifact(source: str, destination_dir: str) -> str:
+    """Copy a canonical session artifact to an optional user export folder."""
+    if not source or not os.path.isfile(source) or not destination_dir:
+        return ""
+    os.makedirs(destination_dir, exist_ok=True)
+    normalized = os.path.abspath(source)
+    marker = f"{os.sep}final{os.sep}"
+    relative = (
+        normalized.split(marker, 1)[1]
+        if marker in normalized
+        else os.path.basename(source)
+    )
+    destination = os.path.join(destination_dir, relative)
+    os.makedirs(os.path.dirname(destination), exist_ok=True)
+    if os.path.abspath(source) != os.path.abspath(destination):
+        shutil.copy2(source, destination)
+    return destination
+
+
+def attach_evidence(
+    session_id: str, source: str, run_id: str = ""
+) -> Dict[str, Any]:
+    """Copy a user-supplied evidence file into ``final/evidence/<run_id>/``."""
+    if not source or not os.path.isfile(source):
+        return {}
+    safe_run = _safe_component(run_id) or "unbound"
+    evidence_dir = os.path.join(
+        session_root(session_id), "final", "evidence", safe_run
+    )
+    os.makedirs(evidence_dir, exist_ok=True)
+    base = _safe_component(os.path.basename(source)) or "evidence"
+    stem, suffix = os.path.splitext(base)
+    destination = os.path.join(
+        evidence_dir, f"{stem}-{uuid.uuid4().hex[:8]}{suffix}"
+    )
+    shutil.copy2(source, destination)
+    digest = ""
+    size = 0
+    try:
+        with open(destination, "rb") as handle:
+            payload = handle.read()
+        digest = hashlib.sha256(payload).hexdigest()
+        size = len(payload)
+    except OSError:
+        size = os.path.getsize(destination)
+    relative = _posix_relpath(destination, session_root(session_id))
+    meta = {
+        "run_id": run_id,
+        "source_name": os.path.basename(source),
+        "path": relative,
+        "artifact": destination,
+        "sha256": digest,
+        "size": size,
+        "observed_at": time.time(),
+    }
+    meta_path = os.path.join(
+        evidence_dir, f"{os.path.splitext(os.path.basename(destination))[0]}.meta.json"
+    )
+    try:
+        with open(meta_path, "w", encoding="utf-8") as handle:
+            json.dump(meta, handle, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+    return meta
+
+
+def write_artifact_manifest(
+    session_id: str, artifacts: Dict[str, Any] | None = None
+) -> str:
+    """Write the cumulative, relocatable ArtifactIndex for a session."""
+    root = session_root(session_id)
+    final_dir = os.path.join(root, "final")
+    os.makedirs(final_dir, exist_ok=True)
+    manifest_path = os.path.join(final_dir, "manifest.json")
+    named_artifacts: Dict[str, str] = {}
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            previous = json.load(handle)
+        for key, relative in dict(previous.get("named_artifacts") or {}).items():
+            resolved = resolve_session_path(session_id, str(relative or ""))
+            if resolved and os.path.isfile(resolved):
+                named_artifacts[str(key)] = _posix_relpath(resolved, root)
+    except (OSError, TypeError, ValueError):
+        pass
+    roles = {
+        os.path.abspath(value): _artifact_role_from_key(key, value)
+        for key, value in (artifacts or {}).items()
+        if isinstance(value, str) and os.path.isfile(value)
+    }
+    root_prefix = os.path.abspath(root) + os.sep
+    for key, value in (artifacts or {}).items():
+        if not isinstance(value, str) or not os.path.isfile(value):
+            continue
+        absolute = os.path.abspath(value)
+        if absolute.startswith(root_prefix):
+            named_artifacts[str(key)] = _posix_relpath(absolute, root)
+    listed = []
+    for current_root, dirnames, names in os.walk(final_dir):
+        dirnames[:] = [
+            name for name in dirnames if not _skip_manifest_name(name)
+        ]
+        for name in sorted(names):
+            if _skip_manifest_name(name):
+                continue
+            listed.append(os.path.join(current_root, name))
+    metadata = ensure_run_metadata(session_id)
+    if os.path.isfile(metadata):
+        listed.append(metadata)
+    entries = []
+    for artifact_path in listed:
+        try:
+            with open(artifact_path, "rb") as handle:
+                digest = hashlib.sha256(handle.read()).hexdigest()
+            size = os.path.getsize(artifact_path)
+        except OSError:
+            continue
+        try:
+            rel = _posix_relpath(artifact_path, root)
+        except ValueError:
+            rel = os.path.basename(artifact_path)
+        role = roles.get(os.path.abspath(artifact_path)) or _infer_artifact_role(rel)
+        artifact_id = "art-" + hashlib.sha256(
+            f"{rel}\0{digest}".encode("utf-8")
+        ).hexdigest()[:16]
+        entries.append({
+            "artifact_id": artifact_id,
+            "role": role,
+            "path": rel,
+            "size": size,
+            "sha256": digest,
+        })
+    payload = {
+        "schema_version": 1,
+        "session_id": session_id,
+        "path_base": "session_root",
+        "named_artifacts": named_artifacts,
+        "artifacts": entries,
+    }
+    tmp = f"{manifest_path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+    os.replace(tmp, manifest_path)
+    return manifest_path
+
+
+def read_named_artifacts(session_id: str) -> Dict[str, str]:
+    """Return existing host paths keyed by their stable artifact names."""
+    root = os.path.abspath(session_root(session_id))
+    path = os.path.join(root, "final", "manifest.json")
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, TypeError, ValueError):
+        return {}
+    result: Dict[str, str] = {}
+    prefix = root + os.sep
+    for key, relative in dict(payload.get("named_artifacts") or {}).items():
+        resolved = resolve_session_path(session_id, str(relative or ""))
+        absolute = os.path.abspath(resolved) if resolved else ""
+        if absolute.startswith(prefix) and os.path.isfile(absolute):
+            result[str(key)] = absolute
+    return result
+
+
+def rewrite_exported_grc_paths(session_id: str, destination_dir: str) -> None:
+    """Make exported GRC companion-artifact references relocatable."""
+    source_final = os.path.join(session_root(session_id), "final")
+    for name in os.listdir(destination_dir) if os.path.isdir(destination_dir) else []:
+        if not name.endswith(".grc"):
+            continue
+        path = os.path.join(destination_dir, name)
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                text = handle.read()
+            rewritten = text
+            for prefix in (source_final, os.path.abspath(destination_dir)):
+                variants = {
+                    prefix.rstrip("/\\"),
+                    prefix.replace("\\", "/").rstrip("/"),
+                    prefix.replace("/", "\\").rstrip("\\"),
+                }
+                for variant in variants:
+                    rewritten = rewritten.replace(variant + "/", "")
+                    rewritten = rewritten.replace(variant + "\\", "")
+            rewritten = rewritten.replace("\\", "/")
+            if rewritten != text:
+                tmp = f"{path}.tmp"
+                with open(tmp, "w", encoding="utf-8") as handle:
+                    handle.write(rewritten)
+                os.replace(tmp, path)
+        except OSError:
+            continue
+
+
+def write_export_manifest(
+    session_id: str,
+    destination_dir: str,
+    exported_paths: List[str] | None = None,
+    *,
+    export_mode: str = "display",
+    source_map: Dict[str, str] | None = None,
+) -> str:
+    """Create a cumulative manifest for every artifact in an export root."""
+    os.makedirs(destination_dir, exist_ok=True)
+    destination = os.path.abspath(destination_dir)
+    explicit_roles = {
+        os.path.abspath(path): _infer_artifact_role(
+            _posix_relpath(os.path.abspath(path), destination)
+        )
+        for path in (exported_paths or [])
+        if isinstance(path, str) and os.path.isfile(path)
+    }
+    candidates = []
+    for current_root, dirnames, names in os.walk(destination):
+        dirnames[:] = [name for name in dirnames if not _skip_manifest_name(name)]
+        for name in sorted(names):
+            candidates.append(os.path.join(current_root, name))
+    entries = []
+    seen_rel = set()
+    for path in candidates:
+        name = os.path.basename(path)
+        if _skip_manifest_name(name) or not os.path.isfile(path):
+            continue
+        abs_path = os.path.abspath(path)
+        if os.path.commonpath([destination, abs_path]) != destination:
+            continue
+        rel = _posix_relpath(abs_path, destination)
+        if rel in seen_rel:
+            continue
+        try:
+            with open(abs_path, "rb") as handle:
+                digest = hashlib.sha256(handle.read()).hexdigest()
+            size = os.path.getsize(abs_path)
+        except OSError:
+            continue
+        role = explicit_roles.get(abs_path) or _infer_artifact_role(rel)
+        artifact_id = "art-" + hashlib.sha256(
+            f"{rel}\0{digest}".encode("utf-8")
+        ).hexdigest()[:16]
+        source = str((source_map or {}).get(abs_path) or "")
+        entries.append({
+            "artifact_id": artifact_id,
+            "role": role,
+            "path": rel,
+            "export_path": rel,
+            "source_path": source,
+            "size": size,
+            "sha256": digest,
+        })
+        seen_rel.add(rel)
+    path = os.path.join(destination, "manifest.json")
+    payload = {
+        "schema_version": 1,
+        "session_id": session_id,
+        "path_base": "export_root",
+        "export_mode": (
+            export_mode if export_mode in {"display", "reproducible"} else "display"
+        ),
+        "artifacts": entries,
+    }
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+    return path
+
+
+def export_session_artifacts(
+    session_id: str,
+    destination_dir: str,
+    explicit_sources: List[str] | None = None,
+    *,
+    export_mode: str | None = None,
+) -> List[str]:
+    """Export either the visible result set or the complete reproducible set."""
+    mode = export_mode or _export_mode()
+    sources = list(explicit_sources or [])
+    if mode == "reproducible":
+        final_dir = os.path.join(session_root(session_id), "final")
+        for current_root, dirnames, names in os.walk(final_dir):
+            dirnames[:] = [
+                name for name in dirnames if not _skip_manifest_name(name)
+            ]
+            for name in sorted(names):
+                if _skip_manifest_name(name):
+                    continue
+                sources.append(os.path.join(current_root, name))
+        for path in (
+            state_path(session_id), workflow_path(session_id),
+            os.path.join(session_root(session_id), "events.jsonl"),
+        ):
+            if os.path.isfile(path):
+                sources.append(path)
+    sources.append(ensure_run_metadata(session_id))
+    exported: List[str] = []
+    source_map: Dict[str, str] = {}
+    seen = set()
+    for source in sources:
+        if not isinstance(source, str) or not os.path.isfile(source):
+            continue
+        absolute = os.path.abspath(source)
+        if absolute in seen or os.path.basename(absolute) == "manifest.json":
+            continue
+        seen.add(absolute)
+        copied = export_artifact(absolute, destination_dir)
+        if copied:
+            exported.append(copied)
+            try:
+                source_path = _posix_relpath(
+                    absolute, session_root(session_id)
+                )
+                if source_path.startswith(".."):
+                    source_path = absolute
+            except ValueError:
+                source_path = absolute
+            source_map[os.path.abspath(copied)] = source_path
+    rewrite_exported_grc_paths(session_id, destination_dir)
+    write_export_manifest(
+        session_id,
+        destination_dir,
+        exported,
+        export_mode=mode,
+        source_map=source_map,
+    )
+    return exported
+
+
+def _skip_manifest_name(name: str) -> bool:
+    return (
+        name in {"manifest.json", "__pycache__"}
+        or name.endswith(".pyc")
+        or name.endswith(".pyo")
+    )
+
+
+def _infer_artifact_role(relative_path: str) -> str:
+    low = str(relative_path or "").replace("\\", "/").lower()
+    name = os.path.basename(low)
+    if name == "run_metadata.json":
+        return "run_metadata"
+    if "/evidence/" in f"/{low}" or name.endswith(".meta.json"):
+        return "human_evidence"
+    if "runtime" in low and name.endswith((".log", ".json")):
+        return "runtime_log"
+    if "device_discovery" in name or "device_probe" in name:
+        return "device_report"
+    if "validation" in name or "verify" in name:
+        return "validation_report"
+    if name.endswith(".grc"):
+        return "armed_flowgraph" if "armed" in name else "safe_preview"
+    if name.endswith((".png", ".jpg", ".jpeg", ".svg")):
+        return "visualization"
+    if name.endswith((".bin", ".c64", ".cfile", ".dat", ".npy")):
+        return "signal_data"
+    if name.endswith(".py"):
+        return "generated_program"
+    if name.endswith(".json"):
+        return "report"
+    return "artifact"
+
+
+def _artifact_role_from_key(key: str, path: str) -> str:
+    normalized = str(key or "").lower()
+    aliases = {
+        "evidence": "human_evidence",
+        "runtime_program": "generated_program",
+        "runtime_log": "runtime_log",
+        "device_discovery": "device_report",
+        "device_probe": "device_report",
+        "flowgraph_validation": "validation_report",
+    }
+    return aliases.get(normalized) or _infer_artifact_role(path)
+
+
 def _jsonable(value: Any) -> Any:
     """把任意值收敛为可 JSON 序列化的结构(尽力而为)。"""
     if value is None or isinstance(value, (str, int, float, bool)):
@@ -161,3 +869,41 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_jsonable(v) for v in value]
     return str(value)
+
+
+def archive_session(session_id: str, destination: str) -> str:
+    """Copy a session tree and rewrite leftover absolute session paths."""
+    source = os.path.abspath(session_root(session_id))
+    dest = os.path.abspath(destination)
+    if os.path.isdir(dest) and os.path.isfile(os.path.join(dest, "state.json")):
+        raise ValueError(f"归档目标已存在会话文件: {dest}")
+    if os.path.isdir(dest):
+        dest = os.path.join(dest, _safe_component(session_id))
+    if os.path.exists(dest):
+        raise ValueError(f"归档目标已存在: {dest}")
+    shutil.copytree(source, dest)
+    from ..state.shared_state import relativize_tree_paths, rewrite_root_prefix
+
+    for current_root, dirnames, names in os.walk(dest):
+        dirnames[:] = [name for name in dirnames if name != "__pycache__"]
+        for name in names:
+            path = os.path.join(current_root, name)
+            if name.endswith(".jsonl"):
+                _rewrite_jsonl_session_paths(path, source, dest)
+                continue
+            if not name.endswith((".json", ".yaml", ".yml")):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    payload = json.load(handle)
+            except (OSError, json.JSONDecodeError, TypeError):
+                continue
+            rewritten = relativize_tree_paths(
+                dest, rewrite_root_prefix(payload, source, dest)
+            )
+            tmp = f"{path}.tmp"
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump(rewritten, handle, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+    append_session_event(session_id, "session_archived", {"destination": dest})
+    return dest

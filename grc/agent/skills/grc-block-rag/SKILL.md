@@ -6,7 +6,7 @@ description: 检索 GNU Radio Companion(GRC)块、解释端口与关键参数、
 # grc-block-rag:块知识检索
 
 ## 何时使用
-- 用户/主 Agent 需要知道**用哪个块**实现某功能(如"BPSK 调制用什么块")。
+- 当前 Stage 需要知道**用哪个块**实现某功能(如"BPSK 调制用什么块")。
 - 需要解释某个块的**端口类型与关键参数**(避免类型不匹配导致连接失败)。
 - 需要检索**可参考的示例链路**作为建图起点。
 
@@ -14,8 +14,7 @@ description: 检索 GNU Radio Companion(GRC)块、解释端口与关键参数、
 1. 先读本目录 `references/block_catalog.md` 了解常用块清单与用途。
 2. 用工具 `search_blocks(query)` 语义检索候选块;用 `describe_block(key)` 查端口/参数。
 3. 用 `list_examples()` 找相近示例链路。
-4. 把结论(推荐块清单 + 端口/参数要点 + 参考示例)写入
-   `/session/work/knowledge/context.md`,供 builder 使用。
+4. 将推荐块、端口、参数和参考示例用于当前 Stage。
 
 ## 硬性护栏(见 references/naming_guardrails.md)
 - 整条链路的数据类型(complex/float/byte)必须一致,否则连接非法。
@@ -23,5 +22,5 @@ description: 检索 GNU Radio Companion(GRC)块、解释端口与关键参数、
 - 只使用 GNU Radio 标准发行版中真实存在的块 key 与参数名,不要臆造。
 
 ## 不要做
-- 不建图、不改图(那是 flowgraph_builder_agent 的职责)。
+- 在 `radio_design` 中不建图、不改图；建图只属于 `flowgraph_build`。
 - 不写 `/session/final/`。

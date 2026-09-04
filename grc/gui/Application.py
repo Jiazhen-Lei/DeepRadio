@@ -34,7 +34,7 @@ class Application(Gtk.Application):
     and handle button presses and flow graph operations from the GUI.
     """
 
-    def __init__(self, file_paths, platform):
+    def __init__(self, file_paths, platform, skip_restore_files=False):
         # On macOS (GTK Quartz backend) a Gtk.Application without an
         # application_id does not keep the main loop alive after do_activate()
         # returns: the freshly created window has not been mapped yet, the
@@ -56,9 +56,11 @@ class Application(Gtk.Application):
         Args:
             file_paths: a list of flow graph file passed from command line
             platform: platform module
+            skip_restore_files: if True, ignore remembered files_open and start blank
         """
         self.clipboard = None
         self.dialog = None
+        self.skip_restore_files = bool(skip_restore_files)
 
         # Setup the main window
         self.platform = platform
@@ -105,11 +107,16 @@ class Application(Gtk.Application):
         self.main_window.present()
 
         # setup the messages
-        Messages.register_messenger(self.main_window.add_console_line)
+        # Agent 在后台线程建图时会 Messages.send_warning;直接写 Console
+        # 会在非 GTK 线程改 TextView,macOS 上表现为 malloc abort。
+        Messages.register_messenger(self._idle_console_line)
         Messages.send_init(self.platform)
 
         log.debug("Calling Actions.APPLICATION_INITIALIZE")
         Actions.APPLICATION_INITIALIZE()
+
+    def _idle_console_line(self, line):
+        GLib.idle_add(self.main_window.add_console_line, line)
 
     def _quit(self, window, event):
         """
@@ -139,7 +146,8 @@ class Application(Gtk.Application):
         if action == Actions.APPLICATION_INITIALIZE:
             log.debug("APPLICATION_INITIALIZE")
             file_path_to_show = self.config.file_open()
-            for file_path in (self.init_file_paths or self.config.get_open_files()):
+            remembered = [] if self.skip_restore_files else self.config.get_open_files()
+            for file_path in (self.init_file_paths or remembered):
                 if os.path.exists(file_path):
                     main.new_page(
                         file_path, show=file_path_to_show == file_path)
@@ -678,6 +686,8 @@ class Application(Gtk.Application):
                     self.config.add_recent_file(file_path)
                     main.tool_bar.refresh_submenus()
                     main.menu.refresh_submenus()
+                    if i == 0 and hasattr(main, "agent_panel"):
+                        main.agent_panel.notify_canvas_opened(file_path)
         elif action == Actions.FLOW_GRAPH_OPEN_QSS_THEME:
             file_paths = FileDialogs.OpenQSS(main, self.platform.config.install_prefix +
                                              '/share/gnuradio/themes/').run()
@@ -691,6 +701,8 @@ class Application(Gtk.Application):
             self.config.add_recent_file(file_path)
             main.tool_bar.refresh_submenus()
             main.menu.refresh_submenus()
+            if hasattr(main, "agent_panel"):
+                main.agent_panel.notify_canvas_opened(file_path)
         elif action == Actions.FLOW_GRAPH_SAVE:
             # read-only or undefined file path, do save-as
             if page.get_read_only() or not page.file_path:
@@ -701,6 +713,8 @@ class Application(Gtk.Application):
                     self.platform.save_flow_graph(page.file_path, flow_graph)
                     flow_graph.grc_file_path = page.file_path
                     page.saved = True
+                    if hasattr(main, "agent_panel"):
+                        main.agent_panel.notify_canvas_saved(page.file_path)
                 except IOError:
                     Messages.send_fail_save(page.file_path)
                     page.saved = False
@@ -718,6 +732,8 @@ class Application(Gtk.Application):
                     self.platform.save_flow_graph(page.file_path, flow_graph)
                     flow_graph.grc_file_path = page.file_path
                     page.saved = True
+                    if hasattr(main, "agent_panel"):
+                        main.agent_panel.notify_canvas_saved(page.file_path)
                 except IOError:
                     Messages.send_fail_save(page.file_path)
                     page.saved = False

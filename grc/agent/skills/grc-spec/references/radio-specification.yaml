@@ -1,0 +1,64 @@
+schema_version: 1
+
+# 本文件是 SpecAgent 的领域参考，不是可执行流程。
+field_reference:
+  goal:
+    label: Goal
+    meaning: 用户希望完成的可观察无线电目标。
+  protocol:
+    label: Protocol
+    meaning: 通信协议或用户自定义空口。
+  direction:
+    label: Direction
+    values: [tx, rx, sim]
+  operation:
+    label: Operation
+    meaning: 构建、仿真、观测、配置或执行。
+  modulation:
+    label: Modulation
+  carrier_frequency:
+    label: Carrier
+    unit: Hz
+  sample_rate:
+    label: Sample rate
+    unit: samples/s
+  bandwidth:
+    label: Bandwidth
+    unit: Hz
+  hardware:
+    label: Device
+  duration_seconds:
+    label: Maximum duration
+    unit: s
+  payload:
+    label: Payload
+  success_conditions:
+    label: Success condition
+    meaning: 后续验证或测量 Stage 用来判断成功的可观察证据。
+
+task_reference:
+  transmit:
+    consider: [protocol, direction, operation, modulation, payload, sample_rate, bandwidth]
+  receive:
+    consider: [protocol, direction, operation, expected_signal, sample_rate, bandwidth, requested_metrics]
+  simulation:
+    consider: [direction, modulation, sample_rate, requested_metrics, success_conditions]
+    note: 通常不需要硬件、载波频率和真实运行时长。
+  physical_rf:
+    consider: [hardware, carrier_frequency, sample_rate, duration_seconds, success_conditions]
+    note: 建议的运行时长需要用户接受后才算对齐。
+
+protocol_reference:
+  ble:
+    standard_facts:
+      modulation: GFSK
+    consider: [ble_mode, advertising_channels, local_name, payload]
+    advertising_channels_hz:
+      37: 2402000000
+      38: 2426000000
+      39: 2480000000
+  wifi:
+    consider: [wifi_role, wifi_standard, wifi_channel, bandwidth, ssid, modulation, payload]
+
+extension:
+  note: 以上内容是参考。未列出的协议或自定义波形可以增加所需字段。

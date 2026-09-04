@@ -8,7 +8,7 @@
 |-----|------|----------|----------|
 | `variable` | 定义变量(如 samp_rate/sps) | value | — |
 | `variable_constellation` | 定义星座(bpsk/qpsk) | type | — |
-| `analog_sig_source_x` | 正弦/方波等信号源 | waveform/freq/amplitude/samp_rate | complex/float |
+| `analog_sig_source_x` | 正弦/方波等信号源 | waveform/freq/amp/samp_rate | complex/float |
 | `analog_noise_source_x` | 高斯/均匀噪声源 | noise_type/amplitude/seed | complex/float |
 | `analog_random_source_x` | 随机字节源 | min/max/num_samps/repeat | byte |
 
@@ -16,6 +16,8 @@
 | key | 用途 | 关键参数 | 端口 |
 |-----|------|----------|------|
 | `digital_constellation_modulator` | 星座调制(含 RRC 成形) | constellation/samples_per_symbol/excess_bw | in:byte out:complex |
+| `digital_pfb_clock_sync_xxx` | 多相时钟同步 | sps/taps/loop_bw | in:complex out:complex |
+| `digital_constellation_receiver_cb` | 载波恢复与判决 | constellation/loop_bw | in:complex out:byte |
 | `digital_ofdm_tx` | OFDM 发射链 | fft_len/cp_len/bps_payload | in:byte out:complex |
 | `blocks_add_xx` | 多路相加 | type/num_inputs | in:N out:1 |
 | `blocks_throttle` | 节流(实时演示用) | type/samp_rate | 1:1 |

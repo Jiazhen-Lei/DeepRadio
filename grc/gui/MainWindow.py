@@ -21,6 +21,7 @@ from .Constants import \
     NEW_FLOGRAPH_TITLE, DEFAULT_CONSOLE_WINDOW_WIDTH
 from .Dialogs import TextDisplay, MessageDialogWrapper
 from .Notebook import Notebook, Page
+from .StateCache import StateCache
 
 from ..core import Messages
 
@@ -45,7 +46,7 @@ class MainWindow(Gtk.ApplicationWindow):
         Setup the menu, toolbar, flow graph editor notebook, block selection window...
         """
         Gtk.ApplicationWindow.__init__(
-            self, title="GNU Radio Companion", application=app)
+            self, title="DeepRadio", application=app)
         log.debug("__init__()")
 
         self._platform = platform
@@ -110,10 +111,11 @@ class MainWindow(Gtk.ApplicationWindow):
         self.vars.connect(
             'remove_block', self._remove_block_from_current_flow_graph)
 
-        # Create the Agent panel (right-side chat dock)
+        # Create the DeepRadio panel (right-side chat dock)
         self.agent_panel = AgentPanel(platform)
         self.agent_panel.connect(
             'open_flow_graph', self._on_agent_open_flow_graph)
+        self.agent_panel.connect('new_session', self._on_agent_new_session)
 
         # Figure out which place to put the variable editor
         self.left = Gtk.VPaned()  # orientation=Gtk.Orientation.VERTICAL)
@@ -122,7 +124,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.left_subpanel = Gtk.HPaned()
 
         # A vertical box that stacks a tab switcher (top) over a Gtk.Stack
-        # holding the block tree ("Core") and the Agent panel ("Agent").
+        # holding the block tree ("Core") and the DeepRadio panel.
         # The Stack shows only one child at a time; the user clicks the
         # switcher tabs to choose which one is visible in the right sidebar,
         # similar to an IDE side panel.
@@ -132,7 +134,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.right_stack.set_transition_type(
             Gtk.StackTransitionType.CROSSFADE)
         self.right_stack.add_titled(self.btwin, "core", "Core")
-        self.right_stack.add_titled(self.agent_panel, "agent", "Agent")
+        self.right_stack.add_titled(self.agent_panel, "agent", "DeepRadio")
 
         self.right_switcher = Gtk.StackSwitcher()
         self.right_switcher.set_stack(self.right_stack)
@@ -161,6 +163,11 @@ class MainWindow(Gtk.ApplicationWindow):
 
         self.main.pack1(self.left)
         self.main.pack2(self.right, False)
+        if hasattr(self.main, "set_wide_handle"):
+            self.main.set_wide_handle(True)
+            self.left.set_wide_handle(True)
+            self.right.set_wide_handle(True)
+            self.left_subpanel.set_wide_handle(True)
 
         # Load preferences and show the main window
         self.resize(*self.config.main_window_size())
@@ -184,8 +191,12 @@ class MainWindow(Gtk.ApplicationWindow):
         self.current_flow_graph.add_new_block(key)
 
     def _on_agent_open_flow_graph(self, _widget, file_path):
-        """Open a .grc file produced by the Agent panel in a new page."""
-        self.new_page(file_path, show=True)
+        """Refresh the current notebook page with a DeepRadio .grc (in place)."""
+        self.load_flow_graph_in_place(file_path)
+
+    def _on_agent_new_session(self, _widget):
+        """Open a fresh canvas while preserving existing tabs and files."""
+        Actions.FLOW_GRAPH_NEW()
 
     def _remove_block_from_current_flow_graph(self, widget, key):
         block = self.current_flow_graph.get_block(key)
@@ -212,7 +223,7 @@ class MainWindow(Gtk.ApplicationWindow):
 
         if panel == self.BLOCKS:
             # The block tree ("Core") now lives inside the right-side stack
-            # together with the Agent panel. Toggling the "Blocks" menu item
+            # together with the DeepRadio panel. Toggling the "Blocks" menu item
             # shows/hides that whole switchable area; when shown, make sure the
             # Core page is the selected one.
             if visibility:
@@ -323,6 +334,51 @@ class MainWindow(Gtk.ApplicationWindow):
         if not file_path or show:
             self._set_page(page)
 
+    def load_flow_graph_in_place(self, file_path):
+        """Load a .grc into the current DeepRadio page instead of opening another tab.
+
+        User-owned files (not under local/output or agent_sessions) are left
+        alone; those get a new page so the chat refresh does not overwrite them.
+        """
+        if not file_path or not os.path.exists(file_path):
+            return
+        files = self._get_files()
+        if file_path in files:
+            page = self.notebook.get_nth_page(files.index(file_path))
+            self._set_page(page)
+            self._reload_page_from_path(page, file_path)
+            return
+        page = self.current_page
+        if page is None:
+            self.new_page(file_path, show=True)
+            return
+        current = (page.file_path or "").replace("\\", "/")
+        markers = ("/local/output/", "/local/agent_sessions/")
+        can_replace = (not current) or any(m in current for m in markers)
+        if can_replace:
+            self._reload_page_from_path(page, file_path)
+            return
+        self.new_page(file_path, show=True)
+
+    def _reload_page_from_path(self, page, file_path):
+        try:
+            Messages.send_start_load(file_path)
+            data = page.flow_graph.parent_platform.parse_flow_graph(file_path)
+            page.flow_graph.grc_file_path = file_path
+            page.flow_graph.import_data(data)
+            page.flow_graph.update()
+            page.file_path = file_path
+            page.saved = True
+            page.state_cache = StateCache(data)
+            if getattr(page, 'drawing_area', None) is not None:
+                page.drawing_area.queue_draw()
+            Messages.send_end_load()
+        except Exception as e:  # noqa: BLE001
+            Messages.send_fail_load(e)
+            return
+        self.vars.update_gui(page.flow_graph.blocks)
+        self.update()
+
     def close_pages(self):
         """
         Close all the pages in this notebook.
@@ -407,9 +463,11 @@ class MainWindow(Gtk.ApplicationWindow):
         basename = os.path.basename(page.file_path)
         dirname = os.path.dirname(page.file_path)
         Gtk.Window.set_title(self, ''.join((
-            '*' if not page.saved else '', basename if basename else NEW_FLOGRAPH_TITLE,
-            '(read only)' if page.get_read_only() else '', ' - ',
-            dirname if dirname else self._platform.config.name,
+            '*' if not page.saved else '',
+            basename if basename else NEW_FLOGRAPH_TITLE,
+            '(read only)' if page.get_read_only() else '',
+            ' - DeepRadio',
+            (' - ' + dirname) if dirname else '',
         )))
         # set tab titles
         for page in self.get_pages():

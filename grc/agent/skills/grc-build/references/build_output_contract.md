@@ -1,21 +1,17 @@
-# 建图输出契约
+# 建图 ResultEnvelope 输出契约
 
-flowgraph_builder_agent 完成后必须满足:
+FlowgraphAgent 完成后返回紧凑 JSON：
 
-## 产物路径
-- 主产物:`/session/work/build/flowgraph.grc`(YAML 文本)。
-- 建图结论摘要:`/session/work/build/summary.md`(配方名/难度/块数/是否合法/可调旋钮)。
+- `workflow_id`、`revision`、`base_project_version`、`stage_id`：原样复制 TaskCard。
+- `outcome`：`passed`、`failed` 或 `inconclusive`。
+- `artifacts`：生成的 `.grc` 和相关产物路径。
+- `evidence`：本轮成功工具结果对应的证据名称。
+- `note`：配方、块数与尚未验证的说明。
 
-## 合法性
-- 产物必须能被 `validate_flowgraph` 判定为 valid;否则回报 critic 并给出可疑块/连接。
+约束：
 
-## 参数占位符
-- `blocks_file_sink` 的 `file` 参数在配方里是占位符 `__PROBE__`,由运行时替换为
-  `<session>/final/<id>_rx.bin`。builder 不要写死绝对路径。
-
-## generate_options
-- 用于离线仿真时必须是 `no_gui`;仅供 GUI 打开展示时可用 `qt_gui`。
-- DeepRadio 主链路走 no_gui(可无头仿真),GUI 打开时由适配层/GUI 侧处理显示。
-
-## 回报格式(给主 Agent)
-一段话说明:选了哪个配方、为何、关键参数、块数、是否已通过校验、产物路径。
+- 请求渲染时，没有有效 `.grc` 路径不得报告成功。
+- 离线仿真使用 `generate_options=no_gui`。
+- `blocks_file_sink.file` 的 `__PROBE__` 由运行时替换，不写死绝对路径。
+- `blocks_file_source.file` 使用 TaskCard 中已经存在的宿主机路径，不得使用虚拟工作区路径。
+- 本 Stage 不执行或声明 Verification。

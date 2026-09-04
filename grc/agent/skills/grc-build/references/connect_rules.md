@@ -18,6 +18,19 @@ random_source(byte) -> constellation_modulator(byte->complex)
    -> channel_model(complex) -> head(complex) -> file_sink(complex)
 ```
 
+## 典型链路骨架(仅发射,无信道)
+```
+random_source(byte) -> constellation_modulator(byte->complex)
+   -> head(complex) -> file_sink(complex)
+```
+
+## 典型链路骨架(BPSK 自包含接收)
+```
+random_source(byte) -> constellation_modulator -> channel_model
+                     -> pfb_clock_sync -> constellation_receiver_cb -> file_sink(byte)
+random_source 另接 tx_sink,作 BER 参考比特。
+```
+
 ## 典型链路骨架(单音+噪声)
 ```
 sig_source(complex) --\

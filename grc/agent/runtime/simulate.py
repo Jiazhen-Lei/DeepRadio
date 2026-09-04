@@ -14,7 +14,7 @@
 * **限长自停**: 靠 ``blocks_head`` 限制样本数,流图自然结束;
   再叠加墙钟超时兜底,防止无 head 的图跑不完。
 * **复用已验证链路**: 接口取自
-  ``grc/agent/examples/bpsk_2g4_regression.py`` 的回归实践。
+  ``dev_docs/regression/bpsk_2g4_regression.py`` 的回归实践。
 
 典型用法::
 
@@ -31,12 +31,12 @@
 
 from __future__ import annotations
 
-import importlib.util
 import logging
 import math
 import os
 import tempfile
 import threading
+import types
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -47,6 +47,16 @@ DEFAULT_TIMEOUT = 30.0
 
 #: 默认采样上限,当图里没有 head 时自动插桩用。
 DEFAULT_MAX_ITEMS = 65536
+
+
+def _is_complex_array(arr) -> bool:
+    if arr is None:
+        return False
+    import numpy as np
+    dtype = getattr(arr, "dtype", None)
+    if dtype is None:
+        return False
+    return np.issubdtype(dtype, np.complexfloating)
 
 
 # ---------------------------------------------------------------------------
@@ -75,10 +85,12 @@ class SimResult:
     stderr: str = ""
     error: Optional[str] = None
     summary: str = ""
+    aligned_symbols: Optional[object] = None
+    symbol_phase: int = 0
 
     # -- 可视化(惰性导入 matplotlib,无显示后端) ---------------------------
     def plot_constellation(self, path: str, probe_id: Optional[str] = None,
-                           sps: int = 1) -> Optional[str]:
+                           sps: int = 1, modulation: str = "") -> Optional[str]:
         """把某个 IQ probe 画成星座散点图,存到 path。返回图路径。"""
         arr = self._pick_complex(probe_id)
         if arr is None:
@@ -88,9 +100,21 @@ class SimResult:
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        syms = arr[sps * 4::sps] if sps > 1 else arr
+        if self.aligned_symbols is not None:
+            syms = self.aligned_symbols
+        elif int(sps or 1) > 1 and modulation:
+            ideal = ideal_points_for(modulation)
+            filtered = matched_filter_rrc(arr, sps=sps)
+            syms, phase = extract_symbols_best_phase(
+                filtered, sps=sps, ideal_points=ideal,
+                skip_symbols=15,
+            )
+            self.aligned_symbols = syms
+            self.symbol_phase = phase
+        else:
+            syms = arr[sps * 4::sps] if sps > 1 else arr
         fig, ax = plt.subplots(figsize=(4, 4))
-        ax.scatter(syms.real, syms.imag, s=6, alpha=0.4)
+        ax.scatter(np.real(syms), np.imag(syms), s=6, alpha=0.4)
         ax.axhline(0, color="gray", lw=0.5)
         ax.axvline(0, color="gray", lw=0.5)
         ax.set_aspect("equal")
@@ -104,24 +128,21 @@ class SimResult:
 
     def plot_spectrum(self, path: str, probe_id: Optional[str] = None,
                       samp_rate: float = 1.0) -> Optional[str]:
-        """把某个 IQ probe 画成频谱(dB),存到 path。返回图路径。"""
+        """把某个 IQ probe 画成频谱(dBFS),存到 path。返回图路径。"""
         arr = self._pick_complex(probe_id)
         if arr is None:
             return None
-        import numpy as np
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        n = min(len(arr), 4096)
-        spec = np.fft.fftshift(np.abs(np.fft.fft(arr[:n])))
-        spec_db = 20 * np.log10(spec + 1e-12)
-        freqs = np.fft.fftshift(np.fft.fftfreq(n, d=1.0 / samp_rate))
+        freqs, spec_db, _n = spectrum_trace(arr, samp_rate)
         fig, ax = plt.subplots(figsize=(5, 3))
         ax.plot(freqs, spec_db, lw=0.8)
+        ax.axvline(0, color="gray", lw=0.6, ls="--")
         ax.set_title("Spectrum")
         ax.set_xlabel("Frequency (Hz)")
-        ax.set_ylabel("Magnitude (dB)")
+        ax.set_ylabel("Magnitude (dBFS)")
         fig.tight_layout()
         fig.savefig(path, dpi=100)
         plt.close(fig)
@@ -172,13 +193,13 @@ class SimResult:
         return path
 
     def _pick_complex(self, probe_id: Optional[str]):
-        import numpy as np
         if probe_id is None:
             for v in self.data.values():
-                if getattr(v, "dtype", None) == np.complex64:
+                if _is_complex_array(v):
                     return v
             return None
-        return self.data.get(probe_id)
+        arr = self.data.get(probe_id)
+        return arr if _is_complex_array(arr) else None
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +241,116 @@ def extract_symbols(iq, sps: int, skip_symbols: int = 4):
     return arr[start::int(sps)]
 
 
+def extract_symbols_best_phase(
+    iq, sps: int, ideal_points, skip_symbols: int = 4
+):
+    """Choose the symbol sampling phase with the lowest decision-directed EVM."""
+    import numpy as np
+
+    arr = np.asarray(iq, dtype=np.complex64)
+    if sps <= 1:
+        return arr[skip_symbols:], 0
+    base = int(sps) * int(skip_symbols)
+    best_symbols = arr[base::int(sps)]
+    best_phase = 0
+    best_evm = evm_from_symbols(best_symbols, ideal_points)
+    for phase in range(1, int(sps)):
+        symbols = arr[base + phase::int(sps)]
+        candidate = evm_from_symbols(symbols, ideal_points)
+        if candidate < best_evm:
+            best_symbols = symbols
+            best_phase = phase
+            best_evm = candidate
+    return best_symbols, best_phase
+
+
+def spectrum_trace(iq, samp_rate: float, fft_size: int = 4096):
+    """Hann-windowed, fftshifted spectrum in dBFS. Returns freqs, dbfs, n."""
+    import numpy as np
+
+    arr = np.asarray(iq)
+    n = min(len(arr), max(32, int(fft_size)))
+    window = np.hanning(n)
+    spectrum = np.fft.fftshift(np.fft.fft(arr[:n] * window, n=n))
+    magnitude = np.abs(spectrum) / max(float(window.sum()), 1e-12)
+    magnitude_dbfs = 20.0 * np.log10(np.maximum(magnitude, 1e-12))
+    freqs = np.fft.fftshift(np.fft.fftfreq(n, d=1.0 / float(samp_rate)))
+    return freqs, magnitude_dbfs, n
+
+
+def spectrum_peak_report(iq, samp_rate: float, fft_size: int = 4096) -> dict:
+    """Peak frequency excluding a DC spike, if one is present."""
+    import numpy as np
+
+    freqs, magnitude_dbfs, n = spectrum_trace(iq, samp_rate, fft_size)
+    dc_bin = int(n // 2)
+    peak_bin = int(np.argmax(magnitude_dbfs))
+    dc_excluded = False
+    if 2 < dc_bin < n - 2:
+        neighbors = np.concatenate((
+            magnitude_dbfs[dc_bin - 3:dc_bin],
+            magnitude_dbfs[dc_bin + 1:dc_bin + 4],
+        ))
+        if neighbors.size and magnitude_dbfs[dc_bin] > float(np.median(neighbors)) + 6.0:
+            masked = np.array(magnitude_dbfs, copy=True)
+            masked[dc_bin] = -np.inf
+            peak_bin = int(np.argmax(masked))
+            dc_excluded = True
+    return {
+        "valid": True, "metric": "spectrum_peak",
+        "frequency_hz": float(freqs[peak_bin]),
+        "magnitude_dbfs": float(magnitude_dbfs[peak_bin]),
+        "fft_bin": peak_bin, "peak_bin": peak_bin, "fft_size": n,
+        "sample_rate": float(samp_rate), "window": "hann",
+        "fft_shifted": True, "dc_excluded": dc_excluded,
+        "bin_resolution_hz": float(samp_rate) / float(n),
+        "peak_interpretation": (
+            "strongest_non_dc_bin_after_dc_spike_exclusion"
+            if dc_excluded else "strongest_fft_bin"
+        ),
+        "dc_exclusion_policy": "exclude_center_bin_only_when_6db_above_neighbors",
+        "dc_dbfs": float(magnitude_dbfs[dc_bin]) if 0 <= dc_bin < n else None,
+    }
+
+
+def matched_filter_rrc(
+    iq, sps: int, excess_bw: float = 0.35, span_symbols: int = 11
+):
+    """Apply a unit-energy root-raised-cosine receive matched filter."""
+    import numpy as np
+
+    arr = np.asarray(iq, dtype=np.complex64)
+    if sps <= 1:
+        return arr
+    beta = float(excess_bw)
+    time_axis = np.arange(
+        -span_symbols * sps, span_symbols * sps + 1, dtype=float
+    ) / float(sps)
+    taps = np.empty_like(time_axis)
+    for index, value in enumerate(time_axis):
+        if abs(value) < 1e-12:
+            taps[index] = 1 + beta * (4 / math.pi - 1)
+        elif beta and abs(abs(value) - 1 / (4 * beta)) < 1e-9:
+            taps[index] = (beta / math.sqrt(2)) * (
+                (1 + 2 / math.pi) * math.sin(math.pi / (4 * beta))
+                + (1 - 2 / math.pi) * math.cos(math.pi / (4 * beta))
+            )
+        else:
+            numerator = math.sin(math.pi * value * (1 - beta))
+            numerator += (
+                4
+                * beta
+                * value
+                * math.cos(math.pi * value * (1 + beta))
+            )
+            denominator = (
+                math.pi * value * (1 - (4 * beta * value) ** 2)
+            )
+            taps[index] = numerator / denominator
+    taps /= max(float(np.sqrt(np.sum(taps * taps))), 1e-12)
+    return np.convolve(arr, taps, mode="same")
+
+
 # ---------------------------------------------------------------------------
 # 指标提取器
 # ---------------------------------------------------------------------------
@@ -248,31 +379,94 @@ def evm_from_symbols(symbols, ideal_points) -> float:
     return float(evm * 100.0)
 
 
-def ber_from_bits(tx_bits, rx_bits) -> Tuple[float, int]:
-    """比对收发比特算 BER,自动搜索最佳对齐时延。
+def bits_from_probe(data):
+    """把探针字节变成 0/1 比特。打包字节(0–255)按 MSB 解开。"""
+    import numpy as np
+    arr = np.asarray(data).ravel()
+    if arr.size == 0:
+        return np.array([], dtype=np.int8)
+    ints = np.asarray(np.clip(arr, 0, 255), dtype=np.uint8).ravel()
+    if int(ints.max()) > 1:
+        return np.unpackbits(np.ascontiguousarray(ints), bitorder="big").astype(np.int8)
+    return ints.astype(np.int8)
 
-    Returns:
-        (ber, best_delay)。若无法对齐返回 (nan, 0)。
+
+def ber_report(tx_bits, rx_bits, *, max_delay: int = 512,
+               min_compare_bits: int = 256,
+               allow_inversion: bool = False) -> dict:
+    """Return an auditable BER measurement with a bounded alignment search.
+
+    The old implementation searched almost the whole capture and always tried
+    an inverted stream.  Selecting the best of that many hypotheses can make a
+    short/random capture look unrealistically good.  Alignment is now bounded;
+    inversion is an explicit modulation ambiguity decision, never implicit.
     """
     import numpy as np
-    tx = np.asarray(tx_bits, dtype=np.int8).ravel()
-    rx = np.asarray(rx_bits, dtype=np.int8).ravel()
+    tx = bits_from_probe(tx_bits)
+    rx = bits_from_probe(rx_bits)
     if len(tx) == 0 or len(rx) == 0:
-        return float("nan"), 0
+        return {"valid": False, "value": float("nan"), "delay_bits": 0,
+                "error": "empty_probe", "compared_bits": 0,
+                "bit_errors": 0, "inversion_applied": False}
     n = min(len(tx), len(rx))
-    # 在小范围内搜索最佳循环时延(成形滤波/同步会引入固定偏移)
-    best_ber, best_delay = 1.0, 0
-    search = min(64, n // 2)
-    for d in range(search):
-        a = tx[:n - d]
-        b = rx[d:n]
-        m = min(len(a), len(b))
-        if m == 0:
-            continue
-        ber = float(np.mean(a[:m] != b[:m]))
-        if ber < best_ber:
-            best_ber, best_delay = ber, d
-    return best_ber, best_delay
+    minimum = max(32, int(min_compare_bits))
+    if n < minimum:
+        return {"valid": False, "value": float("nan"), "delay_bits": 0,
+                "error": "insufficient_bits", "compared_bits": n,
+                "minimum_bits": minimum, "bit_errors": 0,
+                "inversion_applied": False}
+    search = min(max(0, int(max_delay)), n - minimum)
+    best = None
+    for delay in range(search + 1):
+        for direction, a, b in (
+            ("rx_lags_tx", tx[: n - delay], rx[delay:n]),
+            ("tx_lags_rx", tx[delay:n], rx[: n - delay]),
+        ):
+            compared = min(len(a), len(b))
+            if compared < minimum:
+                continue
+            left, right = a[:compared], b[:compared]
+            candidates = [(False, right)]
+            if allow_inversion:
+                candidates.append((True, np.int8(1) - right))
+            for inverted, candidate in candidates:
+                errors = int(np.count_nonzero(left != candidate))
+                item = (errors / compared, -compared, delay, direction,
+                        inverted, errors, compared)
+                if best is None or item < best:
+                    best = item
+    if best is None:
+        return {"valid": False, "value": float("nan"), "delay_bits": 0,
+                "error": "alignment_failed", "compared_bits": 0,
+                "bit_errors": 0, "inversion_applied": False}
+    value, _, delay, direction, inverted, errors, compared = best
+    # Wilson one-sided 95% upper bound.  A measured BER of zero therefore
+    # remains a finite-sample statement rather than an assertion of zero
+    # population error rate.
+    z = 1.6448536269514722
+    proportion = errors / compared
+    denominator = 1.0 + (z * z) / compared
+    center = proportion + (z * z) / (2.0 * compared)
+    radius = z * math.sqrt(
+        (proportion * (1.0 - proportion) / compared)
+        + (z * z) / (4.0 * compared * compared)
+    )
+    confidence_upper_bound = min(1.0, (center + radius) / denominator)
+    return {
+        "valid": True,
+        "metric": "ber",
+        "value": float(value),
+        "bit_errors": errors,
+        "compared_bits": compared,
+        "delay_bits": delay,
+        "alignment_direction": direction,
+        "alignment_method": "bounded_delay_search",
+        "max_delay_bits": search,
+        "inversion_applied": inverted,
+        "confidence_level": 0.95,
+        "confidence_method": "wilson_one_sided",
+        "confidence_upper_bound": confidence_upper_bound,
+    }
 
 
 def demod_bits(symbols, modulation: str = "bpsk"):
@@ -312,10 +506,18 @@ def generate_script(flow_graph, out_dir: str) -> str:
 
 
 def _load_top_block_class(script_path: str):
-    """动态载入生成的脚本,取出 top_block 类(有 start 方法者)。"""
-    spec = importlib.util.spec_from_file_location("_grc_sim_gen", script_path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    """Compile the current generated source without consulting ``.pyc``.
+
+    A flowgraph can be regenerated at the same path, with the same byte size,
+    within one filesystem timestamp tick.  Import loaders may then accept the
+    previous bytecode cache and execute a stale graph.  Simulation is a
+    verification boundary, so it must compile the bytes just generated.
+    """
+    module = types.ModuleType("_grc_sim_gen")
+    module.__file__ = script_path
+    with open(script_path, "rb") as handle:
+        source = handle.read()
+    exec(compile(source, script_path, "exec"), module.__dict__)
     for _name, obj in vars(module).items():
         if (isinstance(obj, type) and hasattr(obj, "start")
                 and getattr(obj, "__module__", None) == module.__name__):
@@ -324,43 +526,52 @@ def _load_top_block_class(script_path: str):
 
 
 def execute_script(script_path: str,
-                   timeout: float = DEFAULT_TIMEOUT) -> Tuple[bool, str]:
+                   timeout: float = DEFAULT_TIMEOUT,
+                   cwd: str = "") -> Tuple[bool, str]:
     """在本进程动态载入并执行 top_block,带墙钟超时兜底。
 
-    用线程跑 start()+wait(),超时则尝试 stop()+wait()。
-    返回 (是否正常结束, 错误信息)。
+    File Sink 在 .grc 里使用 session 相对路径时，必须在输出目录下执行，
+    否则样本会写到进程 cwd，读回就是空探针。
     """
+    previous = os.getcwd()
     try:
-        top_cls = _load_top_block_class(script_path)
-    except Exception as exc:  # noqa: BLE001
-        return False, f"载入脚本失败: {exc}"
-
-    tb = top_cls()
-    err_holder: List[str] = []
-
-    def _run():
+        if cwd:
+            os.chdir(cwd)
         try:
-            tb.start()
-            tb.wait()
+            top_cls = _load_top_block_class(script_path)
         except Exception as exc:  # noqa: BLE001
-            err_holder.append(str(exc))
+            return False, f"载入脚本失败: {exc}"
 
-    th = threading.Thread(target=_run, daemon=True)
-    th.start()
-    th.join(timeout)
-    if th.is_alive():
-        # 超时:请求停止(head 通常已让它自停,这里是兜底)
-        try:
-            tb.stop()
-            tb.wait()
-        except Exception:  # noqa: BLE001
-            pass
-        th.join(5.0)
+        tb = top_cls()
+        err_holder: List[str] = []
+
+        def _run():
+            try:
+                tb.start()
+                tb.wait()
+            except Exception as exc:  # noqa: BLE001
+                err_holder.append(str(exc))
+
+        th = threading.Thread(target=_run, daemon=True)
+        th.start()
+        th.join(timeout)
         if th.is_alive():
-            return False, f"仿真超时(>{timeout}s)且无法停止"
-    if err_holder:
-        return False, "执行异常: " + "; ".join(err_holder)
-    return True, ""
+            try:
+                tb.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            th.join(5.0)
+            if th.is_alive():
+                return False, f"仿真超时(>{timeout}s)且无法停止"
+        if err_holder:
+            return False, "执行异常: " + "; ".join(err_holder)
+        return True, ""
+    finally:
+        if cwd:
+            try:
+                os.chdir(previous)
+            except OSError:
+                pass
 
 
 def read_probe(path: str, dtype: str = "complex64"):
@@ -438,7 +649,7 @@ def run(flow_graph, platform, *,
         return result
 
     # 4. 执行
-    ok, err = execute_script(result.script_path, timeout=timeout)
+    ok, err = execute_script(result.script_path, timeout=timeout, cwd=out_dir)
     if not ok:
         result.error = err
         result.stderr = err
@@ -449,10 +660,13 @@ def run(flow_graph, platform, *,
     if probes:
         import numpy as np
         for pid, (fpath, dtype) in probes.items():
-            arr = read_probe(fpath, dtype)
+            read_path = (
+                fpath if os.path.isabs(fpath) else os.path.join(out_dir, fpath)
+            )
+            arr = read_probe(read_path, dtype)
             result.data[pid] = arr
             if arr.size == 0:
-                logger.warning("probe %s 输出为空: %s", pid, fpath)
+                logger.warning("probe %s 输出为空: %s", pid, read_path)
 
     result.ok = True
     result.summary = _build_summary(result)
@@ -471,121 +685,4 @@ def _build_summary(result: SimResult) -> str:
     return ", ".join(parts)
 
 
-# ---------------------------------------------------------------------------
-# 自检: T2 BPSK + AWGN 端到端
-# ---------------------------------------------------------------------------
-def _selftest_bpsk_awgn() -> int:
-    """构建 BPSK+AWGN 链路,跑无头仿真,算 EVM,验证闭环。
 
-    运行::
-
-        PYTHONPATH=$PWD python -m grc.agent.runtime.simulate
-    """
-    import numpy as np
-    from grc.agent import env
-
-    logging.basicConfig(level=logging.WARNING)
-    out_dir = tempfile.mkdtemp(prefix="bpsk_awgn_")
-    iq_file = os.path.join(out_dir, "rx_iq.bin")
-
-    samp_rate = 1_000_000
-    sps = 4
-    n_samples = 8192
-
-    platform = env.make_platform()
-    print(f"[1] 块库: {len(platform.blocks)} 块 / "
-          f"{len(platform.workflow_manager.workflows)} workflow")
-
-    fg = platform.make_flow_graph()
-    env.configure_options(fg, "python", "no_gui", flowgraph_id="bpsk_awgn_sim")
-
-    def nb(key, bid, **kw):
-        block = fg.new_block(key)
-        if block is None:
-            raise AssertionError(f"块不存在: {key}")
-        block.params["id"].set_value(bid)
-        for name, value in kw.items():
-            if name not in block.params:
-                raise AssertionError(
-                    f"{key} 无参数 {name!r}; 实际: {list(block.params)}")
-            block.params[name].set_value(value)
-        return block
-
-    nb("variable", "samp_rate", value=str(samp_rate))
-    nb("variable", "sps", value=str(sps))
-    nb("variable_constellation", "bpsk_const", type="bpsk")
-
-    src = nb("analog_random_source_x", "src", type="byte",
-             min="0", max="2", num_samps="1000", repeat="True")
-    mod = nb("digital_constellation_modulator", "mod",
-             constellation="bpsk_const", differential="False",
-             samples_per_symbol="sps", excess_bw="0.35")
-    # AWGN 信道: 加噪声,制造非理想星座
-    chan = nb("channels_channel_model", "chan",
-              noise_voltage="0.05", freq_offset="0.0",
-              epsilon="1.0", taps="1.0", seed="0")
-    head = nb("blocks_head", "head", type="complex", num_items=str(n_samples))
-    sink = nb("blocks_file_sink", "sink", type="complex", file=repr(iq_file))
-
-    for i, block in enumerate(fg.blocks):
-        block.states["coordinate"] = (120 + (i % 4) * 230, 140 + (i // 4) * 170)
-
-    fg.rewrite()
-    fg.connect(src.sources[0], mod.sinks[0])
-    fg.connect(mod.sources[0], chan.sinks[0])
-    fg.connect(chan.sources[0], head.sinks[0])
-    fg.connect(head.sources[0], sink.sinks[0])
-    fg.rewrite()
-    fg.validate()
-    print(f"[2] is_valid(): {fg.is_valid()}")
-    if not fg.is_valid():
-        for msg in fg.get_error_messages():
-            print("    !", msg.strip().splitlines()[-1].strip())
-        return 1
-
-    result = run(fg, platform,
-                 probes={"rx": (iq_file, "complex64")},
-                 out_dir=out_dir)
-    print(f"[3] 脚本: {result.script_path}")
-    print(f"[4] {result.summary}")
-    if not result.ok:
-        print("    ! 错误:", result.error)
-        return 1
-
-    # 算 EVM
-    iq = result.data["rx"]
-    if iq.size == 0:
-        print("    ! 无数据")
-        return 1
-    syms = extract_symbols(iq, sps=sps, skip_symbols=4)
-    evm = evm_from_symbols(syms, ideal_points=ideal_points_for("bpsk"))
-    result.metrics["evm_pct"] = evm
-    print(f"[5] EVM = {evm:.2f}%  (样本 {iq.size}, 抽取符号 {syms.size})")
-
-    # 硬判解调 -> 演示 BER 通路(自洽:解调结果与自身比对为 0,验证通路)
-    rx_bits = demod_bits(syms, "bpsk")
-    ber, delay = ber_from_bits(rx_bits, rx_bits)
-    result.metrics["ber_selfcheck"] = ber
-    print(f"[6] BER 通路自检 = {ber:.3g} (delay={delay}), 解调 {rx_bits.size} bit")
-
-    # 画图: 星座 / 频谱 / 眼图
-    const_png = os.path.join(out_dir, "constellation.png")
-    result.plot_constellation(const_png, probe_id="rx", sps=sps)
-    spec_png = os.path.join(out_dir, "spectrum.png")
-    result.plot_spectrum(spec_png, probe_id="rx", samp_rate=samp_rate)
-    eye_png = os.path.join(out_dir, "eye.png")
-    result.plot_eye(eye_png, probe_id="rx", sps=sps)
-    print(f"[7] 星座图: {const_png}")
-    print(f"    频谱图: {spec_png}")
-    print(f"    眼  图: {eye_png}")
-
-    # AWGN(噪声 0.05)下 EVM 应在合理范围(几个百分点),且非 0(有噪声)
-    ok = 0.1 < evm < 40.0
-    print("\n自检结果:", "PASS" if ok else "FAIL",
-          f"(EVM {evm:.2f}% 应落在 0.1~40)")
-    return 0 if ok else 1
-
-
-if __name__ == "__main__":
-    import sys
-    sys.exit(_selftest_bpsk_awgn())
