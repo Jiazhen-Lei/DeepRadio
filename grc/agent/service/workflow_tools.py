@@ -277,7 +277,7 @@ def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> li
         """Pause the Workflow and request one structured user decision.
 
         Use kind='input' for missing information. Use kind='approval' and
-        permission='rf.start' before physical RF transmission. This tool records
+        permission='rf.start' before physical TX or RX execution. This tool records
         a request only; it never grants a permission.
         """
         try:

@@ -36,7 +36,7 @@ stages:
 
   flowgraph_build:
     label: Flowgraph Build
-    objective: Create or modify the GNU Radio flowgraph from the aligned specification and radio design outputs.
+    objective: Create or modify the GNU Radio transmit or receive flowgraph from the aligned specification and available design outputs.
     select_when: Use when the task needs a new or modified GRC project.
     capabilities: [build_signal]
     skills: [grc-build, grc-block-rag]
@@ -53,6 +53,7 @@ stages:
       - inspect_flowgraph
       - apply_grc_diff
       - apply_flowgraph_patch
+      - build_sdr_rx_spectrum_flowgraph
       - build_sdr_tx_flowgraph
       - build_ble_uhd_tx_flowgraph
       - build_ble_pluto_tx_flowgraph

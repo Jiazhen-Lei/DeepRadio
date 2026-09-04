@@ -2,7 +2,7 @@
 
 ``discover_devices`` / ``probe_device`` wrap vendor CLIs (uhd_find_devices,
 iio_info, …). ``arm_hardware_flowgraph`` / ``start_flowgraph`` are DeepRadio
-runtime gates around GNU Radio ``grcc`` + a bounded subprocess. Agents must
+TX/RX runtime gates around GNU Radio ``grcc`` + a bounded subprocess. Agents must
 call these registry tools; GNU Radio has no BLE ADV or device-discovery API.
 """
 
@@ -259,12 +259,6 @@ def _completion_satisfied(ctx: ToolContext, predicate: str) -> bool:
     )
 
 
-def _is_ble_deploy(ctx: ToolContext) -> bool:
-    intent = (ctx.extra.get("workflow") or {}).get("intent") or {}
-    slots = intent.get("slots") or {}
-    return str(slots.get("protocol") or "").lower() == "ble"
-
-
 def _rf_armed(ctx: ToolContext, grc_path: str) -> bool:
     state = ctx.extra.get("state")
     project = getattr(state, "project", None)
@@ -274,17 +268,6 @@ def _rf_armed(ctx: ToolContext, grc_path: str) -> bool:
         and _resolve_work_path(ctx, str(getattr(project, "grc_path", "") or ""))
         == _resolve_work_path(ctx, grc_path)
     )
-
-
-def _tx_requires_arming(ctx: ToolContext) -> bool:
-    intent = (ctx.extra.get("workflow") or {}).get("intent") or {}
-    slots = intent.get("slots") or {}
-    return bool(
-        _is_ble_deploy(ctx)
-        or str(slots.get("direction") or "").lower() == "tx"
-    )
-
-
 def _persist_hardware_report(
     ctx: ToolContext, name: str, payload: Dict[str, Any]
 ) -> str:
@@ -494,8 +477,8 @@ def probe_device(
 @tool(
     name="arm_hardware_flowgraph",
     description=(
-        "Prepare the current session's hardware flowgraph after device probing. "
-        "This never starts RF."
+        "Prepare the current session's TX or RX hardware flowgraph after "
+        "device probing. This never starts RF."
     ),
     parameters={
         "type": "object",
@@ -522,50 +505,70 @@ def arm_hardware_flowgraph(
         return {"ok": False, "armed": False, "error": "Only the current session's flowgraph may be armed"}
     if ctx.flow_graph is None:
         return {"ok": False, "armed": False, "error": "The current session has no loaded flowgraph"}
-    sink_keys = {
-        "uhd_usrp_sink", "iio_pluto_sink", "iio_fmcomms2_sink_fc32",
-        "osmosdr_sink", "limesdr_sink",
-    }
-    sinks = [
-        block for block in ctx.flow_graph.blocks
-        if str(getattr(block, "key", "")) in sink_keys
+    state = ctx.extra.get("state")
+    project = getattr(state, "project", None)
+    configured_direction = str(
+        (getattr(project, "config", {}) or {}).get("direction") or ""
+    ).lower()
+    blocks = list(ctx.flow_graph.blocks)
+    sources = [
+        block for block in blocks
+        if str(getattr(block, "key", "")) in _SOURCE_KEYS
     ]
-    if not sinks:
-        return {"ok": False, "armed": False, "error": "The flowgraph has no supported hardware TX sink"}
-    prior_states = [block.state for block in sinks]
+    sinks = [
+        block for block in blocks
+        if str(getattr(block, "key", "")) in _SINK_KEYS
+    ]
+    if configured_direction == "rx":
+        endpoints, direction = sources, "rx"
+    elif configured_direction == "tx":
+        endpoints, direction = sinks, "tx"
+    elif sources and not sinks:
+        endpoints, direction = sources, "rx"
+    elif sinks and not sources:
+        endpoints, direction = sinks, "tx"
+    else:
+        endpoints, direction = [], ""
+    if not endpoints:
+        return {
+            "ok": False,
+            "armed": False,
+            "error": "The flowgraph has no unambiguous supported hardware source or sink",
+        }
+    prior_states = [block.state for block in endpoints]
     preview_blocks = [
         block for block in ctx.flow_graph.blocks
         if str(getattr(block, "name", "")) in {"preview_throttle", "preview_sink"}
     ]
     preview_prior_states = [block.state for block in preview_blocks]
     bind_endpoint_identity(ctx.flow_graph, device_identity)
-    for block in sinks:
+    for block in endpoints:
         block.state = "enabled"
     for block in preview_blocks:
         block.state = "disabled"
     ctx.flow_graph.rewrite()
     ctx.flow_graph.validate()
     if not ctx.flow_graph.is_valid():
-        for block, state in zip(sinks, prior_states):
-            block.state = state
+        for block, prior_state in zip(endpoints, prior_states):
+            block.state = prior_state
         for block, state in zip(preview_blocks, preview_prior_states):
             block.state = state
         ctx.flow_graph.rewrite()
-        return {"ok": False, "armed": False, "error": "Flowgraph validation failed after enabling the TX sink"}
+        return {"ok": False, "armed": False, "error": "Flowgraph validation failed after enabling the hardware endpoint"}
     armed_path = source.with_name(f"{source.stem}.armed.grc")
     try:
         ctx.platform.save_flow_graph(str(armed_path), ctx.flow_graph)
     except Exception as exc:  # noqa: BLE001
-        for block, state in zip(sinks, prior_states):
-            block.state = state
+        for block, prior_state in zip(endpoints, prior_states):
+            block.state = prior_state
         for block, state in zip(preview_blocks, preview_prior_states):
             block.state = state
         ctx.flow_graph.rewrite()
         return {"ok": False, "armed": False, "error": f"Failed to save the armed flowgraph: {exc}"}
     compiled = _compile_grc(str(armed_path))
     if not compiled.get("compiled"):
-        for block, state in zip(sinks, prior_states):
-            block.state = state
+        for block, prior_state in zip(endpoints, prior_states):
+            block.state = prior_state
         for block, state in zip(preview_blocks, preview_prior_states):
             block.state = state
         ctx.flow_graph.rewrite()
@@ -579,10 +582,9 @@ def arm_hardware_flowgraph(
             "error": "The armed flowgraph did not compile with grcc",
             "compile": compiled,
         }
-    state = ctx.extra.get("state")
-    project = getattr(state, "project", None)
     if project is not None:
         project.grc_path = str(armed_path)
+        project.config["direction"] = direction
         project.config["rf_armed"] = True
         project.config["rf_armed_path"] = str(armed_path)
     ctx.extra.setdefault("artifacts", {})["grc_path"] = str(armed_path)
@@ -590,6 +592,7 @@ def arm_hardware_flowgraph(
         "ok": True,
         "armed": True,
         "grc_path": str(armed_path),
+        "direction": direction,
         "device_identity": device_identity,
         "not_started": True,
         "compile": compiled,
@@ -645,8 +648,8 @@ def start_flowgraph(
         return {"ok": False, "requires_confirmation": True, "error": "rf.start user authorization is missing"}
     if not _completion_satisfied(ctx, "device_probed"):
         return {"ok": False, "error": "Hardware discovery and probing have not passed; refusing to start RF"}
-    if _tx_requires_arming(ctx) and not _rf_armed(ctx, grc_path):
-        return {"ok": False, "error": "The flowgraph has not been armed by the controlled workflow; refusing to start RF"}
+    if not _rf_armed(ctx, grc_path):
+        return {"ok": False, "error": "The hardware flowgraph has not been prepared by the controlled workflow; refusing to start RF"}
     source = _resolve_work_path(ctx, grc_path)
     out_dir = Path(ctx.out_dir or "").resolve()
     if not source.is_file() or out_dir not in source.parents:
@@ -769,9 +772,11 @@ _SINK_KEYS = {
     "uhd_usrp_sink", "iio_pluto_sink", "iio_fmcomms2_sink_fc32",
     "osmosdr_sink", "limesdr_sink",
 }
-_ENDPOINT_KEYS = _SINK_KEYS | {
-    "uhd_usrp_source", "iio_pluto_source", "osmosdr_source",
+_SOURCE_KEYS = {
+    "uhd_usrp_source", "iio_pluto_source", "iio_fmcomms2_source_fc32",
+    "osmosdr_source", "limesdr_source",
 }
+_ENDPOINT_KEYS = _SINK_KEYS | _SOURCE_KEYS
 
 
 def bind_endpoint_identity(flow_graph: Any, identity: str) -> int:

@@ -404,6 +404,24 @@ class WorkflowPresenterTest(unittest.TestCase):
         self.assertTrue(self.panel._evidence_btn.sensitive)
         self.assertIn("Human confirmation", self.panel._pending_label.text)
 
+    def test_rx_runtime_confirmation_is_not_presented_as_transmission(self):
+        view = interaction_view({
+            "intent_ir": {"slots": {"direction": "rx"}},
+        }, {
+            "action": "physical_rf_execution",
+            "purpose": "rf_authorization",
+            "requested_effect": "rf.start",
+            "device": {"type": "pluto", "identity": "usb:test.pluto"},
+            "center_frequency": 2_402_000_000.0,
+            "sample_rate": 2_000_000.0,
+            "bandwidth": 2_000_000.0,
+            "gain": 20.0,
+        })
+
+        self.assertEqual(view["confirm_label"], "Approve Bounded Reception")
+        self.assertIn("bounded reception", view["message"])
+        self.assertIn("限时接收", view["message_cn"])
+
     def test_quality_warning_is_visible_without_raw_warning_dump(self):
         workflow = {
             "task_label": "有限时长发射",

@@ -20,6 +20,7 @@ from grc.agent.schema import AgentReply, ToolInvocation
 from grc.agent.tools import registry
 from grc.agent.tools.build_tools import _missing_literal_file_source
 from grc.agent.tools.critic_tools import _missing_file_sources
+from grc.agent.tools.hardware_tools import arm_hardware_flowgraph
 from grc.agent.tools.registry import ToolContext
 from grc.agent.workflow.dynamic import DynamicWorkflowStore, missing_evidence
 
@@ -39,6 +40,91 @@ def _radio_design_stage(status="pending"):
 
 
 class MainAgentRuntimeTest(unittest.TestCase):
+    def test_hardware_arm_supports_rx_source_and_tx_sink(self):
+        class Parameter:
+            def __init__(self):
+                self.value = ""
+
+            def set_value(self, value):
+                self.value = value
+
+        class FlowGraph:
+            def __init__(self, block):
+                self.blocks = [block]
+
+            def rewrite(self):
+                return None
+
+            def validate(self):
+                return None
+
+            def is_valid(self):
+                return True
+
+        class Platform:
+            @staticmethod
+            def save_flow_graph(path, _flow_graph):
+                Path(path).write_text("test", encoding="utf-8")
+
+        for direction, key in (
+            ("rx", "iio_pluto_source"),
+            ("tx", "iio_pluto_sink"),
+        ):
+            with self.subTest(direction=direction), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source = root / f"pluto_{direction}.grc"
+                source.write_text("test", encoding="utf-8")
+                uri = Parameter()
+                block = SimpleNamespace(
+                    key=key, name=f"pluto_{direction}", state="disabled",
+                    params={"uri": uri},
+                )
+                state = SharedState(session_id="hardware-test")
+                state.project.config.update({
+                    "direction": direction,
+                    "observed_device": {"identity": "usb:test"},
+                })
+                ctx = ToolContext(
+                    platform=Platform(),
+                    flow_graph=FlowGraph(block),
+                    out_dir=str(root),
+                    extra={"state": state, "artifacts": {}},
+                )
+                with patch(
+                    "grc.agent.tools.hardware_tools._compile_grc",
+                    return_value={"ok": True, "compiled": True},
+                ):
+                    result = arm_hardware_flowgraph(
+                        ctx, str(source), "usb:test"
+                    )
+
+                self.assertTrue(result["ok"])
+                self.assertTrue(result["armed"])
+                self.assertEqual(result["direction"], direction)
+                self.assertEqual(block.state, "enabled")
+                self.assertEqual(uri.value, repr("usb:test"))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "display_only.grc"
+            source.write_text("test", encoding="utf-8")
+            state = SharedState(session_id="hardware-test")
+            state.project.config["observed_device"] = {"identity": "usb:test"}
+            ctx = ToolContext(
+                platform=Platform(),
+                flow_graph=FlowGraph(SimpleNamespace(
+                    key="qtgui_freq_sink_x", name="spectrum",
+                    state="enabled", params={},
+                )),
+                out_dir=str(root),
+                extra={"state": state, "artifacts": {}},
+            )
+
+            result = arm_hardware_flowgraph(ctx, str(source), "usb:test")
+
+            self.assertFalse(result["ok"])
+            self.assertIn("hardware source or sink", result["error"])
+
     def test_presentation_settings_are_fixed_and_language_is_explicit(self):
         profile = UserProfile()
         self.assertEqual((profile.level, profile.language), ("practitioner", "en"))
