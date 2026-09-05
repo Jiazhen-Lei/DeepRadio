@@ -133,6 +133,7 @@ _CN = {
     "Confirm whether an independent receiver observed the target signal over the air. Human confirmation is required; you may attach a screenshot.": "请确认独立接收设备是否通过空口观测到目标信号。此处需要人工确认，也可以添加截图。",
     "Not Observed": "未观测到",
     "Approve Bounded Transmission": "批准限时发射",
+    "Approve Bounded Reception": "批准限时接收",
     "Confirm Saved Configuration": "确认已保存配置",
     "Confirm Configuration": "确认配置",
     "The current step did not pass. Retry after correcting the reported condition, or cancel the workflow.": "当前步骤未通过。修正所报告的问题后重试，或取消工作流。",

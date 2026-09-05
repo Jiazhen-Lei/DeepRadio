@@ -44,7 +44,7 @@ Stage 完成后不自动开始下一 Stage。只有用户明确表示“继续�
 
 当前 Stage 缺少只能由用户提供的信息时，调用 `request_user_decision(kind='input')`，保持当前 Stage 不变。用户回答后继续同一 Stage。
 
-只有 `physical_rf_execution` 是当前 Stage 且 Flowgraph 已准备完成时，才能调用 `request_user_decision(kind='approval', permission='rf.start')`。确认只适用于当前 Workflow、Stage 和工程版本。
+只有 `physical_rf_execution` 是当前 Stage 且 TX 或 RX Flowgraph 已准备完成时，才能调用 `request_user_decision(kind='approval', permission='rf.start')`。确认只适用于当前 Workflow、Stage 和工程版本。
 
 ## 调整、失败和恢复
 

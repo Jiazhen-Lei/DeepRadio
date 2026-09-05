@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from grc.agent.memory.profile import UserProfile
 from grc.agent.service import MainAgentRuntime, build_mainagent_runtime
@@ -20,6 +20,7 @@ from grc.agent.schema import AgentReply, ToolInvocation
 from grc.agent.tools import registry
 from grc.agent.tools.build_tools import _missing_literal_file_source
 from grc.agent.tools.critic_tools import _missing_file_sources
+from grc.agent.tools.hardware_tools import arm_hardware_flowgraph
 from grc.agent.tools.registry import ToolContext
 from grc.agent.workflow.dynamic import DynamicWorkflowStore, missing_evidence
 
@@ -39,6 +40,91 @@ def _radio_design_stage(status="pending"):
 
 
 class MainAgentRuntimeTest(unittest.TestCase):
+    def test_hardware_arm_supports_rx_source_and_tx_sink(self):
+        class Parameter:
+            def __init__(self):
+                self.value = ""
+
+            def set_value(self, value):
+                self.value = value
+
+        class FlowGraph:
+            def __init__(self, block):
+                self.blocks = [block]
+
+            def rewrite(self):
+                return None
+
+            def validate(self):
+                return None
+
+            def is_valid(self):
+                return True
+
+        class Platform:
+            @staticmethod
+            def save_flow_graph(path, _flow_graph):
+                Path(path).write_text("test", encoding="utf-8")
+
+        for direction, key in (
+            ("rx", "iio_pluto_source"),
+            ("tx", "iio_pluto_sink"),
+        ):
+            with self.subTest(direction=direction), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source = root / f"pluto_{direction}.grc"
+                source.write_text("test", encoding="utf-8")
+                uri = Parameter()
+                block = SimpleNamespace(
+                    key=key, name=f"pluto_{direction}", state="disabled",
+                    params={"uri": uri},
+                )
+                state = SharedState(session_id="hardware-test")
+                state.project.config.update({
+                    "direction": direction,
+                    "observed_device": {"identity": "usb:test"},
+                })
+                ctx = ToolContext(
+                    platform=Platform(),
+                    flow_graph=FlowGraph(block),
+                    out_dir=str(root),
+                    extra={"state": state, "artifacts": {}},
+                )
+                with patch(
+                    "grc.agent.tools.hardware_tools._compile_grc",
+                    return_value={"ok": True, "compiled": True},
+                ):
+                    result = arm_hardware_flowgraph(
+                        ctx, str(source), "usb:test"
+                    )
+
+                self.assertTrue(result["ok"])
+                self.assertTrue(result["armed"])
+                self.assertEqual(result["direction"], direction)
+                self.assertEqual(block.state, "enabled")
+                self.assertEqual(uri.value, repr("usb:test"))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "display_only.grc"
+            source.write_text("test", encoding="utf-8")
+            state = SharedState(session_id="hardware-test")
+            state.project.config["observed_device"] = {"identity": "usb:test"}
+            ctx = ToolContext(
+                platform=Platform(),
+                flow_graph=FlowGraph(SimpleNamespace(
+                    key="qtgui_freq_sink_x", name="spectrum",
+                    state="enabled", params={},
+                )),
+                out_dir=str(root),
+                extra={"state": state, "artifacts": {}},
+            )
+
+            result = arm_hardware_flowgraph(ctx, str(source), "usb:test")
+
+            self.assertFalse(result["ok"])
+            self.assertIn("hardware source or sink", result["error"])
+
     def test_presentation_settings_are_fixed_and_language_is_explicit(self):
         profile = UserProfile()
         self.assertEqual((profile.level, profile.language), ("practitioner", "en"))
@@ -302,6 +388,7 @@ class MainAgentRuntimeTest(unittest.TestCase):
     def test_ota_checkpoint_records_task_evidence_bound_to_run(self):
         runtime = MainAgentRuntime.__new__(MainAgentRuntime)
         runtime.session_id = "runtime-test"
+        runtime.profile = UserProfile()
         runtime._state = SharedState(session_id="runtime-test")
         runtime._state.intent = SharedIntent.new("Send BLE", "wf-test")
         runtime._state.project.config["runtime"] = {
@@ -313,21 +400,23 @@ class MainAgentRuntimeTest(unittest.TestCase):
             layer="task",
             producer="over_air_verification",
         ))
+        update_stage = Mock()
         runtime._workflow = SimpleNamespace(
-            workflow=SimpleNamespace(workflow_id="wf-test"),
+            workflow=SimpleNamespace(workflow_id="wf-test", revision=2),
             resolve_decision=lambda _checkpoint_id, _decision: {
                 "id": "checkpoint-test",
                 "purpose": "ota_observation",
                 "permission": "",
                 "stage_id": "over_air_verification",
             },
+            update_stage=update_stage,
         )
 
         with tempfile.TemporaryDirectory() as directory, patch.object(
             session_store, "state_path", return_value=str(Path(directory) / "state.json")
         ), patch.object(session_store, "append_session_event"), patch.object(
-            runtime, "_invoke_mainagent", return_value="continued"
-        ):
+            runtime, "_make_ctx", return_value=ToolContext()
+        ), patch.object(runtime, "_finalize_turn", return_value="completed"):
             reply = runtime._resolve_checkpoint({
                 "checkpoint_id": "checkpoint-test",
                 "decision": "approved",
@@ -335,9 +424,42 @@ class MainAgentRuntimeTest(unittest.TestCase):
             })
 
         claim = ClaimStore(runtime._state).get("success_condition_1")
-        self.assertEqual(reply, "continued")
+        self.assertEqual(reply, "completed")
         self.assertEqual(claim.status, "Supported")
         self.assertEqual(claim.evidence[-1].observation["run_id"], "run-test")
+        update_stage.assert_called_once()
+        self.assertEqual(update_stage.call_args.kwargs["status"], "completed")
+        self.assertEqual(
+            update_stage.call_args.kwargs["result_refs"],
+            ["task_observation:user_confirmed"],
+        )
+
+    def test_typed_confirmation_resolves_pending_ota_checkpoint(self):
+        runtime = MainAgentRuntime.__new__(MainAgentRuntime)
+        runtime.session_id = "runtime-test"
+        runtime._state = SharedState(session_id="runtime-test")
+        runtime._workflow = SimpleNamespace(
+            load_error="",
+            workflow=SimpleNamespace(checkpoint={
+                "id": "checkpoint-test",
+                "purpose": "record_task_observation",
+                "stage_id": "over_air_verification",
+                "status": "pending",
+            }),
+        )
+
+        with patch.object(session_store, "append_session_event"), patch.object(
+            runtime, "_resolve_checkpoint", return_value="resolved"
+        ) as resolve:
+            reply = runtime.step("是的")
+
+        self.assertEqual(reply, "resolved")
+        command = resolve.call_args.args[0]
+        self.assertEqual(command["checkpoint_id"], "checkpoint-test")
+        self.assertEqual(command["decision"], "approved")
+        self.assertEqual(
+            command["observation"]["evidence_kind"], "human_confirmation"
+        )
 
     def test_hardware_tool_results_are_projected(self):
         state = SharedState(session_id="runtime-test")
@@ -420,7 +542,123 @@ class MainAgentRuntimeTest(unittest.TestCase):
             self.assertEqual(workflow.workflow.base_project_version, 3)
             self.assertEqual(workflow.workflow.revision, revision + 1)
 
-    def test_completed_stage_waits_for_the_next_user_turn(self):
+    def test_workflow_cannot_reopen_completed_stage_implicitly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workflow = DynamicWorkflowStore(str(Path(directory) / "workflow.json"))
+            workflow.begin_turn("Build a radio", 0)
+            workflow.update(
+                intent_summary="Build a radio",
+                intent_slots={},
+                stages=[_spec_stage(), _radio_design_stage()],
+                current_stage="radio_specification_alignment",
+                execution_status="running",
+                task_type="DYNAMIC",
+                expected_revision=1,
+                events=[],
+                artifacts={},
+                metrics={},
+                project_version=0,
+            )
+            workflow.update_stage(
+                stage_id="radio_specification_alignment",
+                status="completed",
+                inputs=None,
+                result_refs=["spec_commit"],
+                expected_revision=2,
+                events=[{"kind": "spec_commit", "payload": {"ok": True}}],
+                artifacts={},
+                metrics={},
+                project_version=0,
+            )
+            workflow.update_stage(
+                stage_id="radio_design",
+                status="running",
+                inputs=None,
+                result_refs=None,
+                expected_revision=3,
+                events=[],
+                artifacts={},
+                metrics={},
+                project_version=0,
+            )
+
+            with self.assertRaisesRegex(ValueError, "requires allow_reopen=true"):
+                workflow.update(
+                    intent_summary="Build a radio",
+                    intent_slots={},
+                    stages=[_spec_stage("completed"), _radio_design_stage("running")],
+                    current_stage="radio_specification_alignment",
+                    execution_status="running",
+                    task_type="DYNAMIC",
+                    expected_revision=4,
+                    events=[],
+                    artifacts={},
+                    metrics={},
+                    project_version=0,
+                )
+
+        self.assertEqual(workflow.workflow.current_stage, "radio_design")
+        self.assertEqual(workflow.workflow.revision, 4)
+
+    def test_workflow_can_reopen_completed_stage_explicitly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workflow = DynamicWorkflowStore(str(Path(directory) / "workflow.json"))
+            workflow.begin_turn("Build a radio", 0)
+            workflow.update(
+                intent_summary="Build a radio",
+                intent_slots={},
+                stages=[_spec_stage(), _radio_design_stage()],
+                current_stage="radio_specification_alignment",
+                execution_status="running",
+                task_type="DYNAMIC",
+                expected_revision=1,
+                events=[],
+                artifacts={},
+                metrics={},
+                project_version=0,
+            )
+            workflow.update_stage(
+                stage_id="radio_specification_alignment",
+                status="completed",
+                inputs=None,
+                result_refs=["spec_commit"],
+                expected_revision=2,
+                events=[{"kind": "spec_commit", "payload": {"ok": True}}],
+                artifacts={},
+                metrics={},
+                project_version=0,
+            )
+            workflow.update_stage(
+                stage_id="radio_design",
+                status="running",
+                inputs=None,
+                result_refs=None,
+                expected_revision=3,
+                events=[],
+                artifacts={},
+                metrics={},
+                project_version=0,
+            )
+            result = workflow.update(
+                intent_summary="Build a radio",
+                intent_slots={},
+                stages=[_spec_stage("completed"), _radio_design_stage("running")],
+                current_stage="radio_specification_alignment",
+                execution_status="running",
+                task_type="DYNAMIC",
+                expected_revision=4,
+                events=[],
+                artifacts={},
+                metrics={},
+                project_version=0,
+                allow_reopen=True,
+            )
+
+        self.assertEqual(result.current_stage, "radio_specification_alignment")
+        self.assertEqual(result.stage("radio_specification_alignment").status, "pending")
+        self.assertEqual(workflow.reopened_from, "radio_specification_alignment")
+
+    def test_final_completed_stage_completes_workflow(self):
         with tempfile.TemporaryDirectory() as directory:
             workflow = DynamicWorkflowStore(str(Path(directory) / "workflow.json"))
             workflow.begin_turn("Build a radio", 0)
@@ -451,7 +689,7 @@ class MainAgentRuntimeTest(unittest.TestCase):
                 project_version=0,
             )
 
-        self.assertEqual(result.execution_status, "pending")
+        self.assertEqual(result.execution_status, "completed")
 
     @unittest.skipUnless(
         importlib.util.find_spec("langchain_core"), "langchain_core is not installed"
@@ -534,6 +772,46 @@ class MainAgentRuntimeTest(unittest.TestCase):
         self.assertTrue(completed["ok"])
         self.assertFalse(blocked["ok"])
         self.assertEqual(workflow.workflow.current_stage, "radio_specification_alignment")
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("langchain_core"), "langchain_core is not installed"
+    )
+    def test_over_air_checkpoint_uses_canonical_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workflow = DynamicWorkflowStore(str(Path(directory) / "workflow.json"))
+            workflow.begin_turn("Observe RX spectrum", 0)
+            workflow.update(
+                intent_summary="Observe RX spectrum",
+                intent_slots={},
+                stages=[{"id": "over_air_verification", "status": "running"}],
+                current_stage="over_air_verification",
+                execution_status="running",
+                task_type="DYNAMIC",
+                expected_revision=1,
+                events=[],
+                artifacts={},
+                metrics={},
+                project_version=0,
+            )
+            ctx = ToolContext(extra={
+                "session_id": "runtime-test",
+                "events": [],
+                "artifacts": {},
+                "metrics": {},
+            })
+            tools = {tool.name: tool for tool in build_workflow_tools(ctx, workflow)}
+            with patch.object(session_store, "append_session_event"):
+                result = json.loads(tools["request_user_decision"].invoke({
+                    "stage_id": "over_air_verification",
+                    "question": "Did you observe the target spectrum?",
+                    "purpose": "record_task_observation",
+                    "kind": "input",
+                }))
+
+        checkpoint = result["checkpoint"]
+        self.assertEqual(checkpoint["purpose"], "ota_observation")
+        self.assertEqual(checkpoint["kind"], "approval")
+        self.assertEqual(checkpoint["permission"], "")
 
     def test_stage_update_preserves_the_workflow_plan(self):
         with tempfile.TemporaryDirectory() as directory:

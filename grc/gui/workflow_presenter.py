@@ -563,6 +563,11 @@ def interaction_view(
         return {"visible": False}
     purpose = str(item.get("purpose") or "")
     effect = str(item.get("requested_effect") or "")
+    direction = str(
+        item.get("direction")
+        or dict((workflow.get("intent_ir") or {}).get("slots") or {}).get("direction")
+        or ""
+    ).lower()
     can_confirm = bool(item.get("can_confirm", True))
     can_retry = bool(item.get("can_retry"))
     confirm_label = "Confirm"
@@ -602,25 +607,41 @@ def interaction_view(
         frequency = _format_si(item.get("center_frequency"), "Hz")
         sample_rate = _format_si(item.get("sample_rate"), "sps")
         bandwidth = _format_si(item.get("bandwidth"), "Hz")
+        gain = item.get("rx_gain", item.get("gain"))
         level = (
-            f"Attenuation {item.get('tx_attenuation')} dB"
+            f"Gain {gain} dB" if direction == "rx" and gain is not None
+            else "gain not set" if direction == "rx"
+            else f"Attenuation {item.get('tx_attenuation')} dB"
             if item.get("tx_attenuation") is not None
             else f"Gain {item.get('tx_gain')} dB"
             if item.get("tx_gain") is not None
             else "power not set"
         )
         if purpose == "rf_authorization" or effect in {"RF_RUN", "rf.start"}:
-            message = (
-                f"Authorize a bounded RF run on {name} [{identity}] at "
-                f"{frequency}, {sample_rate}, bandwidth {bandwidth}, {level}, "
-                f"for up to {duration} seconds. The controlled stop remains active."
-            )
-            message_cn = (
-                f"批准在 {name} [{identity}] 上执行限时射频运行：频率 {frequency}，"
-                f"采样率 {sample_rate}，带宽 {bandwidth}，{level}，最长 {duration} 秒。"
-                "受控停止保持有效。"
-            )
-            confirm_label = "Approve Bounded Transmission"
+            if direction == "rx":
+                message = (
+                    f"Authorize bounded reception on {name} [{identity}] at "
+                    f"{frequency}, {sample_rate}, bandwidth {bandwidth}, {level}, "
+                    f"for up to {duration} seconds. The controlled stop remains active."
+                )
+                message_cn = (
+                    f"批准在 {name} [{identity}] 上执行限时接收：频率 {frequency}，"
+                    f"采样率 {sample_rate}，带宽 {bandwidth}，{level}，最长 {duration} 秒。"
+                    "受控停止保持有效。"
+                )
+                confirm_label = "Approve Bounded Reception"
+            else:
+                message = (
+                    f"Authorize a bounded RF run on {name} [{identity}] at "
+                    f"{frequency}, {sample_rate}, bandwidth {bandwidth}, {level}, "
+                    f"for up to {duration} seconds. The controlled stop remains active."
+                )
+                message_cn = (
+                    f"批准在 {name} [{identity}] 上执行限时射频运行：频率 {frequency}，"
+                    f"采样率 {sample_rate}，带宽 {bandwidth}，{level}，最长 {duration} 秒。"
+                    "受控停止保持有效。"
+                )
+                confirm_label = "Approve Bounded Transmission"
         else:
             message = (
                 f"Confirm saved configuration for {name} [{identity}] at "

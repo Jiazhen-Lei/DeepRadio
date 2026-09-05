@@ -70,10 +70,13 @@ def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> li
         task_type: str = "DYNAMIC",
         intent_slots: Dict[str, Any] | None = None,
         expected_revision: int = 1,
+        allow_reopen: bool = False,
     ) -> str:
         """Create or update the complete ordered Workflow.
 
         Use this for initial planning or user-requested structural replanning.
+        Routine Stage progress must use update_current_stage. Set allow_reopen
+        only when the user explicitly asks to revise earlier completed work.
         Stage fields: id, inputs, status and result_refs. Objective, skills and
         expected_evidence come from the Stage library.
         Use the revision from CURRENT_WORKFLOW.
@@ -141,6 +144,7 @@ def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> li
                 artifacts=dict(ctx.extra.get("artifacts") or {}),
                 metrics=dict(ctx.extra.get("metrics") or {}),
                 project_version=project_version,
+                allow_reopen=bool(allow_reopen),
             )
         except (TypeError, ValueError) as exc:
             return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
@@ -277,9 +281,29 @@ def build_workflow_tools(ctx: ToolContext, workflow: DynamicWorkflowStore) -> li
         """Pause the Workflow and request one structured user decision.
 
         Use kind='input' for missing information. Use kind='approval' and
-        permission='rf.start' before physical RF transmission. This tool records
-        a request only; it never grants a permission.
+        permission='rf.start' before physical TX or RX execution. Over-air task
+        observations always use the canonical ota_observation approval contract.
+        This tool records a request only; it never grants a permission.
         """
+        if stage_id == "over_air_verification":
+            purpose = "ota_observation"
+            permission = ""
+            kind = "approval"
+            existing = dict(
+                workflow.workflow.checkpoint
+                if workflow.workflow is not None else {}
+            )
+            if (
+                existing.get("status") == "pending"
+                and existing.get("stage_id") == stage_id
+                and existing.get("purpose") == purpose
+            ):
+                ctx.extra["pending_decision"] = existing
+                return json.dumps({
+                    "ok": True,
+                    "checkpoint": existing,
+                    "repeated_request": True,
+                }, ensure_ascii=False)
         try:
             checkpoint = workflow.request_decision(
                 stage_id=stage_id,

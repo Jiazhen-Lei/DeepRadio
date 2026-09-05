@@ -214,6 +214,7 @@ class DynamicWorkflowStore:
         artifacts: Dict[str, Any],
         metrics: Dict[str, Any],
         project_version: int,
+        allow_reopen: bool = False,
     ) -> DynamicWorkflow:
         if self.workflow is None:
             self.begin_turn(intent_summary, project_version)
@@ -271,6 +272,12 @@ class DynamicWorkflowStore:
         ):
             changed_indexes.append(candidate_current_index)
         self.reopened_from = ""
+        if changed_indexes and not allow_reopen:
+            reopened_index = min(changed_indexes)
+            reopen_stage = candidate.stages[reopened_index].id
+            raise ValueError(
+                f"Workflow reopening from {reopen_stage} requires allow_reopen=true"
+            )
         if changed_indexes:
             reopened_index = min(changed_indexes)
             self.reopened_from = candidate.stages[reopened_index].id
@@ -323,7 +330,11 @@ class DynamicWorkflowStore:
         if newly_failed:
             candidate.execution_status = "errored"
         elif newly_completed and candidate.execution_status != "completed":
-            candidate.execution_status = "pending"
+            candidate.execution_status = (
+                "completed"
+                if all(stage.status == "completed" for stage in candidate.stages)
+                else "pending"
+            )
         self.workflow = candidate
         self.save()
         return candidate
@@ -375,6 +386,14 @@ class DynamicWorkflowStore:
             stage.inputs = dict(inputs)
         if result_refs is not None:
             refs = [str(item) for item in result_refs if item]
+            if any(ref.startswith("task_observation") for ref in refs):
+                missing = missing_evidence(
+                    ["task_observation"], events, artifacts, metrics
+                )
+                if missing:
+                    raise ValueError(
+                        "task_observation result_refs require recorded task_observation evidence"
+                    )
             stage.result_refs = refs
 
         if status == "completed" and stage.status != "completed":
@@ -390,7 +409,11 @@ class DynamicWorkflowStore:
         if status == "failed":
             candidate.execution_status = "errored"
         elif status == "completed":
-            candidate.execution_status = "pending"
+            candidate.execution_status = (
+                "completed"
+                if all(item.status == "completed" for item in candidate.stages)
+                else "pending"
+            )
         elif status == "waiting":
             candidate.execution_status = "waiting"
         else:

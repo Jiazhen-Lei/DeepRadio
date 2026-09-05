@@ -65,6 +65,30 @@ def _recursion_limit() -> int:
         return DEFAULT_RECURSION_LIMIT
 
 
+def _is_ota_checkpoint(checkpoint: Dict[str, Any]) -> bool:
+    return (
+        str(checkpoint.get("purpose") or "") == "ota_observation"
+        or str(checkpoint.get("stage_id") or "") == "over_air_verification"
+    )
+
+
+def _explicit_checkpoint_decision(text: str) -> str:
+    normalized = "".join(str(text or "").strip().lower().split()).rstrip("。.!！")
+    approved = {
+        "是", "是的", "确认", "可以", "已确认", "我确认", "观察到了",
+        "已观察到", "目标信号已观察到", "没有问题",
+    }
+    rejected = {
+        "否", "不是", "取消", "没有", "没看到", "没有看到", "未观察到",
+        "目标信号未观察到", "有问题",
+    }
+    if normalized in approved:
+        return "approved"
+    if normalized in rejected:
+        return "rejected"
+    return ""
+
+
 class MainAgentRuntime:
     """Run MainAgent turns without making semantic Workflow decisions.
 
@@ -267,6 +291,26 @@ class MainAgentRuntime:
             return self._error_reply(self._text(
                 "Please describe the radio task.", "请描述无线电任务。"
             ))
+        checkpoint = dict(
+            self._workflow.workflow.checkpoint
+            if self._workflow.workflow is not None else {}
+        )
+        if checkpoint.get("status") == "pending" and _is_ota_checkpoint(checkpoint):
+            decision = _explicit_checkpoint_decision(text)
+            if decision:
+                store.append_session_event(
+                    self.session_id, "user_turn_received", {"text": text}
+                )
+                return self._resolve_checkpoint({
+                    "action": "checkpoint_decision",
+                    "checkpoint_id": str(checkpoint.get("id") or ""),
+                    "decision": decision,
+                    "observation": {
+                        "observed_at": time.time(),
+                        "evidence_kind": "human_confirmation",
+                        "user_statement": text,
+                    },
+                })
         prior_workflow_id = (
             self._workflow.workflow.workflow_id
             if self._workflow.workflow else ""
@@ -397,7 +441,7 @@ class MainAgentRuntime:
         except ValueError as exc:
             return self._error_reply(str(exc))
         permission = str(checkpoint.get("permission") or "")
-        ota_observation = str(checkpoint.get("purpose") or "") == "ota_observation"
+        ota_observation = _is_ota_checkpoint(checkpoint)
         if decision == "approved" and permission:
             grants = self._state.runtime.granted_permissions
             if permission not in grants:
@@ -419,6 +463,7 @@ class MainAgentRuntime:
                 stage_id=str(checkpoint.get("stage_id") or ""),
             )
         )
+        evidence_payload: Dict[str, Any] = {}
         if ota_observation:
             observation = dict(command.get("observation") or {})
             runtime = dict(self._state.project.config.get("runtime") or {})
@@ -459,14 +504,46 @@ class MainAgentRuntime:
             "checkpoint_resolved",
             {**checkpoint, "decision": decision},
         )
+        if ota_observation and decision == "approved":
+            workflow = self._workflow.workflow
+            if workflow is not None:
+                try:
+                    self._workflow.update_stage(
+                        stage_id=str(checkpoint.get("stage_id") or ""),
+                        status="completed",
+                        inputs=None,
+                        result_refs=["task_observation:user_confirmed"],
+                        expected_revision=workflow.revision,
+                        events=[{
+                            "kind": "task_observation",
+                            "payload": evidence_payload,
+                        }],
+                        artifacts={},
+                        metrics={},
+                        project_version=self._state.project.flowgraph_version,
+                    )
+                except ValueError as exc:
+                    return self._error_reply(str(exc))
+            return self._finalize_turn(
+                self._make_ctx(),
+                self._text(
+                    "The observed task result was recorded and the Workflow is complete.",
+                    "已记录本次任务观测，Workflow 已完成。",
+                ),
+                ok=True,
+            )
         if decision == "rejected" and not ota_observation:
             return self._simple_reply(self._text(
                 "The requested action was cancelled.", "请求的操作已取消。"
             ), "CANCELLED")
         if decision == "rejected":
-            return self._invoke_mainagent(
-                "The user did not observe the expected task result. Treat this as "
-                "task evidence and continue the current Workflow without claiming success."
+            return self._finalize_turn(
+                self._make_ctx(),
+                self._text(
+                    "The expected task result was not observed.",
+                    "未观察到预期任务结果。",
+                ),
+                ok=False,
             )
         return self._invoke_mainagent(
             "The user approved the pending decision. Continue the current Workflow "
